@@ -1,0 +1,704 @@
+{
+  "review": {
+    "role": "Senior software architect and reliability engineer",
+    "artifacts_reviewed": [
+      "docs/superpowers/specs/2026-10-02-jev-trading-lab-design.md",
+      "docs/research/reuse-audit.md"
+    ],
+    "files_modified": [],
+    "scope": [
+      "module boundaries",
+      "data model",
+      "append-only guarantees",
+      "idempotency",
+      "restart recovery",
+      "scheduler semantics",
+      "causality enforcement",
+      "model and version pinning",
+      "provider failures",
+      "observability",
+      "security",
+      "testing",
+      "Python and SQLite feasibility",
+      "overengineering",
+      "missing invariants"
+    ]
+  },
+  "verdict": {
+    "status": "BLOCKED_PENDING_REVISION",
+    "implementation_ready": false,
+    "architecture_direction": "SOUND",
+    "summary": "A Python 3.12 modular monolith with SQLite is the correct deployment shape for this experiment. The design has strong causal, paper-only, auditability, and deterministic-computation principles, but its operational contract is incomplete. Six blockers remain: arm-level accounting is ambiguous, OpenAI web-search timing conflicts with the causal cutoff, no next-open stock execution job exists, the Polymarket workload is not capacity-bounded, provider errors are conflated with abstention, and the Polymarket opportunity/unit-of-analysis identity is undefined.",
+    "required_before_implementation_planning": [
+      "Resolve all BLOCKER findings.",
+      "Specify the SQLite schema and accounting invariants rather than table names alone.",
+      "Define cycle-slot, lease, crash-recovery, and pending-work state machines.",
+      "Add an operational capacity budget and cycle deadline.",
+      "Replace autonomous post-cutoff web retrieval with a causally frozen evidence pipeline.",
+      "Define deployment read-back that proves committed code is the running code."
+    ]
+  },
+  "strengths": [
+    {
+      "references": [
+        "§2, lines 24-37",
+        "§12, lines 449-457"
+      ],
+      "assessment": "Live execution is excluded structurally rather than hidden behind configuration. This sharply reduces safety and credential risk."
+    },
+    {
+      "references": [
+        "§3.1, lines 43-50",
+        "§13, lines 459-488"
+      ],
+      "assessment": "Causal cutoffs, immutable inputs, revised-data supersession, no-lookahead fixtures, and restart testing are appropriate responses to the previous stale-data and leakage failures."
+    },
+    {
+      "references": [
+        "§3.2, lines 52-61",
+        "§5, lines 125-181"
+      ],
+      "assessment": "Model judgment is separated from arithmetic, risk, sizing, and execution. Explicit abstention and strict output validation are correct boundaries."
+    },
+    {
+      "references": [
+        "§3.3, lines 63-72",
+        "§9, lines 396-419"
+      ],
+      "assessment": "Transactional SQLite, deterministic identities, immutable blobs, journal-derived state, startup reconciliation, and runtime version reporting directly target the prior portfolio corruption, duplicate-process, and committed-not-live failures."
+    },
+    {
+      "references": [
+        "§4, lines 82-123"
+      ],
+      "assessment": "A modular monolith is preferable to services for this workload. SQLite capacity is ample if all writers are local and serialized."
+    },
+    {
+      "references": [
+        "§14, lines 490-503",
+        "reuse-audit.md, lines 7-29"
+      ],
+      "assessment": "Selective reuse and explicit rejection of unsafe upstream behavior are well documented and avoid inheriting forced trades, stale caching, optimistic fills, and live-by-default paths."
+    }
+  ],
+  "findings": [
+    {
+      "id": "ARCH-001",
+      "severity": "BLOCKER",
+      "area": "Portfolio isolation and economic accounting",
+      "references": [
+        "§1, lines 11-20",
+        "§6.7, lines 248-255",
+        "§7.3, lines 282-294",
+        "§7.6, lines 322-327",
+        "§8.3, lines 355-365"
+      ],
+      "issue": "The specification grants each stream $10,000 but does not state whether each trading arm has an isolated $10,000 portfolio. AI and deterministic arms cannot share cash, positions, risk limits, or fills without contaminating the comparison. It is also unclear whether model and infrastructure costs are deducted from the primary economic result or merely displayed.",
+      "impact": "Shared capital creates cross-arm interference and invalid paired comparisons. Excluding incremental inference costs conflicts with the stated net-of-cost economic-value objective.",
+      "precise_fix": [
+        "Define every account by `(run_id, stream, arm, currency)`.",
+        "Create separate opening-cash events for AI, deterministic, cash, and any tradable passive arm. Non-tradable forecast baselines receive no portfolio.",
+        "Apply all cash, position, exposure, sector, cluster, and reconciliation constraints within one account only.",
+        "Define two explicit results: trading net P&L after market costs and economic net P&L after market, model, and allocated infrastructure costs.",
+        "Make economic net P&L the primary value-add result or revise the objective to state otherwise."
+      ]
+    },
+    {
+      "id": "ARCH-002",
+      "severity": "BLOCKER",
+      "area": "Causality and evidence retrieval",
+      "references": [
+        "§3.1, lines 43-50",
+        "§5.1, lines 127-152",
+        "§10, lines 421-431",
+        "§12, lines 449-454"
+      ],
+      "issue": "The OpenAI Responses API performs web search during the model call, but the validator rejects publication or retrieval times later than the decision cutoff. If the cutoff is fixed before the call, autonomous retrieval necessarily occurs after it. If the cutoff is moved to call completion, the model was not actually constrained to a frozen input set, and retries can see later content.",
+      "impact": "The confirmation run cannot prove which facts were available at decision time. Retries may change evidence and silently violate forward-only causality.",
+      "precise_fix": [
+        "Split retrieval from generation.",
+        "Retrieve and persist source documents first, recording immutable bytes, content hash, provider timestamp, first successful `retrieved_at`, and retrieval status.",
+        "Freeze an `input_cutoff` after retrieval and store the exact ordered document IDs in an input manifest.",
+        "Call the research model without autonomous web-search tools, supplying only frozen documents.",
+        "Require every selected observation to satisfy `available_at <= input_cutoff`; the model may finish after the cutoff.",
+        "Retries must reuse the identical input-manifest hash. Any new retrieval creates a new cycle or opportunity, not a retry."
+      ]
+    },
+    {
+      "id": "ARCH-003",
+      "severity": "BLOCKER",
+      "area": "Stock execution scheduling",
+      "references": [
+        "§7.1, lines 259-265",
+        "§7.4, lines 296-308",
+        "§10, lines 421-429"
+      ],
+      "issue": "The stock decision runs after day D close and must enter at day D+1 official open, but the scheduler defines only an after-close stock scan. No next-session execution task consumes pending orders after the official open becomes available.",
+      "impact": "Stock orders either never fill, fill using data unavailable to the close job, or get processed opportunistically on restart. Each outcome breaks the declared execution model.",
+      "precise_fix": [
+        "Persist an immutable pending order intent containing decision ID, target exchange session, maximum acceptable data age, reference close, gap limit, and expiry.",
+        "Add a calendar-driven `stock-open-execution` entry point after the provider publishes the official open.",
+        "Give the task a unique key `(run_id, arm, symbol, target_session, order_intent_id)`.",
+        "Cancel with a distinct terminal reason when the open is absent, stale, more than 10% from the decision close, or arrives after the execution deadline.",
+        "Specify that post-close direction-flip exits also become next-open intents; intraday stop/target events continue to use the daily-bar adverse-ordering rule."
+      ]
+    },
+    {
+      "id": "ARCH-004",
+      "severity": "BLOCKER",
+      "area": "Capacity and cycle completion",
+      "references": [
+        "§5.1-§5.2, lines 127-164",
+        "§6.1, lines 185-197",
+        "§10, lines 421-431"
+      ],
+      "issue": "Evaluating up to 20 Polymarket clusters every 15 minutes can require up to 1,920 cluster evaluations per day. Each evaluation may include retrieval, an OpenAI research call, citation validation, and a Jev call. No latency budget, concurrency cap, provider quota, monetary budget, cycle deadline, or behavior for unfinished work is specified.",
+      "impact": "Cycles can overlap indefinitely, multiply API costs, exhaust quotas, and make the scheduled cutoff meaningless. Duplicate-process controls do not solve work that legitimately exceeds the next interval.",
+      "precise_fix": [
+        "Preregister per-cycle and per-day limits for model calls, tokens, dollars, concurrent requests, retries, and wall-clock duration.",
+        "Measure provider p50, p95, and p99 latency in a pre-run capacity test.",
+        "Require a cycle deadline before the next slot and terminally mark unstarted or unfinished candidates as `BUDGET_EXHAUSTED` or `DEADLINE_EXCEEDED`.",
+        "Apply deterministic cheap gates before retrieval and skip clusters with conflicting open positions before paying for model calls.",
+        "Either reduce candidate count or cadence until p99 completion fits the slot with margin.",
+        "Treat any evidence reuse as a manifest-pinned freshness policy keyed by document/input hashes, never as an implicit cache."
+      ]
+    },
+    {
+      "id": "ARCH-005",
+      "severity": "BLOCKER",
+      "area": "Failure-state semantics",
+      "references": [
+        "§3.2, lines 52-61",
+        "§5.3, lines 166-181",
+        "§8.5, lines 376-390",
+        "§10, lines 421-431"
+      ],
+      "issue": "Section 3.2 requires `ABSTAIN`, provider failure, validation failure, and stale data to remain distinct. Section 10 says provider outages produce audited abstentions.",
+      "impact": "Outages can be misreported as model choices, corrupt intention-to-treat counts, hide reliability failures, and overstate strategic inactivity.",
+      "precise_fix": [
+        "Replace 'audited abstentions' in §10 with terminal non-decision states.",
+        "Use a closed enum such as `DECIDED`, `MODEL_ABSTAIN`, `PROVIDER_ERROR`, `VALIDATION_ERROR`, `STALE_INPUT`, `VERSION_MISMATCH`, `DEADLINE_EXCEEDED`, and `BUDGET_EXHAUSTED`.",
+        "Permit only `DECIDED` to reach deterministic trade gates.",
+        "Count all terminal states in cycle reliability metrics while reporting model abstentions separately from operational failures."
+      ]
+    },
+    {
+      "id": "ARCH-006",
+      "severity": "BLOCKER",
+      "area": "Opportunity identity and statistical unit",
+      "references": [
+        "§6.1, lines 185-197",
+        "§6.2, lines 199-201",
+        "§8.2, lines 349-353",
+        "§8.3, lines 355-365",
+        "§8.5, lines 376-390"
+      ],
+      "issue": "The same Polymarket event cluster may be selected every 15 minutes, while the unit of analysis is declared to be `event_cluster_id`, not repeated scans. The specification does not define whether repeated scans are one opportunity, eligibility episodes, or repeated decisions. 'Per eligible opportunity' and the 100-independent-opportunity gate are therefore not computable unambiguously.",
+      "impact": "Implementations can inflate sample counts, choose favorable entry times, or aggregate P&L inconsistently across arms.",
+      "precise_fix": [
+        "Define a shared opportunity before arm decisions.",
+        "For Polymarket, choose one preregistered rule: first eligible cutoff per cluster, one eligibility episode after a defined reset, or repeated decision episodes analyzed with cluster-level aggregation.",
+        "Define `opportunity_id` from run, stream, cluster or symbol, eligibility episode, and scheduled cutoff; do not include arm.",
+        "For stocks, define opportunity as `(run_id, exchange_session, symbol)` after synchronized candidate selection.",
+        "Record exactly one terminal outcome per `(opportunity_id, arm)` and aggregate Polymarket inference by cluster regardless of decision count.",
+        "State exactly what counts toward the 100-independent-opportunity requirement."
+      ]
+    },
+    {
+      "id": "ARCH-007",
+      "severity": "HIGH",
+      "area": "Append-only guarantees",
+      "references": [
+        "§3.3, lines 63-72",
+        "§9, lines 396-419"
+      ],
+      "issue": "The tables are described as append-oriented, not append-only. Lifecycle tables such as `experiment_runs`, `paper_orders`, `model_calls`, and `cycle_runs` invite mutable status columns. The specification does not forbid UPDATE or DELETE at the database layer.",
+      "impact": "Application defects or administrative scripts can rewrite economic history while still satisfying the documented repository API.",
+      "precise_fix": [
+        "Separate immutable entities from lifecycle events: for example, `order_intents`, `order_events`, `cycle_events`, and `run_events`.",
+        "Install SQLite `BEFORE UPDATE` and `BEFORE DELETE` triggers that abort changes to economic and audit tables.",
+        "Use append-only supersession for corrections and permit mutable data only in disposable derived tables.",
+        "Constrain `supersedes_id` to the same run, entity type, and logical identity; reject self-reference, cycles, and more than one direct successor.",
+        "Store `created_at`, canonical payload hash, manifest hash, and schema version on every economic event."
+      ]
+    },
+    {
+      "id": "ARCH-008",
+      "severity": "HIGH",
+      "area": "Accounting invariants",
+      "references": [
+        "§3.3, lines 63-72",
+        "§6.4-§6.6, lines 215-246",
+        "§7.3-§7.5, lines 282-320",
+        "§9, lines 396-419"
+      ],
+      "issue": "Table names and nonnegative-size checks do not define an auditable ledger. Cash conservation, position quantity, realized P&L, mark-to-market equity, short proceeds, dividend liabilities, resolution payouts, and fill-to-order limits remain unspecified.",
+      "impact": "A transactional database can still commit internally inconsistent portfolios. This leaves the previous portfolio-corruption failure insufficiently addressed.",
+      "precise_fix": [
+        "Define signed double-entry or equivalent balanced cash and inventory postings for every fill, fee, dividend, borrow charge, split, and resolution.",
+        "Require `filled_quantity <= order_quantity` and cumulative fills not to exceed captured executable depth.",
+        "Define equity as cash plus marked long value minus short liability plus receivables, with an explicit valuation timestamp and stale-price policy.",
+        "Specify whether short-sale proceeds are restricted and how gross exposure and buying power are calculated.",
+        "Add reconciliation equations that must equal zero within the chosen fixed-point unit.",
+        "Record reconciliation violations as blocking events and prohibit new entries until resolved."
+      ]
+    },
+    {
+      "id": "ARCH-009",
+      "severity": "HIGH",
+      "area": "Idempotency",
+      "references": [
+        "§3.3, lines 63-72",
+        "§5.2, lines 154-164",
+        "§9, lines 396-419",
+        "§13, lines 478-480"
+      ],
+      "issue": "Deterministic unique IDs are required but their canonical inputs, namespace, and stage-level behavior are not defined. A crash after a provider call but before recording its response can cause an untracked second call with different output and cost.",
+      "impact": "Economic duplicates may be prevented while model-call duplication, audit gaps, inconsistent retry outputs, and double billing remain.",
+      "precise_fix": [
+        "Define an idempotency key for each semantic stage from run ID, opportunity ID, arm, stage name, manifest hash, and frozen input hash.",
+        "Insert a durable call-intent row before invoking a provider.",
+        "Store attempts separately from the semantic call; only one validated result may be selected for a semantic call.",
+        "On restart, reuse a completed result, resume an explicitly retryable failed call, or mark an unknown in-flight attempt before retrying.",
+        "Use unique indexes as the final guard, not pre-insert existence checks.",
+        "Define simulated fill identity as `(order_id, snapshot_id, book_level, fill_sequence)` rather than the irrelevant phrase 'provider fill identity'."
+      ]
+    },
+    {
+      "id": "ARCH-010",
+      "severity": "HIGH",
+      "area": "Restart recovery and duplicate processes",
+      "references": [
+        "§3.3, lines 63-72",
+        "§10, lines 421-431",
+        "§13, lines 478-480",
+        "reuse-audit.md, lines 21-27"
+      ],
+      "issue": "Startup reconciliation is stated, but multiple systemd-triggered CLI processes can reconcile and execute concurrently. SQLite uniqueness prevents some duplicate commits but does not fence provider calls or stale decisions made before a competing commit.",
+      "impact": "Overlapping timers or manual starts can duplicate external calls, use stale portfolio state, or produce conflicting order intents.",
+      "precise_fix": [
+        "Give each scheduled slot one unique `cycle_key` and acquire it atomically with `BEGIN IMMEDIATE`.",
+        "Use a process-level advisory file lock for the single writer plus a database lease containing owner instance, acquisition time, expiry, and fencing token.",
+        "Require the fencing token on every cycle-stage write.",
+        "Read portfolio state, validate limits, and append the order intent in one transaction.",
+        "Never hold a SQLite transaction open during network calls; use persisted stage state around them.",
+        "Make startup recover nonterminal cycles and pending orders before accepting a new slot."
+      ]
+    },
+    {
+      "id": "ARCH-011",
+      "severity": "HIGH",
+      "area": "Scheduler semantics",
+      "references": [
+        "§6.1, lines 185-197",
+        "§7.1, lines 259-265",
+        "§10, lines 421-431"
+      ],
+      "issue": "The schedule does not define slot identity, timezone, late starts, missed timers, catch-up behavior, overlap behavior, early closes, or deadline handling. systemd persistent catch-up could run an old slot against current data.",
+      "impact": "Late or replayed jobs can masquerade as timely decisions and stale-data checks may use the wrong intended cutoff.",
+      "precise_fix": [
+        "Represent every cycle by immutable `scheduled_for`, `started_at`, `input_cutoff`, `deadline_at`, and `finished_at` timestamps in UTC.",
+        "Derive stock slots from an exchange calendar including holidays and early closes.",
+        "For live forward cycles, never backfill a missed decision using current data; append `MISSED_SLOT`.",
+        "Permit replay only in a separately identified replay mode using already frozen snapshots.",
+        "Set systemd overlap policy explicitly and make duplicate starts converge on the same `cycle_key`.",
+        "Use wall-clock UTC for event time and monotonic time for deadlines and latency."
+      ]
+    },
+    {
+      "id": "ARCH-012",
+      "severity": "HIGH",
+      "area": "Module boundaries and controls",
+      "references": [
+        "§4.1, lines 108-123",
+        "§6.7, lines 248-255",
+        "§7.6, lines 322-327"
+      ],
+      "issue": "The `evaluation` module owns controls, but controls must make synchronized causal decisions, consume portfolio limits, and produce orders and fills during the live forward cycle. Generating them later during evaluation would permit hindsight and omit journaled execution state.",
+      "impact": "Control results could be reconstructed with information unavailable at the original cutoff and would not share actual execution constraints.",
+      "precise_fix": [
+        "Move control decision generation into the application-cycle path.",
+        "Journal control decisions, order intents, fills, exits, and failures at the same cutoff as the AI arm.",
+        "Keep `evaluation` read-only: pairing, aggregation, metrics, bootstrap, permutation tests, and reports only.",
+        "Make candidate and opportunity selection shared upstream of all arms."
+      ]
+    },
+    {
+      "id": "ARCH-013",
+      "severity": "HIGH",
+      "area": "Model and version pinning",
+      "references": [
+        "§3.2, lines 52-61",
+        "§5.1-§5.2, lines 127-164",
+        "§8.1, lines 331-347"
+      ],
+      "issue": "An exact returned model ID may not prove immutable weights or provider behavior. Request model, returned model, API endpoint/version, SDK version, decoding parameters, tool configuration, and provider system fingerprint are not all pinned. Random seeds do not make hosted model calls replayable.",
+      "impact": "A confirmation run can silently span provider revisions while claiming exact model pinning.",
+      "precise_fix": [
+        "Pin request model snapshot, expected returned model ID, provider, endpoint/API version, SDK version, schema version, temperature, top-p, seed when supported, and tool configuration.",
+        "Record all provider response metadata and raw bytes.",
+        "Run a startup preflight before the confirmation period and reject aliases.",
+        "If the provider cannot guarantee immutable deployments, state that limitation and treat changed response identifiers or fingerprints as run-invalidating.",
+        "Replay stored responses; never regenerate historical decisions.",
+        "Specify that model retirement formally invalidates or ends the run rather than silently selecting a replacement."
+      ]
+    },
+    {
+      "id": "ARCH-014",
+      "severity": "HIGH",
+      "area": "Provider and version failures with open positions",
+      "references": [
+        "§3.2, lines 52-61",
+        "§6.6, lines 234-246",
+        "§7.4, lines 296-308",
+        "§10, lines 421-431"
+      ],
+      "issue": "A model-version mismatch 'halts new decisions,' but the design does not explicitly preserve deterministic management of existing positions. Provider outages likewise lack a complete open-position policy.",
+      "impact": "A fail-closed entry policy could accidentally disable stops, time exits, resolutions, borrow accrual, valuation, or reconciliation.",
+      "precise_fix": [
+        "Separate `entry_enabled` from `position_management_enabled`.",
+        "Version mismatch, model outage, or evidence failure must block new entries and model-dependent flip exits only.",
+        "Continue deterministic stops, targets, maximum holding periods, resolutions, corporate actions, borrow/dividend accrual, marks, and reconciliation.",
+        "When executable exit data is unavailable, append `EXIT_PENDING_DATA` and apply the preregistered conservative valuation policy.",
+        "Escalate unresolved exit intents through health and violation events."
+      ]
+    },
+    {
+      "id": "ARCH-015",
+      "severity": "HIGH",
+      "area": "Provider retry and fallback policy",
+      "references": [
+        "§8.1, lines 331-347",
+        "§10, lines 421-431"
+      ],
+      "issue": "The manifest includes a fallback policy but the design does not define whether fallbacks may change market-data vendors, evidence sources, or models. Retries are classified by HTTP status only and have no absolute deadline or input-freeze rule.",
+      "impact": "Fallbacks can alter data semantics or model treatment mid-run. Retries can cross the causal window and produce incomparable decisions.",
+      "precise_fix": [
+        "Prohibit model fallback during a confirmation run.",
+        "List allowed data-provider fallbacks individually, including field mapping, timestamp semantics, precedence, and validation requirements.",
+        "Require all retry attempts to use the same frozen input hash.",
+        "Set maximum attempts, exponential-backoff bounds, jitter seed policy, and an absolute stage deadline.",
+        "Store every attempt and terminal error classification.",
+        "A fallback outside the manifest must create a new exploratory run or invalidate the confirmation run."
+      ]
+    },
+    {
+      "id": "ARCH-016",
+      "severity": "HIGH",
+      "area": "Observability and committed-not-live verification",
+      "references": [
+        "§3.3, lines 63-72",
+        "§10, lines 421-431",
+        "§11, lines 433-447",
+        "reuse-audit.md, lines 26-27"
+      ],
+      "issue": "Displaying commit and manifest hashes is necessary but not enough to prove which code a process is executing. There is no deployment instance identity, source-tree dirty marker, executable path, dependency-lock hash, schema version, process start event, heartbeat, or expected-versus-running verification.",
+      "impact": "A stale process can continue running while the repository and dashboard show newer committed code, repeating the previous committed-not-live gap.",
+      "precise_fix": [
+        "Emit an immutable startup record containing deployment instance ID, PID, host/boot ID, process start time, absolute executable/package path, Git commit, dirty-tree flag, manifest hash, prompt hashes, dependency-lock hash, and database schema version.",
+        "Have each cycle reference that startup record.",
+        "Expose last scheduled slot, last start, last terminal completion, current stage, oldest pending work, consecutive failures, and data ages rather than only last success.",
+        "Add a deployment verification command that compares expected commit and manifest against the latest live startup/cycle read-back.",
+        "Alert on duplicate active instances, missing slots, stale heartbeats, and running-version mismatch."
+      ]
+    },
+    {
+      "id": "ARCH-017",
+      "severity": "HIGH",
+      "area": "Security",
+      "references": [
+        "§5.1, lines 127-152",
+        "§12, lines 449-457"
+      ],
+      "issue": "Host allowlists and 'web content is untrusted' are policies, not enforcement details. Citation retrieval can permit SSRF through redirects, private IP resolution, DNS rebinding, oversized decompression, or unsupported content types. Managed web search also bypasses the stated host allowlist.",
+      "impact": "Malicious evidence can access local services, exfiltrate secrets through model prompts, exhaust memory/disk, or inject instructions into research output.",
+      "precise_fix": [
+        "Disable model-side browsing after adopting the frozen retrieval pipeline.",
+        "Allow only HTTPS and approved source classes; reject credentials in URLs and nonstandard schemes.",
+        "Resolve DNS and block loopback, private, link-local, multicast, and metadata-service ranges before every request and redirect.",
+        "Limit redirects, connection/read timeouts, compressed and decompressed sizes, MIME types, document count, and total evidence bytes.",
+        "Pass documents as explicitly delimited data with tools disabled and validate strict structured output.",
+        "Redact credentials and signed query parameters before persistence and logging.",
+        "Open the dashboard database read-only and use parameterized fixed queries."
+      ]
+    },
+    {
+      "id": "ARCH-018",
+      "severity": "HIGH",
+      "area": "SQLite durability and backup",
+      "references": [
+        "§3.3, lines 63-72",
+        "§12, lines 449-457"
+      ],
+      "issue": "WAL and foreign keys are specified, but SQLite PRAGMAs are connection-local and WAL is unsafe on many network filesystems. Daily backups lack an RPO/RTO, blob consistency rule, integrity check, and restore test. Copying the main database file while WAL is active is not a valid backup method.",
+      "impact": "A connection with foreign keys disabled can corrupt references, and an inconsistent backup can lose or orphan audit history.",
+      "precise_fix": [
+        "Use one connection factory that asserts `foreign_keys=ON`, `journal_mode=WAL`, configured `busy_timeout`, and an explicitly selected `synchronous` policy on every connection.",
+        "Require a local filesystem and reject unsupported network mounts.",
+        "Use `BEGIN IMMEDIATE` for short writer-critical sections.",
+        "Use SQLite's online backup API or `VACUUM INTO`, then run `PRAGMA integrity_check` on the backup.",
+        "Back up content-addressed blobs consistently with the database and verify referenced hashes.",
+        "Set and test RPO/RTO; run a clean-directory restore drill before the confirmation run."
+      ]
+    },
+    {
+      "id": "ARCH-019",
+      "severity": "HIGH",
+      "area": "Event clustering",
+      "references": [
+        "§6.1-§6.2, lines 185-201",
+        "§6.4, lines 215-228",
+        "§8.2, lines 349-353"
+      ],
+      "issue": "Event clustering controls both risk and statistical independence, but the algorithm, metadata fields, version, effective time, correction behavior, and membership immutability are unspecified.",
+      "impact": "A clustering change can move contracts across limits or alter independent sample counts after outcomes are known.",
+      "precise_fix": [
+        "Pin the clustering algorithm version and all normalized inputs in the manifest.",
+        "Persist cluster membership as an immutable cutoff-specific artifact before arm decisions.",
+        "Reject ambiguous membership before opportunity creation.",
+        "Never rewrite historical membership; append a new version for later opportunities.",
+        "Use the frozen entry-time cluster for risk attribution and final inference."
+      ]
+    },
+    {
+      "id": "ARCH-020",
+      "severity": "MEDIUM",
+      "area": "Application-layer boundary",
+      "references": [
+        "§4.1, lines 108-123"
+      ],
+      "issue": "The module list has domain, adapters, persistence, scheduler, and reporting but no explicit application/use-case layer. The scheduler is likely to accumulate orchestration, transaction boundaries, retries, and policy sequencing.",
+      "impact": "Provider and database concerns can leak into domain code or be duplicated across CLI entry points.",
+      "precise_fix": [
+        "Add a thin `app` module owning cycle orchestration and transaction boundaries.",
+        "Keep `scheduler` limited to parsing a scheduled slot and invoking an application use case.",
+        "Keep risk, sizing, eligibility, IDs, and accounting as pure deterministic functions.",
+        "Pass provider and repository dependencies into the application layer; do not add factories or interfaces unless at least one real boundary needs substitution."
+      ]
+    },
+    {
+      "id": "ARCH-021",
+      "severity": "MEDIUM",
+      "area": "Numeric and temporal representation",
+      "references": [
+        "§3.2, lines 52-61",
+        "§6.3-§6.5, lines 203-232",
+        "§7.3-§7.5, lines 282-320",
+        "§9, lines 396-419"
+      ],
+      "issue": "The specification does not define storage precision for money, shares, probabilities, prices, fees, or timestamps.",
+      "impact": "Binary floats and inconsistent timestamp formats can break deterministic IDs, equality constraints, reconciliation, and replay stability.",
+      "precise_fix": [
+        "Store money and fees as integer micros or another declared fixed-point unit.",
+        "Store shares and probability prices as scaled integers with declared scales.",
+        "Use `Decimal` only at external conversion boundaries and quantize explicitly.",
+        "Store timestamps as UTC integer microseconds or canonical RFC 3339 UTC strings, while retaining exchange-local session dates separately.",
+        "Define rounding direction for size, fee, payout, and cash calculations."
+      ]
+    },
+    {
+      "id": "ARCH-022",
+      "severity": "MEDIUM",
+      "area": "Evidence quote validation",
+      "references": [
+        "§5.1, lines 127-152"
+      ],
+      "issue": "Exact quote matching against retrieved text is brittle for HTML normalization, Unicode, dynamic pages, PDFs, and syndication. No canonicalization or document-version rule is defined.",
+      "impact": "Valid evidence can fail nondeterministically, while matching a short quote does not establish source identity or truth.",
+      "precise_fix": [
+        "Validate against the frozen document bytes or a deterministic extracted-text artifact, never a newly fetched page.",
+        "Pin extraction implementation and version.",
+        "Define Unicode normalization and whitespace handling.",
+        "Store byte offsets or normalized-text offsets with the quote.",
+        "Treat extraction failure as `VALIDATION_ERROR` and retain the raw artifact for audit."
+      ]
+    },
+    {
+      "id": "ARCH-023",
+      "severity": "HIGH",
+      "area": "Test completeness",
+      "references": [
+        "§13, lines 459-488"
+      ],
+      "issue": "The testing strategy names the right categories but does not cover concurrent starts, persisted in-flight provider calls, disk-full behavior, database lock contention, corrupted blobs, backup restoration, timer catch-up, model mismatch with open positions, or accounting conservation.",
+      "impact": "The exact failure modes most likely to recreate stale data, duplicates, corruption, and restart gaps can pass the proposed suite.",
+      "precise_fix": [
+        "Add failpoints immediately before and after every database commit and external-call boundary; kill the process and restart from a new interpreter.",
+        "Run N concurrent workers against the same cycle slot and assert one semantic result and one economic event.",
+        "Test locked database, disk full, truncated WAL, missing blob, hash mismatch, provider timeout, 429/5xx exhaustion, and stale fallback data.",
+        "Test DST transitions, holidays, early closes, late timers, missed slots, and next-open pending orders.",
+        "Assert accounting conservation after every generated event sequence with property tests.",
+        "Add a golden end-to-end replay covering discovery through report and compare canonical journal hashes.",
+        "Restore a real backup into an empty directory and reconcile it.",
+        "Test that version/provider failures block entries while deterministic exits and accrual continue."
+      ]
+    },
+    {
+      "id": "ARCH-024",
+      "severity": "MEDIUM",
+      "area": "Schema evolution and manifest immutability",
+      "references": [
+        "§8.1, lines 331-347",
+        "§9, lines 396-419"
+      ],
+      "issue": "There is no database schema-version or migration policy. 'One active manifest' implies mutable activation state even though a confirmation run is frozen.",
+      "impact": "A software update can reinterpret old rows or silently migrate an active confirmation run.",
+      "precise_fix": [
+        "Store a monotonic schema version and migration history.",
+        "Make manifests immutable content-addressed rows.",
+        "Have the immutable run-registration row reference exactly one confirmation manifest hash.",
+        "Represent run invalidation or completion as append-only run events, not a mutable active flag.",
+        "Require migrations to preserve canonical replay results on fixture databases."
+      ]
+    },
+    {
+      "id": "ARCH-025",
+      "severity": "MEDIUM",
+      "area": "Overengineering and delivery risk",
+      "references": [
+        "§4.1, lines 108-123",
+        "§9, lines 396-419",
+        "§11, lines 433-447",
+        "§13, lines 459-488"
+      ],
+      "issue": "Twelve modules, generic provider ports, a dashboard, content-addressed storage, full journal reconstruction, two venues, two model providers, and advanced statistical reporting create a large first-release surface. Some complexity is justified, but a generic event-sourcing framework or live dashboard service would not be.",
+      "impact": "The experiment may miss its start date or spend more effort on infrastructure than on collecting forward evidence.",
+      "precise_fix": [
+        "Implement one end-to-end vertical slice before duplicating stream-specific logic.",
+        "Use normalized immutable fact and ledger tables rather than a generic event bus, aggregate framework, CQRS layer, or universal venue abstraction.",
+        "Keep external adapters as small concrete modules; introduce Protocols only at boundaries needed for fixture substitution.",
+        "Generate a static read-only HTML or JSON report from SQL before building an interactive dashboard service.",
+        "Retain content-addressed blobs because evidence provenance justifies them.",
+        "Do not add Redis, message queues, containers, distributed locks, orchestration platforms, or a separate database for this experiment."
+      ]
+    }
+  ],
+  "missing_invariants": [
+    {
+      "invariant": "Every economic row is scoped by run, stream, arm, and account where applicable.",
+      "enforcement": "NOT NULL foreign keys and composite uniqueness constraints."
+    },
+    {
+      "invariant": "One shared opportunity exists before arm-specific decisions, and each arm has exactly one terminal outcome for it.",
+      "enforcement": "Unique `(opportunity_id, arm)` terminal-result constraint."
+    },
+    {
+      "invariant": "One scheduled slot has at most one active cycle and exactly one terminal cycle status.",
+      "enforcement": "Unique `cycle_key`, atomic lease acquisition, and unique partial index for terminal state."
+    },
+    {
+      "invariant": "A semantic provider call has one selected validated result even when it has multiple attempts.",
+      "enforcement": "Unique semantic idempotency key plus separate attempt rows."
+    },
+    {
+      "invariant": "All decision inputs are an immutable ordered set and satisfy `available_at <= input_cutoff`.",
+      "enforcement": "Persisted input manifest hash and application-level validation inside the decision transaction."
+    },
+    {
+      "invariant": "Retries cannot change input content, cutoff, model contract, or manifest.",
+      "enforcement": "Retry rows reference the same semantic-call and input-manifest IDs."
+    },
+    {
+      "invariant": "No entry order is created from provider failure, malformed output, stale data, version mismatch, or model abstention.",
+      "enforcement": "Closed terminal-state enum and database-checked order-to-decision foreign key."
+    },
+    {
+      "invariant": "Open-position management continues when new entries are disabled.",
+      "enforcement": "Separate run-health entry gate from deterministic position-management jobs."
+    },
+    {
+      "invariant": "Cumulative fills never exceed order quantity or captured depth, and quote time never exceeds order time.",
+      "enforcement": "Transactional aggregate checks or triggers plus unique fill sequence."
+    },
+    {
+      "invariant": "Cash and inventory postings balance after every economic event.",
+      "enforcement": "Balanced ledger transaction and reconciliation query returning zero."
+    },
+    {
+      "invariant": "Historical economic and audit records cannot be updated or deleted.",
+      "enforcement": "SQLite abort triggers and an application role that lacks destructive maintenance paths."
+    },
+    {
+      "invariant": "Supersession cannot cross logical entities or form a cycle.",
+      "enforcement": "Same-entity checks, unique successor, and cycle validation."
+    },
+    {
+      "invariant": "The live process identifies the exact source, manifest, dependency set, prompts, and schema it is running.",
+      "enforcement": "Immutable startup event referenced by every cycle."
+    },
+    {
+      "invariant": "No missed production slot is backfilled using later data.",
+      "enforcement": "Missed-slot terminal record; replay requires a distinct mode and frozen snapshots."
+    },
+    {
+      "invariant": "All monetary and probability computations use declared fixed-point scales and rounding rules.",
+      "enforcement": "Integer storage, range checks, and deterministic conversion tests."
+    }
+  ],
+  "previous_failure_assessment": {
+    "stale_data": {
+      "status": "PARTIALLY_ADDRESSED",
+      "remaining_gap": "Freshness fields exist, but evidence-web-search timing, retry cutoffs, valuation during outages, and fallback semantics remain undefined."
+    },
+    "duplicate_processes": {
+      "status": "PARTIALLY_ADDRESSED",
+      "remaining_gap": "Deterministic IDs and uniqueness are present, but no cycle lease, process lock, fencing token, or overlap semantics exist."
+    },
+    "portfolio_corruption": {
+      "status": "PARTIALLY_ADDRESSED",
+      "remaining_gap": "SQLite transactions and reconciliation are present, but balanced accounting and position/cash conservation invariants are absent."
+    },
+    "committed_not_live": {
+      "status": "PARTIALLY_ADDRESSED",
+      "remaining_gap": "Commit and manifest hashes are displayed, but no startup identity or deployment expected-versus-running read-back is defined."
+    }
+  },
+  "minimal_python_sqlite_assessment": {
+    "feasible": true,
+    "recommended_shape": {
+      "runtime": "One host, Python 3.12, local SQLite database, content-addressed blob directory, systemd user units.",
+      "logical_modules": [
+        "core: immutable types, fixed-point values, IDs, clocks, manifest validation",
+        "app: cycle orchestration and transaction boundaries",
+        "adapters: Polymarket, stock data, evidence retrieval, OpenAI, Jev",
+        "persistence: SQLite schema, append-only repositories, ledger, migrations, reconciliation",
+        "reporting: read-only SQL views, evaluation, static dashboard/report",
+        "cli: thin scheduled entry points"
+      ],
+      "required_cli_entry_points": [
+        "polymarket-cycle",
+        "stock-close-decision",
+        "stock-open-execution",
+        "recover-and-reconcile",
+        "evaluation-snapshot",
+        "final-report",
+        "deployment-verify"
+      ]
+    },
+    "sqlite_capacity": "Adequate by a wide margin for the expected row volume. Reliability depends on single-host local storage, short transactions, one fenced writer, correct PRAGMAs on every connection, and tested online backups.",
+    "avoid": [
+      "microservices",
+      "Redis",
+      "message brokers",
+      "distributed locks",
+      "generic event-sourcing frameworks",
+      "generic multi-venue abstractions",
+      "mutable portfolio snapshots as a source of truth",
+      "a separate live dashboard database"
+    ],
+    "delivery_sequence": [
+      "Implement schema, ledger, deterministic IDs, cycle slots, and reconciliation.",
+      "Prove crash recovery and concurrent-start idempotency with a fake provider.",
+      "Complete one Polymarket opportunity end to end.",
+      "Add stock close decision and separate next-open execution.",
+      "Add synchronized control arms.",
+      "Add evaluation and a static dashboard.",
+      "Run provider capacity and failure rehearsals before registration."
+    ]
+  },
+  "final_decision": {
+    "approve_architectural_direction": true,
+    "approve_current_specification_for_implementation": false,
+    "reason": "The monolith and SQLite choice are proportionate, but the current specification does not yet guarantee causal evidence, isolated arm accounting, deterministic scheduling, crash-safe provider work, or executable stock next-open semantics. Resolve the blockers and encode the missing invariants before implementation planning."
+  }
+}

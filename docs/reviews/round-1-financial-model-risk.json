@@ -1,0 +1,334 @@
+{
+  "review": {
+    "document": "docs/superpowers/specs/2026-10-02-jev-trading-lab-design.md",
+    "supporting_document": "docs/research/reuse-audit.md",
+    "perspective": "Financial analysis and model-risk review",
+    "scope": [
+      "position sizing",
+      "exposure and concentration limits",
+      "transaction and operating costs",
+      "P&L accounting",
+      "control-arm comparability",
+      "passive benchmarks",
+      "sensitivity analysis",
+      "sample and statistical gates",
+      "financial feasibility criteria"
+    ],
+    "files_modified": []
+  },
+  "verdict": {
+    "decision": "REJECT_DESIGN_PHASE_ACCEPTANCE_PENDING_CORRECTION",
+    "implementation_readiness": "BLOCKED",
+    "reason": "The design contains unresolved units errors, an impossible Polymarket passive-return gate, control exit rules that cannot be executed by the deterministic arms, undefined common risk units, and economic-return tests that do not clearly deduct AI operating costs. The 12-week sample also cannot support several stated inferential and tail-risk gates.",
+    "finding_counts": {
+      "critical": 7,
+      "high": 11,
+      "medium": 2
+    }
+  },
+  "strengths": [
+    {
+      "references": [
+        "§3.2, lines 52-61",
+        "§3.4, lines 74-80"
+      ],
+      "assessment": "Sizing, P&L, fees, slippage, exposure, and performance statistics are assigned to deterministic code. Confidence-based sizing and confirmatory tuning are prohibited."
+    },
+    {
+      "references": [
+        "§6.5, lines 230-232",
+        "§7.4, lines 296-308"
+      ],
+      "assessment": "Paper fills use executable prices, captured depth, next-session stock entry, adverse intraday ordering, and gap-through-stop treatment rather than optimistic fills."
+    },
+    {
+      "references": [
+        "§8.1, lines 331-347",
+        "§8.4, lines 367-374"
+      ],
+      "assessment": "The manifest freezes cost, sizing, fill, exit, and statistical rules. Exploratory sensitivities are separated from the confirmatory result."
+    },
+    {
+      "references": [
+        "reuse-audit.md lines 9-14",
+        "reuse-audit.md lines 18-29"
+      ],
+      "assessment": "The reuse audit appropriately rejects free or optimistic execution, confidence-as-skill assumptions, forced actions, and turnover-as-edge claims."
+    }
+  ],
+  "findings": [
+    {
+      "id": "FIN-01",
+      "severity": "critical",
+      "category": "Polymarket position sizing",
+      "references": [
+        "§6.4, lines 219-228"
+      ],
+      "issue": "The sizing formula is dimensionally wrong if seven-day midpoint volatility is an absolute probability change, which is the natural meaning of the text.",
+      "evidence": "The specification sets dollar cost C = 0.005E / max(sigma_p, 0.05). For a binary contract bought at price a, quantity is q = C/a and one-volatility-dollar risk is q*sigma_p = C*sigma_p/a, not C*sigma_p. At E=$10,000, a=0.10, and sigma_p=0.05, the formula reaches the $1,000 cap, buys 10,000 contracts, and creates approximately $500 of one-sigma P&L risk, or 5% of equity rather than 0.5%.",
+      "consequence": "Risk depends inversely on contract price and can be ten times the stated budget for low-priced contracts. The 10% cost cap prevents loss beyond position cost but does not make the volatility targeting correct.",
+      "precise_fix": "Define sigma_p explicitly in dollars per $1-payout contract. Set risk budget B=0.005E, quantity q=B/max(sigma_p,0.05), and position cost C=q*a_vwap. Then apply q <= 0.10E/a_vwap and all liquidity limits. Equivalently, if using return volatility sigma_r=sigma_p/a_vwap, set C=B/max(sigma_r,floor_r). Freeze the estimator, lookback sampling, annualization status, missing-snapshot treatment, and floor units."
+    },
+    {
+      "id": "FIN-02",
+      "severity": "high",
+      "category": "Polymarket liquidity and participation units",
+      "references": [
+        "§6.1, lines 191-193",
+        "§6.4, lines 223-226"
+      ],
+      "issue": "Position cost, visible depth, and trailing volume are compared without defining whether depth and volume are USD notional or contract quantity.",
+      "consequence": "A 5% depth cap can differ materially depending on whether it is applied to contracts, current-price notional, or $1 payout notional. The implementation could pass tests while enforcing a different economic limit.",
+      "precise_fix": "Define side-specific executable depth as contract quantity at captured price levels. Enforce q <= 0.05 times captured executable contract depth within the stated range. Separately enforce entry notional plus fees <= 0.01 times trailing 24-hour USD volume. If provider fields use other units, store both raw and normalized values and test the conversion."
+    },
+    {
+      "id": "FIN-03",
+      "severity": "high",
+      "category": "Polymarket edge and cost formula",
+      "references": [
+        "§6.3, lines 207-213",
+        "§6.5, lines 230-232",
+        "§6.6, lines 234-246"
+      ],
+      "issue": "The actionable-edge formula is not implementable unambiguously. Line 211 describes an all-in margin containing fees, spread/slippage, and the three-point reserve, while line 213 describes twice execution friction plus the reserve. The ask already embeds entry spread, and using best ask rather than size-dependent VWAP ignores the depth consumed by the proposed order.",
+      "consequence": "Spread, reserve, or slippage can be double-counted or omitted. Different implementations can produce different trades under the same manifest.",
+      "precise_fix": "Compute entry VWAP as a function of proposed q. Define gross valuation edge e=p_side-entry_vwap. Define separate probability-point terms for entry fees, expected exit fees, and conservative exit slippage. Do not add entry spread again because it is already in entry VWAP. Freeze one formula, for example: trade only if e >= max(0.05, 2*(entry_fee_pp+exit_fee_pp+exit_slippage_pp)+0.03). State whether the factor of two applies to each friction term. Solve size and edge jointly because VWAP changes with q."
+    },
+    {
+      "id": "FIN-04",
+      "severity": "critical",
+      "category": "Control-arm exits",
+      "references": [
+        "§6.6, lines 236-246",
+        "§6.7, lines 248-255",
+        "§7.4, lines 300-308",
+        "§7.6, lines 322-327"
+      ],
+      "issue": "The deterministic controls are said to use identical exits, but several exits require outputs unavailable to those controls. Polymarket exits require independently recomputed Jev probability edge and a fresh Jev direction. Stock exits require a fresh Jev direction flip.",
+      "consequence": "The deterministic arms cannot follow the stated policy. Reusing AI output would contaminate the control; omitting those exits would violate identical-execution claims.",
+      "precise_fix": "Split exits into common mechanical exits and arm-specific signal exits. Common exits should cover stop, target, maximum holding period, invalidation, resolution, and liquidity failure. AI signal exit uses refreshed AI edge or direction; deterministic signal exit uses refreshed momentum or SMA rule. Report both a full-strategy comparison and a signal-only comparison using common mechanical exits."
+    },
+    {
+      "id": "FIN-05",
+      "severity": "critical",
+      "category": "Polymarket passive benchmark",
+      "references": [
+        "§6.7, lines 250-255",
+        "§8.5, lines 380-390"
+      ],
+      "issue": "The passive Polymarket benchmark is explicitly non-tradable and has no portfolio return, but feasibility condition 3 requires AI total return to exceed its passive benchmark.",
+      "consequence": "The Polymarket stream cannot be evaluated against gate 3 as written.",
+      "precise_fix": "Make gate 3 stream-specific. For Polymarket, require AI economic return to exceed cash and require AI forecast loss to beat the frozen market-probability forecast benchmark. If a tradable passive return is required, define an executable, capitalized passive portfolio with entry, sizing, exit, costs, and event-cluster limits. Do not compare portfolio return with Brier score or log loss."
+    },
+    {
+      "id": "FIN-06",
+      "severity": "critical",
+      "category": "Economic costs and financial feasibility",
+      "references": [
+        "§1, lines 16-22",
+        "§3.4, lines 74-80",
+        "§6.1, lines 187-197",
+        "§8.3, lines 355-365",
+        "§8.5, lines 380-390"
+      ],
+      "issue": "Model/API and infrastructure costs are reported but not explicitly deducted from AI return, expectancy, cash, or promotion gates.",
+      "evidence": "The Polymarket maximum evaluation budget is 20 clusters every 15 minutes, or up to 1,920 cluster evaluations per day and 161,280 over 12 weeks before duplicate suppression. On $10,000 of capital, research and Jev calls can dominate market P&L.",
+      "consequence": "The system can pass while destroying economic value after the incremental cost of producing its signals.",
+      "precise_fix": "Maintain both trading P&L and economic P&L. Economic P&L must equal trading P&L minus actual billed evidence-model cost, Jev cost, retries, paid data cost, and a preregistered allocation of incremental infrastructure. Debit variable costs when incurred, including calls that abstain or fail. Apply the +50% sensitivity to uncertain operating costs as well as execution costs. Report development cost separately and calculate break-even AUM or required annual gross alpha. Feasibility gates must use economic P&L."
+    },
+    {
+      "id": "FIN-07",
+      "severity": "critical",
+      "category": "Primary P&L endpoint and risk units",
+      "references": [
+        "§8.2, lines 349-353",
+        "§8.3, lines 355-365",
+        "§8.5, lines 380-387"
+      ],
+      "issue": "The common risk unit R is undefined, and the stated stock unit of analysis conflicts with intention-to-treat pairing. Stock position-level observations cannot include zero-trade outcomes for candidate opportunities, and AI and control positions need not match.",
+      "consequence": "AI-minus-control P&L per opportunity can use different denominators, omit abstentions, or pair unrelated trades. Path-dependent current-equity sizing further changes R between arms.",
+      "precise_fix": "Use candidate-date for stocks and first-eligible event-cluster opportunity for Polymarket as the paired intention-to-treat unit. Assign zero P&L when an arm abstains, fails, or is rejected by capacity. Define a common fixed R0=0.5% of initial stream capital, or $50, and calculate paired endpoint Delta_i=(AI economic P&L_i-control economic P&L_i)/R0. Keep actual dynamic sizing in portfolio-return analysis but do not use arm-specific current-equity R values in the paired endpoint."
+    },
+    {
+      "id": "FIN-08",
+      "severity": "high",
+      "category": "Stock forecast benchmark",
+      "references": [
+        "§8.3, line 365"
+      ],
+      "issue": "The stock directional Brier outcome depends on the earlier of modeled exit or day ten. Modeled exits differ by arm and may depend on the model prediction being scored.",
+      "consequence": "The label is endogenous and can differ for the same candidate across AI and control arms. Brier scores are then not comparable and may reward early exits rather than forecast quality.",
+      "precise_fix": "Define one exogenous label for every eligible candidate before the run, such as positive versus non-positive split-and-dividend-adjusted return from the common D+1 executable-open reference to the day-ten close. The label must not depend on action, arm, stop, target, or actual exit. Score all eligible opportunities, including abstentions when a probability was produced."
+    },
+    {
+      "id": "FIN-09",
+      "severity": "critical",
+      "category": "Run-end valuation and outcome maturation",
+      "references": [
+        "§6.1, lines 187-195",
+        "§6.6, lines 236-246",
+        "§7.4, lines 296-308",
+        "§8.5, lines 376-394",
+        "§10, lines 421-431"
+      ],
+      "issue": "Markets can resolve up to 30 days after selection and stocks can remain open for ten trading days, but the specification does not define terminal liquidation, open-position marking, or post-run outcome follow-up.",
+      "consequence": "The 12-week return and 100-resolved-opportunity gate can be manipulated by treatment of late entries, unresolved markets, and open gains or losses. Waiting for resolutions also conflicts with an exact fixed run unless follow-up is separated.",
+      "precise_fix": "Freeze a 12-week decision-enrollment window and a separate non-trading maturation window of at least 30 calendar days plus ten trading days. At the 12-week cutoff, calculate portfolio return using a preregistered conservative liquidation or executable-bid mark for every open position. Continue outcome collection without new trades for calibration and resolved-sample gates. Report fixed-cutoff marked return and post-maturation realized return separately."
+    },
+    {
+      "id": "FIN-10",
+      "severity": "high",
+      "category": "Stock sizing implementation",
+      "references": [
+        "§7.3, lines 282-294",
+        "§7.4, lines 296-308"
+      ],
+      "issue": "The stock sizing equation is dimensionally valid only when ATR is dollars per share, but the actual entry price is unknown until D+1 open. The text does not state whether shares and stops are recalculated from the adverse-slippage fill.",
+      "consequence": "Sizing from day-D close can breach the 10% position cap or change stop risk after a permissible gap.",
+      "precise_fix": "Freeze ATR_D at decision time but size after obtaining modeled fill P_fill. Use B=0.005E, d=2*ATR_D, q=min(floor(B/d), floor(0.10E/P_fill), cash-or-collateral limit), then set the static stop at P_fill-d for longs and P_fill+d for shorts. State whether fractional shares are allowed. Recheck sector, gross, cash, and short-collateral limits after fees and slippage."
+    },
+    {
+      "id": "FIN-11",
+      "severity": "high",
+      "category": "Capital and exposure limits",
+      "references": [
+        "§1, line 16",
+        "§5.3, lines 168-179",
+        "§6.4, lines 219-228",
+        "§7.3, lines 282-294"
+      ],
+      "issue": "It is unclear whether each arm receives its own $10,000 counterfactual ledger. Polymarket references gross-exposure capacity but provides no numeric portfolio gross cap. Stock shorts lack a collateral and short-sale-proceeds rule.",
+      "consequence": "Portfolio returns can use inconsistent capital denominators. Polymarket can deploy up to all cash despite undefined gross capacity, and stock short proceeds could accidentally finance additional positions.",
+      "precise_fix": "Create one isolated $10,000 counterfactual account per arm per stream with identical initial timestamps. Specify a numeric Polymarket portfolio gross-cost cap and maximum open event clusters. For stocks, define gross as sum of absolute market values, sector gross similarly, prohibit reuse of short-sale proceeds, and require cash collateral equal to at least short market value plus accrued liabilities. Add a net long/short cap if directional concentration is not intended."
+    },
+    {
+      "id": "FIN-12",
+      "severity": "high",
+      "category": "Stock transaction and financing costs",
+      "references": [
+        "§7.3, line 294",
+        "§7.4, line 298",
+        "§7.5, lines 310-320"
+      ],
+      "issue": "The spread source, timestamp, fill-price convention, regulatory-fee schedule, borrow accrual, and locate source are not specified. A flat 0.50% annual borrow rate is described as conservative without evidence.",
+      "consequence": "Official-open prints plus half spread can be double-counted or inconsistently signed. Hard-to-borrow risk and dividend liabilities can be understated.",
+      "precise_fix": "Define fills by side: long entry P_open*(1+spread_half+0.0005), long exit P_ref*(1-spread_half-0.0005), with signs reversed for shorts. Freeze a point-in-time spread model and fallback. Apply SEC and TAF fees only to applicable sale transactions using date-effective rates and caps. Accrue borrow daily on marked short notional using actual point-in-time rates where available; otherwise exclude shorts or preregister wider borrow scenarios. Charge dividend liability on ex-date and include long dividend receipts."
+    },
+    {
+      "id": "FIN-13",
+      "severity": "high",
+      "category": "P&L accounting",
+      "references": [
+        "§3.4, line 76",
+        "§6.5-§6.6, lines 230-246",
+        "§7.4-§7.5, lines 296-320",
+        "§11, lines 433-447"
+      ],
+      "issue": "The design requires P&L decomposition but does not specify authoritative realized and unrealized formulas.",
+      "consequence": "Resolution proceeds, partial fills, short liabilities, dividends, and marks can be treated inconsistently across journal reconstruction and evaluation.",
+      "precise_fix": "Freeze formulas in the manifest. For a Polymarket side, realized P&L=q*(exit_or_payoff-entry_vwap)-entry_fees-exit_fees; unresolved marks use executable side-specific bid for the full marked quantity or a documented zero/depth haircut when no bid exists. For stock longs, P&L=q*(exit-entry)+dividends-costs. For shorts, P&L=q*(entry-exit)-borrow-dividend_liability-costs. Separate realized P&L, unrealized P&L, cash flows, market costs, model costs, and corporate-action adjustments."
+    },
+    {
+      "id": "FIN-14",
+      "severity": "high",
+      "category": "Cash and stock passive benchmarks",
+      "references": [
+        "§6.7, lines 248-255",
+        "§7.6, lines 322-327",
+        "§8.5, line 384"
+      ],
+      "issue": "Cash is assigned zero return, while SPY is fully invested despite strategy gross exposure being capped at 50%. Start/end execution and benchmark trading costs are undefined.",
+      "consequence": "Zero-return cash understates capital opportunity cost, while raw AI-versus-SPY return compares different market exposure. A result can depend more on equity beta and cash drag than signal quality.",
+      "precise_fix": "Retain a zero-yield operational-cash ledger if that reflects venue reality, but add an economic cash hurdle accruing a frozen daily risk-free series such as three-month Treasury return. Define SPY purchase at the first eligible open and liquidation at the final eligible close, including spread, slippage, and dividends. Report both fully invested SPY and an exposure-matched SPY-plus-cash benchmark. State which benchmark is a promotion hurdle."
+    },
+    {
+      "id": "FIN-15",
+      "severity": "critical",
+      "category": "Sample gate and statistical power",
+      "references": [
+        "§8.2, lines 349-353",
+        "§8.4, lines 367-374",
+        "§8.5, lines 376-394"
+      ],
+      "issue": "The requirement for 100 independent resolved opportunities is unsupported by a power analysis and does not address time dependence. Twelve weeks provide only about 12 weekly blocks, regardless of the number of candidates.",
+      "consequence": "A nominal block-bootstrap interval can be unstable and anti-conservative. One hundred cross-sectional opportunities do not create 100 independent market regimes. The experiment is likely to be inconclusive or falsely precise.",
+      "precise_fix": "Run an a priori simulation using historical causal opportunity frequency, paired-P&L variance, within-week correlation, expected abstention, and the +0.03R minimum effect. Freeze duration and required effective block count from that analysis. If weekly blocking remains primary, extend the fixed duration enough to obtain a defensible number of blocks; otherwise classify the 12-week run as a pilot and prohibit confirmatory profitability claims. Report nominal opportunities, independent clusters, block count, and effective sample size separately."
+    },
+    {
+      "id": "FIN-16",
+      "severity": "high",
+      "category": "Confirmatory hypothesis and Holm adjustment",
+      "references": [
+        "§8.3, lines 355-365",
+        "§8.4, lines 367-374",
+        "§8.5, lines 380-386",
+        "§13, lines 486-488",
+        "reuse-audit.md line 10"
+      ],
+      "issue": "The specification lists multiple primary metrics but refers to only two primary stream hypotheses. It also requires a point estimate of at least +0.03R while the interval only needs to be above zero. A 'Holm-adjusted 95% interval' is not defined operationally.",
+      "consequence": "The stream may pass with weak evidence that the true effect reaches the stated economically meaningful threshold. Different Holm implementations can yield different decisions.",
+      "precise_fix": "Declare one confirmatory endpoint per stream: paired intention-to-treat economic P&L in R0. Test H0: Delta <= 0.03R against H1: Delta > 0.03R, with Holm step-down adjustment across the two streams. Require the adjusted one-sided lower confidence bound to exceed 0.03R. Treat total return, drawdown, expected shortfall, profit factor, and turnover as preregistered secondary or safety outcomes. Pin and test the reused bootstrap implementation and block-length rule."
+    },
+    {
+      "id": "FIN-17",
+      "severity": "high",
+      "category": "Drawdown and expected-shortfall gates",
+      "references": [
+        "§8.3, lines 355-365",
+        "§8.5, lines 385-386"
+      ],
+      "issue": "The drawdown rule becomes impossible when deterministic drawdown is zero because 10% relatively worse than zero permits no drawdown. The 95% expected-shortfall gate is not statistically credible with 100 observations, where the tail contains approximately five observations, or with roughly 60 daily stock observations.",
+      "consequence": "The safety gate is unstable, falsely precise, and can reject or pass based on a few outcomes.",
+      "precise_fix": "Define maximum drawdown as peak-to-trough decline in synchronized marked equity and replace the relative rule with a preregistered absolute non-inferiority margin plus an absolute portfolio drawdown cap. For a 12-week test, use drawdown and worst-week loss as hard safety gates and report 95% expected shortfall descriptively with confidence intervals. Reserve a hard 95% expected-shortfall gate for a sample providing an adequate number of tail observations."
+    },
+    {
+      "id": "FIN-18",
+      "severity": "high",
+      "category": "Sensitivity analysis",
+      "references": [
+        "§6.3, lines 209-213",
+        "§6.4, lines 219-228",
+        "§7.5, lines 310-320",
+        "§8.4, lines 367-374",
+        "§8.5, line 390"
+      ],
+      "issue": "Cost, fill, and threshold sensitivities are required but their grids, parameter scope, and pass/fail interpretation are unspecified. Stock costs receive plus or minus 50% sensitivity, while the hard gate mentions only plus 50% execution costs and does not explicitly cover Polymarket, borrow, or AI operating costs.",
+      "consequence": "Post-run analyst discretion can select favorable scenarios, and legally fixed fees may be scaled while uncertain costs are not.",
+      "precise_fix": "Preregister one-at-a-time and joint scenarios. Apply 0.5x, 1.0x, and 1.5x only to uncertain spread, slippage, borrow, and operating-cost estimates; do not scale statutory fees or observed cash flows. Define Polymarket depth haircuts and exit-liquidity shocks, stock spread/slippage shocks, probability-reserve alternatives, volatility-floor alternatives, and gate-threshold grids. Recompute the full economic P&L endpoint and all safety gates. Require the base and 1.5x adverse joint-cost scenarios to retain the same pass/fail conclusion; label all other grids exploratory."
+    },
+    {
+      "id": "FIN-19",
+      "severity": "medium",
+      "category": "Future probability-based sizing gate",
+      "references": [
+        "§8.5, line 394"
+      ],
+      "issue": "The calibration criterion does not define the baseline, Brier improvement formula, expected-calibration-error bins, or confidence requirement. A point estimate from 250 outcomes can be unstable.",
+      "consequence": "Future confidence-based sizing could be authorized through metric-definition choices made after seeing the data.",
+      "precise_fix": "Define Brier skill score as 1-BS_model/BS_frozen_baseline and require it to be at least 0.10 on untouched resolved outcomes. Freeze the baseline, binning or adaptive-bin algorithm, clipping, and minimum bin counts. Require confidence intervals for both Brier skill and calibration error. Treat 250 outcomes as a minimum data gate, not sufficient authorization; any probability-to-size mapping requires a separate capped pilot with deterministic maximum-loss limits."
+    },
+    {
+      "id": "FIN-20",
+      "severity": "medium",
+      "category": "Metric definitions and inactivity gate",
+      "references": [
+        "§8.3, lines 355-365",
+        "§8.5, lines 387-390",
+        "§11, lines 433-447"
+      ],
+      "issue": "Profit factor, turnover, total return, and '60% of deterministic-arm opportunity exposure' are not defined. Profit factor is undefined with no losses, and exposure could mean trade count, gross dollars, risk budget, or capital-time.",
+      "consequence": "Dashboard and promotion calculations can disagree despite using the same journal.",
+      "precise_fix": "Define simple total return as ending marked economic equity divided by initial equity minus one. Define turnover as total absolute executed notional divided by average equity. Define profit factor as gross positive realized trade P&L divided by absolute gross negative realized trade P&L, returning null rather than infinity when there are no losses. Define inactivity primarily as AI executed eligible opportunities divided by deterministic executed eligible opportunities, with cancellations and risk rejections separately reported; add gross-notional-days or risk-budget-days as a secondary exposure measure."
+    }
+  ],
+  "required_revision_order": [
+    "Correct Polymarket sizing units and liquidity-unit definitions.",
+    "Define authoritative P&L, cost, capital-ledger, terminal-mark, and operating-cost treatment.",
+    "Repair deterministic control exits and the impossible Polymarket passive-return condition.",
+    "Define common intention-to-treat units and a common R0 denominator.",
+    "Replace endogenous stock Brier labels with a fixed arm-independent outcome.",
+    "Run an a priori power analysis and either lengthen the fixed experiment or relabel 12 weeks as a pilot.",
+    "Specify confirmatory Holm testing, downside gates, and sensitivity grids in the manifest."
+  ],
+  "final_assessment": "The architecture is directionally conservative, but its current financial specification is not internally executable or auditable. Implementation should not begin until the critical findings are resolved and the corrected formulas are independently recalculated."
+}

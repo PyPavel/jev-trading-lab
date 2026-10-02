@@ -1,527 +1,217 @@
 # Jev Trading Lab — Design Specification
 
-**Status:** Approved direction; review candidate 1  
+**Status:** Review candidate 4  
 **Date:** 2026-10-02  
-**Repository:** `PyPavel/jev-trading-lab`  
-**Mode:** Paper trading only  
-**Experiment duration:** 12 weeks, with no early promotion or confirmatory-stream tuning
+**Mode:** Paper only; live-order/signing code prohibited  
+**Phase 1:** 12-week preregistered feasibility pilot; no early promotion  
+**Phase 2:** Separate confirmatory run only if Phase 1 justifies it
 
-## 1. Decision and objective
+## 1. Objective and permitted claim
 
-Build a clean, evidence-first feasibility lab with two independent paper-trading streams:
+Build two independent paper streams: liquid non-sports Polymarket contracts and liquid S&P 100 stocks held 2–10 trading days. A deterministic retriever freezes evidence; OpenAI converts only those documents into a structured brief; Jev makes bounded judgments; code owns arithmetic, risk, fills, accounting, and evaluation.
 
-1. liquid, non-sports Polymarket markets;
-2. liquid S&P 100 stocks traded as 2–10 trading-day swings.
+For each stream Phase 1 asks: does the AI arm produce better paired intention-to-treat **economic P&L** than a synchronized deterministic arm under identical eligibility, capital limits, fills, and direct-cost accounting?
 
-Each stream starts with $10,000 of isolated paper capital. An OpenAI research model creates a timestamped evidence brief. Jev makes a bounded, typed decision. Deterministic code owns arithmetic, eligibility, edge calculation, portfolio risk, simulated execution, exits, reconciliation, and evaluation.
-
-The project answers one falsifiable question:
-
-> Does an LLM-evidence + Jev-decision arm produce better out-of-sample, net-of-cost, risk-adjusted results than synchronized cash, passive, and deterministic controls?
-
-The objective is not to demonstrate that an AI can place orders. Public repositories already prove that. The objective is to determine whether this architecture adds measurable economic value under causal, forward-only conditions.
+Phase 1 may conclude `PROMISING`, `NO_EVIDENCE`, `OPERATIONALLY_INFEASIBLE`, or `INCONCLUSIVE`. It cannot establish durable alpha or authorize live trading. A later confirmatory claim requires a new frozen manifest, at least 26 completed weekly blocks, and for Polymarket at least 100 resolved clusters observed over at least 26 weeks. Cutoff/extension rules are frozen before that run.
 
 ## 2. Non-goals
 
-The first release will not contain:
-
-- live broker, wallet, private-key, CLOB order-submission, or withdrawal code;
-- autonomous prompt or strategy rewriting;
-- reinforcement learning, vector memory, or self-modifying agents;
-- confidence-based position sizing;
-- high-frequency or sub-second execution;
-- a generic multi-venue framework;
-- retrospective tuning of the confirmation run;
-- claims of profitability from screenshots, selected trades, or gross returns.
-
-A live-execution interface is intentionally absent, not merely disabled by configuration.
-
-## 3. Foundational rules from the previous trader system
-
-These are design invariants, not optional implementation advice.
-
-### 3.1 Causality and data integrity
-
-1. Every external fact carries `observed_at`, `available_at`, `source_uri`, retrieval status, and content hash.
-2. A decision may use only data whose `available_at <= decision_cutoff`.
-3. Cross-asset daily data is aligned by exchange-local trading date. Raw timestamps and array positions are never used as implicit joins.
-4. Inputs used at entry are frozen. Rolling breakout levels, market definitions, membership lists, and evidence briefs are not silently recomputed when replaying an old decision.
-5. Revised data never overwrites the value originally seen. Corrections append a superseding record.
-6. Historical backtests are exploratory unless the full input set is point-in-time. The 12-week forward run is the confirmatory test.
-
-### 3.2 Model boundaries
-
-1. The research model receives facts and research questions, not the current strategy action.
-2. Jev receives factual state, not a sentence asserting the desired conclusion.
-3. Polymarket prices and the deterministic control’s action are withheld from both AI models until Jev has produced its independent probability judgment.
-4. Every bounded choice includes `ABSTAIN`. `ABSTAIN`, `HOLD/FLAT`, provider failure, validation failure, and stale data remain distinct states.
-5. A malformed response or provider failure can never become a trade, hold, or exit by default.
-6. Code calculates all arithmetic: dates, returns, indicators, probability edge, fees, slippage, size, exposure, P&L, and performance statistics.
-7. Jev confidence is a model feature, not a win probability. It does not control size in the confirmation experiment.
-8. Model aliases are forbidden in a confirmation run. The manifest pins exact returned model/version identifiers. A mismatch halts new decisions.
-
-### 3.3 Execution and state
-
-1. Opportunity IDs, decision IDs, simulated order IDs, and fill IDs are deterministic and unique.
-2. Duplicate events are idempotent no-ops across retries and restarts.
-3. SQLite runs in WAL mode with foreign keys enabled. Transactional writes replace mutable portfolio JSON files.
-4. Market snapshots and evidence are immutable content-addressed blobs; SQLite stores hashes and indexes.
-5. Portfolio state, dashboard values, and reports are derived from the journal. No separate mutable source of truth exists.
-6. Startup rebuilds and reconciles positions, cash, pending orders, and equity from the journal before scheduling work.
-7. Runtime health exposes the exact Git commit, experiment-manifest hash, prompt hashes, provider model IDs, last successful cycle, and data ages.
-8. “Committed” and “running” are separate states. Verification requires process version/read-back, not only a successful commit.
-
-### 3.4 Research discipline
-
-1. Costs are first-class and reported separately: fees, spread, slippage, borrow/dividends, inference, and infrastructure.
-2. Every strategy arm, model call, prompt revision, parameter trial, and exclusion is recorded.
-3. Negative experiments stay visible. No winner-only dashboard or report is permitted.
-4. A feature must beat an identical-execution control before being credited with alpha.
-5. No prompt, threshold, universe, data source, sizing, fill, or exit change is allowed in a running confirmation manifest.
-
-## 4. Architectural choice
-
-Use a Python 3.12 modular monolith with SQLite. Two market adapters share a small experiment kernel. This is intentionally not a microservice system.
-
-```text
-Polymarket adapter ─┐
-                    ├─> point-in-time snapshot ─> evidence retrieval
-S&P 100 adapter ────┘                                  │
-                                                       v
-                                      OpenAI structured evidence brief
-                                                       │
-                                      evidence validation + freeze
-                                                       │
-                                                       v
-                                             Jev typed decision
-                                                       │
-                                                       v
-                          deterministic eligibility / edge / risk / cost gates
-                                                       │
-                                                       v
-                                           paper execution simulator
-                                                       │
-                                                       v
-                                   append-only journal + derived evaluation
-```
-
-### 4.1 Module boundaries
-
-- `core`: immutable domain types, IDs, clocks, manifests, hashes, invariants.
-- `data`: provider ports, timestamp normalization, snapshots, calendars, point-in-time validation.
-- `research`: document retrieval, structured brief generation, citation/evidence validation.
-- `decision`: Jev adapter, schemas, version pinning, confidence metadata.
-- `polymarket`: universe discovery, event clustering, order-book snapshots, resolution ingestion.
-- `stocks`: S&P 100 universe, prices, corporate actions, filings, stock candidate generation.
-- `risk`: portfolio limits and deterministic sizing.
-- `execution`: venue-specific paper fill simulators only.
-- `journal`: SQLite schema, append-only repositories, idempotency, reconciliation.
-- `evaluation`: controls, metrics, bootstrap/permutation tests, final report.
-- `scheduler`: explicit CLI entry points used by systemd timers.
-- `dashboard`: read-only views derived from journal queries.
+No broker, wallet, private-key, signed-order, withdrawal, or live CLOB adapter; no model-side browsing; no self-modification; no confidence sizing; no HFT; no distributed system or generic venue framework; no retrospective tuning; no winner-only reporting. Live execution is absent, not disabled.
 
-Domain code does not import web frameworks, provider SDKs, or database implementations.
+## 3. Accounts, P&L, and risk unit
 
-## 5. Shared decision contract
+Each tradable arm gets an isolated synchronized $10,000 account keyed by `(run_id, stream, arm, currency)`. Arms never share cash, positions, fills, limits, or costs.
 
-### 5.1 Evidence brief
+- Polymarket: `AI`, `DETERMINISTIC`, `CASH`.
+- Stocks: `AI`, `DETERMINISTIC`, `CASH`, `EXPOSURE_MATCHED_PASSIVE`.
+- Non-tradable forecast baselines have no account.
 
-The OpenAI Responses API with web search produces strict structured output:
+Uninvested cash accrues the same point-in-time three-month Treasury yield. Stock passive holds 50% OEF total-return exposure and 50% interest-bearing cash, rebalanced month-end with the same next-open/cost rules. Full OEF and SPY are context only.
 
-- question being answered;
-- `as_of` timestamp and cutoff;
-- facts, each with source URI, publication/retrieval time, and a short exact supporting quote;
-- bullish/YES evidence;
-- bearish/NO evidence;
-- contradictions and unresolved facts;
-- upcoming catalysts with dates;
-- evidence-quality labels;
-- explicit list of missing evidence.
+**Trading P&L** deducts spread, slippage, statutory/venue fees, borrow, dividends owed, and execution costs. **Economic P&L** further deducts operating costs. Failed/abstained calls keep billed cost. Actual OpenAI, Jev, evidence retrieval, paid evidence data, and incremental AI infrastructure costs debit the AI arm only. Deterministic-specific costs debit the deterministic arm. Truly shared market-data, scheduler, storage, and reporting costs split 50:50 between AI and deterministic within each stream; the ratio is frozen before registration. Every posting carries `account_id`. Direct costs attach to their opportunity. Remaining costs attach to the UTC enrollment week, then equally to that week's registered opportunities. A zero-opportunity week's amount remains an arm-scoped weekly residual in account economic P&L and the weekly policy-value vector. For each arm, opportunity allocations plus weekly residuals reconcile exactly to its account economic P&L; stream totals reconcile across arms. No cost disappears. Development labor is reported separately with break-even AUM; it is not debited from paper capital.
 
-The brief may not contain current Polymarket probabilities, deterministic-arm actions, desired trade direction, or position size.
+`R0 = $50` (0.5% of initial capital), fixed for the run. Dynamic equity may change size, but paired outcomes always divide by R0.
 
-A deterministic validator rejects briefs when:
+Authoritative realized P&L:
 
-- any required field is absent;
-- a citation cannot be retrieved or its quote does not match the retrieved text;
-- publication/retrieval time exceeds the decision cutoff;
-- the brief exceeds its freshness limit;
-- a source is duplicated through syndication without being identified as duplicate;
-- the provider returns a different model ID than the manifest.
+- Polymarket: `q × (exit_or_payoff − entry_vwap) − entry_fees − exit_fees`.
+- Stock long: `q × (exit − entry) + dividends − market_costs`.
+- Stock short: `q × (entry − exit) − borrow − dividend_liability − market_costs`.
 
-Validation establishes traceability, not truth. The raw documents and raw model response remain in the audit record.
+Unresolved Polymarket quantity marks at executable bid depth; quantity beyond depth marks at zero and is flagged illiquid. Reports separate realized/unrealized P&L, cash yield, dividends, borrow, spread/slippage, statutory fees, model, data, and infrastructure cost.
 
-### 5.2 Jev questions
+Total return is ending marked economic equity / initial equity − 1. Turnover is total absolute executed notional / average marked equity. Profit factor is gross positive realized trade P&L / absolute gross negative realized trade P&L; no losses yields `null`.
 
-Every call batches bounded questions over the same state:
+## 4. Mandatory invariants from prior systems
 
-- evidence sufficient: binary `Noul`;
-- evidence contradictory or materially ambiguous: binary `Noul`;
-- direction/action: market-specific choice with explicit `ABSTAIN`;
-- setup quality: ordered score used for analysis only;
-- Polymarket only: independent `P(YES)` as a `Noul`.
+1. Every observation stores `published_at`, first successful `retrieved_at`, source URI, status, and hash. Availability means first retrieval; metadata never backdates it.
+2. Cross-asset data joins by exchange-local date, never array position/raw timestamp.
+3. Entry features, universe, cluster membership, rules, evidence, and model input are immutable. Corrections append supersession.
+4. Models see facts, never desired/control action. Polymarket price is hidden until Jev emits independent P(YES).
+5. `ABSTAIN`, operational errors, stale input, and `HOLD/FLAT` remain distinct.
+6. Code owns all numerical calculations. Jev confidence is not win probability and never sizes Phase 1.
+7. SQLite is the only economic source of truth; dashboards derive from it. No portfolio JSON.
+8. Stable semantic IDs and database constraints enforce idempotency.
+9. Runtime identity proves commit, dirty state, lockfile, schema, manifest, prompts, and executable. Commit alone is not deployment proof.
+10. Costs, attempts, exclusions, and negative results remain visible. No run changes after registration.
+11. Signals with leakage, degenerate labels, no cost model, or no consumer are retired.
 
-The exact model ID, question schema, criteria, thresholds, and prompt hashes are frozen in the manifest. Raw provider responses, probabilities, confidence, latency, cost, errors, and retries are stored.
+## 5. Architecture
 
-### 5.3 Shared gates
+Python 3.12 modular monolith, one host, local SQLite, content-addressed artifacts.
 
-No simulated order is created unless all gates pass:
+Modules: `core` (fixed-point types/IDs/manifest), `application` (use cases, stages, transactions, leases), `data` (providers/calendars), `evidence` (safe retrieval/manifests), `research` (OpenAI, tools disabled), `decision` (Jev/pinning), `polymarket`, `stocks`, `controls` (forward-cycle control signals), `risk`, `execution` (paper only), `persistence` (journal/ledger/reconciliation), `evaluation` (read-only statistics), `reporting` (read-only static dashboard), and thin `cli` entry points. Core imports no provider SDK, DB, or web framework. Evaluation never backfills decisions.
 
-- fresh market snapshot;
-- valid evidence brief;
-- valid Jev response;
-- evidence sufficiency at least 0.70;
-- ambiguity at most 0.30;
-- chosen action probability at least 0.55;
-- chosen action exceeds the second-highest action by at least 0.15;
-- deterministic market eligibility and risk limits;
-- no duplicate opportunity or existing conflicting position;
-- sufficient paper cash and gross exposure capacity.
+## 6. Causal evidence pipeline
 
-Thresholds remain frozen for the confirmation run. Their sensitivity is reported after the run, never used to rewrite the confirmatory result.
+For each opportunity:
 
-## 6. Polymarket stream
+1. persist eligibility snapshot `t0`;
+2. retrieve allowlisted documents/APIs and store exact bytes, normalized text, hashes, publication/retrieval times;
+3. freeze ordered `evidence_input_manifest` and `input_cutoff=t1`;
+4. call OpenAI with tools disabled and only frozen documents; completion `t2`;
+5. validate brief; call Jev over same frozen brief; completion `t2j`;
+6. capture one common executable snapshot for all arms at `t3`;
+7. evaluate arm signals and append intents at `t4`.
 
-### 6.1 Universe and schedule
+Require `t0 <= retrieved_at <= t1 < t2 <= t2j <= t3 <= t4`. Retries reuse identical evidence/input hashes. New retrieval is a new opportunity/episode, never a retry.
 
-Run every 15 minutes. A market is eligible only when all conditions hold at the cutoff:
+Retriever permits HTTPS only. For every hop it reapplies scheme/port/hostname allowlist, credentials, redirect, byte, DNS/IP and MIME checks; rejects mixed public/private answers and IPv4-mapped private ranges; connects only to a validated resolved IP while preserving/verifying original Host, SNI and certificate; verifies connected peer IP remains in that set. It blocks loopback/private/link-local/multicast/metadata IPs, unsupported types, excess redirects/time/bytes/documents, and decompression bombs. Model input is explicitly delimited untrusted data.
 
-- active, non-sports, and not already resolving or disputed;
-- scheduled resolution between one hour and 30 days away;
-- at least $10,000 trailing 24-hour volume;
-- at least $5,000 visible depth within two probability points of the best quotes;
-- maximum bid/ask spread of four probability points;
-- unambiguous resolution criteria and an identified resolution source;
-- not a duplicate or derivative of another included market in the same event cluster.
+OpenAI strict schema records facts with document hash, URI, publication/retrieval times and exact normalized quote span; arguments for/against, contradictions, missing evidence, catalysts, and quality. Quote validation uses stored document version and normalized Unicode spans; it proves provenance, not truth.
 
-The scan ranks eligible event clusters by liquidity and evaluates at most 20 clusters per cycle. This budget and ranking are frozen.
+Jev batches: evidence sufficient (Noul), materially ambiguous (Noul), action including `ABSTAIN`, setup quality (analysis only), Polymarket P(YES), and stock P(D+1 common open to D+10 close total return > 0). Forecast probabilities are distinct from action confidence.
 
-### 6.2 Event clustering
+## 7. Model and failure policy
 
-Markets sharing an underlying real-world event, mutually dependent outcomes, or nested thresholds receive one `event_cluster_id`. Cluster-level limits stop many correlated contracts from evading position limits. Event clustering is deterministic where metadata supports it; ambiguous clusters are rejected rather than guessed.
+Manifest pins provider, endpoint/API version, SDK/lock version, request snapshot, expected returned ID, schema, temperature, top-p, supported seed, and tools. Store raw request/response and provider fingerprints. Aliases and model fallback are forbidden. Registration records a stable comparable provider deployment fingerprint/revision when available, and every response must match it. Changed/retired IDs or fingerprints, or a missing required fingerprint, append `VERSION_MISMATCH` and end/invalidate the run; historical outputs replay from storage. If a provider cannot expose stable comparable revision metadata, it is ineligible for a registered run.
 
-### 6.3 AI state and action
+Model result and final arm disposition are separate immutable records. Model results are `ACTION`, `HOLD_FLAT`, `MODEL_ABSTAIN`, `PROVIDER_ERROR`, `VALIDATION_ERROR`, `STALE_INPUT`, `VERSION_MISMATCH`, `DEADLINE_EXCEEDED`, or `BUDGET_EXHAUSTED`. After deterministic gates, every `(opportunity_id, arm)` gets exactly one final disposition: `ORDER_INTENT_CREATED`, `NO_ACTION`, `RISK_REJECTED`, `CAPACITY_REJECTED`, `OPERATIONAL_FAILURE`, or `BASELINE_RECORDED`. Fill/cancel/exit lifecycle belongs to order/position events. Only a valid `ACTION` may create an AI order intent. Non-trade dispositions contribute zero trading P&L and actual attributable cost.
 
-The evidence state includes the exact market question, rules, resolution source, cutoff, end time, and validated evidence. It excludes YES/NO prices, spread, volume-derived direction, current position, and control-arm output.
+`entry_enabled` and `position_management_enabled` are separate. Model/evidence failures block entries and model exits only. Stops, targets, time exits, resolution, corporate actions, accrual, marks, and reconciliation continue. Missing exit data creates `EXIT_PENDING_DATA` and conservative valuation, never a fill.
 
-Jev returns `YES`, `NO`, or `ABSTAIN`, plus independent `P(YES)`. Afterward, deterministic code reveals the executable order book and computes:
+Common gates: fresh market snapshot, registered opportunity, arm-local capital/risk, no duplicate/conflict, complete cost inputs, valid runtime identity. AI-only gates: valid evidence/Jev; sufficiency >=0.70; ambiguity <=0.30; action probability >=0.55; margin over runner-up >=0.15. Each arm uses only its own signal for entry/signal exits.
 
-- `edge_yes = p_yes - executable_yes_ask`;
-- `edge_no = (1 - p_yes) - executable_no_ask`;
-- all-in cost margin from fees, spread/slippage allowance, and a fixed three-point uncertainty reserve.
+## 8. Polymarket
 
-A side is actionable only when its edge is at least the larger of five probability points or twice its all-in execution friction plus the uncertainty reserve.
+### 8.1 Universe, identity, and budget
 
-### 6.4 Position sizing
+Scan each 15-minute slot. Eligibility: accepted frozen non-sports provider category; active; resolution 1 hour–30 days away; >=$10,000 trailing 24h USD volume; >=5,000 visible contracts within two points of best quote; <=4-point spread; required resolution fields/source; deterministic unambiguous cluster.
 
-No model confidence enters the formula.
+Manifest freezes categories/exclusions, normalized cluster inputs, algorithm/version, and tie-breakers. Cluster membership persists before model calls and is never rewritten. Choose one contract per cluster by highest 24h USD volume, then qualifying contract depth, then immutable market ID.
 
-For the selected side:
+One cluster creates one Phase-1 opportunity at its first eligible slot; later scans manage it but create no reentry/observation. `opportunity_id=hash(run,stream,cluster,first_slot)`, never arm.
 
-- estimate seven-day midpoint volatility from causal snapshots;
-- set dollar cost to `0.5% of equity / max(volatility, 0.05)`;
-- cap position cost at 10% of stream equity;
-- cap total cost across one event cluster at 10% of equity;
-- cap simulated participation at 5% of visible depth and 1% of trailing 24-hour volume;
-- reject orders below venue minimum size.
+Budgets include entry and recurring position-review work: maximum 3 new opportunities/cycle, 20/day, 3 concurrent requests, 3 attempts/stage, frozen provider-call, input-token, output-token, evidence-byte, concurrency, and dollar quotas, a ten-minute cycle deadline, and $3/day variable AI spend. Before registration, quotas are deterministically partitioned by `(UTC day, stream, entry_or_review)` pool; immutable scheduled slot then semantic subject ID defines priority. Before retrieval/provider invocation, one short transaction atomically reserves worst-case units in every applicable dimension. Durable usage/billing converts reservations to actuals and releases only verified unused units. Unknown in-flight attempts retain worst-case reservations until recovery resolves them. Reservation failure yields AI `BUDGET_EXHAUSTED`; deterministic/baseline arms continue. Pre-run p99 rehearsal must fit deadline or limits decrease before registration.
 
-This formula targets smaller positions in unstable markets while maintaining a hard worst-case capital cap.
+### 8.2 Edge, sizing, fills
 
-### 6.5 Paper fills
+After Jev p_yes, capture one common book. Reject if older than 60 seconds at intent creation. For proposed quantity compute side-specific entry VWAP from captured levels. Gross edge is `p_yes − YES_VWAP` or `(1−p_yes) − NO_VWAP`. Entry VWAP already contains spread.
 
-A buy fills only against a captured executable ask and only up to captured depth. Slippage consumes successive captured levels. Unfilled quantity is cancelled at the end of the cycle; no optimistic partial fill is invented. A fill cannot use a quote timestamp later than the order timestamp.
+Convert entry fee, expected exit fee, and conservative exit slippage to probability points. Trade only if:
 
-### 6.6 Exit policy
+`gross_edge >= max(0.05, 2 × (entry_fee_pp + exit_fee_pp + exit_slippage_pp) + 0.03)`.
 
-Positions are reassessed every cycle using fresh data. Exit at the first applicable condition:
+Solve size/edge jointly because VWAP changes with quantity.
 
-1. market resolution or invalidation;
-2. current independently recomputed edge is zero or negative;
-3. Jev produces the opposite directional action through a fresh validated brief;
-4. midpoint has moved 15 probability points against entry;
-5. midpoint has moved 10 probability points in favor of entry;
-6. seven calendar days have elapsed;
-7. liquidity no longer supports a modeled exit; in that case mark the position illiquid and value it conservatively at the executable bid rather than inventing a fill.
+Prices/probabilities are decimals on [0,1] for a $1 resolution payoff. `sigma_p` is frozen-estimator seven-day standard deviation in USD per contract; five percentage points is `0.05 = $0.05/contract`. Let B=0.5% current equity, and let `D_side,2pt` be side-specific integer contract quantity captured within the two-point price range. Define Q as positive integer quantities q satisfying: q <= floor(B/max(sigma_p,$0.05/contract)); the edge inequality above evaluated with `VWAP(q)` and explicit entry/exit fee/slippage probability-point functions; entry cost/cluster cost <=10% equity; portfolio gross <=50%; max five clusters; q <= floor(0.05×D_side,2pt); and entry notional+fees <=1% trailing 24h USD volume. Set q*=max(Q); no trade when Q is empty. Store raw/normalized units. Under a 50% adverse depth haircut, each captured level quantity becomes `floor(original_quantity/2)` before recomputing depth, VWAP, Q, fills, and exits.
 
-Exit simulation uses executable bid depth. Resolution uses official Polymarket outcome data and remains separate from trade fills.
+Fills consume only captured ask levels and quantities; remainder cancels. Fill identity includes order, snapshot, level, sequence. Quote cannot postdate order.
 
-### 6.7 Controls
+Common exits: resolution/invalidation; 15 points adverse; 10 points favorable; seven days; liquidity failure without optimistic fill. AI signal exits use immutable recurring reviews every 15-minute Polymarket position-management slot: `position_review_id=hash(position_id,scheduled_review_slot,policy_version)`. A review is not an entry opportunity and never counts in the sample; it has its own frozen evidence manifest, cutoff, call attempts, deadline, and exactly one immutable management disposition (`NO_CHANGE`, `EXIT_INTENT_CREATED`, or an operational failure class), cannot reenter, and attributes costs and exit cash flow to the original opportunity. Deterministic exits use refreshed baseline probability/signal. Deterministic stops/targets/time/resolution continue when AI review fails or exhausts budget. Exits consume bid depth.
 
-Synchronized controls use the identical eligible event-cluster set and cutoff:
+### 8.3 Controls
 
-- **Cash:** no positions; P&L baseline.
-- **Passive forecast:** executable midpoint/market probability as the no-model prediction benchmark, evaluated by Brier score and log loss. It is not presented as a tradable portfolio.
-- **Deterministic arm:** chooses YES when causal price momentum over 24 hours is positive and NO when negative, abstaining inside a two-point dead band. It uses identical sizing, costs, fills, exits, and risk limits.
-- **AI arm:** LLM evidence + Jev decision.
+Deterministic arm uses a frozen probability-valued momentum model mapping causal 24h midpoint change/volatility to clipped probability, fitted only on committed pre-run point-in-time data. It uses the same edge, size, costs and common exits, but its own probability for signal exits.
 
-## 7. Stock swing stream
+Forecast benchmark is executable midpoint probability, evaluated by cluster-weighted Brier; log loss secondary. It is non-tradable. Economic performance compares AI with deterministic and interest-bearing cash.
 
-### 7.1 Universe and schedule
+## 9. Stock swings
 
-Freeze the current S&P 100 constituent snapshot at experiment registration and commit its source and hash. Because the confirmatory run is forward-only, this avoids retroactive membership leakage. Membership changes during the 12 weeks are logged but do not change the frozen universe.
+Freeze S&P 100 membership/source/hash. After official close rank by frozen sum of absolute standardized 5-day return and standardized volume surprise; ticker breaks ties. Register top 20 `(run,session,symbol)` opportunities. Every arm uses this order; unavailable capacity records `CAPACITY_REJECTED`.
 
-Run once after the official US market close. Candidate generation uses only information available by the cutoff. Rank stocks by the sum of absolute standardized five-day return and standardized volume surprise; evaluate the top 20 each day. All arms receive the same candidates.
+Evidence covers prior seven days: SEC/issuer filings, earnings/guidance, material industry/regulatory news, catalysts, opposition, thesis breakers, gaps. Jev also receives causal returns, ATR dollars/share, trend, volume surprise, realized volatility, known earnings date, sector, and arm exposure.
 
-Primary market data is raw daily OHLCV plus corporate-action records. Adjusted series may be used for indicators only after point-in-time adjustment logic is tested. Simulated fills and cash flows always use raw prices with explicit splits and dividends.
+Shorts are enabled only if point-in-time borrow/locate source passes preflight; otherwise both arms are long/cash. Flat 0.50% borrow alone does not authorize shorts.
 
-### 7.2 Evidence and state
+At modeled D+1 fill freeze decision-day ATR_D. B=0.5% current equity; d=2×ATR_D; integer `q=min(floor(B/d), floor(0.10×equity/fill_price), cash_or_collateral_limit)`. Stop is fill−d long/fill+d short. Recheck costs, 10% position, 50% gross, 25% sector, max five positions. Short proceeds are restricted; collateral covers market value plus liabilities.
 
-The evidence brief emphasizes the preceding seven calendar days:
+Close job persists pending intent with decision, target session, reference close, 10% gap limit, manifest, expiry. `stock-open-execution` runs after official open publication. Unique key includes run, arm, symbol, target session, intent. Absent/stale/late or >10% gap cancels explicitly.
 
-- SEC filings and issuer releases;
-- earnings and guidance;
-- material industry or regulatory news;
-- confirmed catalysts;
-- arguments for and against the move;
-- thesis breakers and missing evidence.
+Fill: long entry `open×(1+half_spread+0.0005)`, long exit `reference×(1−half_spread−0.0005)`, adverse signs reversed for shorts. Freeze spread source/model. Apply date-effective SEC/TAF only where applicable. Borrow accrues daily; dividends post on ex-date.
 
-Jev also receives deterministic numeric facts: causal returns, ATR, trend position, volume surprise, realized volatility, next known earnings date, sector, and current exposure. It does not receive the deterministic arm’s action.
+Common exits: 2-ATR stop, 3-ATR target, ten trading days, unmodelable corporate action/invalid pricing. After every official close while a stock AI position is open, create `position_review_id=hash(position_id,session_date,policy_version)` and apply the same frozen-evidence, provider-attempt, deadline, immutable management-disposition, no-reentry, and cost-attribution contract as Polymarket reviews. AI flip and deterministic-rule flip are separate signal exits, executed next open. Daily stop+target collision assumes stop first; gaps fill at open.
 
-Jev returns `LONG`, `SHORT`, or `ABSTAIN`. `ABSTAIN` creates no position. The confirmation experiment allows paper shorts because S&P 100 names are generally liquid; the simulator nevertheless charges conservative borrow and dividend costs.
+Deterministic action: LONG when close>50d SMA and 20d and 5d returns positive; exact inverse SHORT only when shorts enabled; otherwise FLAT. Same candidate order/capital/cost/common exits.
 
-### 7.3 Position sizing and portfolio limits
+Exogenous stock forecast label is total shareholder return from common modeled D+1 open reference to official D+10 close >0, including splits, dividends, delisting proceeds/distributions. Trade exits never change it. Brier uses separately elicited Jev probability, never action confidence.
 
-- initial equity: $10,000;
-- risk budget per position: 0.5% of current equity;
-- stop distance: two 14-day ATRs from entry;
-- shares: risk budget divided by stop distance;
-- hard cap: 10% gross equity per position;
-- hard cap: 50% gross portfolio exposure;
-- hard cap: 25% gross exposure per GICS sector;
-- maximum five concurrent positions;
-- no confidence-based scaling or pyramiding.
+## 10. Estimand and Phase-1 decision
 
-Short positions accrue a conservative 0.50% annualized borrow charge plus dividend liability. A borrow-locatability failure in the data model causes `ABSTAIN`, not a free short.
+For stream s with N_s registered opportunities, the policy-value estimand is `theta_s=(EconomicPnL_AI,s−EconomicPnL_DETERMINISTIC,s)/(N_s×R0)`. Account economic P&L uses the same fixed enrollment-through-T_m interval and includes realized cash flows, fixed-cutoff marks, cash interest, and every arm-scoped direct/allocated cost. Direct items retain opportunity IDs; weekly residuals remain in the owning arm's weekly policy contribution. Allocations and residuals reconcile separately to each arm account; their difference equals the numerator of theta_s. This estimates complete policy value, not an individual opportunity causal effect because portfolio limits create interference.
 
-### 7.4 Fill and exit policy
+The two confirmatory nulls are H0_s: theta_s<=0.03 versus H1_s>0.03. Assign each opportunity and all later cash flows/marks/direct costs to enrollment week. For every calendar week b and stream s store synchronized `(X_sb,n_sb)`, where X is AI-minus-deterministic economic P&L including weekly residual differences and n is registered-opportunity count. Resample the same week indices jointly for both streams using a circular stationary bootstrap with expected block length L selected only from pre-run simulation, 99,999 valid replicates, and frozen RNG seed. Compute `theta*_s=sum(X*_sb)/(R0×sum(n*_sb))`; redraw a replicate when either stream denominator is zero, and declare analysis invalid if 999,990 total draws cannot produce 99,999 valid replicates. Let theta_hat be observed and `d*_r=theta*_r−theta_hat`. The one-sided null-centered p-value is `(1 + count(d*_r >= theta_hat−0.03))/(99,999+1)`. Order p1<=p2; reject both only when p1<=0.025 and p2<=0.05. For each stream, sort the 99,999 centered replicates `d*` ascending and define the fixed basic-bootstrap simultaneous lower bound as `L_s = theta_hat_s - d*_(97,500)`, where `d*_(97,500)` is the 97,500th 1-indexed order statistic (`ceil(0.975 × (99,999+1))`). Report these 97.5% one-sided lower bounds as simultaneous descriptive bounds rather than ordered generic intervals. Both rejections plus every safety gate are required for later confirmation. Phase-1 values are diagnostic only.
 
-A decision made after day `D` close enters at day `D+1` official open plus adverse slippage. It never fills at the already-known close. Entries are cancelled if the next open is absent, stale, or gapped more than 10% from the decision close.
+Forecast scoring covers all registered opportunities. Polymarket y is official payout in the frozen market's admissible resolution set within [0,1], baseline is common t3 executable midpoint. Stock y is the fixed binary D+1-to-D+10 label, baseline is pre-run prevalence from the identical candidate rule. Valid probabilities are scored even for hold/flat/abstain. Missing valid probability substitutes frozen baseline in full-cohort Brier; report coverage and valid-only Brier. Brier skill is `1−BS_full/BS_baseline`, target >0. Calibration on valid probabilities reports intercept target 0, slope target 1, and ten equal-width-bin ECE target 0 with bin counts/block-bootstrap intervals. Phase-1 forecast metrics are descriptive. For labels missing at T_m, bound the paired score difference `mean((p_model−y)^2−(p_baseline−y)^2)` jointly by choosing, for each missing label, the minimizing/maximizing value from its frozen admissible set; because the expression is linear in y, interval endpoints suffice for continuous [0,1] sets. Forecast superiority may be described only when the worst-case upper bound is below zero. Any Brier-skill bounds use the same joint label assignments, never separately bounded numerator/denominator.
 
-Exit at the first applicable condition:
+Secondary: portfolio/control return, max drawdown, worst week, descriptive ES95 with CI, profit factor, turnover, filled-count and gross-dollar-day retention, forecast scores/calibration, reliability, latency, and costs.
 
-1. two-ATR stop;
-2. three-ATR profit target;
-3. ten trading days elapsed;
-4. fresh Jev direction flips;
-5. security leaves trading, undergoes a corporate action that the simulator cannot model, or loses valid pricing.
+Phase-1 precedence is exhaustive: (1) `OPERATIONALLY_INFEASIBLE` on any causality/version/duplicate-economic-event/accounting/reconciliation/risk violation or <99% terminal slots; (2) `INCONCLUSIVE` when enrollment/T_m analysis is incomplete or a manifest-frozen numeric information requirement fails; (3) `PROMISING` only when every numeric gate below passes under full base and joint-adverse replays; (4) otherwise `NO_EVIDENCE`. Numeric gates are: theta_poly>=0.03 and theta_stock>=0.03; positive cumulative AI-minus-deterministic economic P&L per stream; AI economic return above interest-bearing cash and stock AI above exposure-matched passive; AI maximum drawdown <= deterministic drawdown+0.02 and <=0.10 absolute; weekly-loss gate below; count and dollar-day retention each >=0.60. PROMISING is not alpha confirmation or live authorization. Before registration, the manifest freezes numeric information requirements and classification tree. Confirmatory duration is `max(26 weeks,B_min)` where B_min comes from preregistered simulation at >=80% joint-Holm power under a frozen alternative vector `(theta_alt_poly,theta_alt_stock)` with each theta_alt strictly >0.03 (default design target 0.06), paired variance, cross-stream/serial dependence, abstention and missingness. Completed zero-opportunity weeks remain analysis weeks. Report opportunities, clusters, weeks, and spectral effective weeks using a preregistered initial-positive-sequence autocorrelation truncation; effective weeks are diagnostic and never trigger post-result extension.
 
-Daily bars cannot establish intraday ordering when both stop and target cross. The simulator applies the adverse stop-first assumption. Gaps through stops fill at the open, not the stop price.
+At the frozen daily valuation timestamp, maximum drawdown is `max_{t<=u}((peak_equity_t−equity_u)/peak_equity_t)` on synchronized marked economic-equity series. Weekly gate is `min_b[(AI economic P&L_b−deterministic economic P&L_b)/10000] >= -0.01` over identical frozen UTC enrollment weeks. Count retention is AI positive-fill opportunities / deterministic positive-fill opportunities. Dollar-day retention is summed AI daily absolute marked gross notional / corresponding deterministic sum at the daily valuation timestamp. A zero deterministic denominator makes the stream INCONCLUSIVE. All these gates must pass in base and named joint-adverse replay.
 
-### 7.5 Transaction costs
+Uncertain spread/slippage/borrow/operating costs scale 0.5/1/1.5; depth does not. Named joint-adverse is 1.5x uncertain costs plus 50% haircut to every captured Polymarket level quantity and frozen zero-bid valuation. Replay the complete policy—edge, VWAP, sizing, fills, exits, endpoint, benchmarks and safety gates. Statutory fees/cash yield do not scale. Threshold/reserve/volatility grids are exploratory. Base and joint-adverse classifications must both pass and match.
 
-Every entry and exit charges:
+Let E be the manifest's exact UTC end of fixed 12-week enrollment. Before enrollment, resolve and store T_m as the official NYSE close timestamp (America/New_York converted to UTC) on the tenth NYSE session strictly after the UTC calendar date E+30 calendar days, using the pinned NYSE calendar version. The same T_m applies to both streams. No entries occur after E. Primary economic endpoint/classification is fixed at T_m: realized cash flows plus conservative executable marks, with quantity beyond depth zero. Enrollment-cutoff marks are interim; later settlements/corrections are supplemental and never change classification. Forecast labels unavailable at T_m use prespecified best/worst-case bounds and are never silently excluded. Deterministic position management continues.
 
-- half of the observed or modeled bid/ask spread;
-- five basis points of additional slippage per side;
-- SEC/TAF fees where applicable;
-- borrow and dividend costs for shorts;
-- zero commissions unless the selected paper broker later documents a commission.
+## 11. Journal and accounting
 
-Cost assumptions receive ±50% sensitivity analysis in the final report.
+Store UTC timestamps as integer microseconds, money as integer micro-dollars, prices/probabilities as millionths, and quantities in declared venue-native integer scale.
 
-### 7.6 Controls
+Immutable tables cover runs/manifests/startups, opportunities/clusters/snapshots/documents/evidence manifests, provider call intents/attempts/results, decisions, order intents/events/fills, balanced ledger postings, position and position-review events, cycle intents/events, health/violations, artifacts. Mutable operational lease/quota-reservation rows are explicitly excluded from immutable history and append an immutable audit event for every mutation. `BEFORE UPDATE/DELETE` abort triggers protect economic/audit tables. Corrections append same-entity successor; no cross-run/type/identity, self-reference, branch, or cycle. Derived views are disposable.
 
-- **Cash:** zero-return baseline.
-- **Passive:** SPY total return, with the same experiment dates and explicit dividends.
-- **Deterministic arm:** `LONG` when close is above 50-day SMA and both 20-day and five-day returns are positive; `SHORT` for the exact inverse; otherwise `FLAT`. Rank by absolute 20-day return. It uses identical candidate set, sizing, costs, fills, exits, and portfolio limits.
-- **AI arm:** LLM evidence + Jev decision.
+Every fill, fee, cash yield, dividend, borrow, split, resolution, and operating cost writes balanced cash/inventory/expense postings transactionally. Enforce cumulative fill <= order and captured depth; temporal constraints; balanced postings; equity equation; restricted short proceeds; zero reconciliation difference before entries. Violation blocks entries but not exits.
 
-## 8. Experiment protocol
+Each stage key derives from run, semantic subject ID (`opportunity_id` or `position_review_id`), arm, stage, manifest hash, and input hash. Persist provider-call intent before network call; attempts separate; one validated result selected. On crash reuse completed result, resume explicit retryable failure, or mark unknown before retry. Unique indexes are final guard.
 
-### 8.1 Preregistration manifest
+## 12. Scheduling, leases, recovery
 
-Before the first confirmatory decision, commit a machine-readable manifest containing:
+A cycle intent stores `cycle_key=hash(run_id,mode,job_type,stream,scheduled_slot)` and `scheduled_for`, `input_cutoff`, and UTC deadline. Immutable cycle events append start, stage transitions, lease loss/recovery, terminal result and `finished_at`; no cycle row is updated. Recurring reviews have their own slot/ID. Stock uses exchange calendar including holidays/early closes. Persist UTC event/deadline times but enforce elapsed deadlines and latency with a monotonic clock. Missed slots append `MISSED_SLOT`; never backfill current data. Replay is distinct and frozen.
 
-- experiment start/end and timezone;
-- universe snapshots and hashes;
-- exact market filters and candidate limits;
-- exact model IDs, question schemas, prompt hashes, and thresholds;
-- data providers and fallback policy;
-- cost, sizing, fill, and exit rules;
-- random seeds;
-- primary and secondary metrics;
-- minimum sample requirements;
-- statistical tests and promotion gates;
-- code commit deployed at start.
+One advisory file lock plus `BEGIN IMMEDIATE` DB lease with owner, expiry, fencing token protects the writer; every stage write requires token. No DB transaction spans network. Startup recovers nonterminal cycles/pending intents before new slot; duplicate starts converge on cycle key.
 
-Any change creates a new exploratory run ID. The original confirmation run continues unchanged or is formally invalidated; it is never silently migrated.
+One persistent `run-worker` process owns startup identity, heartbeat, writer lock, lease, deterministic scheduler, and all forward cycles. systemd supervises that service and contains no business logic. Thin CLI subcommands (`polymarket-cycle`, `stock-close-decision`, `stock-open-execution`, `manage-open-positions`, `recover-and-reconcile`, `evaluation-snapshot`, `final-report`, `backup-and-verify`, `deployment-verify`) are worker-internal handlers or explicit maintenance/replay commands, never independently timer-launched forward writers.
 
-### 8.2 Units of analysis
+No model fallback. Allowed data fallbacks are manifest-listed with mapping/timestamp/precedence/validation. Retry identical input, max three attempts, bounded exponential backoff+jitter and absolute deadline; store every attempt.
 
-- Polymarket: independent `event_cluster_id`, not repeated scans or related contracts.
-- Stocks: position-level outcome, with uncertainty estimated using week-level blocks to preserve cross-sectional and serial dependence.
-- Holds/abstentions are included as zero-trade outcomes for eligible opportunities in intention-to-treat comparisons.
+## 13. Runtime, durability, security
 
-### 8.3 Primary metrics
+Startup record: instance ID, PID, host/boot ID, start, absolute executable/package path, Git commit, dirty flag, manifest/prompt/lock hashes, schema, plus systemd unit/timer content hashes. Every cycle references it. Health includes last slot/start/terminal completion, stage, oldest pending work, failures, heartbeat, provider IDs, data ages. `deployment-verify` resolves non-expired heartbeats and requires exactly one live instance, compares expected identity with that live startup/latest stage, then separately verifies newest completed cycle references the same startup and fencing token. It verifies PID start identity and boot ID to prevent PID reuse, works before the first cycle from the unique live startup record, and fails on active mismatch, zero/multiple instances, stale heartbeat, superseded token, or historical-only match.
 
-Per stream:
+Connection factory asserts `foreign_keys=ON`, WAL, frozen busy timeout, `synchronous=FULL`. Startup rejects network filesystems. Daily backup uses online backup API or `VACUUM INTO`, includes referenced blobs, verifies hashes and `integrity_check`. RPO 24h, RTO 2h; restore drill before registration and monthly.
 
-1. treatment-minus-deterministic net P&L per eligible opportunity, expressed in risk units (`R`);
-2. treatment-minus-deterministic portfolio return over the exact run;
-3. maximum drawdown and 95% expected shortfall;
-4. profit factor and turnover;
-5. total modeled market costs and model/API costs.
+Secrets remain outside repo in mode-0600/OS store. Logs exclude auth/cookies/keys/signed secrets. Dashboard opens DB read-only with fixed parameterized queries. CI scans secrets and asserts no signing/live adapter.
 
-Polymarket additionally reports Brier score and log loss versus executable market probability. Stocks report directional Brier score for the frozen outcome definition: positive versus non-positive return from modeled entry to the earlier of modeled exit or day ten.
+## 14. Tests
 
-### 8.4 Statistical analysis
+Unit/property: fixed-point arithmetic, IDs, date joins/calendars, causal cutoffs, terminal states, parsing, sizing units, VWAP/costs, arm limits, accounting conservation, supersession.
 
-- Use stationary/block bootstrap confidence intervals; never treat observations as independent bars.
-- Use paired comparisons because arms share opportunities and execution assumptions.
-- Apply Holm correction to the two primary stream hypotheses.
-- Report point estimates, 90% and 95% intervals, raw sample sizes, independent-cluster counts, and effective block counts.
-- Run cost, fill, and threshold sensitivity only after the frozen result is computed; label it exploratory.
-- Preserve all attempted exploratory variants to expose multiple testing.
+No-lookahead/contract: future filings/resolutions/membership/prices cannot change input; stock fill no earlier than next open; Polymarket uses captured depth.
 
-### 8.5 Minimum evidence and promotion gate
+Crash/concurrency: failpoints before/after every commit/network boundary; fresh-interpreter recovery; N workers on one slot yield one semantic/economic event; test in-flight calls, locks, disk full, truncated WAL, corrupt/missing blob, timeout, rate errors, stale fallback.
 
-A stream is **inconclusive** unless the 12 weeks complete and it records at least 100 independent resolved opportunities. No early promotion is allowed.
+Calendar/runtime: DST, holidays, early close, late/missed/catch-up suppression, next-open intents, version failure with deterministic exits, deployment identity read-back.
 
-A stream passes feasibility only if all conditions hold:
+Accounting/backup: property-generated event sequences balance and reconstruct; golden journal hash; restore into empty directory and reconcile.
 
-1. AI-minus-deterministic net expectancy is at least +0.03R per eligible opportunity.
-2. The Holm-adjusted 95% block-bootstrap interval for that difference is entirely above zero.
-3. AI total return exceeds cash and its passive benchmark over the run.
-4. Maximum drawdown is no more than two percentage points or 10% relatively worse than deterministic control, whichever is stricter.
-5. 95% expected shortfall is no more than 0.02R per opportunity worse than control.
-6. The AI arm retains at least 60% of deterministic-arm opportunity exposure; otherwise the result is classified as inactivity, not validated alpha.
-7. At least 99% of scheduled cycles produce a terminal audited status, including explicit error/abstain states.
-8. No causality, model-version, duplicate-fill, reconciliation, or risk-limit violation occurs.
-9. Conclusions remain directionally unchanged under +50% modeled execution costs.
+Statistics: attributed stationary bootstrap, paired permutation, Brier/log loss, multiplicity; synthetic known-effect tests and pinned block-length rule.
 
-Passing authorizes only a separately designed, capped live pilot. It does not authorize live trading automatically.
+## 15. Reuse and review
 
-Jev probabilities may influence future sizing only after at least 250 independent outcomes, expected calibration error no greater than 0.05, and Brier score at least 10% better than the relevant baseline on untouched data.
+Selective MIT adaptation only; copied/materially adapted code goes in `THIRD_PARTY_NOTICES.md` with URL, commit, file, license. Reuse audit holds exact accepted/rejected behavior.
 
-## 9. Persistence model
+Investment, financial/model-risk, statistical/adversarial, and architecture reviews live under `docs/reviews/`. Blocking findings are fixed or explicitly rejected with evidence. A second review validates corrections. No unresolved placeholders, contradictions, or discretionary post-result choices remain before implementation planning.
 
-SQLite tables are append-oriented:
+## 16. Design acceptance
 
-- `experiment_runs` and `manifests`;
-- `provider_observations` and immutable `snapshot_blobs`;
-- `opportunities` and `event_clusters`;
-- `evidence_documents`, `evidence_briefs`, and `evidence_validation`;
-- `model_calls` and `decisions`;
-- `paper_orders`, `paper_fills`, and `position_events`;
-- `cash_events`, `corporate_actions`, and `resolutions`;
-- `equity_snapshots`;
-- `cycle_runs`, `health_events`, and `violations`.
-
-Corrections append a new event linked by `supersedes_id`. Destructive updates to economic events are forbidden. Derived tables or views may be rebuilt from the journal.
-
-SQLite constraints enforce:
-
-- unique opportunity/arm decision;
-- unique provider fill identity;
-- one active manifest per confirmation run;
-- nonnegative costs and sizes;
-- valid state transitions;
-- hash presence for every model input and evidence artifact.
-
-## 10. Scheduling and operation
-
-Every scheduled action maps to a real version-controlled Python CLI entry point. systemd user timers call those scripts directly. No cron prompt acts as production logic.
-
-- Polymarket scan: every 15 minutes.
-- Stock scan: once after official close, using an exchange calendar rather than a weekday check.
-- Reconciliation: at startup and after every cycle.
-- Evaluation snapshot: daily.
-- Final confirmatory report: after the fixed end date and resolution/sample gate.
-
-A bounded retry policy handles 429/5xx responses with jitter. Authentication, validation, stale-data, model-version, and insufficient-funds failures are not blindly retried. Provider outages produce audited abstentions.
-
-## 11. Dashboard and reporting
-
-The read-only dashboard displays:
-
-- exact run/commit/manifest/model versions;
-- cycle health and data ages;
-- opportunity funnel: discovered, eligible, researched, validated, decided, traded;
-- every arm side-by-side;
-- gross and net P&L with cost decomposition;
-- equity, drawdown, exposure, and concentration;
-- calibration and confidence buckets;
-- abstentions, failures, stale rejections, and duplicate suppressions;
-- all exploratory variants, not only the best result.
-
-Dashboard values come only from journal queries. Every headline number links to its underlying opportunities, decisions, and fills.
-
-## 12. Security and safety
-
-- API keys live outside the repository in a mode-0600 environment file or OS credential store.
-- Secrets, authorization headers, raw cookies, signed URLs, and private keys are prohibited in logs and evidence blobs.
-- Network clients use host allowlists and bounded response sizes.
-- Evidence and web content are untrusted data, never executable instructions.
-- SQLite and blob directories use least-privilege file modes and daily backups.
-- The initial dependency graph contains no exchange execution SDK requiring signing credentials.
-- CI scans committed files for secrets and verifies that no live-order adapter exists.
-
-## 13. Testing strategy
-
-### Unit and property tests
-
-- exact ID/hash stability;
-- timezone and market-calendar boundaries;
-- date-keyed multi-asset joins;
-- causal cutoff enforcement;
-- frozen feature baselines;
-- Jev response parsing and explicit abstention;
-- malformed/provider-error behavior;
-- sizing, exposure, sector, and cluster limits;
-- cost and adverse fill calculations;
-- SQLite constraints and idempotency.
-
-### Contract tests
-
-Recorded fixtures validate provider schema adapters without live markets. Separate opt-in smoke tests verify current APIs and record model IDs, but never place orders.
-
-### Replay and restart tests
-
-The same immutable snapshot replayed twice must produce one economic event. Killing the process after any journal write and restarting must yield the same cash, positions, and equity as uninterrupted execution.
-
-### No-lookahead tests
-
-Fixtures place distinctive future values, filings, resolutions, and price bars after the cutoff. The resulting decision input and action must remain unchanged. Stock fills must occur no earlier than the next open. Polymarket fills must use only contemporaneous captured depth.
-
-### Statistical tests
-
-Port the block bootstrap, paired permutation, Brier/log-loss, and multiple-testing controls from the audited reference projects, retaining MIT attribution.
-
-## 14. Reuse policy
-
-Selective adaptation is preferred over whole-project forks. Exact copied or materially adapted code retains source comments and is listed in `THIRD_PARTY_NOTICES.md` with upstream URL, commit, file, and MIT notice.
-
-Planned reuse:
-
-- `jevymarket`: Jev adapter patterns, research brief schema concepts, SQLite decision logging, Polymarket discovery.
-- `jev_bitcoin_backtest`: causal simulator patterns, explicit cost objects, no-lookahead tests, block bootstrap, permutation tests, multiple-testing correction.
-- `jeeva`: stale-decision rejection, position recheck/reconciliation, decision lifecycle and audit persistence concepts.
-- `jev-perp-bot`: WAL journal, duplicate-fill constraint, deterministic risk state, cost/P&L decomposition.
-- `jev-trade-cc`: point-in-time SEC evidence, frozen baselines, jackknife robustness, prompt anti-anchoring rules.
-- `jev-trader`: only the small provider-neutral decision interface pattern; none of its forced-action or simulated maker-fill policy.
-
-Rejected upstream behavior is documented in `docs/research/reuse-audit.md`.
-
-## 15. Review and change control
-
-Before implementation planning, the design receives independent reviews from:
-
-1. investment research;
-2. financial analysis;
-3. statistics/quant methodology;
-4. risk/adversarial operations;
-5. software architecture;
-6. a second financial review after corrections.
-
-Review findings are stored under `docs/reviews/`. Blocking findings must be fixed or explicitly rejected with evidence. The final design must contain no `TBD`, placeholder, contradictory threshold, or unassigned safety decision.
-
-## 16. Acceptance criteria for the design phase
-
-The design phase is complete when:
-
-- the private GitHub repository exists and is cloneable;
-- lessons and reuse decisions are documented with pinned upstream commits and licenses;
-- independent review rounds have no unresolved blocking findings;
-- the specification is internally consistent and free of placeholders;
-- the revised specification and reviews are committed and pushed;
-- the user reviews the written specification before implementation planning begins.
+Complete only when repo is cloneable; lessons/reuse are pinned and licensed; reviews have no blockers; formulas/gates are machine-decidable; spec/reviews/fixes are committed and pushed; and user reviews the written spec before an implementation plan.
