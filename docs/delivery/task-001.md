@@ -14,6 +14,7 @@ c14463db0cee4b46fb27e5536ec2fd123d2fcd30 fix(build): harden paper-only package p
 1d78de00212e7a26c5c64cb539813b0e002c199c fix(build): enforce fail-closed package capabilities
 fe13916                                docs(delivery): update task 001 security rereview
 10433a2ec8211fb444c1775657f4b26503c2b0d5 fix(build): close paper-policy provenance gaps
+e48a5578c97155675a0b2ca29d2586a959e2df53 fix(build): reject mutated bindings and bytecode
 ```
 
 The earlier evidence commit remains in history. Its PASS verdict was premature and is superseded by this document.
@@ -339,6 +340,95 @@ Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
 - All 62 tests, including mandatory positive controls and current-repository policy scan, passed.
 - Delivery evidence remains pending independent review; no Task 2 work started.
 
+## Remaining spec-review MAJOR findings
+
+The adversarial spec re-review found two concrete bypasses after `10433a2`:
+
+1. Binding provenance could still be changed by binding constructs outside direct assignments. In particular, a top-level `for typer in [Evil]` target could replace the approved import before a lexically allowed `typer.Typer()` call, and nested `typer.Typer = exec` could mutate the approved module object.
+2. Git-based source enumeration excluded ignored `src/**/__pycache__`, `.pyc`, and `.pyo` paths. A physically present unchecked-hash bytecode file could therefore execute while the scanner passed.
+
+## Bytecode review RED evidence
+
+Mandatory positive controls were added before the implementation change. Commands:
+
+```console
+PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/test_package_policy.py -k 'binding_mutation' -q
+PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/test_package_policy.py -k 'git_ignored_pycache' -q
+uv run pytest tests/test_package_policy.py::test_test_process_disables_bytecode_writes -q
+uv run pytest tests/test_package_policy.py::test_ci_uses_immutable_actions_and_locked_audit -q
+```
+
+Observed expected output:
+
+```text
+FFFFF                                                                    [100%]
+5 failed, 62 deselected in 0.19s
+
+FF                                                                       [100%]
+2 failed, 65 deselected in 0.16s
+
+F                                                                        [100%]
+1 failed in 0.14s
+
+F                                                                        [100%]
+1 failed in 0.14s
+```
+
+The binding failures covered for-target rebinding of `typer`, nested imported-attribute mutation, `with ... as`, named-expression, and exception targets. The physical-tree failures used Git-initialized temporary repositories with the production-equivalent `__pycache__/` and `*.py[cod]` ignores, and proved both non-UTF8 `live.py` and valid malicious unchecked-hash `.pyc` were invisible to Git enumeration. The remaining RED controls proved ordinary pytest and CI had no bytecode-write suppression.
+
+## Bytecode review fixes
+
+Production fix commit:
+
+```text
+e48a5578c97155675a0b2ca29d2586a959e2df53 fix(build): reject mutated bindings and bytecode
+```
+
+Changes:
+
+- Added a fail-closed AST binding contract for the current two production files. Only the exact package-version assignment, Typer app assignment, and current top-level functions are accepted; other name/delete targets, attribute mutation, aliases, arguments, exception targets, nested/class declarations, `global`, and `nonlocal` are violations. Future source constructs require RED controls before allowlist expansion.
+- Added physical `src/` traversal before Git filtering. It independently rejects every `__pycache__`, `.pyc`, `.pyo`, unreadable path, and non-UTF8 physical file, including ignored files.
+- Added Git-initialized ignored-cache fixtures that create non-UTF8 source and real unchecked-hash malicious bytecode with `py_compile`.
+- Added repository pytest bootstrap and CI `PYTHONDONTWRITEBYTECODE=1` protection. Existing generated `src/jev_trading_lab/__pycache__` was removed explicitly before final verification; the policy never deletes suspicious caches.
+
+## Bytecode review final verification
+
+Commands were run sequentially from the repository root and exited 0:
+
+```console
+uv lock --check
+uv sync --frozen --all-groups
+uv run pytest -q
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src
+uv export --frozen --all-groups --no-emit-project --format requirements-txt --output-file /tmp/jev-audit-requirements.txt
+uv run pip-audit --strict --requirement /tmp/jev-audit-requirements.txt --no-deps --disable-pip
+uv build --no-build-isolation
+git diff --check
+```
+
+Observed output:
+
+```text
+Resolved 51 packages in 1ms
+Checked 50 packages in 0.49ms
+....................................................................     [100%]
+68 passed in 0.37s
+All checks passed!
+6 files already formatted
+Success: no issues found in 2 source files
+WARNING:pip_audit._cli:--no-deps is supported, but users are encouraged to fully hash their pinned dependencies
+WARNING:pip_audit._cli:Consider using a tool like `pip-compile`: https://pip-tools.readthedocs.io/en/latest/#using-hashes
+No known vulnerabilities found
+Building source distribution...
+Building wheel from source distribution...
+Successfully built dist/jev_trading_lab-0.1.0.tar.gz
+Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
+```
+
+`git diff --check` produced no output. Physical `src/` checks after the gates found no `__pycache__` directory or `.pyc` file.
+
 ## Review status
 
-**PENDING INDEPENDENT RE-REVIEW.** The prior PASS claim is withdrawn. Task 1 must not advance to Task 2 until independent spec-compliance and quality/security re-review report zero BLOCKER or MAJOR findings.
+**PENDING FINAL INDEPENDENT RE-REVIEW.** One security reviewer approved the prior change, but this adversarial spec review found the two MAJOR issues now addressed in `e48a557`. Task 1 must not advance to Task 2 until final independent spec-compliance and quality/security re-review report zero BLOCKER or MAJOR findings.
