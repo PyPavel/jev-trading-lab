@@ -2,103 +2,81 @@
 
 ## Status
 
-**PENDING INDEPENDENT REVIEWS**
+**PENDING INDEPENDENT RE-REVIEW**
 
-## Scope
+Task 5 remains blocked until reviewers accept this correction.
 
-Implemented strict immutable Phase-1 JSON manifest parsing, complete nested experiment contracts, canonical identity, reviewed Pydantic dependency/lock changes, and exact source/config/workflow policy approvals. No persistence, environment loading, secrets, live execution, approved design, provider-contract, plan, or review file changed.
+## Commits
 
-Production commit:
+Initial implementation:
 
 ```text
 3a2ede39d5cc4572f9a36ee4f3173fe4953c97e1 feat(core): define immutable run manifest
 ```
 
-## RED evidence
-
-Mandatory nodes were run separately before `manifest.py` existed. Each failed at the intended missing-module boundary:
+Review-finding correction:
 
 ```text
-uv run pytest tests/core/test_manifest.py::test_manifest_hash_stable -q
-1 failed: AssertionError: find_spec("jev_trading_lab.core.manifest") is None
-
-uv run pytest tests/core/test_manifest.py::test_alias_and_unknown_key_rejected -q
-1 failed: AssertionError: find_spec("jev_trading_lab.core.manifest") is None
-
-uv run pytest tests/core/test_manifest.py::test_required_limits_present -q
-15 failed: AssertionError: find_spec("jev_trading_lab.core.manifest") is None
+0476dd3 fix(core): close manifest trust and policy gaps
 ```
 
-Focused immutability, strict primitive, loader, UTF-8/size, deterministic-error, nested-required, and validator-matrix tests were authored before implementation and initially failed at the same missing-module boundary.
+## Review findings resolved
 
-Provider exactness was strengthened by an additional red-green cycle during self-review:
+- Replaced public Pydantic `Manifest` with a slotted, immutable parser-issued wrapper. The private `_ManifestModel` and nested models are implementation details. Public `Manifest` exposes no Pydantic construction/copy/validator surface and cannot be normally constructed.
+- Added canonical bytes, detached `to_dict()`, canonical identity, and authoritative `revalidate_manifest()`. Future registration must accept canonical bytes or use `revalidate_manifest()`; arbitrary wrapper fields are not trusted.
+- Added `assert_activation_candidate()`. It rejects `example_only`, placeholder markers, repeated placeholder hashes, and malformed/tampered wrapper state. Non-example manifests containing placeholders fail during parsing. Task 14 registration must call this method after revalidation.
+- Added all reviewed required experiment settings: exact fallback mapping/timestamp/precedence/validation; normalized cluster metadata and version/hash; sigma estimator inputs/rules/version/hash; exact direct/shared cost routing; classification, scoring, information, power, and adverse-replay gates; OEF contract; SQLite busy timeout; all SEC endpoints; issuer source/domain allowlists; calendar package/content hashes; deterministic retry jitter; rule/artifact versions and SHA-256 fields.
+- Tightened provider categories to lowercase, nonempty, unique tuples with case-insensitive sports rejection. Provider and Treasury contracts now freeze source, endpoint, timestamp, precedence, validation, and fallback behavior.
+- Added provider-specific dated immutable model snapshot validation plus stable expected revision/fingerprint fields. Known OpenAI and Jev moving aliases fail.
+- Hardened parsing with iterative depth/item/string limits, deterministic sorted/capped validation errors, and deterministic `RecursionError` conversion.
+- Hardened file loading to open once, `fstat()` the descriptor before/after, read only `MAX_MANIFEST_BYTES + 1`, and reject practical size/identity races.
+- Preserved exact source/config policy. Updated only reviewed hashes, preflight hash, workflow-embedded preflight hash, and workflow hash. Dependencies and `uv.lock` are unchanged.
 
-```text
-uv run pytest tests/core/test_manifest.py::test_validator_matrix_rejects_non_phase1_contract -q
-3 failed, 37 passed
-DID NOT RAISE for changed Polymarket catalog endpoint, changed Polymarket book source,
-and changed stock OHLCV endpoint.
-```
+## TDD RED evidence
 
-Caller-overrides were also tested before the fix:
-
-```text
-uv run pytest tests/core/test_manifest.py::test_validation_policy_cannot_be_weakened_by_caller -q
-1 failed: DID NOT RAISE when model_validate(..., extra="allow") was requested
-```
-
-The implementation now pins provider source/endpoint pairs and always enforces strict/name-only/extra-forbid validation regardless of caller arguments.
-
-### Source/config/dependency policy RED
-
-After production/config/dependency files were added but before reviewed approvals, fail-closed preflight reported every changed trust surface:
+Focused tests were added before production changes and failed with intended assertions:
 
 ```text
-/usr/bin/python3 -I -S scripts/policy_preflight.py
-exit 1
-policy preflight: uv.lock: SHA-256 does not match exact reviewed dependency lock
-policy preflight: pyproject.toml: content differs from exact approved build, dependency, entry-point, and tool contract
-policy preflight: src/jev_trading_lab/core/manifest.py: file is not approved
-```
-
-Package-policy pytest independently rejected the unapproved dependency and source:
-
-```text
-uv run pytest tests/test_package_policy.py::test_no_live_execution_surface -q
+uv run pytest tests/core/test_manifest.py::test_public_manifest_has_parser_only_trust_boundary -q
 1 failed
-pyproject.toml: runtime dependency not allowlisted: pydantic
-pyproject.toml: runtime dependency source or requirement differs from exact approved strings
-uv.lock: runtime dependency not allowlisted: pydantic
-src/jev_trading_lab/core/manifest.py: production file is not approved
+AssertionError: issubclass(Manifest, BaseModel) was True
+
+uv run pytest tests/core/test_manifest.py::test_categories_and_model_snapshots_reject_ambiguous_inputs -q
+1 failed
+Failed: DID NOT RAISE ValueError for duplicate accepted categories
+
+uv run pytest tests/core/test_manifest.py::test_parser_rejects_excessive_structure_and_caps_sorted_errors -q
+1 failed
+RecursionError from 1,100-level JSON nesting instead of deterministic ValueError
 ```
 
-The exact config physical tree/hash, source hash, runtime requirement string, complete lock SHA-256, preflight hash, workflow-embedded hash, and workflow hash were then approved. Existing dependency-source, workflow-order, source-tree, operational-tree, lock, and live-execution gates remain intact.
+Additional trust/schema/activation/file-race/design-trace tests initially failed because the wrapper API, `revalidate_manifest`, `assert_activation_candidate`, required fields, exact provider contracts, parser limits, and descriptor-race checks did not exist.
 
-## GREEN implementation
-
-- Added frozen Pydantic 2 models using `ConfigDict(frozen=True, extra="forbid", strict=True)` and explicit semantic sections rather than generic dict plugin structures.
-- Added `parse_manifest_bytes()` and `load_manifest()` with a 256 KiB limit, exact bytes input, strict UTF-8, root-object requirement, duplicate-key rejection, non-finite-number rejection, regular/readable-file checks, and deterministic field-path errors.
-- Required exact Phase-1 run/mode, calendar/maturation, account/cash-yield, model/provider, fallback, quota, Polymarket, stock, cost, baseline, endpoint, statistics/classification, runtime/backup, and review-cadence contracts.
-- Rejected model aliases, tools, model fallback, live/non-paper mode, unregistered data fallback, unknown nested keys, coercion, bool-as-int, null required fields, and caller attempts to weaken strict validation.
-- Converted JSON lists to immutable tuples only after exact JSON-domain validation; all nested models are frozen.
-- Derived `manifest_hash` from the complete normalized JSON-mode model dump via existing `canonical_hash("manifest", ...)`; no field is excluded and no mutable cache exists. `manifest_id` is `manifest:<hash>`.
-- Added structurally valid `config/phase1.example.json` with `example_only=true`, deterministic placeholder IDs/hashes, and no secrets.
-- Added only `pydantic>=2.12,<3` as the new runtime dependency; did not add `pydantic-settings` or environment loading.
-- Extended stdlib preflight and package policy to validate the exact physical `config` tree and file hash.
-
-Focused verification:
+A final artifact-version audit added rule hash/version expectations first; its focused RED was:
 
 ```text
-/usr/bin/python3 -I -S scripts/policy_preflight.py
-Policy preflight passed.
+uv run pytest tests/core/test_manifest.py::test_required_review_contract_fields_and_exact_design_literals -q
+1 failed
+KeyError: 'rule_version'
+```
+
+The production schema and example were then extended minimally to satisfy the new contract.
+
+## Focused GREEN evidence
+
+```text
+uv run pytest tests/core/test_manifest.py -q
+142 passed in 0.60s
 
 uv run pytest tests/core/test_manifest.py tests/test_package_policy.py -q
-186 passed in 1.72s
+195 passed in 1.63s
 ```
+
+Adversarial coverage includes Pydantic inherited bypass absence, constructor rejection, `TypeAdapter(Manifest)` rejection, no `__dict__`, object-copy safety, canonical round-trip, deliberate `object.__setattr__` tampering caught by revalidation, example activation rejection, moving model aliases, case/duplicate categories, exact Treasury/provider contracts, 1,100-level nesting, 40,000 invalid categories within the byte cap, deterministic key-order-independent errors, capped error output, and simulated descriptor-size race.
 
 ## Full gate evidence
 
-Commands ran sequentially against the production tree and exited 0:
+All commands ran after the final production changes and exited 0:
 
 ```text
 /usr/bin/python3 -I -S scripts/policy_preflight.py
@@ -111,7 +89,7 @@ uv sync --frozen --all-groups
 Checked 54 packages in 0.52ms
 
 env PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
-318 passed in 1.58s
+327 passed in 1.70s
 
 uv run ruff check .
 All checks passed!
@@ -122,10 +100,10 @@ uv run ruff format --check .
 uv run mypy src
 Success: no issues found in 7 source files
 
-uv export --frozen --all-groups --no-emit-project --format requirements-txt --output-file /tmp/jev-task-004-audit-requirements.txt --quiet
+uv export --frozen --all-groups --no-emit-project --format requirements-txt --output-file /tmp/jev-task-004-review-audit.txt --quiet
 exit 0
 
-uv run pip-audit --strict --requirement /tmp/jev-task-004-audit-requirements.txt --no-deps --disable-pip
+uv run pip-audit --strict --requirement /tmp/jev-task-004-review-audit.txt --no-deps --disable-pip
 No known vulnerabilities found
 
 uv build --no-build-isolation
@@ -136,21 +114,10 @@ git diff --check
 exit 0
 ```
 
-`pip-audit` emitted its standard advisory warnings for `--no-deps`; audit result was clean.
+`pip-audit` emitted its standard `--no-deps` advisory warnings; the audit result was clean. Artifact inspection confirmed both wheel and sdist contain `core/manifest.py`, and the repository-only example config remains excluded.
 
-Artifact inspection passed: wheel and sdist contain `jev_trading_lab/core/manifest.py`; wheel metadata pins `pydantic<3,>=2.12`; the repository-only example config is excluded from both artifacts.
+## Scope and handoff
 
-## Self-review
+No design, plan, provider-research, or review file changed. No dependency changed. The checked-in example remains `example_only=true` and structurally valid with explicit placeholder values. Task 14 registration must revalidate canonical bytes and call `assert_activation_candidate()` before persistence or activation.
 
-- Manifest code imports no database, provider SDK, web framework, settings loader, or persistence layer.
-- Exact built-in JSON primitives are validated before Pydantic tuple normalization. Signed-64-bit integer compatibility is preserved for canonical hashing.
-- Provider contracts freeze the reviewed Phase-1 source names and endpoints. Only the individually enumerated Treasury prior-observation fallback is enabled.
-- `example_only` remains part of the canonical hash. Activation rejection is intentionally deferred to the later registration/preflight task.
-- Model revision/fingerprint and artifact hash fields remain required even though the checked-in example uses clearly marked deterministic placeholders.
-- No secrets appear in the example manifest.
-- Exact package policy now includes config tree/hash mutation controls without weakening prior trust boundaries.
-- Production/tests/config/dependency/policy changes and this evidence document are isolated in separate commits.
-
-## Independent reviews
-
-Independent spec/adversarial and code-quality reviews have not yet been recorded. Status remains **PENDING INDEPENDENT REVIEWS**.
+Independent spec/adversarial and quality/security re-reviews have not yet been recorded. Status remains **PENDING INDEPENDENT RE-REVIEW**.
