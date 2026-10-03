@@ -2,89 +2,93 @@
 
 ## Status
 
-**PENDING INDEPENDENT REVIEWS**
+**PENDING INDEPENDENT RE-REVIEW**
 
-Production implementation is committed and locally verified. Independent spec/adversarial and quality/model-risk reviews have not yet been performed.
+All Task 6 review findings were addressed in the production commit below and verified locally. No independent re-review has yet approved this revision.
 
-## Production commit
+## Production commits
 
 ```text
 847cbc1 feat(persistence): add checked SQLite migrations
+40dcc21 fix(persistence): harden database and migrations
 ```
 
-## Scope delivered
+## Review findings resolved
 
-- Added one `Path`-only SQLite connection factory with exact built-in integer busy-timeout validation, SQLite `>=3.37.0`, explicit autocommit mode, `sqlite3.Row`, default thread affinity, and non-URI paths.
-- Verified `foreign_keys=ON`, `journal_mode=WAL`, exact `busy_timeout`, `synchronous=FULL`, and `trusted_schema=OFF` on every connection. Setup failures close the connection.
-- Created private parents as `0700` and the database file as `0600`; rejected symlink database paths, symlink parent components, special files, and the required network-filesystem denylist using injectable `/proc/self/mountinfo` resolution with decoded paths and longest mount-point matching.
-- Added immutable package-resource migration discovery with exact `NNN_slug.sql` names, contiguous versions from 001, duplicate/gap checks, UTF-8 and size bounds, regular-file/symlink/readability checks for filesystem resources, and SHA-256 over exact bytes. Zip-import resources are covered without assuming filesystem `Path` objects.
-- Added trigger-aware SQL statement splitting through `sqlite3.complete_statement`; transaction control, `ATTACH`/`DETACH`, `VACUUM`, and migration PRAGMAs are rejected before any migration applies. Comments and string literals do not trigger false positives.
-- Applied each migration under `BEGIN IMMEDIATE`, inserted version/name/hash/timestamp in the same transaction, rolled back failed multi-statement migrations, validated all applied metadata before pending work, serialized concurrent migrators, and made repeated application idempotent.
-- Added migration 001 with only the STRICT, WITHOUT ROWID `schema_migrations` table and metadata constraints. No business tables were introduced.
-- Added exact source/package policy hashes, SQL artifact contents, wheel/sdist assertions, preflight hash, and workflow hash. `pyproject.toml`, `uv.lock`, approved design, implementation plan, and review files were unchanged.
+- **Filesystem/path blocker:** database paths must be absolute and lexically normalized before mount lookup. Descriptor-relative `O_NOFOLLOW` traversal rejects symlink components. Mountinfo escapes are decoded, containment is component-aware, longest mount points win, and the last equal-depth stacked record is visible.
+- **Filesystem policy:** replaced the remote denylist with a reviewed local allowlist: `ext2`, `ext3`, `ext4`, `xfs`, `btrfs`, `f2fs`, `zfs`, `overlay`, and `tmpfs`. Unknown types plus all reviewed NFS/CIFS/SMB/FUSE/9p/Ceph/Gluster/Lustre/AFS/DAV types fail closed. `overlay` and `tmpfs` are required for common local/container and temporary test environments and retain the same private-directory boundary.
+- **Private SQLite boundary:** the final parent is created as `0700` or must already be a non-symlink directory owned by the effective UID with exact mode `0700`. Existing database files must be regular, effective-UID-owned, exact `0600`, and single-linked. Parent and file identity/owner/mode are rechecked after connect. WAL/SHM sidecars are verified `0600`. This is a pathname/WAL/SHM TOCTOU boundary, not an atomic fd binding claim.
+- **Adversarial path tests:** unsafe `0755`/`0777` parents, hard links, path replacement, parent replacement, symlinks, dot/dotdot spellings, stacked overmounts, and sidecar modes are covered.
+- **Caller transaction blocker:** migration application requires `isolation_level=None` and an idle connection. An active caller transaction raises deterministic `MigrationError` before migration work, remains active, retains unrelated inserts, and can be committed by the caller. Rollback is performed only for a transaction successfully started by the migration runner.
+- **TEMP shadowing:** all metadata reads/inserts use `main.schema_migrations`; existence checks use `main.sqlite_schema`. A populated TEMP shadow remains untouched while main metadata applies and survives reconnect consistently.
+- **Empty chain:** `load_migrations` requires at least one migration and a contiguous chain starting at 001; empty packages fail before database mutation.
+- **Schema name constraints:** migration metadata rejects separators, controls, uppercase, punctuation outside lowercase alphanumeric/underscore, empty or invalid slugs, bad suffixes, and version/name prefix mismatches.
+- **Resource TOCTOU/bounds:** filesystem resources are opened once with `O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK`, checked as regular and effective-UID-owned, read in chunks to `MAX+1`, and fstat-rechecked for inode/size changes. Archive resources use one bounded binary stream read. Symlink replacement, FIFO/special/unreadable input, invalid UTF-8, and oversized streams are covered.
+- **Actual wheel CI:** added `scripts/wheel_migration_smoke.py`. CI builds first, then creates a clean Python 3.12 venv, installs the actual wheel without dependencies, runs outside the source tree, loads packaged migration 001, applies it, and validates main metadata. Script content/hash, workflow order/hash, source/SQL hashes, and preflight hash are exact-policy protected.
+- Trigger-aware splitting, forbidden SQL checks, per-migration owned transactions, idempotence, rollback, and concurrent migration serialization remain covered.
 
 ## TDD RED evidence
 
-The four mandatory nodes were executed individually before implementation and failed for the intended missing behavior:
+Reviewer probes were added before production changes. The initial focused run exited 1 with **33 failed, 57 passed**. Representative intended failures:
 
 ```text
-test_connection_pragmas
-FAILED: connection.row_factory was None, expected sqlite3.Row
+test_database_path_must_be_absolute_and_lexically_normalized
+FAILED: DID NOT RAISE ValueError
 
-test_migration_checksum_change_rejected
-2 failed: DID NOT RAISE MigrationError after applied SQL bytes/name changed
+test_mountinfo_last_stacked_mount_wins_and_matches_components
+FAILED: expected nfs from last stacked /data record, received ext4
 
-test_installed_wheel_loads_sql
-FAILED: schema_migrations contained no recorded migration
+test_unknown_remote_and_fuse_filesystems_fail_closed
+FAILED: unknownfs/fuse variants did not raise
 
-test_network_fs_rejected
-FAILED: DID NOT RAISE DatabaseConfigurationError for injected nfs
+test_existing_database_parent_requires_exact_private_mode
+FAILED: unsafe 0755/0777 parents were accepted
+
+test_existing_database_requires_owner_mode_and_single_link
+FAILED: existing 0644 file was silently changed instead of rejected
+
+test_apply_rejects_caller_transaction_without_rollback
+FAILED: sqlite3.OperationalError: cannot start a transaction within a transaction
+
+test_apply_requires_autocommit_connection_contract
+FAILED: DID NOT RAISE MigrationError
+
+test_temp_schema_migrations_cannot_shadow_main
+FAILED: TEMP row count became 2
+
+test_empty_migration_package_fails_before_database_mutation
+FAILED: DID NOT RAISE MigrationError
+
+test_schema_rejects_hostile_or_mismatched_migration_names
+FAILED: hostile/mismatched direct inserts were accepted
+
+test_archive_resource_read_is_bounded_to_maximum_plus_one
+FAILED: read_bytes was called
 ```
 
-Exact source policy failed closed after the new production tree appeared and before approval hashes were updated:
+The wheel policy probe was also witnessed RED individually:
 
 ```text
-/usr/bin/python3 -I -S scripts/policy_preflight.py
-exit 1
-policy preflight: src/jev_trading_lab/persistence: directory is not approved
-policy preflight: src/jev_trading_lab/persistence/schema/001_migration_metadata.sql: file is not approved
-policy preflight: src/jev_trading_lab/persistence/migrations.py: file is not approved
-policy preflight: src/jev_trading_lab/persistence/db.py: file is not approved
+test_ci_builds_before_actual_wheel_migration_smoke
+FAILED: expected `run: uv run python scripts/wheel_migration_smoke.py` in workflow
 ```
 
-A self-review regression was also witnessed RED before its fix:
-
-```text
-test_runtime_pycache_does_not_break_resource_discovery
-FAILED: MigrationError: unexpected resource in migration package: '__pycache__'
-```
-
-The loader now ignores only the normal runtime `__pycache__` directory while rejecting other unexpected resources.
+Exact preflight then failed closed while production/SQL/script/workflow hashes differed; hashes were updated only after the reviewed content stabilized.
 
 ## GREEN evidence
 
-Focused tests after implementation:
-
 ```text
 env PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/persistence/test_migrations.py tests/test_package_policy.py -q
-97 passed, 1 skipped in 1.35s
-```
+146 passed in 1.75s
 
-After the build gate refreshed distributions, artifact-specific inspection passed:
-
-```text
-env PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/test_package_policy.py::test_migration_sql_is_packaged_in_wheel_and_sdist tests/test_package_policy.py::test_built_artifacts_exclude_repository_and_host_junk -q
-2 passed in 0.41s
-```
-
-Final full test run after the production commit and self-review fix:
-
-```text
 env PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
-494 passed in 3.56s
-```
+541 passed in 3.69s
 
-Coverage includes connection PRAGMAs and permissions, input types, mountinfo parsing, full network filesystem denylist, symlink paths, old SQLite, setup-close behavior, clean/repeated migration application, checksum/name drift, zip-import resources, malformed/duplicate/gapped filenames, non-UTF-8/oversize/unreadable/symlink/FIFO/unexpected resources, transaction rollback, trigger bodies, forbidden control SQL, comment/string false positives, applied future/gap/missing package metadata, strict timestamps, and concurrent migrators.
+env PYTHONDONTWRITEBYTECODE=1 uv run pytest \
+  tests/test_package_policy.py::test_migration_sql_is_packaged_in_wheel_and_sdist \
+  tests/test_package_policy.py::test_built_artifacts_exclude_repository_and_host_junk -q
+2 passed in 0.42s
+```
 
 ## Verification gates
 
@@ -98,44 +102,43 @@ uv lock --check
 Resolved 64 packages in 1ms
 
 uv sync --frozen --all-groups
-Checked 63 packages in 0.65ms
+Checked 63 packages in 0.87ms
 
 env PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
-494 passed in 3.56s
+541 passed in 3.69s
 
-uv run ruff check .
+env PYTHONDONTWRITEBYTECODE=1 uv run ruff check .
 All checks passed!
 
-uv run ruff format --check .
-25 files already formatted
+env PYTHONDONTWRITEBYTECODE=1 uv run ruff format --check .
+26 files already formatted
 
-uv run mypy src
+env PYTHONDONTWRITEBYTECODE=1 uv run mypy src
 Success: no issues found in 14 source files
 
-uv run pip-audit --strict --requirement /tmp/jev-task-006-audit.txt --no-deps --disable-pip
+uv export --frozen --all-groups --no-emit-project \
+  --format requirements-txt --output-file /tmp/jev-task-006-review-audit.txt
+exit 0
+
+uv run pip-audit --strict \
+  --requirement /tmp/jev-task-006-review-audit.txt --no-deps --disable-pip
 No known vulnerabilities found
 
 uv build --no-build-isolation
 Successfully built dist/jev_trading_lab-0.1.0.tar.gz
 Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
 
-git diff --check HEAD^ HEAD
+uv run python scripts/wheel_migration_smoke.py
+Successfully installed jev-trading-lab-0.1.0
+Installed-wheel migration smoke passed.
+
+git diff --check
 exit 0
 ```
 
-`pip-audit` emitted only its standard `--no-deps` advisory warnings. Built wheel and sdist both contain `jev_trading_lab/persistence/schema/001_migration_metadata.sql`; the clean artifact file-set test passed.
-
-## Self-review
-
-- Confirmed migration 001 creates no business table.
-- Confirmed forbidden SQL validation occurs across the full package before migration 001 can bootstrap metadata.
-- Confirmed applied resource name/hash drift fails before pending changes.
-- Confirmed network filesystem rejection occurs before `sqlite3.connect` in injected tests.
-- Confirmed runtime bytecode cache directories do not make source-tree resource loading fail.
-- Confirmed no dependency or lock changes and no design/plan/review edits.
-- No push performed.
+`pip-audit` emitted only its standard `--no-deps` advisory warnings. `uv.lock` and `pyproject.toml` were unchanged. Design, plan, and review documents were unchanged. No push was performed.
 
 ## Independent reviews
 
-- Spec/adversarial review: **PENDING**
-- Quality/model-risk review: **PENDING**
+- Spec/adversarial re-review: **PENDING**
+- Quality/model-risk re-review: **PENDING**
