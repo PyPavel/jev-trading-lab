@@ -18,6 +18,7 @@ e48a5578c97155675a0b2ca29d2586a959e2df53 fix(build): reject mutated bindings and
 395ad157a3c6ba01ec47a7286cba58fcfca444ce fix(build): freeze task1 source capability surface
 acdcd86d90ce77a429af8a31e862fb7bbdf5ff24 fix(build): freeze workflow and entry surfaces
 e7c9194                                fix(build): close ops symlink and backend injection
+c469b9e1bf3023b422b00fc50b5ba0b76b99e210 fix(build): preflight dependency sources before sync
 ```
 
 The earlier evidence commit remains in history. Its PASS verdict was premature and is superseded by this document.
@@ -699,6 +700,114 @@ Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
 `git diff --check` produced no output. Artifact inspection found 7 sdist members and 6 wheel members, no VCS metadata, cache, or bytecode paths, and exactly `jev_trading_lab/__init__.py` and `jev_trading_lab/cli.py` as wheel package files.
 
 No approved design, plan, or review file changed. Task 2 remains blocked.
+
+## Dependency-source and pre-sync review findings
+
+A subsequent independent review found two remaining MAJOR gaps:
+
+1. Dependency checks normalized only names. A same-name direct requirement such as `typer @ file:///.../vendor/typer` could regenerate a valid `uv.lock`, pass `uv lock --check`, and evade policy despite replacing the approved registry package. Direct URL, file/path, editable, Git/VCS, and alternate-index sources had the same trust-boundary problem.
+2. Pytest enforced the backend policy only after `uv sync`. A malicious repository-local backend selected through `backend-path` could therefore execute before the policy test that rejected it.
+
+## Dependency-source and pre-sync RED evidence
+
+Tests were added first and run before `scripts/policy_preflight.py` or workflow changes existed:
+
+```console
+uv run pytest tests/test_package_policy.py -k 'same_name_local_typer or preflight_rejects_non_registry or ci_order_preflight' -q
+```
+
+Observed expected output:
+
+```text
+FFFFFFF                                                                  [100%]
+7 failed, 40 deselected in 0.74s
+```
+
+The same-name local Typer fixture ran `uv lock` and `uv lock --check` successfully, then showed `_runtime_policy_violations()` returning `[]`. The CI-order fixture had no preflight, proceeded to the uv commands, and created `backend-executed`, proving backend code ran before pytest. The other failures covered file URL, HTTPS direct archive, Git/VCS, relative path, and non-registry lock source controls.
+
+Additional GREEN controls cover editable path configuration and alternate-index source configuration.
+
+## Dependency-source and pre-sync fix
+
+Production fix commit:
+
+```text
+c469b9e1bf3023b422b00fc50b5ba0b76b99e210 fix(build): preflight dependency sources before sync
+```
+
+Changes:
+
+- Added `scripts/policy_preflight.py`, runnable with pristine system `python3 -I` and stdlib only. It reads files without importing or building the project.
+- Froze exact current `[build-system]`, `[project]`, runtime requirements, development requirement strings, entry-point tables, and `[tool]` configuration before any dependency tool runs.
+- Required every non-project `uv.lock` package to use exactly `{ registry = "https://pypi.org/simple" }` and froze the project's direct runtime/dev metadata representations.
+- Rejected direct URL, file/path, editable, Git/VCS, alternate-index, and mutated lock sources, including a same-name local Typer package with a valid regenerated lock.
+- Froze the exact physical `src/` tree and hashes. Expanded the operational allowlist only to `scripts/` and `scripts/policy_preflight.py`; every other `scripts/`/`ops` file, directory, symlink, or special path remains rejected.
+- Added an inline CI SHA-256 check before executing the preflight, then placed preflight before `setup-uv`, `uv lock --check`, and `uv sync`.
+- The preflight reconstructs and validates the exact reviewed workflow content, including its own current hash literal, and checks the resulting workflow SHA-256 contract.
+
+Reviewed hashes:
+
+```text
+scripts/policy_preflight.py  8b31202946edadb2caf36ac26e7e4a14f337746e4a17f972504401266d60efe8
+.github/workflows/ci.yml      cdc8f8bbb79bf9732d7d56d6762391d71611f7001960507510a6a90628906245
+```
+
+Trust boundary: this is a reviewed change-control gate protecting accidental or independently reviewed changes. It is not a runtime sandbox and does not protect against a malicious change that alters both the workflow and its embedded preflight hash literal.
+
+## Dependency-source and pre-sync final verification
+
+Commands were run sequentially from the repository root in CI order and exited 0:
+
+```console
+python3 -I scripts/policy_preflight.py
+uv lock --check
+uv sync --frozen --all-groups
+uv run pytest -q
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src
+uv export --frozen --all-groups --no-emit-project --format requirements-txt --output-file /tmp/jev-audit-requirements.txt
+uv run pip-audit --strict --requirement /tmp/jev-audit-requirements.txt --no-deps --disable-pip
+uv build --no-build-isolation
+python3 -c '<tar/wheel allowlist inspection>'
+git diff --check
+```
+
+Observed output, accurately abridged to gate summaries:
+
+```text
+Policy preflight passed.
+Resolved 51 packages in 1ms
+Checked 50 packages in 0.49ms
+.................................................                        [100%]
+49 passed in 0.95s
+All checks passed!
+7 files already formatted
+Success: no issues found in 2 source files
+WARNING:pip_audit._cli:--no-deps is supported, but users are encouraged to fully hash their pinned dependencies
+WARNING:pip_audit._cli:Consider using a tool like `pip-compile`: https://pip-tools.readthedocs.io/en/latest/#using-hashes
+No known vulnerabilities found
+Building source distribution...
+Building wheel from source distribution...
+Successfully built dist/jev_trading_lab-0.1.0.tar.gz
+Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
+sdist_members=7 wheel_members=6
+forbidden=[]
+wheel_package_files=['jev_trading_lab/__init__.py', 'jev_trading_lab/cli.py']
+```
+
+The CI static/order regression and dependency/preflight controls also passed:
+
+```console
+uv run pytest tests/test_package_policy.py -k 'same_name_local_typer or preflight_rejects or ci_order_preflight or ci_uses_immutable' -q
+```
+
+```text
+..........                                                               [100%]
+10 passed, 39 deselected in 0.66s
+```
+
+`git diff --check` produced no output. No production source hash changed. No approved design, plan, or review file changed. Task 2 remains blocked.
 
 ## Review status
 
