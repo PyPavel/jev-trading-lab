@@ -19,6 +19,7 @@ e48a5578c97155675a0b2ca29d2586a959e2df53 fix(build): reject mutated bindings and
 acdcd86d90ce77a429af8a31e862fb7bbdf5ff24 fix(build): freeze workflow and entry surfaces
 e7c9194                                fix(build): close ops symlink and backend injection
 c469b9e1bf3023b422b00fc50b5ba0b76b99e210 fix(build): preflight dependency sources before sync
+a43c3b7e40931ef3dcc97196a59dad97009977ae fix(build): freeze reviewed dependency lock
 ```
 
 The earlier evidence commit remains in history. Its PASS verdict was premature and is superseded by this document.
@@ -808,6 +809,103 @@ uv run pytest tests/test_package_policy.py -k 'same_name_local_typer or prefligh
 ```
 
 `git diff --check` produced no output. No production source hash changed. No approved design, plan, or review file changed. Task 2 remains blocked.
+
+## Lock-artifact review finding
+
+A further independent review found one remaining MAJOR gap after `c469b9e`: the preflight validated each third-party package's `source = { registry = "https://pypi.org/simple" }` but did not freeze artifact URLs or hashes. An approved package wheel URL and hash could be replaced with a malicious `file://` wheel while retaining its registry source; the preflight, `uv lock --check`, and frozen sync all accepted it.
+
+## Lock-artifact RED evidence
+
+The positive control created a valid malicious wheel containing a `.pth` marker payload, replaced the approved `annotated-doc` wheel URL and hash in a copied lock while preserving the PyPI registry source, then ran the current preflight, lock check, frozen sync, and a fresh interpreter. Command:
+
+```console
+uv run pytest tests/test_package_policy.py::test_preflight_rejects_registry_artifact_substitution -q
+```
+
+Observed expected failure before implementation:
+
+```text
+F                                                                        [100%]
+E       AssertionError: preflight_returncode=0 marker_exists=True
+1 failed in 0.59s
+```
+
+This reproduced the complete bypass: preflight returned 0, `uv lock --check` and `uv sync --frozen --all-groups` succeeded, and the substituted wheel's marker executed.
+
+A second ordering control was added to require the lock byte hash failure before semantic TOML diagnostics. Before reordering, its first diagnostic was the invalid `pyproject.toml` error rather than the lock SHA-256 violation:
+
+```console
+uv run pytest tests/test_package_policy.py::test_preflight_checks_lock_hash_before_semantic_toml -q
+```
+
+```text
+F                                                                        [100%]
+E       assert False
+E        +  where False = "policy preflight: pyproject.toml: unreadable or invalid UTF-8 TOML: ...".startswith("policy preflight: uv.lock: SHA-256")
+1 failed in 0.19s
+```
+
+## Lock-artifact fix
+
+Production fix commit:
+
+```text
+a43c3b7e40931ef3dcc97196a59dad97009977ae fix(build): freeze reviewed dependency lock
+```
+
+Changes:
+
+- Froze the complete reviewed `uv.lock` byte content at SHA-256 `de8ad6a56fadc9beed5d1e8350e5bd1b43bb597e2805751d64506e933ed3af7c`.
+- Made the stdlib-only preflight read lock bytes, reject a mismatched hash, and only then decode and parse the reviewed bytes as TOML.
+- Ran the lock check before every semantic TOML policy check in `main()`, closing artifact URL/hash substitution and every other unreviewed lock mutation before dependency tooling.
+- Retained the workflow's preflight integrity check and pre-uv ordering; updated reviewed preflight/workflow hashes after the minimal policy change.
+- Added positive controls proving malicious registry artifact substitution is rejected before sync and proving lock byte validation precedes semantic TOML diagnostics.
+
+This is a Task 1 change-control gate. Any future task that legitimately changes dependencies must first add a new RED test, review the complete regenerated lock, and deliberately update the approved lock SHA-256.
+
+## Lock-artifact final verification
+
+Commands were run sequentially from the repository root in CI order and exited 0:
+
+```console
+/usr/bin/python3 -I -S scripts/policy_preflight.py
+uv lock --check
+uv sync --frozen --all-groups
+uv run pytest -q
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src
+uv export --frozen --all-groups --no-emit-project --format requirements-txt --output-file /tmp/jev-audit-requirements.txt
+uv run pip-audit --strict --requirement /tmp/jev-audit-requirements.txt --no-deps --disable-pip
+uv build --no-build-isolation
+python3 -c '<tar/wheel allowlist inspection>'
+git diff --check
+```
+
+Observed output, accurately abridged to gate summaries:
+
+```text
+Policy preflight passed.
+Resolved 51 packages in 1ms
+Checked 50 packages in 0.54ms
+...................................................                      [100%]
+51 passed in 0.95s
+All checks passed!
+7 files already formatted
+Success: no issues found in 2 source files
+WARNING:pip_audit._cli:--no-deps is supported, but users are encouraged to fully hash their pinned dependencies
+WARNING:pip_audit._cli:Consider using a tool like `pip-compile`: https://pip-tools.readthedocs.io/en/latest/#using-hashes
+No known vulnerabilities found
+Building source distribution...
+Building wheel from source distribution...
+Successfully built dist/jev_trading_lab-0.1.0.tar.gz
+Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
+sdist_members=7 wheel_members=6
+forbidden=[]
+wheel_package_files=['jev_trading_lab/__init__.py', 'jev_trading_lab/cli.py']
+```
+
+`git diff --check` produced no output. The code commit changed only `.github/workflows/ci.yml`, `scripts/policy_preflight.py`, and `tests/test_package_policy.py`. No approved design, plan, or review file changed. Task 2 remains blocked.
 
 ## Review status
 
