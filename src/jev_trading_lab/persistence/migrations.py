@@ -40,6 +40,7 @@ _FORBIDDEN_FIRST_KEYWORDS = frozenset(
         "DETACH",
         "END",
         "PRAGMA",
+        "REINDEX",
         "RELEASE",
         "ROLLBACK",
         "SAVEPOINT",

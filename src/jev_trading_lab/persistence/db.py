@@ -545,6 +545,10 @@ def connect_database(
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
             _verify_pragma(connection, "foreign_keys", 1, label="foreign_keys")
+            connection.execute("PRAGMA recursive_triggers = ON")
+            _verify_pragma(
+                connection, "recursive_triggers", 1, label="recursive_triggers"
+            )
             journal = _activate_wal(connection, timeout)
             if journal is None or str(journal[0]).casefold() != "wal":
                 actual = None if journal is None else journal[0]

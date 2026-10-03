@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from dataclasses import InitVar, dataclass
+from dataclasses import InitVar, dataclass, field
 from enum import Enum
 from urllib.parse import urlsplit
 
@@ -130,6 +130,7 @@ class ObservationMetadata:
     content_sha256: str
     supersedes_id: str | None = None
     predecessor: InitVar[ObservationMetadata | None] = None
+    _constructor_proof: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self, predecessor: ObservationMetadata | None) -> None:
         _validate_source_uri(self.source_uri)
@@ -144,6 +145,7 @@ class ObservationMetadata:
         if self.supersedes_id is None:
             if predecessor is not None:
                 raise ValueError("predecessor cannot be provided without supersedes_id")
+            object.__setattr__(self, "_constructor_proof", self.observation_id)
             return
         _validate_sha256(self.supersedes_id, name="supersedes_id")
         if type(predecessor) is not ObservationMetadata:
@@ -156,6 +158,7 @@ class ObservationMetadata:
             )
         if self.content_sha256 == predecessor.content_sha256:
             raise ValueError("correction must use a different content hash")
+        object.__setattr__(self, "_constructor_proof", self.observation_id)
 
     @property
     def observation_id(self) -> str:

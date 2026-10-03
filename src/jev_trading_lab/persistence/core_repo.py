@@ -9,7 +9,11 @@ from datetime import UTC, datetime
 from pathlib import PurePosixPath
 
 from jev_trading_lab.core.ids import canonical_hash
-from jev_trading_lab.core.manifest import Manifest, revalidate_manifest
+from jev_trading_lab.core.manifest import (
+    Manifest,
+    parse_manifest_bytes,
+    revalidate_manifest,
+)
 from jev_trading_lab.core.observations import ObservationMetadata, ObservationStatus
 from jev_trading_lab.core.run_window import RunWindow, revalidate_run_window
 from jev_trading_lab.core.time import MAX_DATETIME_US, MIN_DATETIME_US, validate_utc_us
@@ -31,6 +35,15 @@ _ARTIFACT_KINDS = frozenset(
         "other",
     }
 )
+_PRAGMA_CONTRACT = (
+    ("foreign_keys", 1),
+    ("recursive_triggers", 1),
+    ("trusted_schema", 0),
+)
+
+
+class CoreRepositoryError(RuntimeError):
+    """Raised when a repository connection violates its write contract."""
 
 
 def _hex64(value: str, *, name: str) -> str:
@@ -85,9 +98,6 @@ class CoreRepository:
             raise ValueError(
                 "repository connection must use autocommit isolation_level=None"
             )
-        foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()
-        if foreign_keys is None or foreign_keys[0] != 1:
-            raise ValueError("repository connection must enforce foreign keys")
         if clock is not None and not callable(clock):
             raise TypeError("clock must be callable")
         self._connection = connection
@@ -96,10 +106,27 @@ class CoreRepository:
     def _created_at_us(self) -> int:
         return _timestamp(self._clock(), name="created_at_us", post_epoch=True)
 
+    def _verify_write_boundary(self) -> None:
+        if self._connection.isolation_level is not None:
+            raise CoreRepositoryError(
+                "repository connection isolation_level drift: expected autocommit"
+            )
+        if self._connection.in_transaction:
+            raise CoreRepositoryError(
+                "cannot write inside an active caller transaction"
+            )
+        for pragma, expected in _PRAGMA_CONTRACT:
+            row = self._connection.execute(f"PRAGMA {pragma}").fetchone()
+            actual = None if row is None else row[0]
+            if actual != expected:
+                raise CoreRepositoryError(
+                    f"repository connection PRAGMA {pragma} drift: "
+                    f"expected {expected}, received {actual!r}"
+                )
+
     @contextmanager
     def _write(self) -> Iterator[None]:
-        if self._connection.in_transaction:
-            raise RuntimeError("cannot write inside an active caller transaction")
+        self._verify_write_boundary()
         owned = False
         try:
             self._connection.execute("BEGIN IMMEDIATE")
@@ -284,35 +311,76 @@ class CoreRepository:
         run_id: str,
         stream: str,
         arm: str,
-        currency: str,
-        initial_capital: MicroDollars,
+        currency: str | None = None,
+        initial_capital: MicroDollars | None = None,
     ) -> str:
         run = _hex64(run_id, name="run_id")
         if type(stream) is not str or stream not in _STREAM_ARMS:
             raise ValueError("stream must be polymarket or stocks")
-        if type(arm) is not str or arm not in _STREAM_ARMS[stream]:
-            raise ValueError(f"arm is not allowed for {stream}")
-        if currency != "USD" or type(currency) is not str:
-            raise ValueError("currency must be USD")
-        if type(initial_capital) is not MicroDollars:
-            raise TypeError("initial_capital must be MicroDollars")
-        capital = int(initial_capital)
-        if capital <= 0:
-            raise ValueError("initial_capital must be positive")
-        account_id = canonical_hash(
-            "account-v1",
-            {"run_id": run, "stream": stream, "arm": arm, "currency": currency},
-        )
-        columns = (
-            "account_id",
-            "run_id",
-            "stream",
-            "arm",
-            "currency",
-            "initial_capital_microdollars",
-        )
-        values = (account_id, run, stream, arm, currency, capital)
         with self._write():
+            row = self._connection.execute(
+                "SELECT runs.manifest_id, manifests.canonical_json "
+                "FROM runs JOIN manifests USING (manifest_id) WHERE runs.run_id = ?",
+                (run,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("run does not reference a persisted manifest")
+            try:
+                trusted_manifest = parse_manifest_bytes(row[1])
+                trusted_manifest.assert_activation_candidate()
+            except (TypeError, ValueError) as error:
+                raise ValueError("persisted manifest failed revalidation") from error
+            manifest_id = _bare_id(
+                trusted_manifest.manifest_id,
+                prefix="manifest",
+                name="manifest_id",
+            )
+            if manifest_id != row[0]:
+                raise ValueError("persisted manifest ID does not match canonical bytes")
+            contract = trusted_manifest.accounts
+            allowed_arms = (
+                contract.polymarket_arms
+                if stream == "polymarket"
+                else contract.stock_arms
+            )
+            if type(arm) is not str or arm not in allowed_arms:
+                raise ValueError(f"arm is not allowed for {stream}")
+            expected_currency = contract.currency
+            expected_capital = contract.initial_capital_microdollars
+            if currency is not None and currency != expected_currency:
+                raise ValueError("currency conflicts with manifest account contract")
+            if initial_capital is not None:
+                if type(initial_capital) is not MicroDollars:
+                    raise TypeError("initial_capital must be MicroDollars")
+                if int(initial_capital) != expected_capital:
+                    raise ValueError(
+                        "initial_capital conflicts with manifest account contract"
+                    )
+            account_id = canonical_hash(
+                "account-v1",
+                {
+                    "run_id": run,
+                    "stream": stream,
+                    "arm": arm,
+                    "currency": expected_currency,
+                },
+            )
+            columns = (
+                "account_id",
+                "run_id",
+                "stream",
+                "arm",
+                "currency",
+                "initial_capital_microdollars",
+            )
+            values = (
+                account_id,
+                run,
+                stream,
+                arm,
+                expected_currency,
+                expected_capital,
+            )
             self._insert_exact(
                 table="accounts",
                 key_column="account_id",
@@ -329,7 +397,6 @@ class CoreRepository:
         stream: str,
         subject_id: str,
         scheduled_for_us: int,
-        eligibility_episode: int,
         snapshot_id: str | None = None,
     ) -> str:
         run = _hex64(run_id, name="run_id")
@@ -337,7 +404,6 @@ class CoreRepository:
             raise ValueError("stream must be polymarket or stocks")
         subject = _text(subject_id, name="subject_id", maximum=255)
         scheduled = _timestamp(scheduled_for_us, name="scheduled_for_us")
-        episode = _nonnegative_int(eligibility_episode, name="eligibility_episode")
         snapshot = (
             None if snapshot_id is None else _hex64(snapshot_id, name="snapshot_id")
         )
@@ -346,7 +412,6 @@ class CoreRepository:
             "stream": stream,
             "subject_id": subject,
             "scheduled_for_us": scheduled,
-            "eligibility_episode": episode,
         }
         opportunity_id = canonical_hash("opportunity-v1", identity)
         columns = (
@@ -355,7 +420,6 @@ class CoreRepository:
             "stream",
             "subject_id",
             "scheduled_for_us",
-            "eligibility_episode",
             "snapshot_id",
         )
         values = (
@@ -364,7 +428,6 @@ class CoreRepository:
             stream,
             subject,
             scheduled,
-            episode,
             snapshot,
         )
         with self._write():
@@ -377,6 +440,40 @@ class CoreRepository:
             )
         return opportunity_id
 
+    def _stored_observation(self, observation_id: str) -> ObservationMetadata:
+        pending: list[sqlite3.Row | tuple[object, ...]] = []
+        current: str | None = observation_id
+        seen: set[str] = set()
+        while current is not None:
+            if current in seen:
+                raise ValueError("persisted observation lineage contains a cycle")
+            seen.add(current)
+            row = self._connection.execute(
+                "SELECT source_uri,published_at_us,retrieved_at_us,status,"
+                "content_sha256,supersedes_id FROM observations "
+                "WHERE observation_id = ?",
+                (current,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("correction predecessor is not persisted")
+            pending.append(row)
+            current = row[5]
+        predecessor: ObservationMetadata | None = None
+        for row in reversed(pending):
+            predecessor = ObservationMetadata(
+                source_uri=row[0],  # type: ignore[arg-type]
+                published_at_us=row[1],  # type: ignore[arg-type]
+                retrieved_at_us=row[2],  # type: ignore[arg-type]
+                status=ObservationStatus(row[3]),
+                content_sha256=row[4],  # type: ignore[arg-type]
+                supersedes_id=row[5],  # type: ignore[arg-type]
+                predecessor=predecessor,
+            )
+        assert predecessor is not None
+        if predecessor.observation_id != observation_id:
+            raise ValueError("persisted observation ID does not match stored fields")
+        return predecessor
+
     def insert_observation(
         self,
         observation: ObservationMetadata,
@@ -388,65 +485,61 @@ class CoreRepository:
             raise TypeError("observation must be ObservationMetadata")
         logical = _hex64(logical_key, name="logical_key")
         run = None if run_id is None else _hex64(run_id, name="run_id")
-        source = _text(observation.source_uri, name="source_uri", maximum=4096)
-        published = observation.published_at_us
-        if published is not None:
-            published = _timestamp(published, name="published_at_us")
-        retrieved = _timestamp(observation.retrieved_at_us, name="retrieved_at_us")
-        if published is not None and published > retrieved:
-            raise ValueError("published_at_us cannot be after retrieved_at_us")
-        if type(observation.status) is not ObservationStatus:
-            raise TypeError("status must be an ObservationStatus")
-        content_hash = _hex64(observation.content_sha256, name="content_sha256")
-        supersedes = (
-            None
-            if observation.supersedes_id is None
-            else _hex64(observation.supersedes_id, name="supersedes_id")
-        )
-        observation_id = canonical_hash(
-            "observation-metadata-v1",
-            {
-                "source_uri": source,
-                "published_at_us": published,
-                "retrieved_at_us": retrieved,
-                "status": observation.status.value,
-                "content_sha256": content_hash,
-                "supersedes_id": supersedes,
-            },
-        )
-        if observation.observation_id != observation_id:
-            raise ValueError("observation revalidation failed: ID mismatch")
-        columns = (
-            "observation_id",
-            "run_id",
-            "logical_key",
-            "source_uri",
-            "published_at_us",
-            "retrieved_at_us",
-            "status",
-            "content_sha256",
-            "supersedes_id",
-        )
-        values = (
-            observation_id,
-            run,
-            logical,
-            source,
-            published,
-            retrieved,
-            observation.status.value,
-            content_hash,
-            supersedes,
-        )
+        try:
+            constructor_proof = observation._constructor_proof
+            supersedes = observation.supersedes_id
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError(
+                "observation revalidation failed: wrapper state"
+            ) from error
         with self._write():
+            try:
+                predecessor = (
+                    None if supersedes is None else self._stored_observation(supersedes)
+                )
+                trusted = ObservationMetadata(
+                    source_uri=observation.source_uri,
+                    published_at_us=observation.published_at_us,
+                    retrieved_at_us=observation.retrieved_at_us,
+                    status=observation.status,
+                    content_sha256=observation.content_sha256,
+                    supersedes_id=supersedes,
+                    predecessor=predecessor,
+                )
+            except (TypeError, ValueError) as error:
+                raise ValueError("observation revalidation failed") from error
+            if trusted.observation_id != constructor_proof:
+                raise ValueError("observation revalidation failed: ID mismatch")
+            columns = (
+                "observation_id",
+                "run_id",
+                "logical_key",
+                "source_uri",
+                "published_at_us",
+                "retrieved_at_us",
+                "status",
+                "content_sha256",
+                "supersedes_id",
+            )
+            values = (
+                trusted.observation_id,
+                run,
+                logical,
+                trusted.source_uri,
+                trusted.published_at_us,
+                trusted.retrieved_at_us,
+                trusted.status.value,
+                trusted.content_sha256,
+                trusted.supersedes_id,
+            )
             self._insert_exact(
                 table="observations",
                 key_column="observation_id",
-                key=observation_id,
+                key=trusted.observation_id,
                 columns=columns,
                 values=values,
             )
-        return observation_id
+        return trusted.observation_id
 
     def insert_artifact_ref(
         self,

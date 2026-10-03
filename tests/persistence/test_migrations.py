@@ -91,6 +91,7 @@ def test_connection_pragmas(tmp_path: Path) -> None:
             assert connection.row_factory is sqlite3.Row
             assert connection.isolation_level is None
             assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+            assert connection.execute("PRAGMA recursive_triggers").fetchone()[0] == 1
             assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
             assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 4_321
             assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
@@ -2000,6 +2001,40 @@ def test_explicit_non_main_schema_is_rejected_before_execution(
         connection.close()
 
 
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "REINDEX idx",
+        'REINDEX "idx"',
+        "REINDEX main.idx",
+        'REINDEX "main"."idx"',
+    ),
+)
+def test_reindex_is_forbidden_before_authorizer_without_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, statement: str
+) -> None:
+    package, _schema = _package(
+        tmp_path,
+        monkeypatch,
+        {
+            "001_migration_metadata.sql": SCHEMA_SQL,
+            "002_reindex.sql": f"{statement};\n".encode(),
+        },
+    )
+    connection = _connect(tmp_path / "reindex" / "db.sqlite3")
+    try:
+        with pytest.raises(MigrationError, match="forbidden SQL REINDEX"):
+            apply_migrations(connection, package=package, clock=lambda: 1_000_000)
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_schema WHERE name = 'schema_migrations'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+
+
 def test_quoted_temp_reindex_is_denied_without_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2015,7 +2050,7 @@ def test_quoted_temp_reindex_is_denied_without_metadata(
     try:
         connection.execute("CREATE TEMP TABLE sink (value TEXT)")
         connection.execute("CREATE INDEX temp.idx ON sink(value)")
-        with pytest.raises(MigrationError, match="TEMP|authorized"):
+        with pytest.raises(MigrationError, match="forbidden SQL REINDEX"):
             apply_migrations(connection, package=package, clock=lambda: 1_000_000)
         assert (
             connection.execute(

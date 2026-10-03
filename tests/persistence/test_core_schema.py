@@ -24,7 +24,7 @@ from jev_trading_lab.core.time import (
     datetime_to_utc_us,
 )
 from jev_trading_lab.core.values import MicroDollars
-from jev_trading_lab.persistence.core_repo import CoreRepository
+from jev_trading_lab.persistence.core_repo import CoreRepository, CoreRepositoryError
 from jev_trading_lab.persistence.migrations import apply_migrations, load_migrations
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -47,6 +47,8 @@ def _connection(path: str = ":memory:") -> sqlite3.Connection:
     connection = sqlite3.connect(path, isolation_level=None, timeout=5)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA recursive_triggers = ON")
+    connection.execute("PRAGMA trusted_schema = OFF")
     apply_migrations(connection, clock=lambda: 1_700_000_000_000_000)
     return connection
 
@@ -185,14 +187,12 @@ def test_shared_opportunity_id_excludes_arm() -> None:
             stream="stocks",
             subject_id="AAPL",
             scheduled_for_us=1_800_000_100_000_000,
-            eligibility_episode=0,
         )
         assert opportunity_id == repository.insert_opportunity(
             run_id=run_id,
             stream="stocks",
             subject_id="AAPL",
             scheduled_for_us=1_800_000_100_000_000,
-            eligibility_episode=0,
         )
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(opportunities)")
@@ -204,7 +204,6 @@ def test_shared_opportunity_id_excludes_arm() -> None:
                 stream="stocks",
                 subject_id="AAPL",
                 scheduled_for_us=1_800_000_100_000_000,
-                eligibility_episode=0,
                 arm="AI",
             )
     finally:
@@ -241,7 +240,7 @@ def test_manifest_and_run_immutable() -> None:
             observation, logical_key=logical_key, run_id=run_id
         )
         artifact_id = repository.insert_artifact_ref(
-            kind="provider_payload",
+            kind="snapshot",
             content_sha256=HEX_C,
             byte_size=1,
             storage_relpath="sha256/cc/immutable.bin",
@@ -253,7 +252,6 @@ def test_manifest_and_run_immutable() -> None:
             stream="stocks",
             subject_id="AAPL",
             scheduled_for_us=1_800_000_000_000_003,
-            eligibility_episode=0,
             snapshot_id=artifact_id,
         )
 
@@ -591,6 +589,435 @@ def test_run_insert_failure_rolls_back_manifest_and_window() -> None:
         connection.close()
 
 
+def _populated_core(
+    connection: sqlite3.Connection,
+) -> tuple[CoreRepository, dict[str, str]]:
+    repository, run_id = _registered(connection)
+    account_id = repository.create_account(
+        run_id=run_id,
+        stream="stocks",
+        arm="AI",
+        currency="USD",
+        initial_capital=MicroDollars(10_000_000_000),
+    )
+    original = ObservationMetadata(
+        source_uri="https://example.test/raw",
+        published_at_us=None,
+        retrieved_at_us=1_800_000_000_000_001,
+        status=ObservationStatus.OK,
+        content_sha256=HEX_B,
+    )
+    observation_id = repository.insert_observation(
+        original, logical_key=HEX_A, run_id=run_id
+    )
+    artifact_id = repository.insert_artifact_ref(
+        kind="snapshot",
+        content_sha256=HEX_C,
+        byte_size=1,
+        storage_relpath="snapshots/core.bin",
+        created_at_us=1_800_000_000_000_002,
+        source_observation_id=observation_id,
+    )
+    opportunity_id = repository.insert_opportunity(
+        run_id=run_id,
+        stream="stocks",
+        subject_id="AAPL",
+        scheduled_for_us=1_800_000_000_000_003,
+        snapshot_id=artifact_id,
+    )
+    manifest_id = connection.execute("SELECT manifest_id FROM runs").fetchone()[0]
+    window_id = connection.execute("SELECT run_window_id FROM runs").fetchone()[0]
+    return repository, {
+        "manifests": manifest_id,
+        "run_windows": window_id,
+        "runs": run_id,
+        "accounts": account_id,
+        "opportunities": opportunity_id,
+        "observations": observation_id,
+        "artifact_refs": artifact_id,
+    }
+
+
+@pytest.mark.parametrize("table", TABLES)
+def test_insert_or_replace_cannot_change_immutable_row(table: str) -> None:
+    connection = _connection()
+    try:
+        _repository, keys = _populated_core(connection)
+        connection.execute("PRAGMA recursive_triggers = OFF")
+        columns = [row[1] for row in connection.execute(f"PRAGMA table_info({table})")]
+        row = list(connection.execute(f"SELECT * FROM {table}").fetchone())
+        changed_index = next(
+            index
+            for index, column in enumerate(columns)
+            if index and column not in {"manifest_id", "run_window_id", "run_id"}
+        )
+        value = row[changed_index]
+        row[changed_index] = (
+            value + 1
+            if type(value) is int
+            else value + (b"-changed" if type(value) is bytes else "-changed")
+        )
+        placeholders = ",".join("?" for _ in columns)
+        with pytest.raises(sqlite3.IntegrityError, match=f"immutable-conflict:{table}"):
+            connection.execute(
+                f"INSERT OR REPLACE INTO {table} VALUES ({placeholders})", row
+            )
+        assert (
+            connection.execute(
+                f"SELECT * FROM {table} WHERE {columns[0]} = ?", (keys[table],)
+            ).fetchone()
+            is not None
+        )
+    finally:
+        connection.close()
+
+
+def test_observation_replace_rejects_two_node_and_long_cycles() -> None:
+    connection = _connection()
+    try:
+        repository, _keys = _populated_core(connection)
+        original_row = connection.execute("SELECT * FROM observations").fetchone()
+        original = ObservationMetadata(
+            source_uri=original_row["source_uri"],
+            published_at_us=original_row["published_at_us"],
+            retrieved_at_us=original_row["retrieved_at_us"],
+            status=ObservationStatus(original_row["status"]),
+            content_sha256=original_row["content_sha256"],
+        )
+        second = correct_observation(
+            original,
+            retrieved_at_us=original.retrieved_at_us + 1,
+            content_sha256=hashlib.sha256(b"second").hexdigest(),
+            supersedes_id=original.observation_id,
+        )
+        repository.insert_observation(
+            second, logical_key=HEX_A, run_id=original_row["run_id"]
+        )
+        third = correct_observation(
+            second,
+            retrieved_at_us=second.retrieved_at_us + 1,
+            content_sha256=hashlib.sha256(b"third").hexdigest(),
+            supersedes_id=second.observation_id,
+        )
+        repository.insert_observation(
+            third, logical_key=HEX_A, run_id=original_row["run_id"]
+        )
+        connection.execute("PRAGMA recursive_triggers = OFF")
+        for successor in (second.observation_id, third.observation_id):
+            changed = list(original_row)
+            changed[-1] = successor
+            with pytest.raises(
+                sqlite3.IntegrityError, match="immutable-conflict:observations"
+            ):
+                connection.execute(
+                    "INSERT OR REPLACE INTO observations VALUES (?,?,?,?,?,?,?,?,?)",
+                    changed,
+                )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("pragma", ("foreign_keys", "recursive_triggers"))
+def test_repository_rejects_pragma_drift_before_account_write(pragma: str) -> None:
+    connection = _connection()
+    try:
+        repository, run_id = _registered(connection)
+        connection.execute(f"PRAGMA {pragma} = OFF")
+        with pytest.raises(CoreRepositoryError, match=pragma):
+            repository.create_account(
+                run_id=run_id,
+                stream="stocks",
+                arm="AI",
+                currency="USD",
+                initial_capital=MicroDollars(10_000_000_000),
+            )
+        assert connection.execute("SELECT count(*) FROM accounts").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_repository_rejects_foreign_key_drift_before_opportunity_write() -> None:
+    connection = _connection()
+    try:
+        repository, run_id = _registered(connection)
+        connection.execute("PRAGMA foreign_keys = OFF")
+        with pytest.raises(CoreRepositoryError, match="foreign_keys"):
+            repository.insert_opportunity(
+                run_id=run_id,
+                stream="stocks",
+                subject_id="AAPL",
+                scheduled_for_us=1_800_000_000_000_001,
+            )
+        assert (
+            connection.execute("SELECT count(*) FROM opportunities").fetchone()[0] == 0
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    (
+        ("source_uri", "http://example.test/x"),
+        ("source_uri", "https://user@example.test/x"),
+        ("source_uri", "https://example.test/x#fragment"),
+        ("status", "ok"),
+        ("content_sha256", "A" * 64),
+        ("retrieved_at_us", True),
+        ("supersedes_id", HEX_C),
+    ),
+)
+def test_repository_authoritatively_revalidates_tampered_observation(
+    attribute: str, value: object
+) -> None:
+    connection = _connection()
+    repository = CoreRepository(connection)
+    observation = ObservationMetadata(
+        source_uri="https://example.test/x",
+        published_at_us=None,
+        retrieved_at_us=200,
+        status=ObservationStatus.OK,
+        content_sha256=HEX_A,
+    )
+    object.__setattr__(observation, attribute, value)
+    try:
+        with pytest.raises((TypeError, ValueError), match="observation"):
+            repository.insert_observation(observation, logical_key=HEX_B)
+        assert (
+            connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 0
+        )
+    finally:
+        connection.close()
+
+
+def test_repository_rejects_forged_observation_wrapper_and_id() -> None:
+    connection = _connection()
+    repository = CoreRepository(connection)
+    forged = object.__new__(ObservationMetadata)
+    object.__setattr__(forged, "source_uri", "https://example.test/forged")
+    object.__setattr__(forged, "published_at_us", None)
+    object.__setattr__(forged, "retrieved_at_us", 200)
+    object.__setattr__(forged, "status", ObservationStatus.OK)
+    object.__setattr__(forged, "content_sha256", HEX_A)
+    object.__setattr__(forged, "supersedes_id", None)
+    try:
+        with pytest.raises(ValueError, match="observation revalidation"):
+            repository.insert_observation(forged, logical_key=HEX_B)
+    finally:
+        connection.close()
+
+
+def test_repository_reconstructs_correction_predecessor_from_database() -> None:
+    connection = _connection()
+    repository = CoreRepository(connection)
+    original = ObservationMetadata(
+        source_uri="https://example.test/original",
+        published_at_us=None,
+        retrieved_at_us=200,
+        status=ObservationStatus.OK,
+        content_sha256=HEX_A,
+    )
+    repository.insert_observation(original, logical_key=HEX_C)
+    correction = correct_observation(
+        original,
+        retrieved_at_us=300,
+        content_sha256=HEX_B,
+        supersedes_id=original.observation_id,
+    )
+    object.__setattr__(original, "content_sha256", HEX_C)
+    try:
+        assert repository.insert_observation(correction, logical_key=HEX_C)
+    finally:
+        connection.close()
+
+
+def test_all_identifier_and_hash_columns_reject_nul_suffix() -> None:
+    connection = _connection()
+    try:
+        _repository, _keys = _populated_core(connection)
+        targets = {
+            "manifests": ("manifest_id",),
+            "run_windows": (
+                "run_window_id",
+                "calendar_lock_sha256",
+                "calendar_artifact_sha256",
+                "tm_rule_sha256",
+            ),
+            "runs": (
+                "run_id",
+                "manifest_id",
+                "run_window_id",
+                "dependency_lock_sha256",
+            ),
+            "accounts": ("account_id", "run_id"),
+            "opportunities": ("opportunity_id", "run_id", "snapshot_id"),
+            "observations": (
+                "observation_id",
+                "run_id",
+                "logical_key",
+                "content_sha256",
+                "supersedes_id",
+            ),
+            "artifact_refs": ("artifact_id", "content_sha256", "source_observation_id"),
+        }
+        for table, column_names in targets.items():
+            columns = [
+                row[1] for row in connection.execute(f"PRAGMA table_info({table})")
+            ]
+            source = list(
+                connection.execute(f"SELECT * FROM {table} LIMIT 1").fetchone()
+            )
+            for column in column_names:
+                row = source.copy()
+                row[columns.index(column)] = HEX_A + "\x00suffix"
+                placeholders = ",".join("?" for _ in columns)
+                with pytest.raises(sqlite3.IntegrityError):
+                    connection.execute(
+                        f"INSERT OR REPLACE INTO {table} VALUES ({placeholders})", row
+                    )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "path", (".", "..", "a//b", "a/", "/a", "a/./b", "a/../b", "a\\b", "a\x00b")
+)
+def test_artifact_path_database_check_rejects_noncanonical_paths(path: str) -> None:
+    connection = _connection()
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            connection.execute(
+                "INSERT INTO artifact_refs VALUES (?,?,?,?,?,?,?)",
+                (HEX_A, "snapshot", HEX_B, 1, 1, None, path),
+            )
+    finally:
+        connection.close()
+
+
+def test_artifact_path_is_unique_and_valid_nested_path_passes() -> None:
+    connection = _connection()
+    try:
+        connection.execute(
+            "INSERT INTO artifact_refs VALUES (?,?,?,?,?,?,?)",
+            (HEX_A, "snapshot", HEX_B, 1, 1, None, "a/b/c.bin"),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            connection.execute(
+                "INSERT INTO artifact_refs VALUES (?,?,?,?,?,?,?)",
+                (HEX_C, "snapshot", HEX_A, 1, 1, None, "a/b/c.bin"),
+            )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("kind", ("report", "document"))
+def test_opportunity_snapshot_must_reference_snapshot_artifact(kind: str) -> None:
+    connection = _connection()
+    try:
+        repository, run_id = _registered(connection)
+        artifact_id = repository.insert_artifact_ref(
+            kind=kind,
+            content_sha256=HEX_B,
+            byte_size=1,
+            storage_relpath=f"{kind}/item.bin",
+            created_at_us=1,
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="opportunity:snapshot-kind"):
+            connection.execute(
+                "INSERT INTO opportunities VALUES (?,?,?,?,?,?)",
+                (HEX_C, run_id, "stocks", "AAPL", 100, artifact_id),
+            )
+    finally:
+        connection.close()
+
+
+def test_account_contract_is_loaded_from_persisted_manifest() -> None:
+    connection = _connection()
+    try:
+        repository, run_id = _registered(connection)
+        expected = {
+            (stream, arm)
+            for stream, arms in (
+                ("polymarket", ("AI", "DETERMINISTIC", "CASH")),
+                ("stocks", ("AI", "DETERMINISTIC", "CASH", "EXPOSURE_MATCHED_PASSIVE")),
+            )
+            for arm in arms
+        }
+        for stream, arm in expected:
+            repository.create_account(run_id=run_id, stream=stream, arm=arm)
+        assert {
+            (row[0], row[1], row[2], row[3])
+            for row in connection.execute(
+                "SELECT stream,arm,currency,initial_capital_microdollars FROM accounts"
+            )
+        } == {(stream, arm, "USD", 10_000_000_000) for stream, arm in expected}
+        with pytest.raises(ValueError, match="arm"):
+            repository.create_account(run_id=run_id, stream="polymarket", arm="NOPE")
+    finally:
+        connection.close()
+
+
+def test_account_rejects_wrong_compatibility_values_on_first_insert() -> None:
+    connection = _connection()
+    try:
+        repository, run_id = _registered(connection)
+        with pytest.raises(ValueError, match="manifest account contract"):
+            repository.create_account(
+                run_id=run_id,
+                stream="stocks",
+                arm="AI",
+                currency="EUR",
+                initial_capital=MicroDollars(9_000_000_000),
+            )
+        assert connection.execute("SELECT count(*) FROM accounts").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_account_rejects_tampered_or_example_persisted_manifest() -> None:
+    connection = _connection()
+    try:
+        repository, run_id = _registered(connection)
+        connection.execute("DROP TRIGGER manifests_immutable_update")
+        connection.execute("UPDATE manifests SET canonical_json = ?", (b"{}",))
+        with pytest.raises(ValueError, match="persisted manifest"):
+            repository.create_account(run_id=run_id, stream="stocks", arm="AI")
+    finally:
+        connection.close()
+
+
+def test_opportunity_identity_has_no_eligibility_episode() -> None:
+    connection = _connection()
+    try:
+        repository, run_id = _registered(connection)
+        first = repository.insert_opportunity(
+            run_id=run_id,
+            stream="stocks",
+            subject_id="AAPL",
+            scheduled_for_us=100,
+        )
+        assert first == repository.insert_opportunity(
+            run_id=run_id,
+            stream="stocks",
+            subject_id="AAPL",
+            scheduled_for_us=100,
+        )
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(opportunities)")
+        }
+        assert "eligibility_episode" not in columns
+        with pytest.raises(TypeError, match="unexpected keyword"):
+            repository.insert_opportunity(
+                run_id=run_id,
+                stream="stocks",
+                subject_id="AAPL",
+                scheduled_for_us=100,
+                eligibility_episode=1,  # type: ignore[call-arg]
+            )
+    finally:
+        connection.close()
+
+
 def test_concurrent_identical_insert_converges(tmp_path: Path) -> None:
     database = tmp_path / "core.sqlite3"
     setup = _connection(str(database))
@@ -602,6 +1029,8 @@ def test_concurrent_identical_insert_converges(tmp_path: Path) -> None:
         connection = sqlite3.connect(database, isolation_level=None, timeout=5)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA recursive_triggers=ON")
+        connection.execute("PRAGMA trusted_schema=OFF")
         try:
             barrier.wait(timeout=5)
             return CoreRepository(connection).insert_manifest(_manifest())
