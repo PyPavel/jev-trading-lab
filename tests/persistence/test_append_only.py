@@ -12,7 +12,14 @@ from pathlib import Path
 import pytest
 
 from jev_trading_lab.core.ids import canonical_hash
-from jev_trading_lab.persistence.db import SecureConnection, connect_database
+from jev_trading_lab.persistence.db import (
+    DatabaseConfigurationError,
+    SecureConnection,
+    _journal_authorizer,
+    _runtime_authorizer,
+    _seal_runtime_authorizer,
+    connect_database,
+)
 from jev_trading_lab.persistence.journal import (
     AppendOnlyJournal,
     JournalConflictError,
@@ -321,6 +328,204 @@ def test_secure_journal_write_scope_restores_denial_after_error(tmp_path: Path) 
         assert not connection.in_transaction
     finally:
         connection.close()
+
+
+def test_append_ignores_matching_temp_journal_shadows(tmp_path: Path) -> None:
+    connection = _secure_connection(tmp_path / "private" / "journal.sqlite3")
+    try:
+        run_id = _insert_run(connection)
+        journal = AppendOnlyJournal(connection)
+        sqlite3.Connection.set_authorizer(connection, None)
+        connection.execute(
+            "CREATE TEMP TABLE journal_entities AS "
+            "SELECT * FROM main.journal_entities WHERE 0"
+        )
+        connection.execute(
+            "CREATE TEMP TABLE journal_events AS "
+            "SELECT * FROM main.journal_events WHERE 0"
+        )
+        sqlite3.Connection.set_authorizer(connection, _runtime_authorizer)
+        entity = _entity(run_id)
+        event = _event(entity.entity_id, 0)
+        assert journal.append_entity(entity) == entity.entity_id
+        assert journal.append_event(event) == event.event_id
+        assert (
+            connection.execute("SELECT count(*) FROM main.journal_entities").fetchone()[
+                0
+            ]
+            == 1
+        )
+        assert (
+            connection.execute("SELECT count(*) FROM main.journal_events").fetchone()[0]
+            == 1
+        )
+        assert (
+            connection.execute("SELECT count(*) FROM temp.journal_entities").fetchone()[
+                0
+            ]
+            == 0
+        )
+        assert (
+            connection.execute("SELECT count(*) FROM temp.journal_events").fetchone()[0]
+            == 0
+        )
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            connection.execute(
+                "INSERT INTO temp.journal_entities SELECT * FROM main.journal_entities"
+            )
+    finally:
+        connection.close()
+
+
+def test_runtime_authorizer_denies_journal_dml_in_every_database() -> None:
+    for database in (None, "main", "temp", "auxiliary"):
+        for action in (
+            sqlite3.SQLITE_INSERT,
+            sqlite3.SQLITE_UPDATE,
+            sqlite3.SQLITE_DELETE,
+        ):
+            for table in TABLES:
+                assert (
+                    _runtime_authorizer(action, table, None, database, None)
+                    == sqlite3.SQLITE_DENY
+                )
+
+
+def test_journal_authorizer_only_allows_direct_selected_main_insert() -> None:
+    authorize = _journal_authorizer("journal_entities")
+    assert (
+        authorize(sqlite3.SQLITE_INSERT, "journal_entities", None, "main", None)
+        == sqlite3.SQLITE_OK
+    )
+    for table, database, source in (
+        ("journal_events", "main", None),
+        ("journal_entities", "temp", None),
+        ("journal_entities", "main", "forged_temp_trigger"),
+    ):
+        assert (
+            authorize(sqlite3.SQLITE_INSERT, table, None, database, source)
+            == sqlite3.SQLITE_DENY
+        )
+
+
+def test_runtime_authorizer_denies_all_available_temp_schema_actions() -> None:
+    names = (
+        "SQLITE_CREATE_TEMP_TABLE",
+        "SQLITE_CREATE_TEMP_INDEX",
+        "SQLITE_CREATE_TEMP_TRIGGER",
+        "SQLITE_CREATE_TEMP_VIEW",
+        "SQLITE_DROP_TEMP_TABLE",
+        "SQLITE_DROP_TEMP_INDEX",
+        "SQLITE_DROP_TEMP_TRIGGER",
+        "SQLITE_DROP_TEMP_VIEW",
+    )
+    supported = [getattr(sqlite3, name) for name in names if hasattr(sqlite3, name)]
+    assert supported
+    for action in supported:
+        assert (
+            _runtime_authorizer(action, "unrelated", None, "temp", None)
+            == sqlite3.SQLITE_DENY
+        )
+
+
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "CREATE TEMP TABLE unrelated(value INTEGER)",
+        "CREATE TEMP VIEW unrelated AS SELECT 1 AS value",
+        "CREATE TEMP TRIGGER inject_forged_entity "
+        "AFTER INSERT ON main.journal_entities BEGIN "
+        "INSERT INTO journal_entities VALUES "
+        f"('{HEX_A}', '{HEX_B}', 'entity', '{HEX_C}', 0, '{HEX_A}', X'7b7d'); END",
+    ),
+)
+def test_sealed_connection_denies_temp_schema_creation(
+    tmp_path: Path, statement: str
+) -> None:
+    connection = _secure_connection(tmp_path / "private" / "journal.sqlite3")
+    try:
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            connection.execute(statement)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "setup_sql",
+    (
+        "CREATE TEMP TABLE unrelated(value INTEGER)",
+        "CREATE TEMP TABLE base(value INTEGER); "
+        "CREATE INDEX temp.unrelated_index ON base(value)",
+        "CREATE TABLE main.trigger_target(value INTEGER); "
+        "CREATE TEMP TRIGGER unrelated_trigger AFTER INSERT ON main.trigger_target "
+        "BEGIN SELECT 1; END",
+        "CREATE TEMP VIEW unrelated_view AS SELECT 1 AS value",
+        "CREATE TEMP TABLE journal_entities AS SELECT 1 AS marker; "
+        "CREATE TEMP TABLE journal_events AS SELECT 1 AS marker",
+    ),
+)
+def test_sealing_rejects_preexisting_user_temp_objects(
+    tmp_path: Path, setup_sql: str
+) -> None:
+    connection = connect_database(
+        (tmp_path / _hex(setup_sql) / "journal.sqlite3").absolute(),
+        busy_timeout_ms=5000,
+        mount_resolver=lambda _path: "ext4",
+    )
+    try:
+        connection.executescript(setup_sql)
+        with pytest.raises(DatabaseConfigurationError, match="TEMP schema"):
+            apply_migrations(connection, clock=lambda: 1)
+    finally:
+        connection.close()
+
+
+def test_journal_boundary_rejects_preexisting_forging_temp_trigger(
+    tmp_path: Path,
+) -> None:
+    connection = _secure_connection(tmp_path / "private" / "journal.sqlite3")
+    try:
+        run_id = _insert_run(connection)
+        forged = _entity(run_id, logical_identity=HEX_B, payload={"forged": True})
+        values = tuple(
+            getattr(forged, field) for field in JournalEntity.__dataclass_fields__
+        )
+        quoted = ", ".join(
+            "X'" + value.hex() + "'"
+            if isinstance(value, bytes)
+            else str(value)
+            if isinstance(value, int)
+            else "'" + value.replace("'", "''") + "'"
+            for value in values
+        )
+        sqlite3.Connection.set_authorizer(connection, None)
+        connection.execute(
+            "CREATE TEMP TRIGGER inject_forged_entity "
+            "AFTER INSERT ON main.journal_entities BEGIN "
+            f"INSERT INTO journal_entities VALUES ({quoted}); END"
+        )
+        sqlite3.Connection.set_authorizer(connection, _runtime_authorizer)
+        with pytest.raises(DatabaseConfigurationError, match="TEMP schema"):
+            AppendOnlyJournal(connection)
+        with pytest.raises(DatabaseConfigurationError, match="TEMP schema"):
+            _seal_runtime_authorizer(connection)
+        assert (
+            connection.execute("SELECT count(*) FROM main.journal_entities").fetchone()[
+                0
+            ]
+            == 0
+        )
+    finally:
+        connection.close()
+
+
+def test_append_only_journal_documents_supported_python_boundary() -> None:
+    boundary = AppendOnlyJournal.__doc__ or ""
+    assert "public instance methods" in boundary
+    assert "base-class descriptors" in boundary
+    assert "object internals" in boundary
+    assert "process memory" in boundary
+    assert "out of scope" in boundary
 
 
 def test_append_only_journal_rejects_plain_sqlite_connection() -> None:

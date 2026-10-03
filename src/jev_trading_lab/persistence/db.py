@@ -15,20 +15,38 @@ from typing import Protocol
 
 _Authorizer = Callable[[int, str | None, str | None, str | None, str | None], int]
 _JOURNAL_TABLES = frozenset({"journal_entities", "journal_events"})
-_SCHEMA_ACTIONS = frozenset(
-    {
-        sqlite3.SQLITE_ALTER_TABLE,
-        sqlite3.SQLITE_CREATE_INDEX,
-        sqlite3.SQLITE_CREATE_TABLE,
-        sqlite3.SQLITE_CREATE_TRIGGER,
-        sqlite3.SQLITE_CREATE_VIEW,
-        sqlite3.SQLITE_CREATE_VTABLE,
-        sqlite3.SQLITE_DROP_INDEX,
-        sqlite3.SQLITE_DROP_TABLE,
-        sqlite3.SQLITE_DROP_TRIGGER,
-        sqlite3.SQLITE_DROP_VIEW,
-        sqlite3.SQLITE_DROP_VTABLE,
-    }
+_TEMP_SCHEMA_ACTION_NAMES = (
+    "SQLITE_CREATE_TEMP_INDEX",
+    "SQLITE_CREATE_TEMP_TABLE",
+    "SQLITE_CREATE_TEMP_TRIGGER",
+    "SQLITE_CREATE_TEMP_VIEW",
+    "SQLITE_DROP_TEMP_INDEX",
+    "SQLITE_DROP_TEMP_TABLE",
+    "SQLITE_DROP_TEMP_TRIGGER",
+    "SQLITE_DROP_TEMP_VIEW",
+)
+_TEMP_SCHEMA_ACTIONS = frozenset(
+    getattr(sqlite3, name)
+    for name in _TEMP_SCHEMA_ACTION_NAMES
+    if hasattr(sqlite3, name)
+)
+_SCHEMA_ACTIONS = (
+    frozenset(
+        {
+            sqlite3.SQLITE_ALTER_TABLE,
+            sqlite3.SQLITE_CREATE_INDEX,
+            sqlite3.SQLITE_CREATE_TABLE,
+            sqlite3.SQLITE_CREATE_TRIGGER,
+            sqlite3.SQLITE_CREATE_VIEW,
+            sqlite3.SQLITE_CREATE_VTABLE,
+            sqlite3.SQLITE_DROP_INDEX,
+            sqlite3.SQLITE_DROP_TABLE,
+            sqlite3.SQLITE_DROP_TRIGGER,
+            sqlite3.SQLITE_DROP_VIEW,
+            sqlite3.SQLITE_DROP_VTABLE,
+        }
+    )
+    | _TEMP_SCHEMA_ACTIONS
 )
 _DANGEROUS_PRAGMAS = frozenset({"writable_schema", "wal_checkpoint"})
 
@@ -163,11 +181,25 @@ def _runtime_authorizer(
         and (argument1 or "").casefold() in _DANGEROUS_PRAGMAS
     ):
         return sqlite3.SQLITE_DENY
-    if action in _SCHEMA_ACTIONS:
+    if (
+        action in _SCHEMA_ACTIONS
+        or database == "temp"
+        and action
+        in {
+            sqlite3.SQLITE_ALTER_TABLE,
+            sqlite3.SQLITE_CREATE_INDEX,
+            sqlite3.SQLITE_CREATE_TABLE,
+            sqlite3.SQLITE_CREATE_TRIGGER,
+            sqlite3.SQLITE_CREATE_VIEW,
+            sqlite3.SQLITE_DROP_INDEX,
+            sqlite3.SQLITE_DROP_TABLE,
+            sqlite3.SQLITE_DROP_TRIGGER,
+            sqlite3.SQLITE_DROP_VIEW,
+        }
+    ):
         return sqlite3.SQLITE_DENY
     if (
         action in {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE}
-        and database == "main"
         and argument1 in _JOURNAL_TABLES
     ):
         return sqlite3.SQLITE_DENY
@@ -189,6 +221,7 @@ def _journal_authorizer(table: str) -> _Authorizer:
             action == sqlite3.SQLITE_INSERT
             and database == "main"
             and argument1 == table
+            and trigger is None
         ):
             return sqlite3.SQLITE_OK
         return _runtime_authorizer(action, argument1, argument2, database, trigger)
@@ -202,7 +235,19 @@ def _set_internal_authorizer(
     connection._set_sqlite_authorizer(authorizer)
 
 
+def _reject_user_temp_schema(connection: SecureConnection) -> None:
+    row = connection.execute(
+        "SELECT type, name FROM temp.sqlite_schema "
+        "WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\' LIMIT 1"
+    ).fetchone()
+    if row is not None:
+        raise DatabaseConfigurationError(
+            f"TEMP schema contains unsupported user object {row[0]} {row[1]!r}"
+        )
+
+
 def _seal_runtime_authorizer(connection: SecureConnection) -> None:
+    _reject_user_temp_schema(connection)
     _set_internal_authorizer(connection, _runtime_authorizer)
     object.__setattr__(connection, "_authorizer_sealed", True)
 

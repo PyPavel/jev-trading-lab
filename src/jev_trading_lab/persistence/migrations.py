@@ -30,6 +30,7 @@ from jev_trading_lab.core.time import (
 )
 from jev_trading_lab.persistence.db import (
     SecureConnection,
+    _reject_user_temp_schema,
     _seal_runtime_authorizer,
     _set_internal_authorizer,
 )
@@ -622,6 +623,8 @@ def apply_migrations(
     if not callable(clock):
         raise TypeError("migration clock must be callable")
     _require_main_only(connection)
+    if isinstance(connection, SecureConnection):
+        _reject_user_temp_schema(connection)
     migrations = load_migrations(package)
     migration_statements = tuple(_validated_statements(item) for item in migrations)
     _validate_applied(_applied_rows(connection), migrations)

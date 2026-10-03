@@ -896,7 +896,8 @@ def test_temp_schema_migrations_cannot_shadow_main(tmp_path: Path) -> None:
             "INSERT INTO temp.schema_migrations VALUES (99, 'shadow', 'bad', 1)"
         )
 
-        apply_migrations(connection, clock=lambda: 1_000_000)
+        with pytest.raises(DatabaseConfigurationError, match="TEMP schema"):
+            apply_migrations(connection, clock=lambda: 1_000_000)
 
         assert (
             connection.execute(
@@ -904,14 +905,12 @@ def test_temp_schema_migrations_cannot_shadow_main(tmp_path: Path) -> None:
             ).fetchone()[0]
             == 1
         )
-        rows = connection.execute(
-            "SELECT version, name FROM main.schema_migrations ORDER BY version"
-        ).fetchall()
-        assert [tuple(row) for row in rows] == [
-            (1, "001_migration_metadata.sql"),
-            (2, "002_core_entities.sql"),
-            (3, "003_append_only_guards.sql"),
-        ]
+        assert (
+            connection.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE name = 'schema_migrations'"
+            ).fetchone()
+            is None
+        )
     finally:
         connection.close()
 
@@ -2105,7 +2104,7 @@ def test_quoted_temp_reindex_is_denied_without_metadata(
     try:
         connection.execute("CREATE TEMP TABLE sink (value TEXT)")
         connection.execute("CREATE INDEX temp.idx ON sink(value)")
-        with pytest.raises(MigrationError, match="forbidden SQL REINDEX"):
+        with pytest.raises(DatabaseConfigurationError, match="TEMP schema"):
             apply_migrations(connection, package=package, clock=lambda: 1_000_000)
         assert (
             connection.execute(
@@ -2136,7 +2135,7 @@ def test_temp_trigger_cannot_write_during_metadata_insert(
             "BEGIN INSERT INTO sink VALUES (NEW.version); END"
         )
 
-        with pytest.raises(MigrationError, match="authorized"):
+        with pytest.raises(DatabaseConfigurationError, match="TEMP schema"):
             apply_migrations(connection, package=package, clock=lambda: 1_000_000)
 
         assert connection.execute("SELECT count(*) FROM temp.sink").fetchone()[0] == 0

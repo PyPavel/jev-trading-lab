@@ -12,7 +12,11 @@ from dataclasses import dataclass
 
 from jev_trading_lab.core.ids import canonical_hash, canonical_json_bytes
 from jev_trading_lab.core.time import MAX_DATETIME_US, MIN_DATETIME_US
-from jev_trading_lab.persistence.db import SecureConnection, _journal_write_scope
+from jev_trading_lab.persistence.db import (
+    SecureConnection,
+    _journal_write_scope,
+    _reject_user_temp_schema,
+)
 
 _HEX = frozenset("0123456789abcdef")
 _SLUG = re.compile(r"[a-z](?:[a-z0-9]|_(?=[a-z0-9])){0,63}")
@@ -275,9 +279,11 @@ def _reconstruct_event(record: JournalEvent) -> JournalEvent:
 class AppendOnlyJournal:
     """Validate and append immutable records through a sealed ``SecureConnection``.
 
-    Consistency and controlled-writer change control apply only to writes through
-    this supported API. This is not keyed provenance or authentication against
-    malicious same-process code, raw SQLite connections, or filesystem writers.
+    Consistency and controlled-writer change control assume callers use
+    ``SecureConnection`` public instance methods. Code that deliberately invokes
+    base-class descriptors, mutates object internals or process memory, opens raw
+    SQLite connections, or writes files directly is out of scope. This is not
+    keyed provenance or writer authentication against hostile same-process code.
 
     Supersession is acyclic without graph traversal: each new event may reference
     only an already persisted predecessor, event primary keys are immutable, and
@@ -300,6 +306,7 @@ class AppendOnlyJournal:
             )
         if not connection.authorizer_sealed:
             raise ValueError("journal connection runtime authorizer must be sealed")
+        _reject_user_temp_schema(connection)
         configured = connection.busy_timeout_ms
         if (
             expected_busy_timeout_ms is not None
@@ -368,7 +375,7 @@ class AppendOnlyJournal:
         conflicts: tuple[tuple[str, tuple[object, ...]], ...],
     ) -> str:
         existing = self._connection.execute(
-            f"SELECT {', '.join(columns)} FROM {table} WHERE {key_column} = ?",
+            f"SELECT {', '.join(columns)} FROM main.{table} WHERE {key_column} = ?",
             (key,),
         ).fetchone()
         if existing is not None:
@@ -377,13 +384,14 @@ class AppendOnlyJournal:
             return key
         for where, parameters in conflicts:
             if self._connection.execute(
-                f"SELECT 1 FROM {table} WHERE {where}", parameters
+                f"SELECT 1 FROM main.{table} WHERE {where}", parameters
             ).fetchone():
                 raise JournalConflictError(f"existing {table} identity conflicts")
         placeholders = ", ".join("?" for _ in columns)
         try:
             self._connection.execute(
-                f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
+                f"INSERT INTO main.{table} ({', '.join(columns)}) "
+                f"VALUES ({placeholders})",
                 values,
             )
         except sqlite3.IntegrityError as error:
@@ -421,7 +429,7 @@ class AppendOnlyJournal:
             if trusted.supersedes_event_id is not None:
                 predecessor = self._connection.execute(
                     "SELECT entity_id, sequence, occurred_at_us, payload_sha256 "
-                    "FROM journal_events WHERE event_id = ?",
+                    "FROM main.journal_events WHERE event_id = ?",
                     (trusted.supersedes_event_id,),
                 ).fetchone()
                 if predecessor is None:
