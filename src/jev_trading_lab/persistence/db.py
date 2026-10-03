@@ -48,14 +48,30 @@ class SecureConnection(sqlite3.Connection):
     """SQLite connection that owns its validated parent directory descriptor."""
 
     _parent_descriptor: int | None = None
+    _close_descriptor = staticmethod(os.close)
+    _close_sqlite = sqlite3.Connection.close
 
     def close(self) -> None:
         try:
-            super().close()
+            self._close_sqlite()
         finally:
-            if self._parent_descriptor is not None:
-                os.close(self._parent_descriptor)
-                self._parent_descriptor = None
+            descriptor = self._parent_descriptor
+            self._parent_descriptor = None
+            if descriptor is not None:
+                self._close_descriptor(descriptor)
+
+    def __del__(self) -> None:
+        descriptor = getattr(self, "_parent_descriptor", None)
+        self._parent_descriptor = None
+        if descriptor is not None:
+            try:
+                self._close_descriptor(descriptor)
+            except BaseException:
+                pass
+        try:
+            self._close_sqlite()
+        except BaseException:
+            pass
 
 
 def _decode_mountinfo_path(value: str) -> str:
@@ -263,39 +279,49 @@ def _verify_sqlite_descriptors(
     parent_descriptor: int,
 ) -> None:
     candidates = _new_regular_descriptors(before)
-    if not candidates:
+    main = [
+        candidate
+        for candidate in candidates
+        if (candidate[1].st_dev, candidate[1].st_ino) == expected
+    ]
+    if len(main) != 1:
         raise DatabaseConfigurationError(
-            "SQLite main database fd does not match the validated inode"
+            "SQLite main database descriptor ambiguity or validated inode mismatch"
         )
+    _validate_database_metadata(main[0][1], path)
 
-    _descriptor, main_metadata, _target = candidates[0]
-    _validate_database_metadata(main_metadata, path)
-    if (main_metadata.st_dev, main_metadata.st_ino) != expected:
+    try:
+        parent_target = Path(os.readlink(f"/proc/self/fd/{parent_descriptor}"))
+    except OSError as error:
         raise DatabaseConfigurationError(
-            "SQLite main database fd does not match the validated inode"
-        )
-
-    parent_target = Path(os.readlink(f"/proc/self/fd/{parent_descriptor}"))
+            f"cannot classify SQLite descriptors: {error}"
+        ) from error
     sidecars = set(_sidecar_names(path))
-    for _descriptor, metadata, target in candidates[1:]:
+    for descriptor, metadata, target in candidates:
+        if descriptor == main[0][0]:
+            continue
         candidate_path = _target_path(target)
-        if (metadata.st_dev, metadata.st_ino) == expected:
-            raise DatabaseConfigurationError("SQLite database descriptor ambiguity")
-        try:
-            candidate_path.relative_to(parent_target)
-        except ValueError:
-            continue
-        if candidate_path.parent != parent_target:
-            continue
-        if candidate_path.name not in sidecars:
-            name = candidate_path.name
+        if (
+            candidate_path.parent != parent_target
+            or candidate_path.name not in sidecars
+        ):
             raise DatabaseConfigurationError(
-                f"unexpected regular descriptor in database directory: {name!r}"
+                f"SQLite descriptor inode or role mismatch: {target!r}"
             )
         _validate_sidecar(metadata, candidate_path.name)
-        if metadata.st_nlink == 0:
+        try:
+            visible = os.stat(
+                candidate_path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
             raise DatabaseConfigurationError(
-                f"database sidecar {candidate_path.name!r} was deleted while opening"
+                f"SQLite sidecar descriptor is not visible: {candidate_path.name!r}"
+            ) from error
+        if (visible.st_dev, visible.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise DatabaseConfigurationError(
+                f"SQLite sidecar descriptor inode mismatch: {candidate_path.name!r}"
             )
 
 

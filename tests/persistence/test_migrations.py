@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import importlib
 import importlib.resources
@@ -1328,7 +1329,7 @@ def test_database_parent_rejects_unexpected_entry(tmp_path: Path) -> None:
         _connect(parent / "db.sqlite3")
 
 
-def test_decoy_fd_cannot_hide_sqlite_opening_replaced_inode(
+def test_decoy_opened_before_sqlite_cannot_hide_replaced_inode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     parent = tmp_path / "private"
@@ -1342,16 +1343,16 @@ def test_decoy_fd_cannot_hide_sqlite_opening_replaced_inode(
     held: list[int] = []
     real_connect = sqlite3.connect
 
-    def swap_and_open_decoy(*args: object, **kwargs: object) -> sqlite3.Connection:
+    def open_decoy_then_swap(*args: object, **kwargs: object) -> sqlite3.Connection:
+        held.append(os.open(database, os.O_RDONLY))
         database.rename(parked_original)
         replacement.rename(database)
         connection = real_connect(*args, **kwargs)  # type: ignore[arg-type]
         database.rename(parked_replacement)
         parked_original.rename(database)
-        held.append(os.open(database, os.O_RDONLY))
         return connection
 
-    monkeypatch.setattr(db_module.sqlite3, "connect", swap_and_open_decoy)
+    monkeypatch.setattr(db_module.sqlite3, "connect", open_decoy_then_swap)
     before = set(_proc_fd_targets())
     try:
         with pytest.raises(DatabaseConfigurationError, match="inode|ambiguity"):
@@ -1416,7 +1417,7 @@ def test_unsafe_open_sidecar_renamed_away_is_rejected(
                 sidecar.touch(mode=0o666)
                 sidecar.chmod(0o666)
                 held.append(os.open(sidecar, os.O_RDONLY))
-                parked = database.parent / "parked-wal"
+                parked = tmp_path / "parked-wal"
                 sidecar.rename(parked)
                 parked.unlink()
             return super().execute(sql, parameters)  # type: ignore[arg-type]
@@ -1437,7 +1438,7 @@ def test_unsafe_open_sidecar_renamed_away_is_rejected(
             os.close(descriptor)
 
 
-def test_unrelated_new_regular_fd_does_not_block_connection(
+def test_unrelated_regular_fd_opened_during_connect_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     database = tmp_path / "private" / "db.sqlite3"
@@ -1448,17 +1449,85 @@ def test_unrelated_new_regular_fd_does_not_block_connection(
 
     def open_unrelated_fd(*args: object, **kwargs: object) -> sqlite3.Connection:
         connection = real_connect(*args, **kwargs)  # type: ignore[arg-type]
-        held.append(os.open(unrelated, os.O_RDONLY))
+        opener = threading.Thread(
+            target=lambda: held.append(os.open(unrelated, os.O_RDONLY))
+        )
+        opener.start()
+        opener.join()
         return connection
 
     monkeypatch.setattr(db_module.sqlite3, "connect", open_unrelated_fd)
-    connection = _connect(database)
     try:
-        assert connection.execute("SELECT 1").fetchone()[0] == 1
+        with pytest.raises(DatabaseConfigurationError, match="descriptor"):
+            _connect(database)
     finally:
-        connection.close()
         for descriptor in held:
             os.close(descriptor)
+
+
+def test_dropped_connection_releases_parent_descriptor(tmp_path: Path) -> None:
+    database = tmp_path / "private" / "db.sqlite3"
+    before = _proc_fd_targets()
+    connection = _connect(database)
+    during = _proc_fd_targets()
+    parent_fds = [
+        descriptor
+        for descriptor, target in during.items()
+        if descriptor not in before and target == str(database.parent)
+    ]
+    assert len(parent_fds) == 1
+
+    del connection
+    gc.collect()
+
+    assert parent_fds[0] not in _proc_fd_targets()
+
+
+def test_explicit_close_then_gc_does_not_double_close_reused_fd(tmp_path: Path) -> None:
+    database = tmp_path / "private" / "db.sqlite3"
+    connection = _connect(database)
+    parent_descriptor = connection._parent_descriptor  # type: ignore[attr-defined]
+    assert parent_descriptor is not None
+    connection.close()
+
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_text("open", encoding="utf-8")
+    opened_descriptor = os.open(sentinel, os.O_RDONLY)
+    try:
+        sentinel_descriptor = os.dup2(opened_descriptor, parent_descriptor)
+        if opened_descriptor != sentinel_descriptor:
+            os.close(opened_descriptor)
+        del connection
+        gc.collect()
+        assert os.read(sentinel_descriptor, 4) == b"open"
+    finally:
+        os.close(parent_descriptor)
+
+
+def test_failed_connection_construction_does_not_leak_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "private" / "db.sqlite3"
+    before = set(_proc_fd_targets())
+
+    def fail_connect(*_args: object, **_kwargs: object) -> sqlite3.Connection:
+        raise sqlite3.OperationalError("construction failed")
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", fail_connect)
+    with pytest.raises(sqlite3.OperationalError, match="construction failed"):
+        _connect(database)
+    gc.collect()
+    assert set(_proc_fd_targets()) == before
+
+
+def test_dropped_connection_cycles_do_not_leak_descriptors(tmp_path: Path) -> None:
+    database = tmp_path / "private" / "db.sqlite3"
+    before = set(_proc_fd_targets())
+    for _ in range(100):
+        connection = _connect(database)
+        del connection
+        gc.collect()
+        assert set(_proc_fd_targets()) == before
 
 
 def test_connection_open_close_cycles_do_not_leak_descriptors(tmp_path: Path) -> None:
