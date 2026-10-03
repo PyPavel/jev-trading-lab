@@ -2,83 +2,73 @@
 
 ## Status
 
-**IMPLEMENTED / PENDING INDEPENDENT REVIEWS**
+**REVIEW FINDINGS FIXED / PENDING INDEPENDENT REVIEW**
 
-## Code commit
+## Code commits
 
 ```text
 75addb4 feat(core): freeze experiment run window
+3ff6a02 fix(core): make run window calendar authoritative
 ```
 
-## Delivered contract
+## Review findings resolved
 
-- Added immutable, slotted `RunWindow` with exact built-in integer UTC-microsecond validation, supported datetime-range checks, exact 12-week enrollment invariant, `T_m > E`, and pinned calendar identity fields.
-- Defined enrollment as `[E_start, E)`: scheduled entry slots before `E_start`, at `E`, or after `E` are rejected.
-- Resolved one shared `T_m` as the official close on the tenth XNYS session strictly after the UTC calendar date `E + 30 calendar days`.
-- Added a minimal offline XNYS adapter backed by `exchange-calendars==4.11.2`; official schedule data handles holidays, DST, and early closes.
-- Converted pandas schedule timestamps to stdlib UTC datetimes at the adapter boundary and then to integer microseconds without float seconds.
-- Pinned the reviewed universal-wheel SHA-256, deterministic calendar content/rule identities, and NYSE provider-contract identity in the manifest example.
-- Added exact manifest/runtime identity mismatch rejection for package version/hash, calendar content hash, T_m rule version/hash, and NYSE provider contract hash.
-- Added the exact runtime dependency and transitive `uv.lock` entries. Updated source/config/lock/preflight/workflow policy hashes and artifact allowlists only for Task 5 surfaces.
+- Replaced publicly constructible `RunWindow` dataclass with a slotted, immutable resolver-issued wrapper over private frozen `_RunWindowData`, canonical bytes, and `run_window_id`.
+- Added `revalidate_run_window(window, manifest)`: recomputes from `enrollment_start_us`, reparses the manifest, checks canonical bytes/data/ID, rejects `object.__new__` forgeries and tampered internals, and returns a fresh authoritative wrapper.
+- Made `resolve_run_window` the sole issuer. Arbitrary `T_m` changes of ±1 microsecond and ±1 day fail revalidation. Normal construction fails and instances expose no `__dict__`.
+- Enforced exact NYSE provider `contract_version` and `contract_sha256` independently in manifest semantic validation and runtime calendar identity checks.
+- Removed misleading wheel-hash/content-label semantics. Manifest now pins the exact `uv.lock` SHA-256 and the authoritative schedule artifact SHA-256.
+- Added packaged canonical `src/jev_trading_lab/artifacts/xnys-schedule-2020-2036.json`, generated from `exchange-calendars==4.11.2` and `tzdata==2026.5`. It freezes 4,122 ordered XNYS session labels, opens, and official UTC closes, with explicit enrollment support from 2020-01-01 through 2035-12-31.
+- Resolver now derives results only from the packaged artifact. `verify_runtime_calendar_against_artifact()` independently compares the installed provider schedule with every frozen row and rejects version, identity, or content drift.
+- Artifact SHA, metadata, schema, row ordering/uniqueness, UTC integer timestamps, and supported range fail closed. Runtime package behavior can be monkeypatched without changing resolver output, while verification rejects that mutation.
+- Added the runtime artifact to exact source policy, wheel/sdist package data, artifact-content inspection, preflight hashes, and workflow hash. `uv.lock` was unchanged.
 
 ## TDD RED evidence
 
-Mandatory named tests were written before production modules existed. Individual runs failed at collection as intended:
+Reviewer probes were added before production changes. Initial focused collection failed because the required trust-boundary and calendar APIs did not exist:
 
 ```text
-uv run pytest tests/core/test_run_window.py::test_tm_is_tenth_nyse_session_strictly_after_e_plus_30 -q
-ModuleNotFoundError: No module named 'jev_trading_lab.core.run_window'
-
-uv run pytest tests/core/test_run_window.py::test_dst_holiday_early_close -q
-ModuleNotFoundError: No module named 'jev_trading_lab.core.run_window'
-
-uv run pytest tests/core/test_run_window.py::test_same_tm_for_both_streams -q
-ModuleNotFoundError: No module named 'jev_trading_lab.core.run_window'
+env PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest tests/core/test_run_window.py tests/core/test_manifest.py::test_nyse_provider_contract_version_is_exact_independent_of_hash -q
+ImportError: cannot import name 'revalidate_run_window' from 'jev_trading_lab.core.run_window'
 ```
 
-Source/dependency policy also failed before approvals were updated:
+Source/config/artifact/package-data policy also failed before approvals were updated:
 
 ```text
 /usr/bin/python3 -I -S scripts/policy_preflight.py
-policy preflight: uv.lock: SHA-256 does not match exact reviewed dependency lock
 policy preflight: pyproject.toml: content differs from exact approved build, dependency, entry-point, and tool contract
+policy preflight: src/jev_trading_lab/stocks/calendar.py: SHA-256 does not match approved content
+policy preflight: src/jev_trading_lab/core/manifest.py: SHA-256 does not match approved content
+policy preflight: src/jev_trading_lab/core/run_window.py: SHA-256 does not match approved content
+policy preflight: src/jev_trading_lab/artifacts: directory is not approved
+policy preflight: src/jev_trading_lab/artifacts/xnys-schedule-2020-2036.json: file is not approved
+policy preflight: config/phase1.example.json: SHA-256 does not match approved content
 ```
 
-Later test-first corrections reproduced two boundary/identity gaps before implementation:
+Artifact packaging test then exposed the repository-wide `artifacts/` ignore rule:
 
 ```text
-uv run pytest tests/core/test_run_window.py::test_enrollment_is_exactly_twelve_weeks_and_boundary_is_exclusive -q
-1 failed: entries_allowed_at(E_start - 1) returned True
-
-uv run pytest tests/core/test_run_window.py::test_package_and_calendar_identity_mismatch_with_manifest_is_rejected -q
-1 failed: providers.nyse_calendar.contract_sha256 mismatch did not raise
+env PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/test_package_policy.py::test_calendar_schedule_artifact_is_packaged_in_wheel_and_sdist -q
+1 failed: jev_trading_lab/artifacts/xnys-schedule-2020-2036.json not in wheel
 ```
 
-Both focused cases passed after minimal production changes.
+The ignore rule was narrowed to root `/artifacts/`; rebuilt wheel and sdist both contain the runtime artifact.
 
-## Focused GREEN evidence
+## GREEN evidence
 
 ```text
-/usr/bin/python3 -I -S scripts/policy_preflight.py
-Policy preflight passed.
+env PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/core/test_run_window.py tests/core/test_manifest.py tests/test_package_policy.py -q
+317 passed in 3.37s
 
-env PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/core/test_run_window.py tests/test_package_policy.py -q
-76 passed in 3.19s
+env PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/test_package_policy.py::test_calendar_schedule_artifact_is_packaged_in_wheel_and_sdist -q
+1 passed in 0.13s
 ```
 
-Task tests cover:
+Review-focused coverage includes constructor/forgery rejection, private-state/canonical-byte/ID tampering, arbitrary cutoff probes, fresh revalidation, independent provider version/hash mismatches, package-version drift, artifact mutation, runtime calendar monkeypatch drift, deterministic artifact resolution, range rejection, and wheel/sdist inclusion.
 
-- Hand-counted 2024-11-27 through 2024-12-11 sessions, excluding the threshold session itself; first through ninth sessions are not selected.
-- DST transition close movement from 21:00 UTC to 20:00 UTC.
-- July 4 and Thanksgiving closures plus July 3 and day-after-Thanksgiving 17:00/18:00 UTC early closes.
-- One run-wide cutoff with no stream override, stable canonical serialization/hash, and fresh-process stability under a different host `TZ`.
-- Exact `[E_start, E)` entry boundary and exact 84-day enrollment duration.
-- Boolean, integer-subclass, enum, float, string, ordering, calendar identity, pre-epoch, out-of-range, missing-session, malformed-schedule, and unavailable-calendar-range rejection.
-- Installed version, manifest identities, lock pin, package policy, and build artifact contents.
+## Final gates after code commit
 
-## Full gate evidence
-
-All commands ran after final production changes and exited 0:
+All commands exited 0:
 
 ```text
 /usr/bin/python3 -I -S scripts/policy_preflight.py
@@ -88,10 +78,10 @@ uv lock --check
 Resolved 64 packages in 1ms
 
 uv sync --frozen --all-groups
-Checked 63 packages in 0.63ms
+Checked 63 packages in 0.59ms
 
 env PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
-454 passed in 4.01s
+449 passed in 3.60s
 
 uv run ruff check .
 All checks passed!
@@ -102,26 +92,19 @@ uv run ruff format --check .
 uv run mypy src
 Success: no issues found in 10 source files
 
-uv export --frozen --all-groups --no-emit-project --format requirements-txt --output-file /tmp/jev-task-005-audit.txt --quiet
-exit 0
-
-uv run pip-audit --strict --requirement /tmp/jev-task-005-audit.txt --no-deps --disable-pip
+uv run pip-audit --strict --requirement /tmp/jev-task-005-review-audit.txt --no-deps --disable-pip
 No known vulnerabilities found
 
 uv build --no-build-isolation
 Successfully built dist/jev_trading_lab-0.1.0.tar.gz
 Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
 
-git diff --check
+git diff --check HEAD^ HEAD
 exit 0
 ```
 
-`pip-audit` emitted its standard `--no-deps` advisory warnings; the audit result was clean. Artifact inspection confirmed `core/run_window.py`, `stocks/__init__.py`, and `stocks/calendar.py` in the wheel, and both Task 5 production modules in the sdist.
+`pip-audit` emitted only its standard `--no-deps` advisory warnings. Artifact inspection passed against both built distributions.
 
 ## Scope
 
-No approved design, implementation plan, provider-contract research, or review file changed. No push performed. Task 6 remains blocked pending independent Task 5 reviews.
-
-## Independent reviews
-
-**PENDING INDEPENDENT REVIEWS**
+No design, implementation plan, provider-contract research, or review files changed. No push performed. Task 6 remains blocked pending independent Task 5 review.
