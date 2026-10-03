@@ -13,54 +13,63 @@ All reported Task 6 adversarial findings were addressed and verified locally. No
 40dcc21 fix(persistence): harden database and migrations
 5e05789 fix(persistence): bind database and migration trust
 88dc9fd fix(persistence): close descriptor and authorizer races
+ba6329e fix(persistence): validate every SQLite descriptor
 ```
 
-## Review findings resolved
+## Final findings resolved
 
-- **Database descriptor and dedicated-directory trust:** `connect_database` retains an effective-UID-owned exact-`0700` parent descriptor and connects through `/proc/self/fd/<dirfd>/<basename>`. Descriptor-relative scans require the physical directory to contain only the database basename and its `-wal`/`-shm` sidecars. A `/proc/self/fd` census made before connect verifies the lowest new regular descriptor as SQLite's main database, requires its device/inode to equal the securely prepared inode, rejects duplicate/ambiguous database candidates, validates every new sidecar descriptor, and rejects any extra new regular descriptor in the retained directory. The census is repeated after WAL activation while connect setup is serialized. Exact A/B swap/restore with a decoy FD, deleted replacement inode with a decoy FD, renamed-away unsafe sidecar, unrelated-FD acceptance, and 100-cycle leak probes are covered.
-- **Security boundary:** this is a strong dedicated-directory invariant, not a claim that stdlib SQLite can defeat every same-UID hostile process. A same-UID actor that swaps, renames, or unlinks an opened database/sidecar is detected through retained-directory state plus actual new-FD metadata. Any descriptor ambiguity fails closed. The parent descriptor remains retained for connection lifetime.
-- **Migration parent TOCTOU:** filesystem package directories are traversed component-by-component with `O_DIRECTORY|O_NOFOLLOW` and `dir_fd`; each descriptor is retained through all resource reads. Every component requires root/effective-UID ownership and no group/world write bit, and its device/inode/mode/UID/ctime snapshot is revalidated after loading. Migration files are opened by basename with `O_NOFOLLOW` relative to the retained schema descriptor; no absolute pathname reopen occurs. Descriptor cleanup is unconditional. A schema-directory swap/restore race fails before attacker SQL executes or metadata is recorded. Archive `Traversable` resources retain bounded streaming and rely on exact locked/hash-protected wheel bytes.
-- **Main-only authorizer:** `PRAGMA database_list` must be exactly `main`, optionally followed only by fileless `temp`; attached databases remain rejected. The authorizer stays active from before migration statements through timestamp generation, metadata insertion, and `COMMIT`, and is cleared only after commit or rollback. It denies all TEMP create/drop actions, ATTACH/DETACH, REINDEX, ANALYZE, and write-capable actions whose database is not `main`. Parser defense recognizes quoted and unquoted TEMP schema qualification plus `CREATE TEMP`/`CREATE TEMPORARY`; SQLite's authorizer remains authoritative. Exact `REINDEX "temp".idx` and a pre-existing TEMP trigger attempting to write `temp.sink` during metadata insertion both fail with no metadata row or main payload after reconnect.
-- **Timestamp integrity independently preserved:** migration SQL requires `typeof(applied_at_us) = 'integer'` and range `0..253402300799999999`; direct `-1` and signed-64 maximum inserts fail. `_applied_rows` requires exact built-in `int` and the same current-era range. Reconnect corruption probes remain green.
-- **Policy updates:** exact source, preflight, and workflow hashes were updated after behavior stabilized. Migration SQL was unchanged because its existing timestamp constraint was already correct.
+- **Fail-closed process descriptor census:** `connect_database` snapshots `/proc/self/fd` immediately before `sqlite3.connect` while holding a module process-wide lock. The lock remains held through SQLite connect, main-FD validation, WAL activation, the second complete census, storage rechecks, and pragma setup. Every newly opened regular descriptor is classified; none are ignored because of descriptor number, renamed pathname, deletion, or location outside the retained database directory.
+- **Main database identity:** exactly one new regular descriptor must match the securely prepared database device/inode. The census no longer chooses the lowest FD. An expected-inode decoy opened before SQLite followed by SQLite opening a replacement inode creates an unclassified mismatch and is rejected. Replacement/deletion/restore variants remain rejected and failed construction closes the SQLite connection plus retained parent descriptor.
+- **Sidecar identity and metadata:** every non-main new regular descriptor must still resolve to the exact `db.sqlite3-wal` or `db.sqlite3-shm` basename under the retained parent descriptor. Its `fstat` owner, regular-file type, exact `0600` mode, and link count are checked, then its device/inode is correlated with the descriptor-relative visible entry. Renamed, moved outside, unlinked, unsafe `0666`, hard-linked, ambiguous, and otherwise unprovable descriptors fail closed.
+- **Concurrent unrelated descriptors:** any unrelated regular FD opened by another thread during this critical section causes safe rejection. This deliberate fail-closed behavior prevents unrelated same-process descriptor activity from being mistaken for SQLite state. Legitimate `connect_database` setup overlap is serialized by the module lock.
+- **GC descriptor lifecycle:** `SecureConnection.__del__` directly detaches and closes `_parent_descriptor`, then invokes `sqlite3.Connection.close`, suppressing shutdown-time exceptions. Explicit close and finalization are idempotent. Tests cover dropping the last reference plus `gc.collect`, explicit close followed by FD-number reuse and GC, constructor failure, 100 GC cycles, and 100 explicit close cycles.
+- **Prior migration protections preserved:** descriptor-relative migration resource loading, retained package-directory descriptors, main-only authorizer enforcement through metadata insertion/commit, TEMP/ATTACH/DETACH/REINDEX/ANALYZE denial, and timestamp integrity tests remain green.
+- **Policy updates:** exact `db.py`, preflight, and workflow hashes were updated after behavior stabilized. `pyproject.toml`, `uv.lock`, dependencies, and migration SQL were unchanged.
+
+## Security boundary
+
+This is a same-process fail-closed descriptor census plus an effective-UID-owned dedicated `0700` directory and retained dirfd boundary. It detects and rejects the exact same-process monkeypatch/thread reproductions reviewed for Task 6. It is **not** protection against a malicious same-UID process capable of manipulating another process's namespace or `/proc` view; Python stdlib SQLite cannot establish that stronger cross-process boundary.
 
 ## TDD RED evidence
 
-The exact new reviewer reproductions were run before production changes. The combined command exited 1 with seven intended failures and two controls already passing:
+The final exact reproductions were added before production changes. The focused command exited 1:
 
 ```text
-FAILED test_database_parent_rejects_unexpected_entry
-FAILED test_decoy_fd_cannot_hide_sqlite_opening_replaced_inode
-FAILED test_deleted_sqlite_inode_cannot_be_hidden_by_decoy_fd
+FAILED test_decoy_opened_before_sqlite_cannot_hide_replaced_inode
 FAILED test_unsafe_open_sidecar_renamed_away_is_rejected
-FAILED test_schema_directory_swap_restore_is_rejected_before_sql_executes
-FAILED test_quoted_temp_reindex_is_denied_without_metadata
-FAILED test_temp_trigger_cannot_write_during_metadata_insert
-7 failed, 2 passed in 0.31s
+FAILED test_unrelated_regular_fd_opened_during_connect_fails_closed
+FAILED test_dropped_connection_releases_parent_descriptor
+FAILED test_explicit_close_then_gc_does_not_double_close_reused_fd
+FAILED test_dropped_connection_cycles_do_not_leak_descriptors
+6 failed, 1 passed in 0.30s
 ```
 
-The two passing controls were `test_unrelated_new_regular_fd_does_not_block_connection` and `test_connection_open_close_cycles_do_not_leak_descriptors`. The first migration-race RED reached attacker SQL and then failed with `sqlite3.OperationalError: no such table: main.schema_migrations`, proving the untrusted replacement resource was read before the descriptor-relative fix. The explicit quoted non-main schema parser reproduction also failed RED with `sqlite3.OperationalError: unknown database "aux"` before the parser defense was added.
+`test_failed_connection_construction_does_not_leak_descriptors` was the passing control: the pre-existing exception cleanup already released the retained parent descriptor when `sqlite3.connect` raised before returning a connection. The GC-cycle RED later failed while leaked prior connections accumulated, independently confirming missing finalization.
 
-Exact source-policy preflight was witnessed RED before hash updates because `db.py` and `migrations.py` no longer matched approved SHA-256 values. Hashes were updated only after focused behavior was green.
+Exact source-policy preflight was also witnessed RED before hash updates. It reported `src/jev_trading_lab/persistence/db.py: SHA-256 does not match approved content`; generated `__pycache__` entries from an isolated diagnostic were removed, then approved hashes were updated only after focused behavior was green.
 
 ## GREEN evidence
 
 ```text
-env PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/persistence/test_migrations.py -q
-119 passed in 0.33s
-
 env PYTHONDONTWRITEBYTECODE=1 uv run pytest \
-  tests/persistence/test_migrations.py tests/test_package_policy.py -q
-176 passed in 1.63s
+  tests/persistence/test_migrations.py::test_connection_pragmas \
+  tests/persistence/test_migrations.py::test_decoy_opened_before_sqlite_cannot_hide_replaced_inode \
+  tests/persistence/test_migrations.py::test_unsafe_open_sidecar_renamed_away_is_rejected \
+  tests/persistence/test_migrations.py::test_unrelated_regular_fd_opened_during_connect_fails_closed \
+  tests/persistence/test_migrations.py::test_dropped_connection_releases_parent_descriptor \
+  tests/persistence/test_migrations.py::test_explicit_close_then_gc_does_not_double_close_reused_fd \
+  tests/persistence/test_migrations.py::test_failed_connection_construction_does_not_leak_descriptors \
+  tests/persistence/test_migrations.py::test_dropped_connection_cycles_do_not_leak_descriptors -q
+8 passed in 0.68s
+
+env PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/persistence/test_migrations.py -q
+124 passed in 0.93s
+
+env PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/test_package_policy.py -q
+56 passed in 1.56s
 
 env PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
-571 passed in 3.68s
-
-env PYTHONDONTWRITEBYTECODE=1 uv run pytest \
-  tests/persistence/test_migrations.py::test_connection_open_close_cycles_do_not_leak_descriptors \
-  tests/persistence/test_migrations.py::test_schema_rejects_invalid_applied_timestamp \
-  tests/persistence/test_migrations.py::test_reconnect_detects_corrupt_applied_timestamp -q
-5 passed in 0.21s
+575 passed in 6.60s
 ```
 
 ## Verification gates
@@ -75,7 +84,7 @@ uv lock --check
 Resolved 64 packages in 1ms
 
 uv sync --frozen --all-groups
-Checked 63 packages in 0.59ms
+Checked 63 packages in 0.71ms
 
 env PYTHONDONTWRITEBYTECODE=1 uv run ruff check .
 All checks passed!
@@ -105,13 +114,13 @@ Installed-wheel migration smoke passed.
 env PYTHONDONTWRITEBYTECODE=1 uv run pytest \
   tests/test_package_policy.py::test_migration_sql_is_packaged_in_wheel_and_sdist \
   tests/test_package_policy.py::test_built_artifacts_exclude_repository_and_host_junk -q
-2 passed in 0.40s
+2 passed in 0.39s
 
 git diff --check
 exit 0
 ```
 
-`pip-audit` emitted only its standard `--no-deps` advisory warnings. `uv.lock` and `pyproject.toml` were unchanged. Design, plan, and review documents were unchanged. No push was performed.
+`pip-audit` emitted only its standard `--no-deps` advisory warnings. Design, plan, and review documents were unchanged. No push was performed.
 
 ## Independent reviews
 
