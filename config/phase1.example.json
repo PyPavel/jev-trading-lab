@@ -14,9 +14,9 @@
     "maturation_trading_days": 10,
     "tm_rule": "tenth_nyse_session_strictly_after_e_plus_30_calendar_days",
     "tm_rule_version": "phase1-v1",
-    "package_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "content_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
-    "tm_rule_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    "package_sha256": "00b8672b567d52ff81ebfb0e9be8b3932f343de98496b65bbda4ee48540a2d36",
+    "content_sha256": "729be049d61d2d1e2f86d1b6805ff09a1becbf86c68228d68480d95ff9b5073c",
+    "tm_rule_sha256": "8f827b89de3ed73872c9935f4c3efb619b9fb922e47cc1009ef0820ce7597186"
   },
   "accounts": {
     "currency": "USD",
@@ -199,7 +199,7 @@
       "validation": "phase1_xnys_calendar_v1",
       "fallback_enabled": false,
       "contract_version": "phase1-provider-contract-v1",
-      "contract_sha256": "9999999999999999999999999999999999999999999999999999999999999999"
+      "contract_sha256": "b9a7e118387a8068087436e74ab485c7ffa15d190402dbd24b15bc3d738d6fa3"
     },
     "stock_spread_model": {
       "source_name": "Frozen Phase-1 spread model",

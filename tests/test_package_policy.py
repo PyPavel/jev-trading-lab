@@ -66,12 +66,17 @@ def _requirement_name(requirement: str) -> str:
 
 
 _APPROVED_SOURCE_DIRS = frozenset(
-    {"src", "src/jev_trading_lab", "src/jev_trading_lab/core"}
+    {
+        "src",
+        "src/jev_trading_lab",
+        "src/jev_trading_lab/core",
+        "src/jev_trading_lab/stocks",
+    }
 )
 _APPROVED_CONFIG_DIRS = frozenset({"config"})
 _APPROVED_CONFIG_HASHES = {
     "config/phase1.example.json": (
-        "05171caf5c83057771d21e315884cf0cc5521a5dedbef2f2255ec284ae7b4918"
+        "a38c7ec9dcd6bcdea1044d5bdac282febbec3a29c6b1624456dac18e30b5178e"
     )
 }
 _APPROVED_SOURCE_HASHES = {
@@ -87,6 +92,9 @@ _APPROVED_SOURCE_HASHES = {
     "src/jev_trading_lab/core/manifest.py": (
         "5ab6afa23825f47ea45cc6e7d63b8d6d878d4bf9a96e119ee564ff32c01004fd"
     ),
+    "src/jev_trading_lab/core/run_window.py": (
+        "b99e380c5a593acf7c9039796da92651a797328e095c74c748f39bf09d5de6ca"
+    ),
     "src/jev_trading_lab/core/observations.py": (
         "dbad9fa1099b527a640e68fc105641757ef2ef2fd68a504e208dda06958391ec"
     ),
@@ -95,6 +103,12 @@ _APPROVED_SOURCE_HASHES = {
     ),
     "src/jev_trading_lab/core/values.py": (
         "806e4d4681da763cd78efa8b636ad51be74f61b425c9ad833b44781d43b10087"
+    ),
+    "src/jev_trading_lab/stocks/__init__.py": (
+        "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"
+    ),
+    "src/jev_trading_lab/stocks/calendar.py": (
+        "00d21c5bcb58293ab66710dbf06d4ae8668a005a8aa2201808950a23ed8e5d03"
     ),
 }
 _ALLOWED_TOOL_CONFIG = {
@@ -146,12 +160,16 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "f9c263154dda9d3e6a578117332fe4c0434b45fd002c1d1d1bd1f8d2bb816677"
+    "565a54e027c1bb349a09da765409fedf9b8abe0cfa31f4ac7fdcac0e49e17326"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "e9286991a7c0c931818f2a63e623a6eec26970d460613f4467b2ed1b4559ae62"
+    "edce2f7c5cf7d5fa405fb19e6f54a2e15cf34ae42f9466017ca4a27a75367922"
 )
-_ALLOWED_RUNTIME_REQUIREMENTS = ["pydantic>=2.12,<3", "typer>=0.19,<1"]
+_ALLOWED_RUNTIME_REQUIREMENTS = [
+    "exchange-calendars==4.11.2",
+    "pydantic>=2.12,<3",
+    "typer>=0.19,<1",
+]
 _ALLOWED_DEPENDENCY_GROUPS = {
     "dev": [
         "hatchling==1.27.0",
@@ -443,7 +461,7 @@ def _operational_policy_violations(root: Path) -> list[str]:
 def _runtime_policy_violations(root: Path) -> list[str]:
     project_data = _project_data(root)
     project = project_data.get("project", {})
-    allowed_runtime = {"pydantic", "typer"}
+    allowed_runtime = {"exchange-calendars", "pydantic", "typer"}
     runtime_requirements = project.get("dependencies", [])
     runtime_names = _dependency_names(runtime_requirements)
     violations = [
@@ -567,8 +585,11 @@ def _initialize_approved_source_fixture(tmp_path: Path) -> Path:
         "core/ids.py",
         "core/manifest.py",
         "core/observations.py",
+        "core/run_window.py",
         "core/time.py",
         "core/values.py",
+        "stocks/__init__.py",
+        "stocks/calendar.py",
     ):
         target = package / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1218,6 +1239,7 @@ def test_locked_build_configuration() -> None:
     locked = {package["name"]: package["version"] for package in lock_data["package"]}
     assert project_data["project"]["name"] in locked
     assert locked["hatchling"] == "1.27.0"
+    assert locked["exchange-calendars"] == "4.11.2"
 
 
 def test_ci_uses_immutable_actions_and_locked_audit() -> None:
@@ -1369,7 +1391,10 @@ def test_built_artifacts_exclude_repository_and_host_junk(tmp_path: Path) -> Non
         "jev_trading_lab/core/ids.py",
         "jev_trading_lab/core/manifest.py",
         "jev_trading_lab/core/observations.py",
+        "jev_trading_lab/core/run_window.py",
         "jev_trading_lab/core/time.py",
         "jev_trading_lab/core/values.py",
+        "jev_trading_lab/stocks/__init__.py",
+        "jev_trading_lab/stocks/calendar.py",
     }
     assert not _wheel_entry_point_violations(wheel)

@@ -13,15 +13,20 @@ from typing import Any
 
 ROOT = Path(__file__).absolute().parent.parent
 SCRIPT = ROOT / "scripts/policy_preflight.py"
-EXPECTED_LOCK_HASH = "463b2ad06b3fcc3af5f7507dd8185b6c7397145a38f2bf9e4f9e65cb5bdad538"
+EXPECTED_LOCK_HASH = "4535dbd779b3c903f57235bb5f3a5c5ce12e3bf13f1b8e01da0576f97df212ac"
 PYPI_SOURCE = {"registry": "https://pypi.org/simple"}
 EXPECTED_SOURCE_DIRS = frozenset(
-    {"src", "src/jev_trading_lab", "src/jev_trading_lab/core"}
+    {
+        "src",
+        "src/jev_trading_lab",
+        "src/jev_trading_lab/core",
+        "src/jev_trading_lab/stocks",
+    }
 )
 EXPECTED_CONFIG_DIRS = frozenset({"config"})
 EXPECTED_CONFIG_HASHES = {
     "config/phase1.example.json": (
-        "05171caf5c83057771d21e315884cf0cc5521a5dedbef2f2255ec284ae7b4918"
+        "a38c7ec9dcd6bcdea1044d5bdac282febbec3a29c6b1624456dac18e30b5178e"
     )
 }
 EXPECTED_SOURCE_HASHES = {
@@ -37,6 +42,9 @@ EXPECTED_SOURCE_HASHES = {
     "src/jev_trading_lab/core/manifest.py": (
         "5ab6afa23825f47ea45cc6e7d63b8d6d878d4bf9a96e119ee564ff32c01004fd"
     ),
+    "src/jev_trading_lab/core/run_window.py": (
+        "b99e380c5a593acf7c9039796da92651a797328e095c74c748f39bf09d5de6ca"
+    ),
     "src/jev_trading_lab/core/observations.py": (
         "dbad9fa1099b527a640e68fc105641757ef2ef2fd68a504e208dda06958391ec"
     ),
@@ -46,6 +54,12 @@ EXPECTED_SOURCE_HASHES = {
     "src/jev_trading_lab/core/values.py": (
         "806e4d4681da763cd78efa8b636ad51be74f61b425c9ad833b44781d43b10087"
     ),
+    "src/jev_trading_lab/stocks/__init__.py": (
+        "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"
+    ),
+    "src/jev_trading_lab/stocks/calendar.py": (
+        "00d21c5bcb58293ab66710dbf06d4ae8668a005a8aa2201808950a23ed8e5d03"
+    ),
 }
 EXPECTED_PROJECT = {
     "name": "jev-trading-lab",
@@ -53,7 +67,11 @@ EXPECTED_PROJECT = {
     "description": "Paper-only evidence-first market research lab",
     "readme": "README.md",
     "requires-python": ">=3.12",
-    "dependencies": ["pydantic>=2.12,<3", "typer>=0.19,<1"],
+    "dependencies": [
+        "exchange-calendars==4.11.2",
+        "pydantic>=2.12,<3",
+        "typer>=0.19,<1",
+    ],
     "classifiers": [
         "Development Status :: 2 - Pre-Alpha",
         "Intended Audience :: Science/Research",
@@ -120,7 +138,11 @@ EXPECTED_PROJECT_PACKAGE = {
     "name": "jev-trading-lab",
     "version": "0.1.0",
     "source": {"editable": "."},
-    "dependencies": [{"name": "pydantic"}, {"name": "typer"}],
+    "dependencies": [
+        {"name": "exchange-calendars"},
+        {"name": "pydantic"},
+        {"name": "typer"},
+    ],
     "dev-dependencies": {
         "dev": [
             {"name": "hatchling"},
@@ -135,6 +157,7 @@ EXPECTED_PROJECT_PACKAGE = {
     },
     "metadata": {
         "requires-dist": [
+            {"name": "exchange-calendars", "specifier": "==4.11.2"},
             {"name": "pydantic", "specifier": ">=2.12,<3"},
             {"name": "typer", "specifier": ">=0.19,<1"},
         ],

@@ -876,8 +876,15 @@ def test_model_input_policy_is_required_content_addressed_and_identity_bound() -
 
 def test_required_review_contract_fields_and_exact_design_literals() -> None:
     expected: dict[str, object] = {
-        "calendar.package_sha256": "8" * 64,
-        "calendar.content_sha256": "9" * 64,
+        "calendar.package_sha256": (
+            "00b8672b567d52ff81ebfb0e9be8b3932f343de98496b65bbda4ee48540a2d36"
+        ),
+        "calendar.content_sha256": (
+            "729be049d61d2d1e2f86d1b6805ff09a1becbf86c68228d68480d95ff9b5073c"
+        ),
+        "calendar.tm_rule_sha256": (
+            "8f827b89de3ed73872c9935f4c3efb619b9fb922e47cc1009ef0820ce7597186"
+        ),
         "accounts.cash_yield.rule_version": "phase1-cash-yield-v1",
         "accounts.cash_yield.rule_sha256": "1" * 64,
         "ai_thresholds.rule_version": "phase1-ai-thresholds-v1",

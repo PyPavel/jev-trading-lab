@@ -9,6 +9,7 @@ description = "Paper-only evidence-first market research lab"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "exchange-calendars==4.11.2",
     "pydantic>=2.12,<3",
     "typer>=0.19,<1",
 ]
