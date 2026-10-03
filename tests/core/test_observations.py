@@ -139,17 +139,22 @@ def test_direct_non_correction_constructor_rejects_predecessor() -> None:
 @pytest.mark.parametrize(
     "source_uri",
     (
-        "https://example.test/%zz",
-        "https://example.test:invalid/data",
-        "https://:443/data",
-        "https://user@:443/data",
-        "https://example.test/data\x00tail",
-        "https://example.test/data\x7ftail",
-        "https://[2001:db8::1/data",
-        "custom:?query-only",
+        "ftp://example.test/data",
+        "ftp://example.test:invalid/data",
+        "ftp:///missing-host",
+        "custom:provider-record",
     ),
 )
-def test_hostile_source_uris_are_rejected(source_uri: str) -> None:
+def test_source_uri_requires_exact_lowercase_https_scheme(source_uri: str) -> None:
+    with pytest.raises(ValueError, match="source URI"):
+        _metadata(source_uri=source_uri)
+
+
+@pytest.mark.parametrize(
+    "source_uri",
+    ("HTTPS://example.test/data", "Https://example.test/data"),
+)
+def test_source_uri_rejects_non_lowercase_https_scheme(source_uri: str) -> None:
     with pytest.raises(ValueError, match="source URI"):
         _metadata(source_uri=source_uri)
 
@@ -157,13 +162,126 @@ def test_hostile_source_uris_are_rejected(source_uri: str) -> None:
 @pytest.mark.parametrize(
     "source_uri",
     (
-        "https://[2001:db8::1]:443/a%20b?value=%2F#ok",
-        "urn:isbn:9780140328721",
-        "file:///tmp/provider%20payload",
+        "https://exa|mple.test/data",
+        "https://-example.test/data",
+        "https://example-.test/data",
+        "https://example..test/data",
+        "https://exa_mple.test/data",
+        "https://999.1.1.1/data",
+        "https://:443/data",
     ),
 )
-def test_valid_absolute_source_uris_are_accepted(source_uri: str) -> None:
-    assert _metadata(source_uri=source_uri) is not None
+def test_source_uri_rejects_invalid_dns_hosts(source_uri: str) -> None:
+    with pytest.raises(ValueError, match="source URI"):
+        _metadata(source_uri=source_uri)
+
+
+@pytest.mark.parametrize(
+    "source_uri",
+    (
+        "https://[2001:db8::1/data",
+        "https://2001:db8::1/data",
+        "https://[2001:db8::gg]/data",
+        "https://example.test/path[0]",
+    ),
+)
+def test_source_uri_rejects_malformed_or_misplaced_ipv6_brackets(
+    source_uri: str,
+) -> None:
+    with pytest.raises(ValueError, match="source URI"):
+        _metadata(source_uri=source_uri)
+
+
+@pytest.mark.parametrize(
+    "source_uri",
+    (
+        "https://example.test:invalid/data",
+        "https://example.test:/data",
+        "https://example.test:0/data",
+        "https://example.test:65536/data",
+    ),
+)
+def test_source_uri_rejects_invalid_ports(source_uri: str) -> None:
+    with pytest.raises(ValueError, match="source URI"):
+        _metadata(source_uri=source_uri)
+
+
+@pytest.mark.parametrize(
+    "source_uri",
+    (
+        "https://example.test/%",
+        "https://example.test/%2",
+        "https://example.test/%zz",
+        "https://example.test/data?value=%GG",
+    ),
+)
+def test_source_uri_rejects_invalid_percent_escapes(source_uri: str) -> None:
+    with pytest.raises(ValueError, match="source URI"):
+        _metadata(source_uri=source_uri)
+
+
+@pytest.mark.parametrize(
+    "source_uri",
+    (
+        "https://user@example.test/data",
+        "https://user:secret@example.test/data",
+        "https://user@:443/data",
+    ),
+)
+def test_source_uri_rejects_userinfo(source_uri: str) -> None:
+    with pytest.raises(ValueError, match="source URI"):
+        _metadata(source_uri=source_uri)
+
+
+@pytest.mark.parametrize(
+    "source_uri",
+    ("https://example.test/data#section", "https://example.test/data#"),
+)
+def test_source_uri_rejects_fragments(source_uri: str) -> None:
+    with pytest.raises(ValueError, match="source URI"):
+        _metadata(source_uri=source_uri)
+
+
+@pytest.mark.parametrize(
+    "character",
+    ("<", ">", '"', "{", "}", "|", "\\", "^", "`", "[", "]"),
+)
+def test_source_uri_rejects_raw_disallowed_path_characters(character: str) -> None:
+    with pytest.raises(ValueError, match="source URI"):
+        _metadata(source_uri=f"https://example.test/a{character}b")
+
+
+@pytest.mark.parametrize("character", ("\x00", "\t", " ", "\x7f", "é"))
+def test_source_uri_rejects_controls_whitespace_and_non_ascii(character: str) -> None:
+    with pytest.raises(ValueError, match="source URI"):
+        _metadata(source_uri=f"https://example.test/a{character}b")
+
+
+@pytest.mark.parametrize(
+    "source_uri",
+    (
+        "https://example.test",
+        "https://example.test/a-z_A-Z~!$&'()*+,;=:@/segment?value=ok/?;:@&=+$,",
+        "https://example.test/a%20b?value=%2F",
+        "https://192.0.2.1/data",
+        "https://[2001:db8::1]/data",
+        "https://example.test:443/data",
+        "https://[2001:db8::1]:8443/data",
+    ),
+)
+def test_valid_https_source_uris_are_accepted(source_uri: str) -> None:
+    metadata = _metadata(source_uri=source_uri)
+
+    assert getattr(metadata, "source_uri") == source_uri
+
+
+def test_source_uri_is_not_silently_normalized() -> None:
+    source_uri = "https://EXAMPLE.test:443/%7eitem?Value=%2f"
+    metadata = _metadata(source_uri=source_uri)
+    normalized = _metadata(source_uri="https://example.test:443/~item?Value=%2F")
+
+    assert getattr(metadata, "source_uri") == source_uri
+    assert getattr(metadata, "observation_id") != getattr(normalized, "observation_id")
 
 
 def test_metadata_validates_required_fields() -> None:

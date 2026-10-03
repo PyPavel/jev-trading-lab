@@ -7,6 +7,7 @@ are separate observations linked to the observation they supersede.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from dataclasses import InitVar, dataclass
 from enum import Enum
@@ -16,8 +17,10 @@ from jev_trading_lab.core.ids import canonical_hash
 from jev_trading_lab.core.time import validate_utc_us
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
-_SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*\Z")
+_DNS_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
 _INVALID_PERCENT_ESCAPE_RE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+_URI_PATH_CHARACTER_RE = re.compile(r"[A-Za-z0-9._~!$&'()*+,;=:@/%-]*\Z")
+_URI_QUERY_CHARACTER_RE = re.compile(r"[A-Za-z0-9._~!$&'()*+,;=:@/?%-]*\Z")
 
 
 class ObservationStatus(Enum):
@@ -33,40 +36,72 @@ def _validate_sha256(value: str, *, name: str) -> str:
     return value
 
 
+def _validate_hostname(hostname: str, *, bracketed: bool) -> None:
+    if bracketed:
+        try:
+            ipaddress.IPv6Address(hostname)
+        except ipaddress.AddressValueError as error:
+            raise ValueError("source URI must include a valid IPv6 host") from error
+        return
+    try:
+        ipaddress.IPv4Address(hostname)
+    except ipaddress.AddressValueError:
+        labels = hostname.split(".")
+        if (
+            len(hostname) > 253
+            or (len(labels) == 4 and all(label.isdigit() for label in labels))
+            or any(_DNS_LABEL_RE.fullmatch(label) is None for label in labels)
+        ):
+            raise ValueError(
+                "source URI must include a valid DNS hostname or IPv4 host"
+            )
+
+
 def _validate_source_uri(value: str) -> str:
-    if (
-        type(value) is not str
-        or not value
-        or any(
-            character.isspace() or ord(character) < 32 or 127 <= ord(character) <= 159
-            for character in value
-        )
+    """Return an exact, absolute lowercase-HTTPS source identity."""
+    if type(value) is not str or not value or not value.isascii():
+        raise ValueError("source URI must be non-empty ASCII")
+    if any(
+        character.isspace() or ord(character) < 32 or ord(character) == 127
+        for character in value
     ):
-        raise ValueError(
-            "source URI must be a non-empty absolute URI without control or whitespace"
-        )
-    if _INVALID_PERCENT_ESCAPE_RE.search(value):
-        raise ValueError("source URI must contain only valid percent escapes")
+        raise ValueError("source URI must not contain control or whitespace characters")
+    if not value.startswith("https://"):
+        raise ValueError("source URI must use exact lowercase https scheme")
     try:
         parsed = urlsplit(value)
     except ValueError as error:
         raise ValueError("source URI must have valid syntax") from error
-    if _SCHEME_RE.fullmatch(parsed.scheme) is None or not (
-        parsed.netloc or parsed.path
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError("source URI must be an absolute HTTPS URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("source URI must not include userinfo")
+    if "#" in value:
+        raise ValueError("source URI must not include a fragment")
+    if (
+        _INVALID_PERCENT_ESCAPE_RE.search(parsed.path)
+        or _INVALID_PERCENT_ESCAPE_RE.search(parsed.query)
+        or _URI_PATH_CHARACTER_RE.fullmatch(parsed.path) is None
+        or _URI_QUERY_CHARACTER_RE.fullmatch(parsed.query) is None
     ):
-        raise ValueError("source URI must include a valid scheme and location")
-    if parsed.scheme.casefold() in {"http", "https"}:
-        if parsed.username is not None or parsed.password is not None:
-            raise ValueError("source URI HTTP(S) form must not include userinfo")
-        try:
-            hostname = parsed.hostname
-            parsed.port
-        except ValueError as error:
-            raise ValueError(
-                "source URI HTTP(S) form has invalid host or port"
-            ) from error
-        if not hostname:
-            raise ValueError("source URI HTTP(S) form must include a host")
+        raise ValueError(
+            "source URI path and query must use valid RFC 3986 ASCII syntax"
+        )
+    try:
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("source URI must include a valid host and port") from error
+    if not hostname:
+        raise ValueError("source URI must include a host")
+    bracketed = parsed.netloc.startswith("[")
+    host_end = parsed.netloc.find("]") + 1 if bracketed else len(hostname)
+    port_text = parsed.netloc[host_end:]
+    if port_text and (not port_text.startswith(":") or not port_text[1:].isdigit()):
+        raise ValueError("source URI port must be numeric")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("source URI port must be in 1..65535")
+    _validate_hostname(hostname, bracketed=bracketed)
     return value
 
 
@@ -74,8 +109,9 @@ def _validate_source_uri(value: str) -> str:
 class ObservationMetadata:
     """Validated immutable provenance for one exact provider payload.
 
-    ``predecessor`` is constructor-only context: pass it exactly when
-    ``supersedes_id`` is present. It is validated but neither stored nor hashed.
+    ``source_uri`` is an exact, unnormalized lowercase-HTTPS URL without userinfo
+    or fragments. ``predecessor`` is constructor-only context: pass it exactly
+    when ``supersedes_id`` is present. It is validated but neither stored nor hashed.
     """
 
     source_uri: str
