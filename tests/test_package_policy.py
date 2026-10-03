@@ -65,13 +65,18 @@ def _requirement_name(requirement: str) -> str:
     return _normalize_name(match.group())
 
 
-_APPROVED_SOURCE_DIRS = frozenset({"src", "src/jev_trading_lab"})
+_APPROVED_SOURCE_DIRS = frozenset(
+    {"src", "src/jev_trading_lab", "src/jev_trading_lab/core"}
+)
 _APPROVED_SOURCE_HASHES = {
     "src/jev_trading_lab/__init__.py": (
         "583ff05fc923ac30ef5cd0e9c44271e53746a65e312f53f112ec1b49e827647b"
     ),
     "src/jev_trading_lab/cli.py": (
         "e1018e68f8902660a347c842866c321a42bad08d3f332cdf7f32bf0029cc84d9"
+    ),
+    "src/jev_trading_lab/core/values.py": (
+        "c8dfa751e5a4548ec8ed0571e7441c0c06914676a86ead1b29f3ada02c00a399"
     ),
 }
 _ALLOWED_TOOL_CONFIG = {
@@ -123,10 +128,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "258d54bb899b54787dfef75e03e12bb9add951eb7b376228a50499cde8e503f5"
+    "f7be8b220e7cbb54433ab303362e053a678960f477aba8f6af8e428321e21d6d"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "a26996ef188d6f87d3f97c37022514cda75c68cd1719bf5082d8cc1bd1ec5a7d"
+    "575d4605121d1e90b6fdc7f429ef7f3641ae5acea464f71cd10272a6391fd80e"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = ["typer>=0.19,<1"]
 _ALLOWED_DEPENDENCY_GROUPS = {
@@ -462,8 +467,10 @@ def test_no_live_execution_surface() -> None:
 def _initialize_approved_source_fixture(tmp_path: Path) -> Path:
     package = tmp_path / "src/jev_trading_lab"
     package.mkdir(parents=True)
-    for name in ("__init__.py", "cli.py"):
-        (package / name).write_bytes((SRC / "jev_trading_lab" / name).read_bytes())
+    for relative in ("__init__.py", "cli.py", "core/values.py"):
+        target = package / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((SRC / "jev_trading_lab" / relative).read_bytes())
     workflow = tmp_path / ".github/workflows/ci.yml"
     workflow.parent.mkdir(parents=True)
     workflow.write_bytes((ROOT / ".github/workflows/ci.yml").read_bytes())
@@ -1253,5 +1260,6 @@ def test_built_artifacts_exclude_repository_and_host_junk(tmp_path: Path) -> Non
     assert package_files == {
         "jev_trading_lab/__init__.py",
         "jev_trading_lab/cli.py",
+        "jev_trading_lab/core/values.py",
     }
     assert not _wheel_entry_point_violations(wheel)

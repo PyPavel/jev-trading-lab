@@ -15,13 +15,18 @@ ROOT = Path(__file__).absolute().parent.parent
 SCRIPT = ROOT / "scripts/policy_preflight.py"
 EXPECTED_LOCK_HASH = "de8ad6a56fadc9beed5d1e8350e5bd1b43bb597e2805751d64506e933ed3af7c"
 PYPI_SOURCE = {"registry": "https://pypi.org/simple"}
-EXPECTED_SOURCE_DIRS = frozenset({"src", "src/jev_trading_lab"})
+EXPECTED_SOURCE_DIRS = frozenset(
+    {"src", "src/jev_trading_lab", "src/jev_trading_lab/core"}
+)
 EXPECTED_SOURCE_HASHES = {
     "src/jev_trading_lab/__init__.py": (
         "583ff05fc923ac30ef5cd0e9c44271e53746a65e312f53f112ec1b49e827647b"
     ),
     "src/jev_trading_lab/cli.py": (
         "e1018e68f8902660a347c842866c321a42bad08d3f332cdf7f32bf0029cc84d9"
+    ),
+    "src/jev_trading_lab/core/values.py": (
+        "c8dfa751e5a4548ec8ed0571e7441c0c06914676a86ead1b29f3ada02c00a399"
     ),
 }
 EXPECTED_PROJECT = {
