@@ -8,6 +8,8 @@ import io
 import os
 import sqlite3
 import stat
+import subprocess
+import sys
 import threading
 import uuid
 import zipfile
@@ -23,6 +25,7 @@ from jev_trading_lab.persistence import migrations as migration_module
 from jev_trading_lab.persistence.db import (
     MIN_SQLITE_VERSION,
     DatabaseConfigurationError,
+    DatabaseSafetyError,
     connect_database,
 )
 from jev_trading_lab.persistence.migrations import (
@@ -1125,6 +1128,50 @@ def test_world_writable_migration_package_directory_is_rejected(
         load_migrations(package)
 
 
+def test_rejected_migration_package_directories_do_not_leak_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for rejected_depth in range(2):
+        package, schema = _package(
+            tmp_path / f"rejected-{rejected_depth}",
+            monkeypatch,
+            {"001_ok.sql": b"SELECT 1;\n"},
+        )
+        rejected = (schema.parent, schema)[rejected_depth]
+        rejected.chmod(0o777)
+        before = set(_proc_fd_targets())
+        for _ in range(100):
+            with pytest.raises(MigrationError, match="package directory.*writable"):
+                load_migrations(package)
+        assert set(_proc_fd_targets()) == before
+
+
+def test_successful_migration_load_does_not_leak_or_close_retained_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package, _schema = _package(tmp_path, monkeypatch, {"001_ok.sql": b"SELECT 1;\n"})
+    real_read = migration_module._read_filesystem_resource
+    observed_retained_directories = False
+
+    def assert_retained_directories(
+        resource: Path, parent_descriptor: int | None = None
+    ) -> bytes:
+        nonlocal observed_retained_directories
+        assert parent_descriptor is not None
+        os.fstat(parent_descriptor)
+        observed_retained_directories = True
+        return real_read(resource, parent_descriptor)
+
+    monkeypatch.setattr(
+        migration_module, "_read_filesystem_resource", assert_retained_directories
+    )
+    before = set(_proc_fd_targets())
+    for _ in range(100):
+        assert [migration.version for migration in load_migrations(package)] == [1]
+        assert set(_proc_fd_targets()) == before
+    assert observed_retained_directories
+
+
 def test_group_writable_migration_file_is_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1487,6 +1534,69 @@ def test_descriptor_census_documents_cooperative_lock_boundary() -> None:
     assert "ABA" in boundary
     assert "bypasses this lock" in boundary
     assert "not a sandbox" in boundary
+
+
+def test_recursive_mount_resolver_fails_without_deadlock(tmp_path: Path) -> None:
+    outer = tmp_path / "outer" / "db.sqlite3"
+    inner = tmp_path / "inner" / "db.sqlite3"
+    script = f"""
+from pathlib import Path
+from jev_trading_lab.persistence.db import DatabaseConfigurationError, connect_database
+
+outer = Path({str(outer)!r})
+inner = Path({str(inner)!r})
+
+def recursive_resolver(_path: Path) -> str:
+    connect_database(
+        inner,
+        busy_timeout_ms=1000,
+        mount_resolver=lambda _inner_path: "nfs",
+    )
+    return "ext4"
+
+try:
+    connect_database(outer, busy_timeout_ms=1000, mount_resolver=recursive_resolver)
+except DatabaseConfigurationError as error:
+    print(type(error).__name__)
+else:
+    raise AssertionError("recursive resolver unexpectedly connected")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    assert completed.stdout.strip() == "DatabaseSafetyError"
+
+
+def test_mount_resolver_exception_does_not_leak_descriptors(tmp_path: Path) -> None:
+    database = tmp_path / "private" / "db.sqlite3"
+    before = set(_proc_fd_targets())
+
+    def failing_resolver(_path: Path) -> str:
+        raise RuntimeError("resolver failed")
+
+    for _ in range(100):
+        with pytest.raises(RuntimeError, match="resolver failed"):
+            connect_database(
+                database,
+                busy_timeout_ms=1_000,
+                mount_resolver=failing_resolver,  # type: ignore[arg-type]
+            )
+    assert set(_proc_fd_targets()) == before
+
+
+@pytest.mark.parametrize("invalid", (None, "", 7, object()))
+def test_mount_resolver_result_is_validated(tmp_path: Path, invalid: object) -> None:
+    with pytest.raises(DatabaseSafetyError, match="invalid filesystem"):
+        connect_database(
+            tmp_path / "private" / "db.sqlite3",
+            busy_timeout_ms=1_000,
+            mount_resolver=lambda _path: invalid,  # type: ignore[return-value]
+        )
 
 
 def test_concurrent_library_connection_attempts_serialize_fd_activity(

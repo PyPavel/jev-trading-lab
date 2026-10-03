@@ -158,8 +158,12 @@ def _open_resource_directories(
         for component in package_parts:
             current_path /= component
             child = os.open(component, _directory_flags(), dir_fd=current)
-            metadata = os.fstat(child)
-            _validate_resource_directory(metadata, current_path)
+            try:
+                metadata = os.fstat(child)
+                _validate_resource_directory(metadata, current_path)
+            except BaseException:
+                os.close(child)
+                raise
             opened.append((child, _directory_snapshot(metadata), current_path))
             current = child
         return opened

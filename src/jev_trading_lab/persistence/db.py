@@ -56,6 +56,10 @@ class DatabaseConfigurationError(RuntimeError):
     """Raised when SQLite cannot meet the persistence contract."""
 
 
+class DatabaseSafetyError(DatabaseConfigurationError):
+    """Raised when database storage cannot satisfy the safety boundary."""
+
+
 class MountResolver(Protocol):
     def __call__(self, path: Path) -> str: ...
 
@@ -144,17 +148,22 @@ def _validate_busy_timeout(value: int) -> int:
     return value
 
 
-def _validate_filesystem(path: Path, resolver: MountResolver) -> None:
+def _resolve_filesystem(path: Path, resolver: MountResolver) -> str:
     filesystem = resolver(path)
     if not isinstance(filesystem, str) or not filesystem:
-        raise DatabaseConfigurationError(
-            "mount resolver returned an invalid filesystem"
-        )
+        raise DatabaseSafetyError("mount resolver returned an invalid filesystem")
     normalized = filesystem.casefold()
     if normalized not in _LOCAL_FILESYSTEMS:
-        raise DatabaseConfigurationError(
+        raise DatabaseSafetyError(
             f"database path uses unsupported filesystem {filesystem!r}"
         )
+    return normalized
+
+
+def _validate_filesystem(path: Path, expected: str) -> None:
+    filesystem = _resolve_filesystem(path, _linux_mount_resolver)
+    if filesystem != expected:
+        raise DatabaseSafetyError("database filesystem changed while opening")
 
 
 def _directory_flags() -> int:
@@ -494,15 +503,18 @@ def connect_database(
         raise ValueError("database path must name a file")
 
     resolver = mount_resolver or _linux_mount_resolver
+    filesystem = _resolve_filesystem(path.parent, resolver)
     with _connection_fd_activity():
-        _validate_filesystem(path.parent, resolver)
+        if mount_resolver is None:
+            _validate_filesystem(path.parent, filesystem)
         parent_descriptor = _open_private_parent(path.parent)
         parent_metadata = os.fstat(parent_descriptor)
         parent_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
         connection: SecureConnection | None = None
         transferred_parent = False
         try:
-            _validate_filesystem(path.parent, resolver)
+            if mount_resolver is None:
+                _validate_filesystem(path.parent, filesystem)
             file_identity = _prepare_database_file(path, parent_descriptor)
             _check_directory_entries(path, parent_descriptor)
             _check_sidecars(path, parent_descriptor)
