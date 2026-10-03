@@ -111,6 +111,9 @@ def test_secure_connection_retains_immutable_busy_timeout(tmp_path: Path) -> Non
             connection.busy_timeout_ms = 1  # type: ignore[attr-defined]
         with pytest.raises(AttributeError):
             connection._busy_timeout_ms = 1  # type: ignore[attr-defined]
+        with pytest.raises(AttributeError):
+            del connection._busy_timeout_ms  # type: ignore[attr-defined]
+        assert connection.busy_timeout_ms == 4_321  # type: ignore[attr-defined]
     finally:
         connection.close()
 

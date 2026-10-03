@@ -67,29 +67,38 @@ class MountResolver(Protocol):
 class SecureConnection(sqlite3.Connection):
     """SQLite connection that owns its validated parent directory descriptor."""
 
-    _parent_descriptor: int | None = None
-    _busy_timeout_ms: int | None = None
+    __slots__ = ("_parent_descriptor", "_busy_timeout_ms")
+
+    _parent_descriptor: int | None
+    _busy_timeout_ms: int
     _close_descriptor = staticmethod(os.close)
     _close_sqlite = sqlite3.Connection.close
 
     def __setattr__(self, name: str, value: object) -> None:
-        if name == "_busy_timeout_ms" and self._busy_timeout_ms is not None:
+        if name == "_busy_timeout_ms":
             raise AttributeError("busy timeout is immutable")
         super().__setattr__(name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name == "_busy_timeout_ms":
+            raise AttributeError("busy timeout is immutable")
+        super().__delattr__(name)
 
     @property
     def busy_timeout_ms(self) -> int:
         """Return the frozen busy timeout configured by ``connect_database``."""
-        timeout = self._busy_timeout_ms
-        if timeout is None:
-            raise DatabaseConfigurationError("busy timeout has not been configured")
-        return timeout
+        try:
+            return self._busy_timeout_ms
+        except AttributeError as error:
+            raise DatabaseConfigurationError(
+                "busy timeout has not been configured"
+            ) from error
 
     def close(self) -> None:
         try:
             self._close_sqlite()
         finally:
-            descriptor = self._parent_descriptor
+            descriptor = getattr(self, "_parent_descriptor", None)
             self._parent_descriptor = None
             if descriptor is not None:
                 self._close_descriptor(descriptor)
@@ -576,7 +585,7 @@ def connect_database(
             _check_sidecars(path, parent_descriptor)
             connection.execute(f"PRAGMA busy_timeout = {timeout}")
             _verify_pragma(connection, "busy_timeout", timeout, label="busy_timeout")
-            connection._busy_timeout_ms = timeout
+            object.__setattr__(connection, "_busy_timeout_ms", timeout)
             connection.execute("PRAGMA synchronous = FULL")
             _verify_pragma(connection, "synchronous", 2, label="synchronous")
             connection.execute("PRAGMA trusted_schema = OFF")

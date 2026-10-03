@@ -22,6 +22,7 @@ from jev_trading_lab.core.observations import (
 from jev_trading_lab.core.run_window import RunWindow, revalidate_run_window
 from jev_trading_lab.core.time import MAX_DATETIME_US, MIN_DATETIME_US, validate_utc_us
 from jev_trading_lab.core.values import MAX_INT64, MicroDollars
+from jev_trading_lab.persistence.db import SecureConnection
 
 _HEX = frozenset("0123456789abcdef")
 _STREAM_ARMS = {
@@ -106,12 +107,22 @@ class CoreRepository:
             raise ValueError(
                 "repository connection must use autocommit isolation_level=None"
             )
-        if expected_busy_timeout_ms is None:
-            expected_busy_timeout_ms = getattr(connection, "busy_timeout_ms", None)
-        if type(expected_busy_timeout_ms) is not int:
+        if isinstance(connection, SecureConnection):
+            configured_timeout = connection.busy_timeout_ms
+            if (
+                expected_busy_timeout_ms is not None
+                and expected_busy_timeout_ms != configured_timeout
+            ):
+                raise ValueError(
+                    "expected_busy_timeout_ms cannot override SecureConnection"
+                )
+            expected_busy_timeout_ms = configured_timeout
+        elif expected_busy_timeout_ms is None:
             raise ValueError(
                 "expected_busy_timeout_ms is required for plain sqlite connections"
             )
+        if type(expected_busy_timeout_ms) is not int:
+            raise TypeError("expected_busy_timeout_ms must be a built-in integer")
         if not 0 < expected_busy_timeout_ms <= _MAX_BUSY_TIMEOUT_MS:
             raise ValueError(
                 f"expected_busy_timeout_ms must be between 1 and {_MAX_BUSY_TIMEOUT_MS}"
@@ -134,9 +145,12 @@ class CoreRepository:
             raise CoreRepositoryError(
                 "cannot write inside an active caller transaction"
             )
+        expected_busy_timeout_ms = self._expected_busy_timeout_ms
+        if isinstance(self._connection, SecureConnection):
+            expected_busy_timeout_ms = self._connection.busy_timeout_ms
         contract = (
             *_STATIC_PRAGMA_CONTRACT,
-            ("busy_timeout", self._expected_busy_timeout_ms),
+            ("busy_timeout", expected_busy_timeout_ms),
         )
         for pragma, expected in contract:
             row = self._connection.execute(f"PRAGMA {pragma}").fetchone()

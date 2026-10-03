@@ -27,6 +27,7 @@ from jev_trading_lab.core.time import (
 )
 from jev_trading_lab.core.values import MicroDollars
 from jev_trading_lab.persistence.core_repo import CoreRepository, CoreRepositoryError
+from jev_trading_lab.persistence.db import connect_database
 from jev_trading_lab.persistence.migrations import apply_migrations, load_migrations
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -766,6 +767,35 @@ def test_plain_sqlite_repository_requires_explicit_expected_busy_timeout() -> No
     try:
         with pytest.raises(ValueError, match="expected_busy_timeout_ms"):
             CoreRepository(connection)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("invalid", (True, "5000", 0, -1, 2**31))
+def test_plain_sqlite_repository_rejects_invalid_expected_busy_timeout(
+    invalid: object,
+) -> None:
+    connection = _connection()
+    try:
+        with pytest.raises((TypeError, ValueError), match="expected_busy_timeout_ms"):
+            CoreRepository(connection, expected_busy_timeout_ms=invalid)  # type: ignore[arg-type]
+    finally:
+        connection.close()
+
+
+def test_secure_repository_rejects_explicit_timeout_override(tmp_path: Path) -> None:
+    connection = connect_database(
+        (tmp_path / "private" / "db.sqlite3").absolute(),
+        busy_timeout_ms=5000,
+        mount_resolver=lambda _path: "ext4",
+    )
+    try:
+        connection.execute("PRAGMA busy_timeout = 1234")
+        with pytest.raises(ValueError, match="expected_busy_timeout_ms"):
+            CoreRepository(connection, expected_busy_timeout_ms=1234)
+        repository = CoreRepository(connection, expected_busy_timeout_ms=5000)
+        with pytest.raises(CoreRepositoryError, match="busy_timeout"):
+            repository.insert_manifest(_manifest())
     finally:
         connection.close()
 
