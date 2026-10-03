@@ -2,9 +2,9 @@
 
 ## Status
 
-**PENDING INDEPENDENT RE-REVIEW**
+**FINAL APPROVED / COMPLETE**
 
-The final default-resolver concurrency race is fixed. No independent re-review has approved this revision.
+The final default-resolver concurrency race is fixed. Both required independent reviews approved the current revision with zero BLOCKER and zero MAJOR findings.
 
 ## Production commits
 
@@ -157,7 +157,39 @@ exit 0
 
 `pip-audit` emitted only its standard `--no-deps` advisory warnings. Design, plan, and review documents were unchanged. No dependency or SQL changes were made. No push was performed.
 
-## Independent reviews
+## Final independent review verdicts
 
-- Spec/adversarial re-review: **PENDING**
-- Quality/model-risk re-review: **PENDING**
+### Spec and adversarial review: PASS
+
+The independent spec/adversarial reviewer reported **PASS**, with zero BLOCKER and zero MAJOR findings at `70260999c7933fbeab9ea682436f470a1e0a47e1`. The reviewer verified the 25/25 mountinfo-race stress run, 11 adversarial tests, 139 persistence tests, 56 policy tests, the complete 590-test suite, and the required verification gates.
+
+### Quality and security review: APPROVED
+
+The independent quality/security reviewer reported **APPROVED**, with zero BLOCKER and zero MAJOR findings at `70260999c7933fbeab9ea682436f470a1e0a47e1`. The reviewer verified policy preflight, Ruff lint and format, mypy, dependency audit, package build, wheel migration smoke, and artifact-policy checks.
+
+## Final reviewed commit chain
+
+```text
+847cbc18d3ef5af8cfd6830bb97eb5776bc32c86 feat(persistence): add checked SQLite migrations
+543e865bb8e612f4852c2af785603d25ad71c3a8 docs(delivery): record task 006 evidence
+40dcc2176b04894627251c2d807fc589cff171aa fix(persistence): harden database and migrations
+1f12c2566d72ae0435b163af08bed37f08533462 docs(delivery): update task 006 review evidence
+5e057890875c91fa6ffc9c60d408457a83449e83 fix(persistence): bind database and migration trust
+43074edb9fe7183df8c7c7890874ec84adfc7770 docs(delivery): update task 006 trust review
+88dc9fd91557ec5808c42a6839fc1358eabd674c fix(persistence): close descriptor and authorizer races
+3212a3b05ce606c4aacab69be2c18c7c8104a3dc docs(delivery): update task 006 race review
+ba6329e12c32ed91f9e57b504a370765042ad156 fix(persistence): validate every SQLite descriptor
+0565f1345b0e4b89f913a39c6df127e97dbea89a docs(delivery): update task 006 descriptor review
+dea5a97f9cbea7023c1c3390df90f83dedbaf016 fix(persistence): bind migration enumeration
+ebdca9b0b367c8dfb1793a73cb35bbe8e4ebd0e4 docs(delivery): update task 006 enumeration review
+805a7f1b8deb274b9bffe9182b7bbe5856caa34c fix(persistence): close rejected descriptors and resolver deadlock
+8ab955f0672313208c92e78437eba084efe1d813 docs(delivery): update task 006 cleanup review
+8bd0976d157278f27456dd28502f23442396f6a8 fix(persistence): serialize built-in mount resolution
+70260999c7933fbeab9ea682436f470a1e0a47e1 docs(delivery): update task 006 mount review
+```
+
+The approval evidence commit containing this section follows `70260999c7933fbeab9ea682436f470a1e0a47e1` and changes only `docs/delivery/task-006.md`.
+
+## Final status
+
+**FINAL APPROVED / COMPLETE.** Both required independent reviews report zero BLOCKER and zero MAJOR findings. Task 6 is complete.
