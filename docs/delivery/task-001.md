@@ -17,6 +17,7 @@ fe13916                                docs(delivery): update task 001 security 
 e48a5578c97155675a0b2ca29d2586a959e2df53 fix(build): reject mutated bindings and bytecode
 395ad157a3c6ba01ec47a7286cba58fcfca444ce fix(build): freeze task1 source capability surface
 acdcd86d90ce77a429af8a31e862fb7bbdf5ff24 fix(build): freeze workflow and entry surfaces
+e7c9194                                fix(build): close ops symlink and backend injection
 ```
 
 The earlier evidence commit remains in history. Its PASS verdict was premature and is superseded by this document.
@@ -608,6 +609,96 @@ Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
 ```
 
 `git diff --check` produced no output. Direct tar/wheel inspection found no forbidden names or `/home/` content. The wheel contained only the two approved package files plus distribution metadata, and the sdist contained only package source, project metadata/notices/readme, generated package metadata, and Hatchling's generated `.gitignore` (not VCS metadata or a worktree pointer).
+
+## Backend review findings
+
+A later independent review found two remaining MAJOR policy gaps:
+
+1. `Path.rglob()` plus `Path.is_file()` followed nested directory symlinks under `scripts/` and `ops/`, allowing an ignored external operational tree to evade rejection.
+2. The build policy checked the required backend and requirement values separately but allowed extra `[build-system]` keys. `backend-path = ["."]` could therefore inject a repository-local `hatchling/build.py` before the no-isolation build.
+
+## Backend review RED evidence
+
+Git-backed directory-symlink controls for both guarded roots and a local-backend fixture were added before policy changes. Command:
+
+```console
+uv run pytest tests/test_package_policy.py -k 'operational_directory_symlink or backend_path_build_system' -q
+```
+
+Observed expected output after correcting the symlink fixture setup so failures exercised policy rather than a missing project file:
+
+```text
+FFF                                                                      [100%]
+3 failed, 37 deselected in 0.18s
+```
+
+Both `scripts/external` and `ops/external` were Git-ignored directory symlinks to an external directory containing `live.sh`; neither produced a symlink violation. The PEP 517 fixture added `backend-path = ["."]` and a local `hatchling/build.py`; it produced no build-system violation.
+
+## Backend review fix
+
+Production fix commit:
+
+```text
+e7c9194 fix(build): close ops symlink and backend injection
+```
+
+Changes:
+
+- Replaced operational `rglob()`/`is_file()` scanning with physical `lstat()`/`scandir()` traversal that never follows symlinks.
+- Kept the current exact contract fail-closed: because no reviewed `scripts/` or `ops/` paths are approved, either directory and every contained directory, regular file, symlink, special file, unreadable path, or non-UTF8 file is a violation.
+- Froze the complete `[build-system]` table to exactly `{requires = ["hatchling==1.27.0"], build-backend = "hatchling.build"}`. Every extra key, including `backend-path`, is rejected before build.
+- Added positive controls for Git-ignored external directory symlinks under both operational roots and local PEP 517 backend injection.
+
+Targeted GREEN command:
+
+```console
+uv run pytest tests/test_package_policy.py -k 'operational_directory_symlink or backend_path_build_system or positive_controls_reject_non_source_surfaces or locked_build_configuration' -q
+```
+
+```text
+..........                                                               [100%]
+10 passed, 30 deselected in 0.16s
+```
+
+## Backend review final verification
+
+Commands were run sequentially from the repository root and exited 0:
+
+```console
+uv lock --check
+uv sync --frozen --all-groups
+uv run pytest -q
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src
+uv export --frozen --all-groups --no-emit-project --format requirements-txt --output-file /tmp/jev-audit-requirements.txt
+uv run pip-audit --strict --requirement /tmp/jev-audit-requirements.txt --no-deps --disable-pip
+uv build --no-build-isolation
+git diff --check
+```
+
+Observed output, accurately abridged to gate summaries:
+
+```text
+Resolved 51 packages in 1ms
+Checked 50 packages in 0.49ms
+........................................                                 [100%]
+40 passed in 0.51s
+All checks passed!
+6 files already formatted
+Success: no issues found in 2 source files
+WARNING:pip_audit._cli:--no-deps is supported, but users are encouraged to fully hash their pinned dependencies
+WARNING:pip_audit._cli:Consider using a tool like `pip-compile`: https://pip-tools.readthedocs.io/en/latest/#using-hashes
+No known vulnerabilities found
+Building source distribution...
+Building wheel from source distribution...
+Successfully built dist/jev_trading_lab-0.1.0.tar.gz
+Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
+```
+
+`git diff --check` produced no output. Artifact inspection found 7 sdist members and 6 wheel members, no VCS metadata, cache, or bytecode paths, and exactly `jev_trading_lab/__init__.py` and `jev_trading_lab/cli.py` as wheel package files.
+
+No approved design, plan, or review file changed. Task 2 remains blocked.
 
 ## Review status
 
