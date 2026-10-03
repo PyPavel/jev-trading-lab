@@ -1,0 +1,317 @@
+{
+  "schema_version": 1,
+  "run": {
+    "phase": "phase1",
+    "mode": "paper",
+    "example_only": true
+  },
+  "calendar": {
+    "exchange": "NYSE",
+    "exchange_calendars_version": "4.11.2",
+    "timezone": "America/New_York",
+    "enrollment_weeks": 12,
+    "maturation_calendar_days": 30,
+    "maturation_trading_days": 10,
+    "tm_rule": "tenth_nyse_session_strictly_after_e_plus_30_calendar_days",
+    "tm_rule_version": "phase1-v1"
+  },
+  "accounts": {
+    "currency": "USD",
+    "initial_capital_microdollars": 10000000000,
+    "risk_unit_microdollars": 50000000,
+    "polymarket_arms": ["AI", "DETERMINISTIC", "CASH"],
+    "stock_arms": ["AI", "DETERMINISTIC", "CASH", "EXPOSURE_MATCHED_PASSIVE"],
+    "cash_yield": {
+      "series": "DGS3MO",
+      "source": "FRED",
+      "observation_rule": "last_published_prior_observation",
+      "first_retrieval_controls_availability": true,
+      "revision_backdating_allowed": false
+    }
+  },
+  "models": {
+    "openai": {
+      "provider": "OpenAI",
+      "endpoint": "https://api.openai.com/v1/responses",
+      "api_version": "v1",
+      "sdk_package": "openai",
+      "sdk_version": "EXAMPLE_PINNED_OPENAI_SDK",
+      "request_model_snapshot": "gpt-5-2025-08-07",
+      "expected_returned_model_id": "gpt-5-2025-08-07",
+      "expected_revision": "EXAMPLE_OPENAI_REVISION",
+      "expected_fingerprint": "EXAMPLE_OPENAI_FINGERPRINT",
+      "schema_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "temperature_micros": 0,
+      "top_p_micros": 1000000,
+      "seed": 42001,
+      "tools_enabled": false,
+      "fallback_enabled": false
+    },
+    "jev": {
+      "provider": "TypeSafe",
+      "endpoint": "https://api.typesafe.ai/v1/systemone",
+      "api_version": "v1",
+      "sdk_package": "stdlib_https",
+      "sdk_version": "python-3.12",
+      "request_model_snapshot": "jev-phase1-example-2026-10-02",
+      "expected_returned_model_id": "jev-phase1-example-2026-10-02",
+      "expected_revision": "EXAMPLE_JEV_REVISION",
+      "expected_fingerprint": "EXAMPLE_JEV_FINGERPRINT",
+      "schema_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "temperature_micros": 0,
+      "top_p_micros": 1000000,
+      "seed": 42002,
+      "tools_enabled": false,
+      "fallback_enabled": false
+    }
+  },
+  "providers": {
+    "polymarket_catalog": {
+      "source_name": "Polymarket Gamma",
+      "endpoint": "https://gamma-api.polymarket.com/markets",
+      "timestamp_semantics": "first_successful_retrieval_utc",
+      "precedence": 1,
+      "validation": "phase1_gamma_market_schema_v1",
+      "fallback_enabled": false
+    },
+    "polymarket_books": {
+      "source_name": "Polymarket CLOB",
+      "endpoint": "https://clob.polymarket.com/book?token_id={token_id}",
+      "timestamp_semantics": "server_and_first_successful_client_retrieval_utc",
+      "precedence": 1,
+      "validation": "phase1_clob_book_schema_v1",
+      "fallback_enabled": false
+    },
+    "polymarket_resolution": {
+      "source_name": "Polymarket Gamma and stated resolution source",
+      "endpoint": "https://gamma-api.polymarket.com/markets",
+      "timestamp_semantics": "official_resolution_and_first_successful_retrieval_utc",
+      "precedence": 1,
+      "validation": "phase1_resolution_schema_v1",
+      "fallback_enabled": false
+    },
+    "stock_ohlcv_actions": {
+      "source_name": "Yahoo Finance chart v8",
+      "endpoint": "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&events=div,splits",
+      "timestamp_semantics": "exchange_date_and_first_successful_retrieval_utc",
+      "precedence": 1,
+      "validation": "phase1_yahoo_chart_schema_v1",
+      "fallback_enabled": false
+    },
+    "sp100_membership": {
+      "source_name": "Frozen Wikipedia S&P 100 artifact",
+      "endpoint": "https://en.wikipedia.org/wiki/S%26P_100",
+      "timestamp_semantics": "frozen_first_successful_retrieval_utc",
+      "precedence": 1,
+      "validation": "phase1_sp100_table_schema_v1",
+      "fallback_enabled": false
+    },
+    "treasury_cash_yield": {
+      "source_name": "FRED DGS3MO",
+      "endpoint": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS3MO",
+      "timestamp_semantics": "observation_date_and_first_successful_retrieval_utc",
+      "precedence": 1,
+      "validation": "phase1_fred_dgs3mo_schema_v1",
+      "fallback_enabled": true
+    },
+    "sec_evidence": {
+      "source_name": "SEC EDGAR",
+      "endpoint": "https://data.sec.gov/submissions/CIK##########.json",
+      "timestamp_semantics": "accepted_timestamp_and_first_successful_retrieval_utc",
+      "precedence": 1,
+      "validation": "phase1_sec_submission_schema_v1",
+      "fallback_enabled": false
+    },
+    "issuer_news": {
+      "source_name": "Issuer RSS and Google News RSS discovery",
+      "endpoint": "https://news.google.com/rss/search?q={query}",
+      "timestamp_semantics": "original_publication_and_first_successful_retrieval_utc",
+      "precedence": 2,
+      "validation": "phase1_original_source_retrieval_v1",
+      "fallback_enabled": false
+    },
+    "nyse_calendar": {
+      "source_name": "exchange-calendars",
+      "endpoint": "python:exchange_calendars:XNYS",
+      "timestamp_semantics": "pinned_package_session_schedule",
+      "precedence": 1,
+      "validation": "phase1_xnys_calendar_v1",
+      "fallback_enabled": false
+    },
+    "stock_spread_model": {
+      "source_name": "Frozen Phase-1 spread model",
+      "endpoint": "artifact:stock_spread_model:v1",
+      "timestamp_semantics": "registration_time_artifact",
+      "precedence": 1,
+      "validation": "half_spread_5bps_slippage_5bps",
+      "fallback_enabled": false
+    },
+    "borrow_locate": {
+      "source_name": "none approved",
+      "endpoint": "none",
+      "timestamp_semantics": "not_applicable",
+      "precedence": 1,
+      "validation": "shorts_disabled",
+      "fallback_enabled": false
+    },
+    "data_fallbacks": {
+      "treasury_last_published_prior": {
+        "source_name": "FRED DGS3MO prior observation",
+        "endpoint": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS3MO",
+        "timestamp_semantics": "latest_published_observation_strictly_prior_to_valuation",
+        "precedence": 2,
+        "validation": "manifest_freshness_and_first_retrieval_v1",
+        "enabled": true
+      }
+    }
+  },
+  "ai_thresholds": {
+    "sufficiency_probability_micros": 700000,
+    "ambiguity_probability_micros": 300000,
+    "action_probability_micros": 550000,
+    "runner_up_margin_probability_micros": 150000
+  },
+  "quotas": {
+    "max_new_opportunities_per_cycle": 3,
+    "max_new_opportunities_per_utc_day": 20,
+    "max_concurrent_requests": 3,
+    "max_attempts_per_stage": 3,
+    "cycle_deadline_seconds": 600,
+    "daily_ai_budget_microdollars": 3000000,
+    "daily_provider_calls": 240,
+    "daily_input_tokens": 2000000,
+    "daily_output_tokens": 400000,
+    "daily_evidence_bytes": 67108864,
+    "max_evidence_bytes_per_opportunity": 4194304,
+    "retry_initial_backoff_milliseconds": 500,
+    "retry_max_backoff_milliseconds": 8000,
+    "retry_jitter_micros": 200000,
+    "pool_allocation": {
+      "polymarket_entry_micros": 350000,
+      "polymarket_review_micros": 150000,
+      "stock_entry_micros": 350000,
+      "stock_review_micros": 150000,
+      "priority_rule": "scheduled_slot_then_semantic_subject_id"
+    }
+  },
+  "polymarket": {
+    "scan_interval_minutes": 15,
+    "accepted_categories": ["business", "crypto", "economy", "politics", "science", "technology", "world"],
+    "excluded_categories": ["sports"],
+    "min_resolution_hours": 1,
+    "max_resolution_days": 30,
+    "min_trailing_24h_volume_microdollars": 10000000000,
+    "min_two_point_depth_contracts": 5000,
+    "max_spread_probability_micros": 40000,
+    "cluster_algorithm": "normalized_resolution_source_question_v1",
+    "cluster_version": "phase1-v1",
+    "cluster_tie_breakers": ["trailing_24h_usd_volume_desc", "qualifying_depth_desc", "market_id_asc"],
+    "opportunity_rule": "first_eligible_slot_per_cluster_no_reentry",
+    "book_max_age_seconds": 60,
+    "min_gross_edge_probability_micros": 50000,
+    "cost_edge_multiplier_micros": 2000000,
+    "edge_reserve_probability_micros": 30000,
+    "risk_budget_equity_micros": 5000,
+    "sigma_floor_microdollars_per_contract": 50000,
+    "max_cluster_cost_equity_micros": 100000,
+    "max_portfolio_gross_equity_micros": 500000,
+    "max_open_clusters": 5,
+    "max_depth_participation_micros": 50000,
+    "max_volume_participation_micros": 10000,
+    "adverse_stop_probability_micros": 150000,
+    "favorable_target_probability_micros": 100000,
+    "max_holding_calendar_days": 7,
+    "review_interval_minutes": 15,
+    "depth_haircut_micros": 500000,
+    "quantity_beyond_depth_marks_zero": true
+  },
+  "stocks": {
+    "universe": "S&P 100",
+    "membership_artifact_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+    "candidate_count": 20,
+    "candidate_score_rule": "abs_zscore_5d_return_plus_zscore_volume_surprise",
+    "candidate_tie_breaker": "ticker_ascending",
+    "evidence_lookback_calendar_days": 7,
+    "shorts_enabled": false,
+    "risk_budget_equity_micros": 5000,
+    "stop_atr_multiplier_micros": 2000000,
+    "target_atr_multiplier_micros": 3000000,
+    "max_position_equity_micros": 100000,
+    "max_portfolio_gross_equity_micros": 500000,
+    "max_sector_gross_equity_micros": 250000,
+    "max_open_positions": 5,
+    "entry_gap_limit_micros": 100000,
+    "half_spread_micros": 500,
+    "adverse_slippage_micros": 500,
+    "max_holding_trading_days": 10,
+    "review_cadence": "after_each_official_close",
+    "common_exit_rules": ["two_atr_stop", "three_atr_target", "ten_trading_days", "unmodelable_corporate_action", "invalid_pricing"],
+    "fill_rule": "next_official_open_after_publication",
+    "stop_target_collision_rule": "stop_first",
+    "gap_fill_rule": "official_open"
+  },
+  "costs": {
+    "shared_ai_deterministic_split_micros": 500000,
+    "ai_direct_costs": ["openai", "jev", "evidence_retrieval", "paid_evidence_data", "incremental_ai_infrastructure"],
+    "deterministic_direct_costs": ["deterministic_specific"],
+    "weekly_allocation_rule": "direct_to_opportunity_then_equal_within_utc_enrollment_week_residual_retained",
+    "uncertain_cost_stress_multipliers_micros": [500000, 1000000, 1500000],
+    "joint_adverse_cost_multiplier_micros": 1500000,
+    "joint_adverse_depth_haircut_micros": 500000,
+    "zero_bid_valuation_rule": "quantity_beyond_executable_bid_depth_marks_zero",
+    "statutory_fees_scale": false,
+    "cash_yield_scales": false
+  },
+  "baselines": {
+    "cash_series": "DGS3MO",
+    "stock_passive_oef_weight_micros": 500000,
+    "stock_passive_cash_weight_micros": 500000,
+    "stock_passive_rebalance": "month_end_next_open_same_cost_rules",
+    "polymarket_control_artifact_id": "EXAMPLE_POLY_CONTROL_V1",
+    "polymarket_control_artifact_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+    "stock_control_artifact_id": "EXAMPLE_STOCK_CONTROL_V1",
+    "stock_control_artifact_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+    "stock_prevalence_artifact_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+    "polymarket_forecast_baseline": "common_t3_executable_midpoint",
+    "stock_forecast_baseline": "frozen_pre_run_candidate_prevalence"
+  },
+  "endpoint": {
+    "tm_rule": "tenth_nyse_session_strictly_after_e_plus_30_calendar_days",
+    "daily_valuation_time_utc": "21:00:00",
+    "no_entry_after_enrollment_end": true,
+    "classification_uses_fixed_tm": true,
+    "later_settlements_are_supplemental": true
+  },
+  "statistics": {
+    "risk_unit_microdollars": 50000000,
+    "theta_null_probability_micros": 30000,
+    "theta_alt_probability_micros": 60000,
+    "bootstrap_replicates": 99999,
+    "bootstrap_seed": 20261002,
+    "expected_block_length_policy": "pre_run_simulation_only",
+    "expected_block_length_artifact_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+    "holm_first_threshold_probability_micros": 25000,
+    "holm_second_threshold_probability_micros": 50000,
+    "confirmatory_min_weeks": 26,
+    "confirmatory_min_resolved_polymarket_clusters": 100,
+    "confirmatory_power_probability_micros": 800000,
+    "terminal_slot_threshold_probability_micros": 990000,
+    "max_drawdown_relative_tolerance_probability_micros": 20000,
+    "max_drawdown_absolute_probability_micros": 100000,
+    "weekly_loss_floor_probability_micros": -10000,
+    "count_retention_probability_micros": 600000,
+    "dollar_day_retention_probability_micros": 600000,
+    "classification_precedence": ["OPERATIONALLY_INFEASIBLE", "INCONCLUSIVE", "PROMISING", "NO_EVIDENCE"],
+    "simultaneous_lower_bound_order_statistic": 97500,
+    "max_total_bootstrap_draws": 999990
+  },
+  "runtime": {
+    "writer_processes": 1,
+    "sqlite_synchronous": "FULL",
+    "backup_rpo_hours": 24,
+    "restore_rto_hours": 2,
+    "restore_drill_cadence": "before_registration_and_monthly",
+    "polymarket_review_cadence_minutes": 15,
+    "stock_review_cadence": "after_each_official_close"
+  }
+}

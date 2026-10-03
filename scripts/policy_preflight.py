@@ -13,11 +13,17 @@ from typing import Any
 
 ROOT = Path(__file__).absolute().parent.parent
 SCRIPT = ROOT / "scripts/policy_preflight.py"
-EXPECTED_LOCK_HASH = "de8ad6a56fadc9beed5d1e8350e5bd1b43bb597e2805751d64506e933ed3af7c"
+EXPECTED_LOCK_HASH = "463b2ad06b3fcc3af5f7507dd8185b6c7397145a38f2bf9e4f9e65cb5bdad538"
 PYPI_SOURCE = {"registry": "https://pypi.org/simple"}
 EXPECTED_SOURCE_DIRS = frozenset(
     {"src", "src/jev_trading_lab", "src/jev_trading_lab/core"}
 )
+EXPECTED_CONFIG_DIRS = frozenset({"config"})
+EXPECTED_CONFIG_HASHES = {
+    "config/phase1.example.json": (
+        "7f4d0c04af6ed7b19952cba9be9f827117261cc573e77b7404f3fe6ae2037a1c"
+    )
+}
 EXPECTED_SOURCE_HASHES = {
     "src/jev_trading_lab/__init__.py": (
         "583ff05fc923ac30ef5cd0e9c44271e53746a65e312f53f112ec1b49e827647b"
@@ -27,6 +33,9 @@ EXPECTED_SOURCE_HASHES = {
     ),
     "src/jev_trading_lab/core/ids.py": (
         "0e73742a406e112f269e7b8d5fd205c448eb4fbf49541cab3c669bf7b4dc0dd4"
+    ),
+    "src/jev_trading_lab/core/manifest.py": (
+        "675c0aa9e1489d29753c3b7f3e5a5bc756b363e5e64e4fa3a1f2be9f3b29a07c"
     ),
     "src/jev_trading_lab/core/observations.py": (
         "dbad9fa1099b527a640e68fc105641757ef2ef2fd68a504e208dda06958391ec"
@@ -44,7 +53,7 @@ EXPECTED_PROJECT = {
     "description": "Paper-only evidence-first market research lab",
     "readme": "README.md",
     "requires-python": ">=3.12",
-    "dependencies": ["typer>=0.19,<1"],
+    "dependencies": ["pydantic>=2.12,<3", "typer>=0.19,<1"],
     "classifiers": [
         "Development Status :: 2 - Pre-Alpha",
         "Intended Audience :: Science/Research",
@@ -111,7 +120,7 @@ EXPECTED_PROJECT_PACKAGE = {
     "name": "jev-trading-lab",
     "version": "0.1.0",
     "source": {"editable": "."},
-    "dependencies": [{"name": "typer"}],
+    "dependencies": [{"name": "pydantic"}, {"name": "typer"}],
     "dev-dependencies": {
         "dev": [
             {"name": "hatchling"},
@@ -125,7 +134,10 @@ EXPECTED_PROJECT_PACKAGE = {
         ]
     },
     "metadata": {
-        "requires-dist": [{"name": "typer", "specifier": ">=0.19,<1"}],
+        "requires-dist": [
+            {"name": "pydantic", "specifier": ">=2.12,<3"},
+            {"name": "typer", "specifier": ">=0.19,<1"},
+        ],
         "requires-dev": {
             "dev": [
                 {"name": "hatchling", "specifier": "==1.27.0"},
@@ -338,6 +350,7 @@ def _check_workflow_and_trees(violations: list[str]) -> None:
                 f"approved workflow ({expected_hash})"
             )
     _walk_exact_tree("src", EXPECTED_SOURCE_DIRS, EXPECTED_SOURCE_HASHES, violations)
+    _walk_exact_tree("config", EXPECTED_CONFIG_DIRS, EXPECTED_CONFIG_HASHES, violations)
     _walk_exact_tree(
         "scripts",
         {"scripts"},

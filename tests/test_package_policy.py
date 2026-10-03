@@ -68,6 +68,12 @@ def _requirement_name(requirement: str) -> str:
 _APPROVED_SOURCE_DIRS = frozenset(
     {"src", "src/jev_trading_lab", "src/jev_trading_lab/core"}
 )
+_APPROVED_CONFIG_DIRS = frozenset({"config"})
+_APPROVED_CONFIG_HASHES = {
+    "config/phase1.example.json": (
+        "7f4d0c04af6ed7b19952cba9be9f827117261cc573e77b7404f3fe6ae2037a1c"
+    )
+}
 _APPROVED_SOURCE_HASHES = {
     "src/jev_trading_lab/__init__.py": (
         "583ff05fc923ac30ef5cd0e9c44271e53746a65e312f53f112ec1b49e827647b"
@@ -77,6 +83,9 @@ _APPROVED_SOURCE_HASHES = {
     ),
     "src/jev_trading_lab/core/ids.py": (
         "0e73742a406e112f269e7b8d5fd205c448eb4fbf49541cab3c669bf7b4dc0dd4"
+    ),
+    "src/jev_trading_lab/core/manifest.py": (
+        "675c0aa9e1489d29753c3b7f3e5a5bc756b363e5e64e4fa3a1f2be9f3b29a07c"
     ),
     "src/jev_trading_lab/core/observations.py": (
         "dbad9fa1099b527a640e68fc105641757ef2ef2fd68a504e208dda06958391ec"
@@ -137,12 +146,12 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "9d79b05b4cd1c7219f3eac14ea3e78b636ec088e93be998cc57e68f9916ca165"
+    "a33883350e207506dd05f80f065c3cf817545708b87052eaef55daf31a283967"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "39e9b034de67fb4dd4c2cbf3fbf4c1bdfcb68f2b4732525fd1802e5deced6bfd"
+    "95de5d60ce44d1c2bb8131f93163eb14b802f5abfdf9024db75001e353aad25d"
 )
-_ALLOWED_RUNTIME_REQUIREMENTS = ["typer>=0.19,<1"]
+_ALLOWED_RUNTIME_REQUIREMENTS = ["pydantic>=2.12,<3", "typer>=0.19,<1"]
 _ALLOWED_DEPENDENCY_GROUPS = {
     "dev": [
         "hatchling==1.27.0",
@@ -222,6 +231,81 @@ def _source_policy_violations(root: Path) -> list[str]:
         for relative in sorted(expected - seen)
     )
     return violations
+
+
+def _config_policy_violations(root: Path) -> list[str]:
+    expected = _APPROVED_CONFIG_DIRS | _APPROVED_CONFIG_HASHES.keys()
+    seen: set[str] = set()
+    violations: list[str] = []
+    pending = [root / "config"]
+    while pending:
+        path = pending.pop()
+        relative = path.relative_to(root).as_posix()
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            violations.append(f"{relative}: config path is unreadable: {error}")
+            continue
+        seen.add(relative)
+        if stat.S_ISLNK(metadata.st_mode):
+            violations.append(f"{relative}: config symlink is not allowed")
+        elif stat.S_ISDIR(metadata.st_mode):
+            if relative not in _APPROVED_CONFIG_DIRS:
+                violations.append(f"{relative}: config directory is not approved")
+            try:
+                with os.scandir(path) as entries:
+                    pending.extend(Path(entry.path) for entry in entries)
+            except OSError as error:
+                violations.append(
+                    f"{relative}: config directory is unreadable: {error}"
+                )
+        elif stat.S_ISREG(metadata.st_mode):
+            approved_hash = _APPROVED_CONFIG_HASHES.get(relative)
+            if approved_hash is None:
+                violations.append(f"{relative}: config file is not approved")
+                continue
+            try:
+                content = path.read_bytes()
+                content.decode("utf-8")
+            except (OSError, UnicodeError) as error:
+                violations.append(
+                    f"{relative}: config file is not readable UTF-8: {error}"
+                )
+                continue
+            if hashlib.sha256(content).hexdigest() != approved_hash:
+                violations.append(f"{relative}: SHA-256 does not match approved config")
+        else:
+            violations.append(f"{relative}: special config file is not allowed")
+    violations.extend(
+        f"{relative}: approved config path is missing"
+        for relative in sorted(expected - seen)
+    )
+    return violations
+
+
+def test_exact_config_hash_rejects_mutation(tmp_path: Path) -> None:
+    config = tmp_path / "config/phase1.example.json"
+    config.parent.mkdir()
+    config.write_bytes((ROOT / "config/phase1.example.json").read_bytes())
+    with config.open("ab") as manifest:
+        manifest.write(b"\n")
+
+    violations = _config_policy_violations(tmp_path)
+
+    assert violations == [
+        "config/phase1.example.json: SHA-256 does not match approved config"
+    ]
+
+
+def test_extra_physical_config_path_is_rejected(tmp_path: Path) -> None:
+    config = tmp_path / "config/phase1.example.json"
+    config.parent.mkdir()
+    config.write_bytes((ROOT / "config/phase1.example.json").read_bytes())
+    (tmp_path / "config/unreviewed.json").write_text("{}\n", encoding="utf-8")
+
+    violations = _config_policy_violations(tmp_path)
+
+    assert violations == ["config/unreviewed.json: config file is not approved"]
 
 
 def _dependency_names(requirements: object) -> set[str]:
@@ -359,7 +443,7 @@ def _operational_policy_violations(root: Path) -> list[str]:
 def _runtime_policy_violations(root: Path) -> list[str]:
     project_data = _project_data(root)
     project = project_data.get("project", {})
-    allowed_runtime = {"typer"}
+    allowed_runtime = {"pydantic", "typer"}
     runtime_requirements = project.get("dependencies", [])
     runtime_names = _dependency_names(runtime_requirements)
     violations = [
@@ -465,6 +549,7 @@ def _runtime_policy_violations(root: Path) -> list[str]:
             )
 
     violations.extend(_source_policy_violations(root))
+    violations.extend(_config_policy_violations(root))
     violations.extend(_operational_policy_violations(root))
     return violations
 
@@ -480,6 +565,7 @@ def _initialize_approved_source_fixture(tmp_path: Path) -> Path:
         "__init__.py",
         "cli.py",
         "core/ids.py",
+        "core/manifest.py",
         "core/observations.py",
         "core/time.py",
         "core/values.py",
@@ -493,6 +579,9 @@ def _initialize_approved_source_fixture(tmp_path: Path) -> Path:
     script = tmp_path / "scripts/policy_preflight.py"
     script.parent.mkdir()
     script.write_bytes((ROOT / "scripts/policy_preflight.py").read_bytes())
+    config = tmp_path / "config/phase1.example.json"
+    config.parent.mkdir()
+    config.write_bytes((ROOT / "config/phase1.example.json").read_bytes())
     return package
 
 
@@ -813,6 +902,7 @@ def _copy_preflight_fixture(tmp_path: Path) -> Path:
         target.parent.mkdir(parents=True)
         target.write_bytes((ROOT / relative).read_bytes())
     shutil.copytree(ROOT / "src", repo / "src")
+    shutil.copytree(ROOT / "config", repo / "config")
     scripts = ROOT / "scripts"
     if scripts.exists():
         shutil.copytree(scripts, repo / "scripts", symlinks=True)
@@ -1277,6 +1367,7 @@ def test_built_artifacts_exclude_repository_and_host_junk(tmp_path: Path) -> Non
         "jev_trading_lab/__init__.py",
         "jev_trading_lab/cli.py",
         "jev_trading_lab/core/ids.py",
+        "jev_trading_lab/core/manifest.py",
         "jev_trading_lab/core/observations.py",
         "jev_trading_lab/core/time.py",
         "jev_trading_lab/core/values.py",
