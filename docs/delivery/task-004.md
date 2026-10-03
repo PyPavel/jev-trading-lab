@@ -19,6 +19,7 @@ Review-finding corrections:
 ```text
 0476dd3 fix(core): close manifest trust and policy gaps
 be86be2cf9a764b7b9120c5008ac46fc6451707c fix(core): freeze model input and activation identities
+b85d8fc00942730c2819c9583c48574da1b5ff46 fix(core): close activation and schema identity gaps
 ```
 
 ## Review findings resolved
@@ -30,7 +31,9 @@ be86be2cf9a764b7b9120c5008ac46fc6451707c fix(core): freeze model input and activ
 - Tightened provider categories to lowercase, nonempty, unique tuples with case-insensitive sports rejection. Provider and Treasury contracts now freeze source, endpoint, timestamp, precedence, validation, and fallback behavior.
 - Added provider-specific dated immutable model snapshot validation plus stable expected revision/fingerprint fields. Snapshot IDs now reject `latest`, `current`, and `default` as case-insensitive token components anywhere in the ID, and validate the required suffix with `date.fromisoformat()` so impossible dates fail.
 - Replaced the broad activation placeholder scan with field-aware identity validation. Revision, fingerprint, artifact, model, hash, and version fields reject normalized unresolved markers; hashes reject trivial/repeated patterns; revision, fingerprint, version, and artifact identities require structured values. The checked-in example remains parser-valid only under `example_only=true`, while a sanitized non-example fixture passes activation.
-- Added required root `model_input_policy` identities for the OpenAI prompt template, OpenAI schema, evidence delimiter, Jev state template, and Jev question set. Every artifact has a required version and lowercase SHA-256; removal fails validation, mutation changes `manifest_id`, and activation rejects placeholder identities.
+- Added required root `model_input_policy` identities for the OpenAI prompt template, evidence delimiter, Jev state template, and Jev question set. Every artifact has a required version and lowercase SHA-256; removal fails validation, mutation changes `manifest_id`, and activation rejects placeholder identities.
+- Closed activation marker bypasses with deterministic lowercase, non-alphanumeric component parsing. Strong unresolved components and explicit phrases are rejected anywhere in revisions, fingerprints, SDK identities, artifact IDs/versions, model-input policy versions, provider contract versions, and rule versions; real-shaped identities with marker substrings remain valid.
+- Made each model contract the sole response-schema identity owner. Removed duplicate OpenAI schema identity from `model_input_policy`, rejected legacy/divergent duplicate fields, named OpenAI and Jev response schemas distinctly, and retained the independently frozen Jev question-set identity.
 - Hardened parsing with iterative depth/item/string limits, deterministic sorted/capped validation errors, and deterministic `RecursionError` conversion.
 - Hardened file loading to open once, `fstat()` the descriptor before/after, read only `MAX_MANIFEST_BYTES + 1`, and reject practical size/identity races.
 - Preserved exact source/config policy. Updated only reviewed hashes, preflight hash, workflow-embedded preflight hash, and workflow hash. Dependencies and `uv.lock` are unchanged.
@@ -87,17 +90,29 @@ Failed: DID NOT RAISE ValueError
 
 Each focused case passed after its minimal implementation, including adversarial embedded normalized markers and malformed version/artifact identities.
 
+The remaining activation/schema identity correction was also test-first:
+
+```text
+uv run pytest tests/core/test_manifest.py::test_activation_rejects_unresolved_marker_components_anywhere tests/core/test_manifest.py::test_activation_rejects_unresolved_markers_in_every_identity_class tests/core/test_manifest.py::test_activation_accepts_real_shaped_identity_components tests/core/test_manifest.py::test_model_input_policy_is_required_content_addressed_and_identity_bound -q
+35 failed, 45 passed
+Missing failures covered embedded/suffixed `placeholder`, `todo`, and `tbd`; `none`, `null`, `na`, and `notapplicable`; SDK package/version and other activation identity classes; the duplicate OpenAI policy schema still existed.
+
+uv run pytest tests/core/test_manifest.py::test_model_input_policy_is_required_content_addressed_and_identity_bound -q
+1 failed
+Expected distinct authoritative `phase1-openai-response-schema-v1`; found ambiguous `phase1-schema-v1`.
+```
+
 ## Focused GREEN evidence
 
 ```text
-uv run pytest tests/core/test_manifest.py -q
-177 passed in 0.72s
+uv run pytest tests/core/test_manifest.py::test_activation_rejects_unresolved_marker_components_anywhere tests/core/test_manifest.py::test_activation_rejects_unresolved_markers_in_every_identity_class tests/core/test_manifest.py::test_activation_accepts_real_shaped_identity_components tests/core/test_manifest.py::test_model_input_policy_is_required_content_addressed_and_identity_bound -q
+92 passed in 0.43s
 
-uv run pytest tests/core/test_manifest.py tests/test_package_policy.py -q
-230 passed in 1.76s
+uv run pytest tests/test_package_policy.py -q
+53 passed in 1.11s
 ```
 
-Adversarial coverage includes Pydantic inherited bypass absence, constructor rejection, `TypeAdapter(Manifest)` rejection, no `__dict__`, object-copy safety, canonical round-trip, deliberate `object.__setattr__` tampering caught by revalidation, parser-valid/example-only activation rejection, a valid sanitized activation fixture, reserved alias components under mixed case/separators, impossible snapshot dates, every reviewer-supplied unresolved marker in `expected_revision`, embedded markers, representative fingerprint/artifact/version/hash fields, required model-input policy removals, manifest identity mutation, case/duplicate categories, exact Treasury/provider contracts, 1,100-level nesting, 40,000 invalid categories within the byte cap, deterministic key-order-independent errors, capped error output, and simulated descriptor-size race.
+Adversarial coverage includes Pydantic inherited bypass absence, constructor rejection, `TypeAdapter(Manifest)` rejection, no `__dict__`, object-copy safety, canonical round-trip, deliberate `object.__setattr__` tampering caught by revalidation, parser-valid/example-only activation rejection, a valid sanitized activation fixture, reserved alias components under mixed case/separators, impossible snapshot dates, every requested unresolved token/phrase in prefix/embedded/suffix positions, revisions/fingerprints/SDK identities/artifact identities/model-input versions/provider revisions/rule versions, valid real-shaped substring controls, rejected legacy/divergent OpenAI policy-schema keys, distinct model response-schema identities, retained Jev question-set identity, manifest identity mutation, case/duplicate categories, exact Treasury/provider contracts, 1,100-level nesting, 40,000 invalid categories within the byte cap, deterministic key-order-independent errors, capped error output, and simulated descriptor-size race.
 
 ## Full gate evidence
 
@@ -111,10 +126,10 @@ uv lock --check
 Resolved 55 packages in 1ms
 
 uv sync --frozen --all-groups
-Checked 54 packages in 0.53ms
+Checked 54 packages in 0.56ms
 
 env PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
-362 passed in 1.87s
+451 passed in 2.31s
 
 uv run ruff check .
 All checks passed!
@@ -125,10 +140,10 @@ uv run ruff format --check .
 uv run mypy src
 Success: no issues found in 7 source files
 
-uv export --frozen --all-groups --no-emit-project --format requirements-txt --output-file /tmp/jev-task-004-review-audit.txt --quiet
+uv export --frozen --all-groups --no-emit-project --format requirements-txt --output-file /tmp/jev-task-004-activation-audit.txt --quiet
 exit 0
 
-uv run pip-audit --strict --requirement /tmp/jev-task-004-review-audit.txt --no-deps --disable-pip
+uv run pip-audit --strict --requirement /tmp/jev-task-004-activation-audit.txt --no-deps --disable-pip
 No known vulnerabilities found
 
 uv build --no-build-isolation
