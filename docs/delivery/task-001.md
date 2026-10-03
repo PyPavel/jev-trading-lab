@@ -10,6 +10,8 @@ Initialized the Python 3.12 `jev-trading-lab` package and hardened its package, 
 808bf56705f36961fa0c59024f4012dc97f6bd20 build: initialize paper-only trading lab
 3cdd7d6                                docs(delivery): record task 001 evidence
 c14463db0cee4b46fb27e5536ec2fd123d2fcd30 fix(build): harden paper-only package policy
+9be18de                                docs(delivery): update task 001 review evidence
+1d78de00212e7a26c5c64cb539813b0e002c199c fix(build): enforce fail-closed package capabilities
 ```
 
 The earlier evidence commit remains in history. Its PASS verdict was premature and is superseded by this document.
@@ -116,6 +118,48 @@ astral-sh/setup-uv v6:     d0d8abe699bfb85fec6de9f7adb5ae17292296ff
 gitleaks/gitleaks-action v2: dcedce43c6f43de0b836d1fe38946645c9c638dc
 ```
 
+## Independent re-review findings
+
+Two independent re-reviews still found major issues after `c14463d`:
+
+1. The syntax-pattern scanner allowed every standard-library import and the top-level `jev_trading_lab` package. This permitted network/process capabilities (`urllib`, `http`, `socket`, `subprocess`, `os.system`, and `importlib`) plus project-local execution modules through import aliases and full paths.
+2. Pattern checks could be bypassed through `urllib.request.Request(method="POST")`, `http.client.HTTPSConnection.request`, composed subprocess/curl arguments, dynamic imports, `getattr` name composition, and mapping or keyword URL arguments.
+3. Non-UTF8 files under `src/`, `scripts/`, and `ops/` were silently skipped.
+4. CI used isolated `uv build`, which could resolve a build environment separately from the frozen synced lock.
+
+## Re-review RED evidence
+
+Mandatory positive controls were added before the implementation change. Command:
+
+```console
+uv run pytest tests/test_package_policy.py -k 'fail_closed or ci_uses' -q
+```
+
+Observed expected output:
+
+```text
+FFFFFFFFFFFFFFFFFFFF                                                     [100%]
+20 failed, 32 deselected in 0.25s
+```
+
+The failures covered urllib POST plus `urlopen`, `http.client` POST, subprocess curl with composed argv, dynamic `__import__` and `importlib`, project-local broker/wallet/signing/order/execution/live imports, composed `getattr`, mapping and keyword URL arguments, composed shell variables, non-UTF8 files in all three guarded roots, and CI's missing `--no-build-isolation` flag.
+
+## Re-review fixes
+
+Production fix commit:
+
+```text
+1d78de00212e7a26c5c64cb539813b0e002c199c fix(build): enforce fail-closed package capabilities
+```
+
+Changes:
+
+- Replaced the growing dangerous-spelling scan with exact per-path import and call allowlists for the current `__init__.py` and `cli.py` package only.
+- Inspected complete import paths, including names imported by `from` statements; any future production module, import, or call now fails until explicitly authorized under a failing test.
+- Restricted project entry points and complete `[tool]` configuration to the current known values while retaining the PEP 503-normalized runtime dependency allowlist.
+- Rejected every current `scripts/` and `ops/` file and every non-Python file under `src/`; unreadable/non-UTF8 surfaces therefore fail closed rather than being skipped.
+- Changed CI to build from the frozen synced environment with `uv build --no-build-isolation` and added a policy assertion preventing regression to isolated build mode.
+
 ## Focused paper-only policy verification
 
 Command:
@@ -127,28 +171,37 @@ uv run pytest tests/test_package_policy.py -q
 Observed output:
 
 ```text
-.................................                                        [100%]
-33 passed in 0.23s
+........................................                                 [100%]
+40 passed in 0.23s
 ```
 
 This includes all positive controls and a scan of the repository's current runtime/config surfaces.
 
 ## Lock, sync, full suite, lint, type, audit, and build verification
 
-Command:
+Commands were run sequentially and each exited 0:
 
 ```console
-uv lock --check && uv sync --frozen --all-groups && uv run pytest -q && uv run ruff check . && uv run ruff format --check . && uv run mypy src && uv export --frozen --all-groups --no-emit-project --format requirements-txt --output-file /tmp/jev-audit-requirements.txt >/tmp/jev-export.log && uv run pip-audit --strict --requirement /tmp/jev-audit-requirements.txt --no-deps --disable-pip && uv build
+uv lock --check
+uv sync --frozen --all-groups
+uv run pytest -q
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src
+uv export --frozen --all-groups --no-emit-project --format requirements-txt --output-file /tmp/jev-audit-requirements.txt
+uv run pip-audit --strict --requirement /tmp/jev-audit-requirements.txt --no-deps --disable-pip
+uv build --no-build-isolation
+git diff --check
 ```
 
-Observed output and exit status 0:
+Observed output:
 
 ```text
 Resolved 51 packages in 1ms
-Checked 50 packages in 0.52ms
+Checked 50 packages in 0.90ms
 
-.................................                                        [100%]
-33 passed in 0.23s
+........................................                                 [100%]
+40 passed in 0.23s
 All checks passed!
 5 files already formatted
 Success: no issues found in 2 source files
@@ -161,7 +214,9 @@ Successfully built dist/jev_trading_lab-0.1.0.tar.gz
 Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
 ```
 
-`uv export` generated a fully pinned, hashed requirements file from the frozen lock. `pip-audit --locked .` was also attempted, but pip-audit 2.10.1 returned `no lockfiles found in .` because it does not recognize `uv.lock`; the frozen export route above is the reproducible CI/local audit path.
+The successful build used `--no-build-isolation`; a normal isolated build is no longer treated as reproducibility evidence.
+
+`uv export` generated a fully pinned, hashed requirements file from the frozen lock for the reproducible CI/local audit path.
 
 Locked reviewed tool versions:
 
@@ -176,12 +231,13 @@ respx 0.23.1
 
 ## Self-review
 
-- Production diff is limited to `.github/workflows/ci.yml`, `pyproject.toml`, `tests/test_package_policy.py`, and `uv.lock`.
+- Latest production diff is limited to `.github/workflows/ci.yml` and `tests/test_package_policy.py`.
 - No approved design, plan, or review file changed.
 - `git diff --check` passed.
-- Production fix commit was verified with `git show --stat --oneline c14463d`.
+- Production fix commit was verified with `git show --stat --oneline 1d78de0`.
 - Vulnerability audit completed over the frozen, fully pinned lock export with no known vulnerabilities.
 - Policy positive controls and the current repository scan passed.
+- Delivery evidence remains pending independent re-review; no Task 2 work started.
 
 ## Review status
 
