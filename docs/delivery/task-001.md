@@ -12,6 +12,8 @@ Initialized the Python 3.12 `jev-trading-lab` package and hardened its package, 
 c14463db0cee4b46fb27e5536ec2fd123d2fcd30 fix(build): harden paper-only package policy
 9be18de                                docs(delivery): update task 001 review evidence
 1d78de00212e7a26c5c64cb539813b0e002c199c fix(build): enforce fail-closed package capabilities
+fe13916                                docs(delivery): update task 001 security rereview
+10433a2ec8211fb444c1775657f4b26503c2b0d5 fix(build): close paper-policy provenance gaps
 ```
 
 The earlier evidence commit remains in history. Its PASS verdict was premature and is superseded by this document.
@@ -229,15 +231,113 @@ pytest-asyncio 1.4.0
 respx 0.23.1
 ```
 
+## Provenance re-review findings
+
+A further independent review found four remaining fail-open paths after `1d78de0`:
+
+1. Lexically allowed call names `main` and `app` could be rebound or aliased to `exec`, `__import__`, `os.system`, urllib/http/process functions, or `getattr`, then invoked through the allowed spelling.
+2. Arbitrary direct packages could be added to development dependency groups, and their direct lock representations were not checked.
+3. `[project.optional-dependencies]` and the corresponding lock section could introduce trading SDKs without violating runtime dependency checks.
+4. Production paths beneath `src/**/__pycache__` were skipped, including executable, unreadable, or non-UTF8 source fixtures.
+
+## Provenance RED evidence
+
+Positive controls were added before implementation. Command:
+
+```console
+uv run pytest tests/test_package_policy.py -k 'allowed_call_names or dependency_group_rejects or optional_dependencies_are_rejected or production_pycache' -q
+```
+
+Observed expected output:
+
+```text
+FFFFFFFFFFFFFFF                                                          [100%]
+15 failed, 40 deselected in 0.19s
+```
+
+The failures covered `main` rebound to `exec`, `__import__`, `os.system`, urllib, HTTP, subprocess, and `getattr`; `app` rebound to `exec`; assignment/alias chains; an unapproved `py-clob-client` dev dependency in `pyproject.toml` and `uv.lock`; `alpaca-py` optional dependencies in both files; and executable non-UTF8 `src/__pycache__/live.py`.
+
+Additional frozen-contract and lock-metadata controls were observed failing before their minimal fixes:
+
+```console
+uv run pytest tests/test_package_policy.py -k frozen_source_contract -q
+uv run pytest tests/test_package_policy.py::test_lock_metadata_dev_group_rejects_unapproved_direct_dependency -q
+```
+
+```text
+3 failed, 59 deselected in 0.15s
+1 failed in 0.12s
+```
+
+These controls cover mutation of allowed imported attributes, mutation of the `app` instance, arbitrary alias assignments, and uv's `[package.metadata.requires-dev]` direct dependency representation.
+
+Regenerated-lock controls were verified against real uv output in temporary projects. Both an unapproved dev group and an optional `alpaca-py` extra produced valid locks (`uv lock --check` exit 0) with project-level `dev-dependencies` and `optional-dependencies` sections, respectively.
+
+## Provenance fixes
+
+Production fix commit:
+
+```text
+10433a2ec8211fb444c1775657f4b26503c2b0d5 fix(build): close paper-policy provenance gaps
+```
+
+Changes:
+
+- Calls now require allowed provenance: the imported `typer` module, the one allowlisted `typer.Typer()` app binding, or the declared local `main` function. Dynamic execution and introspection calls are explicitly blocked.
+- Protected `app`/`main` bindings reject assignment, import aliasing, nested declarations, arguments, deletion, and alias chains. The frozen two-file contract also rejects every assignment except the current app initialization and package version constant.
+- Runtime and every dependency group now use exact direct dependency allowlists. uv project-lock `dev-dependencies`, `dependency-groups`, and `metadata.requires-dev` representations are all checked.
+- Optional dependency tables are rejected in both `pyproject.toml` and the project package's uv lock section.
+- Production source enumeration uses Git tracked plus non-ignored untracked paths for the real repository, so ordinary ignored interpreter caches do not make tests flaky. Explicit fixture roots inspect their complete source tree and reject any `__pycache__` path, including unreadable/non-UTF8/executable content.
+- Invalid or unreadable lock TOML now records a policy violation rather than escaping the scanner.
+
+## Final verification
+
+Commands were run sequentially from the repository root and exited 0:
+
+```console
+uv lock
+uv lock --check
+uv sync --frozen --all-groups
+uv run pytest -q
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src
+uv export --frozen --all-groups --no-emit-project --format requirements-txt --output-file /tmp/jev-audit-requirements.txt
+uv run pip-audit --strict --requirement /tmp/jev-audit-requirements.txt --no-deps --disable-pip
+uv build --no-build-isolation
+git diff --check
+```
+
+Observed output:
+
+```text
+Resolved 51 packages in 1ms
+Resolved 51 packages in 1ms
+Checked 50 packages in 0.48ms
+..............................................................           [100%]
+62 passed in 0.33s
+All checks passed!
+5 files already formatted
+Success: no issues found in 2 source files
+WARNING:pip_audit._cli:--no-deps is supported, but users are encouraged to fully hash their pinned dependencies
+WARNING:pip_audit._cli:Consider using a tool like `pip-compile`: https://pip-tools.readthedocs.io/en/latest/#using-hashes
+No known vulnerabilities found
+Building source distribution...
+Building wheel from source distribution...
+Successfully built dist/jev_trading_lab-0.1.0.tar.gz
+Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
+```
+
+`uv lock` regenerated no tracked change. `git diff --check` produced no output.
+
 ## Self-review
 
-- Latest production diff is limited to `.github/workflows/ci.yml` and `tests/test_package_policy.py`.
+- Latest production fix is limited to `tests/test_package_policy.py`; delivery evidence is isolated in this document.
 - No approved design, plan, or review file changed.
-- `git diff --check` passed.
-- Production fix commit was verified with `git show --stat --oneline 1d78de0`.
+- Production fix commit was verified with `git show --stat --oneline 10433a2`.
 - Vulnerability audit completed over the frozen, fully pinned lock export with no known vulnerabilities.
-- Policy positive controls and the current repository scan passed.
-- Delivery evidence remains pending independent re-review; no Task 2 work started.
+- All 62 tests, including mandatory positive controls and current-repository policy scan, passed.
+- Delivery evidence remains pending independent review; no Task 2 work started.
 
 ## Review status
 
