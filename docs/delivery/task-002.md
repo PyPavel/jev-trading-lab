@@ -206,3 +206,101 @@ exit 0
 ```
 
 No dependency or lock file changed. No approved design, plan, or review file changed. Exact source/preflight/workflow contracts remain fail-closed. Task 002 remains pending independent re-review; Task 3 must not start.
+
+## Exact-integer review remediation
+
+Status: **PENDING INDEPENDENT RE-REVIEW**. Task 3 remains blocked.
+
+Quality review found that `_validate_integer()` accepted `int` subclasses. Tagged integer values and hostile subclasses could therefore cross public constructor boundaries, and overridden comparisons could bypass range validation. A reproduced `MicroDollars` bypass persisted `-1` to SQLite.
+
+Production commit:
+
+```text
+c304e83facb7d62cbc5f619978bed1acf6c8ddd0 fix(core): reject tagged and subclass integer inputs
+```
+
+Implemented:
+
+- Public persisted-integer constructors and `scaled_quantity(..., scale=...)` require exact built-in integers before comparisons.
+- `MicroDollars`, `ProbabilityMicros`, and `PriceMicros` reject cross-tag inputs and all custom `int` subclasses.
+- `ScaledQuantity` rejects custom and tagged `units` or `scale` values.
+- `decimal_dollars()` retains its exact `MicroDollars` boundary and converts the validated tag to a plain integer before range validation.
+- Internal factory scaling still yields plain built-in integers. No arithmetic framework was added.
+- Exact source, preflight, and workflow hashes were updated under the fail-closed policy.
+
+### Exact-integer RED evidence
+
+Each regression was run individually before the production change and failed for the intended bypass:
+
+```text
+uv run pytest tests/core/test_values.py::test_tagged_constructors_reject_hostile_int_subclass -q
+1 failed
+Failed: DID NOT RAISE TypeError
+
+uv run pytest tests/core/test_values.py::test_tagged_constructors_reject_cross_tag_inputs -q
+6 failed
+Failed: DID NOT RAISE TypeError
+
+uv run pytest tests/core/test_values.py::test_scaled_quantity_rejects_custom_and_tagged_integer_inputs -q
+1 failed
+Failed: DID NOT RAISE TypeError
+
+uv run pytest tests/core/test_values.py::test_hostile_int_subclass_cannot_persist_negative_micro_dollars -q
+1 failed
+AssertionError: constructor allowed a negative value to reach SQLite
+assert -1 >= 0
+```
+
+After production behavior changed but before reviewed source hashes were updated, both source-policy controls failed closed:
+
+```text
+/usr/bin/python3 -I -S scripts/policy_preflight.py
+exit 1
+policy preflight: src/jev_trading_lab/core/values.py: SHA-256 does not match approved content
+
+uv run pytest tests/test_package_policy.py::test_no_live_execution_surface -q
+1 failed
+src/jev_trading_lab/core/values.py: SHA-256 does not match approved source
+```
+
+### Exact-integer gate evidence
+
+Commands ran sequentially before production commit `c304e83` and exited 0:
+
+```text
+/usr/bin/python3 -I -S scripts/policy_preflight.py
+Policy preflight passed.
+
+uv lock --check
+Resolved 51 packages in 1ms
+
+uv sync --frozen --all-groups
+Checked 50 packages in 0.53ms
+
+uv run pytest -q
+76 passed in 1.17s
+
+uv run ruff check .
+All checks passed!
+
+uv run ruff format --check .
+9 files already formatted
+
+uv run mypy src
+Success: no issues found in 3 source files
+
+uv export --frozen --all-groups --no-emit-project --format requirements-txt --output-file /tmp/jev-task-002-exact-int-audit-requirements.txt
+exit 0
+
+uv run pip-audit --strict --requirement /tmp/jev-task-002-exact-int-audit-requirements.txt --no-deps --disable-pip
+No known vulnerabilities found
+
+uv build --no-build-isolation
+Successfully built dist/jev_trading_lab-0.1.0.tar.gz
+Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
+
+git diff --check
+exit 0
+```
+
+No dependency or lock file changed. No approved design, plan, or review file changed. Task 002 remains pending independent re-review; Task 3 must not start.
