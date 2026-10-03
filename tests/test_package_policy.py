@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import configparser
 import hashlib
 import importlib
 import importlib.util
@@ -9,7 +10,9 @@ import re
 import stat
 import subprocess
 import sys
+import tarfile
 import tomllib
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -73,15 +76,35 @@ _APPROVED_SOURCE_HASHES = {
 _ALLOWED_TOOL_CONFIG = {
     "hatch": {
         "build": {
+            "exclude": [
+                "/.git",
+                "/.github",
+                "/.mypy_cache",
+                "/.pytest_cache",
+                "/.ruff_cache",
+                "/.venv",
+                "/build",
+                "/dist",
+                "/**/__pycache__",
+                "/**/*.py[cod]",
+            ],
             "targets": {
+                "sdist": {
+                    "include": [
+                        "/README.md",
+                        "/THIRD_PARTY_NOTICES.md",
+                        "/pyproject.toml",
+                        "/src/jev_trading_lab",
+                    ]
+                },
                 "wheel": {
                     "packages": ["src/jev_trading_lab"],
                     "include": [
                         "src/jev_trading_lab/**/*.sql",
                         "src/jev_trading_lab/templates/**/*",
                     ],
-                }
-            }
+                },
+            },
         }
     },
     "pytest": {"ini_options": {"testpaths": ["tests"]}},
@@ -94,6 +117,9 @@ _ALLOWED_TOOL_CONFIG = {
     "mypy": {"python_version": "3.12", "strict": True, "files": ["src"]},
 }
 _ALLOWED_ENTRY_POINTS = {"jev-lab": "jev_trading_lab.cli:app"}
+_APPROVED_WORKFLOW_HASH = (
+    "b83b99f09d72d41b28a10116ed5cc20efb316e86d6e4bbccfaf396a40e1442b9"
+)
 _ALLOWED_DEPENDENCY_GROUPS = {
     "dev": frozenset(
         {
@@ -252,6 +278,9 @@ def _runtime_policy_violations(root: Path) -> list[str]:
         violations.append(
             f"pyproject.toml: entry points not allowlisted: {entry_points}"
         )
+    for table in ("gui-scripts", "entry-points"):
+        if table in project:
+            violations.append(f"pyproject.toml: entry-point table not allowed: {table}")
     tool_config = project_data.get("tool", {})
     if tool_config != _ALLOWED_TOOL_CONFIG:
         violations.append(f"pyproject.toml: tool config not allowlisted: {tool_config}")
@@ -296,6 +325,18 @@ def _runtime_policy_violations(root: Path) -> list[str]:
                     location="uv.lock",
                     locked=True,
                 )
+            )
+
+    workflow = root / ".github/workflows/ci.yml"
+    try:
+        workflow_hash = hashlib.sha256(workflow.read_bytes()).hexdigest()
+    except OSError as error:
+        violations.append(f".github/workflows/ci.yml: missing or unreadable: {error}")
+    else:
+        if workflow_hash != _APPROVED_WORKFLOW_HASH:
+            violations.append(
+                ".github/workflows/ci.yml: workflow SHA-256 does not match "
+                "approved workflow"
             )
 
     violations.extend(_source_policy_violations(root))
@@ -666,3 +707,125 @@ def test_ci_uses_immutable_actions_and_locked_audit() -> None:
     ) in workflow
     assert "run: uv build --no-build-isolation" in workflow
     assert "run: uv build\n" not in workflow
+
+
+def test_workflow_hash_accepts_current_reviewed_workflow() -> None:
+    assert (
+        hashlib.sha256((ROOT / ".github/workflows/ci.yml").read_bytes()).hexdigest()
+        == _APPROVED_WORKFLOW_HASH
+    )
+
+
+def test_workflow_hash_rejects_appended_run_step(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_bytes((ROOT / "pyproject.toml").read_bytes())
+    _initialize_approved_source_fixture(tmp_path)
+    workflow = tmp_path / ".github/workflows/ci.yml"
+    workflow.parent.mkdir(parents=True)
+    reviewed = (ROOT / ".github/workflows/ci.yml").read_bytes()
+    workflow.write_bytes(
+        reviewed + b"      - run: curl -X POST https://example.test/orders\n"
+    )
+
+    violations = _runtime_policy_violations(tmp_path)
+
+    assert any("workflow SHA-256" in violation for violation in violations), violations
+
+
+@pytest.mark.parametrize(
+    "extra_table",
+    (
+        '[project.gui-scripts]\ntrade-gui="jev_trading_lab.cli:app"\n',
+        '[project.entry-points.live]\nsubmit-order="jev_trading_lab.cli:app"\n',
+    ),
+)
+def test_policy_rejects_unapproved_entry_point_tables(
+    extra_table: str, tmp_path: Path
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        (ROOT / "pyproject.toml").read_text(encoding="utf-8") + extra_table,
+        encoding="utf-8",
+    )
+    _initialize_approved_source_fixture(tmp_path)
+
+    violations = _runtime_policy_violations(tmp_path)
+
+    assert any("entry-point table not allowed" in item for item in violations), (
+        violations
+    )
+
+
+def _wheel_entry_point_violations(wheel: Path) -> list[str]:
+    with zipfile.ZipFile(wheel) as archive:
+        metadata_files = [
+            name for name in archive.namelist() if name.endswith("entry_points.txt")
+        ]
+        if len(metadata_files) != 1:
+            return [f"wheel must contain one entry_points.txt: {metadata_files}"]
+        parser = configparser.ConfigParser()
+        parser.read_string(archive.read(metadata_files[0]).decode("utf-8"))
+    entry_points = {section: dict(parser[section]) for section in parser.sections()}
+    allowed = {"console_scripts": _ALLOWED_ENTRY_POINTS}
+    return (
+        []
+        if entry_points == allowed
+        else [f"wheel entry points not allowed: {entry_points}"]
+    )
+
+
+def test_wheel_metadata_rejects_unapproved_entry_points(tmp_path: Path) -> None:
+    wheel = tmp_path / "sample.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(
+            "sample-0.1.0.dist-info/entry_points.txt",
+            "[console_scripts]\njev-lab = jev_trading_lab.cli:app\n"
+            "[gui_scripts]\ntrade-gui = jev_trading_lab.cli:app\n",
+        )
+
+    violations = _wheel_entry_point_violations(wheel)
+
+    assert any("gui_scripts" in item for item in violations), violations
+
+
+def test_built_artifacts_exclude_repository_and_host_junk(tmp_path: Path) -> None:
+    output = tmp_path / "dist"
+    subprocess.run(
+        ["uv", "build", "--no-build-isolation", "--out-dir", str(output)],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    sdist = next(output.glob("*.tar.gz"))
+    wheel = next(output.glob("*.whl"))
+
+    with tarfile.open(sdist, "r:gz") as archive:
+        sdist_members = {}
+        for member in archive.getmembers():
+            extracted = archive.extractfile(member)
+            if extracted is not None:
+                sdist_members[member.name] = extracted.read()
+    with zipfile.ZipFile(wheel) as archive:
+        wheel_members = {name: archive.read(name) for name in archive.namelist()}
+
+    for members in (sdist_members, wheel_members):
+        names = tuple(members)
+        assert not any(".git" in Path(name).parts for name in names), names
+        assert not any("__pycache__" in Path(name).parts for name in names), names
+        assert not any("dist" in Path(name).parts for name in names), names
+        assert not any(name.endswith((".pyc", ".pyo")) for name in names), names
+        content = b"\n".join(members.values())
+        assert b"/home/" not in content
+        assert b"persist-credentials" not in content
+        assert b"GITHUB_TOKEN" not in content
+        assert b"PRIVATE KEY-----" not in content
+
+    package_files = {
+        name
+        for name in wheel_members
+        if not any(part.endswith(".dist-info") for part in Path(name).parts)
+    }
+    assert package_files == {
+        "jev_trading_lab/__init__.py",
+        "jev_trading_lab/cli.py",
+    }
+    assert not _wheel_entry_point_violations(wheel)

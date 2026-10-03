@@ -32,6 +32,28 @@ dev = [
     "ruff>=0.13,<1",
 ]
 
+[tool.hatch.build]
+exclude = [
+    "/.git",
+    "/.github",
+    "/.mypy_cache",
+    "/.pytest_cache",
+    "/.ruff_cache",
+    "/.venv",
+    "/build",
+    "/dist",
+    "/**/__pycache__",
+    "/**/*.py[cod]",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/README.md",
+    "/THIRD_PARTY_NOTICES.md",
+    "/pyproject.toml",
+    "/src/jev_trading_lab",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/jev_trading_lab"]
 include = [
