@@ -52,6 +52,30 @@ def test_calendar_schedule_artifact_is_packaged_in_wheel_and_sdist() -> None:
         assert any(name.endswith("/src/" + artifact) for name in archive.getnames())
 
 
+def test_migration_sql_is_packaged_in_wheel_and_sdist() -> None:
+    migration = "jev_trading_lab/persistence/schema/001_migration_metadata.sql"
+    wheels = tuple((ROOT / "dist").glob("*.whl"))
+    sdists = tuple((ROOT / "dist").glob("*.tar.gz"))
+    if not wheels or not sdists:
+        pytest.skip("build artifacts are inspected after the build gate")
+    newest_source = max(
+        (ROOT / relative).stat().st_mtime_ns
+        for relative in (
+            "pyproject.toml",
+            "src/jev_trading_lab/persistence/schema/001_migration_metadata.sql",
+        )
+    )
+    if (
+        min(wheels[-1].stat().st_mtime_ns, sdists[-1].stat().st_mtime_ns)
+        < newest_source
+    ):
+        pytest.skip("stale build artifacts are replaced by the build gate")
+    with zipfile.ZipFile(wheels[-1]) as archive:
+        assert migration in archive.namelist()
+    with tarfile.open(sdists[-1]) as archive:
+        assert any(name.endswith("/src/" + migration) for name in archive.getnames())
+
+
 def test_package_imports() -> None:
     sys.path.insert(0, str(SRC))
     try:
@@ -95,6 +119,8 @@ _APPROVED_SOURCE_DIRS = frozenset(
         "src/jev_trading_lab",
         "src/jev_trading_lab/artifacts",
         "src/jev_trading_lab/core",
+        "src/jev_trading_lab/persistence",
+        "src/jev_trading_lab/persistence/schema",
         "src/jev_trading_lab/stocks",
     }
 )
@@ -131,6 +157,21 @@ _APPROVED_SOURCE_HASHES = {
     ),
     "src/jev_trading_lab/core/values.py": (
         "806e4d4681da763cd78efa8b636ad51be74f61b425c9ad833b44781d43b10087"
+    ),
+    "src/jev_trading_lab/persistence/__init__.py": (
+        "be5cdea878ba9575ad6a83bc43819e3c1cbaecdf8ad351b2d8374f94b6c496e9"
+    ),
+    "src/jev_trading_lab/persistence/db.py": (
+        "934b840cd7a294490cea7d0d31fd68fba1897a65c74c4fb151171681b38b4a42"
+    ),
+    "src/jev_trading_lab/persistence/migrations.py": (
+        "1fd52c3b4e0bd6b5763a9b375514f929162f78f69a17f0de3192fe783ed8444c"
+    ),
+    "src/jev_trading_lab/persistence/schema/__init__.py": (
+        "5f19444569734cd60895d22219e7e2481fd00efb6054fb1d4cf9f7b38e26e4a5"
+    ),
+    "src/jev_trading_lab/persistence/schema/001_migration_metadata.sql": (
+        "5c76b89eaebb14e7155de6a76d12bb9bc67fb7519d4019e7f673196e2f9de347"
     ),
     "src/jev_trading_lab/stocks/__init__.py": (
         "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"
@@ -189,10 +230,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "20b3507a20d261a53169020357b53844c6351bfa48cfe4717be174319633dfd3"
+    "94df662df0636c18f4e629d96eb7420b0649b91f9d270e95a59dbcffb73e1858"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "ca9eacb7ae1ce20966da6073f68668f02883e8522b3346278e46a0d8e440e084"
+    "538bcf2e8f186a50589e5a57315db4adfc3c088728d0d307166a7e42fea5cd32"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = [
     "exchange-calendars==4.11.2",
@@ -617,6 +658,11 @@ def _initialize_approved_source_fixture(tmp_path: Path) -> Path:
         "core/run_window.py",
         "core/time.py",
         "core/values.py",
+        "persistence/__init__.py",
+        "persistence/db.py",
+        "persistence/migrations.py",
+        "persistence/schema/__init__.py",
+        "persistence/schema/001_migration_metadata.sql",
         "stocks/__init__.py",
         "stocks/calendar.py",
     ):
@@ -1424,6 +1470,11 @@ def test_built_artifacts_exclude_repository_and_host_junk(tmp_path: Path) -> Non
         "jev_trading_lab/core/run_window.py",
         "jev_trading_lab/core/time.py",
         "jev_trading_lab/core/values.py",
+        "jev_trading_lab/persistence/__init__.py",
+        "jev_trading_lab/persistence/db.py",
+        "jev_trading_lab/persistence/migrations.py",
+        "jev_trading_lab/persistence/schema/__init__.py",
+        "jev_trading_lab/persistence/schema/001_migration_metadata.sql",
         "jev_trading_lab/stocks/__init__.py",
         "jev_trading_lab/stocks/calendar.py",
     }
