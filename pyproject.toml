@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jev-trading-lab"
+version = "0.1.0"
+description = "Paper-only evidence-first market research lab"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "typer>=0.19,<1",
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.scripts]
+jev-lab = "jev_trading_lab.cli:app"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.18,<2",
+    "pytest>=8.4,<9",
+    "ruff>=0.13,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jev_trading_lab"]
+include = [
+    "src/jev_trading_lab/**/*.sql",
+    "src/jev_trading_lab/templates/**/*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]
