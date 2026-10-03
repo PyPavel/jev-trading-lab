@@ -13,6 +13,7 @@ from typing import Any
 
 ROOT = Path(__file__).absolute().parent.parent
 SCRIPT = ROOT / "scripts/policy_preflight.py"
+EXPECTED_LOCK_HASH = "de8ad6a56fadc9beed5d1e8350e5bd1b43bb597e2805751d64506e933ed3af7c"
 PYPI_SOURCE = {"registry": "https://pypi.org/simple"}
 EXPECTED_SOURCE_DIRS = frozenset({"src", "src/jev_trading_lab"})
 EXPECTED_SOURCE_HASHES = {
@@ -204,7 +205,22 @@ def _check_pyproject(violations: list[str]) -> None:
 
 
 def _check_lock(violations: list[str]) -> None:
-    data = _read_toml("uv.lock", violations)
+    lock_path = ROOT / "uv.lock"
+    try:
+        lock_content = lock_path.read_bytes()
+    except OSError as error:
+        violations.append(f"uv.lock: unreadable: {error}")
+        return
+    if hashlib.sha256(lock_content).hexdigest() != EXPECTED_LOCK_HASH:
+        violations.append(
+            "uv.lock: SHA-256 does not match exact reviewed dependency lock"
+        )
+        return
+    try:
+        data = tomllib.loads(lock_content.decode("utf-8"))
+    except (UnicodeError, tomllib.TOMLDecodeError) as error:
+        violations.append(f"uv.lock: unreadable or invalid UTF-8 TOML: {error}")
+        return
     packages = data.get("package")
     if not isinstance(packages, list):
         violations.append("uv.lock: package list is missing")
@@ -327,8 +343,8 @@ def _check_workflow_and_trees(violations: list[str]) -> None:
 
 def main() -> int:
     violations: list[str] = []
-    _check_pyproject(violations)
     _check_lock(violations)
+    _check_pyproject(violations)
     _check_workflow_and_trees(violations)
     if violations:
         for violation in violations:

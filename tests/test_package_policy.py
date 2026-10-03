@@ -123,10 +123,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "cdc8f8bbb79bf9732d7d56d6762391d71611f7001960507510a6a90628906245"
+    "258d54bb899b54787dfef75e03e12bb9add951eb7b376228a50499cde8e503f5"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "8b31202946edadb2caf36ac26e7e4a14f337746e4a17f972504401266d60efe8"
+    "a26996ef188d6f87d3f97c37022514cda75c68cd1719bf5082d8cc1bd1ec5a7d"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = ["typer>=0.19,<1"]
 _ALLOWED_DEPENDENCY_GROUPS = {
@@ -905,6 +905,92 @@ def test_preflight_rejects_non_registry_lock_source(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "uv.lock" in result.stderr
+
+
+def test_preflight_rejects_registry_artifact_substitution(tmp_path: Path) -> None:
+    repo = _copy_preflight_fixture(tmp_path)
+    for relative in ("README.md", "THIRD_PARTY_NOTICES.md"):
+        (repo / relative).write_bytes((ROOT / relative).read_bytes())
+    marker = tmp_path / "malicious-wheel-executed"
+    wheel = tmp_path / "annotated_doc-0.0.5-py3-none-any.whl"
+    dist_info = "annotated_doc-0.0.5.dist-info"
+    pth = "annotated_doc.pth"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(
+            pth,
+            f"import pathlib; pathlib.Path({str(marker)!r}).write_text('executed')\n",
+        )
+        archive.writestr(
+            f"{dist_info}/METADATA",
+            "Metadata-Version: 2.1\nName: annotated-doc\nVersion: 0.0.5\n",
+        )
+        archive.writestr(
+            f"{dist_info}/WHEEL",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+        archive.writestr(
+            f"{dist_info}/RECORD",
+            f"{pth},,\n{dist_info}/METADATA,,\n{dist_info}/WHEEL,,\n"
+            f"{dist_info}/RECORD,,\n",
+        )
+
+    lock_path = repo / "uv.lock"
+    lock = lock_path.read_text(encoding="utf-8")
+    lock_data = tomllib.loads(lock)
+    package = next(
+        item for item in lock_data["package"] if item["name"] == "annotated-doc"
+    )
+    approved_artifact = package["wheels"][0]
+    malicious_hash = f"sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}"
+    lock = lock.replace(approved_artifact["url"], wheel.as_uri(), 1)
+    lock = lock.replace(approved_artifact["hash"], malicious_hash, 1)
+    lock_path.write_text(lock, encoding="utf-8")
+
+    result = _run_preflight(repo)
+    if result.returncode == 0:
+        subprocess.run(
+            ["uv", "lock", "--check"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        environment = tmp_path / "venv"
+        sync = subprocess.run(
+            ["uv", "sync", "--frozen", "--all-groups"],
+            cwd=repo,
+            env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(environment)},
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert sync.returncode == 0, sync.stderr
+        subprocess.run(
+            [str(environment / "bin/python"), "-c", "pass"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    assert result.returncode != 0 and not marker.exists(), (
+        f"preflight_returncode={result.returncode} marker_exists={marker.exists()}"
+    )
+    assert "uv.lock" in result.stderr
+
+
+def test_preflight_checks_lock_hash_before_semantic_toml(tmp_path: Path) -> None:
+    repo = _copy_preflight_fixture(tmp_path)
+    with (repo / "uv.lock").open("ab") as lock:
+        lock.write(b"\n# unreviewed lock mutation\n")
+    (repo / "pyproject.toml").write_text("not valid TOML = [", encoding="utf-8")
+
+    result = _run_preflight(repo)
+
+    assert result.returncode != 0
+    assert result.stderr.splitlines()[0].startswith(
+        "policy preflight: uv.lock: SHA-256"
+    )
 
 
 def test_ci_order_preflight_blocks_local_backend_before_uv(tmp_path: Path) -> None:
