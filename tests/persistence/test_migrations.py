@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import importlib.resources
+import io
 import os
 import sqlite3
 import stat
@@ -16,6 +17,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from jev_trading_lab.persistence import db as db_module
+from jev_trading_lab.persistence import migrations as migration_module
 from jev_trading_lab.persistence.db import (
     MIN_SQLITE_VERSION,
     DatabaseConfigurationError,
@@ -57,7 +59,7 @@ def _package(
 
 def _connect(path: Path, *, timeout: int = 1_000) -> sqlite3.Connection:
     return connect_database(
-        path,
+        path if path.is_absolute() else path.absolute(),
         busy_timeout_ms=timeout,
         mount_resolver=lambda _path: "ext4",
     )
@@ -136,7 +138,7 @@ def test_network_fs_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
         "glusterfs",
     )
     for filesystem in network_filesystems:
-        with pytest.raises(DatabaseConfigurationError, match="network filesystem"):
+        with pytest.raises(DatabaseConfigurationError, match="unsupported filesystem"):
             connect_database(
                 tmp_path / filesystem / "db.sqlite3",
                 busy_timeout_ms=1_000,
@@ -596,3 +598,339 @@ def test_concurrent_migration_attempts_serialize(tmp_path: Path) -> None:
 
     assert len(results[0]) == 1
     assert results[0] == results[1]
+
+
+def test_database_path_must_be_absolute_and_lexically_normalized(
+    tmp_path: Path,
+) -> None:
+    relative = Path("relative/db.sqlite3")
+    with pytest.raises(ValueError, match="absolute"):
+        connect_database(
+            relative,
+            busy_timeout_ms=1_000,
+            mount_resolver=lambda _path: "ext4",
+        )
+
+    crossing = tmp_path / "private" / ".." / "escaped.sqlite3"
+    with pytest.raises(ValueError, match="normalized"):
+        _connect(crossing)
+    assert not (tmp_path / "escaped.sqlite3").exists()
+
+
+def test_mountinfo_last_stacked_mount_wins_and_matches_components() -> None:
+    mountinfo = (
+        "1 0 8:1 / / rw - ext4 /dev/root rw\n"
+        "2 1 8:2 / /data rw - ext4 /dev/a rw\n"
+        "3 1 0:3 / /database rw - nfs server:/database rw\n"
+        "4 1 0:4 / /data rw - nfs server:/data rw\n"
+    )
+    assert (
+        db_module._filesystem_type_from_mountinfo(Path("/data/db.sqlite3"), mountinfo)
+        == "nfs"
+    )
+    assert (
+        db_module._filesystem_type_from_mountinfo(
+            Path("/database/db.sqlite3"), mountinfo
+        )
+        == "nfs"
+    )
+
+
+@pytest.mark.parametrize(
+    "filesystem",
+    ("ext2", "ext3", "ext4", "xfs", "btrfs", "f2fs", "zfs", "overlay", "tmpfs"),
+)
+def test_reviewed_local_filesystems_are_allowed(
+    tmp_path: Path, filesystem: str
+) -> None:
+    connection = connect_database(
+        tmp_path / filesystem / "db.sqlite3",
+        busy_timeout_ms=1_000,
+        mount_resolver=lambda _path: filesystem,
+    )
+    connection.close()
+
+
+@pytest.mark.parametrize(
+    "filesystem",
+    (
+        "unknownfs",
+        "fuse",
+        "fuse.rclone",
+        "fuse.s3fs",
+        "nfs",
+        "nfs4",
+        "cifs",
+        "smb3",
+        "smbfs",
+        "9p",
+        "ceph",
+        "glusterfs",
+        "lustre",
+        "afs",
+        "davfs",
+    ),
+)
+def test_unknown_remote_and_fuse_filesystems_fail_closed(
+    tmp_path: Path, filesystem: str
+) -> None:
+    with pytest.raises(DatabaseConfigurationError, match="unsupported filesystem"):
+        connect_database(
+            tmp_path / filesystem / "db.sqlite3",
+            busy_timeout_ms=1_000,
+            mount_resolver=lambda _path: filesystem,
+        )
+
+
+@pytest.mark.parametrize("mode", (0o755, 0o777))
+def test_existing_database_parent_requires_exact_private_mode(
+    tmp_path: Path, mode: int
+) -> None:
+    parent = tmp_path / f"unsafe-{mode:o}"
+    parent.mkdir(mode=mode)
+    parent.chmod(mode)
+
+    with pytest.raises(DatabaseConfigurationError, match="mode 0700"):
+        _connect(parent / "db.sqlite3")
+    assert stat.S_IMODE(parent.stat().st_mode) == mode
+
+
+def test_existing_database_requires_owner_mode_and_single_link(tmp_path: Path) -> None:
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    database = parent / "db.sqlite3"
+    database.touch(mode=0o644)
+    with pytest.raises(DatabaseConfigurationError, match="mode 0600"):
+        _connect(database)
+    assert stat.S_IMODE(database.stat().st_mode) == 0o644
+
+    database.chmod(0o600)
+    hardlink = parent / "linked.sqlite3"
+    hardlink.hardlink_to(database)
+    with pytest.raises(DatabaseConfigurationError, match="hard links"):
+        _connect(database)
+
+
+def test_parent_replacement_during_connect_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    database = parent / "db.sqlite3"
+    original = tmp_path / "original"
+    real_connect = sqlite3.connect
+
+    def replace_parent(*args: object, **kwargs: object) -> sqlite3.Connection:
+        parent.rename(original)
+        parent.mkdir(mode=0o700)
+        return real_connect(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", replace_parent)
+    with pytest.raises(DatabaseConfigurationError, match="parent changed"):
+        _connect(database)
+
+
+def test_database_path_replacement_during_connect_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    database = parent / "db.sqlite3"
+    database.touch(mode=0o600)
+    real_connect = sqlite3.connect
+
+    def replace_database(*args: object, **kwargs: object) -> sqlite3.Connection:
+        database.unlink()
+        database.touch(mode=0o600)
+        return real_connect(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", replace_database)
+    with pytest.raises(DatabaseConfigurationError, match="database file changed"):
+        _connect(database)
+
+
+def test_database_sidecars_remain_private(tmp_path: Path) -> None:
+    database = tmp_path / "private" / "db.sqlite3"
+    connection = _connect(database)
+    try:
+        connection.execute("CREATE TABLE sample (id INTEGER PRIMARY KEY) STRICT")
+        connection.execute("INSERT INTO sample VALUES (1)")
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{database}{suffix}")
+            assert sidecar.is_file()
+            assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
+    finally:
+        connection.close()
+
+
+def test_apply_rejects_caller_transaction_without_rollback(tmp_path: Path) -> None:
+    connection = _connect(tmp_path / "db.sqlite3")
+    try:
+        connection.execute("CREATE TABLE caller_data (value TEXT NOT NULL) STRICT")
+        connection.execute("BEGIN")
+        connection.execute("INSERT INTO caller_data VALUES ('keep me')")
+
+        with pytest.raises(MigrationError, match="active caller transaction"):
+            apply_migrations(connection, clock=lambda: 1_000_000)
+
+        assert connection.in_transaction
+        assert (
+            connection.execute("SELECT value FROM caller_data").fetchone()[0]
+            == "keep me"
+        )
+        connection.execute("COMMIT")
+        assert connection.execute("SELECT count(*) FROM caller_data").fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_apply_requires_autocommit_connection_contract() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(MigrationError, match="autocommit"):
+            apply_migrations(connection)
+    finally:
+        connection.close()
+
+
+def test_temp_schema_migrations_cannot_shadow_main(tmp_path: Path) -> None:
+    connection = _connect(tmp_path / "db.sqlite3")
+    try:
+        connection.execute(
+            "CREATE TEMP TABLE schema_migrations "
+            "(version INTEGER, name TEXT, sha256 TEXT, applied_at_us INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO temp.schema_migrations VALUES (99, 'shadow', 'bad', 1)"
+        )
+
+        apply_migrations(connection, clock=lambda: 1_000_000)
+
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM temp.schema_migrations"
+            ).fetchone()[0]
+            == 1
+        )
+        row = connection.execute(
+            "SELECT version, name FROM main.schema_migrations"
+        ).fetchone()
+        assert tuple(row) == (1, "001_migration_metadata.sql")
+    finally:
+        connection.close()
+
+    reopened = _connect(tmp_path / "db.sqlite3")
+    try:
+        apply_migrations(reopened, clock=lambda: 2_000_000)
+        assert (
+            reopened.execute("SELECT count(*) FROM main.schema_migrations").fetchone()[
+                0
+            ]
+            == 1
+        )
+    finally:
+        reopened.close()
+
+
+def test_empty_migration_package_fails_before_database_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package, _schema = _package(tmp_path, monkeypatch, {})
+    connection = _connect(tmp_path / "db.sqlite3")
+    try:
+        with pytest.raises(MigrationError, match="at least migration 001"):
+            apply_migrations(connection, package=package)
+        assert (
+            connection.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE name = 'schema_migrations'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("version", "name"),
+    (
+        (2, "002_a/evil.sql"),
+        (2, "002_a\\evil.sql"),
+        (2, "002_A.sql"),
+        (2, "002_.sql"),
+        (2, "002_a-b.sql"),
+        (2, "002_a.b.sql"),
+        (2, "003_ok.sql"),
+        (2, "002_bad\nname.sql"),
+    ),
+)
+def test_schema_rejects_hostile_or_mismatched_migration_names(
+    tmp_path: Path, version: int, name: str
+) -> None:
+    connection = _connect(tmp_path / "db.sqlite3")
+    try:
+        apply_migrations(connection, clock=lambda: 1_000_000)
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO main.schema_migrations "
+                "(version, name, sha256, applied_at_us) VALUES (?, ?, ?, ?)",
+                (version, name, "a" * 64, 2_000_000),
+            )
+    finally:
+        connection.close()
+
+
+def test_filesystem_resource_replacement_with_symlink_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package, schema = _package(tmp_path, monkeypatch, {"001_ok.sql": b"SELECT 1;\n"})
+    migration = schema / "001_ok.sql"
+    target = tmp_path / "replacement.sql"
+    target.write_bytes(b"SELECT 2;\n")
+    real_open = os.open
+    replaced = False
+
+    def replacing_open(
+        path: object, flags: int, *args: object, **kwargs: object
+    ) -> int:
+        nonlocal replaced
+        if Path(path) == migration and not replaced:
+            replaced = True
+            migration.unlink()
+            migration.symlink_to(target)
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(migration_module.os, "open", replacing_open)
+    with pytest.raises(MigrationError, match="symlink|unreadable"):
+        load_migrations(package)
+    assert replaced
+
+
+def test_archive_resource_read_is_bounded_to_maximum_plus_one() -> None:
+    class RecordingStream(io.BytesIO):
+        bytes_returned = 0
+
+        def read(self, size: int | None = -1) -> bytes:
+            result = super().read(size)
+            self.bytes_returned += len(result)
+            return result
+
+    class ArchiveResource:
+        name = "001_large.sql"
+
+        def __init__(self) -> None:
+            self.stream = RecordingStream(b"x" * (MAX_MIGRATION_BYTES + 100))
+            self.read_bytes_called = False
+
+        def open(self, mode: str) -> RecordingStream:
+            assert mode == "rb"
+            return self.stream
+
+        def read_bytes(self) -> bytes:
+            self.read_bytes_called = True
+            return b"x" * (MAX_MIGRATION_BYTES + 100)
+
+    resource = ArchiveResource()
+    with pytest.raises(MigrationError, match="maximum size"):
+        migration_module._read_resource(resource)  # type: ignore[arg-type]
+    assert not resource.read_bytes_called
+    assert resource.stream.bytes_returned == MAX_MIGRATION_BYTES + 1

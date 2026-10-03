@@ -7,16 +7,18 @@ committed independently, so no migration prefix may expose an unguarded table.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib.resources
+import os
 import re
 import sqlite3
 import stat
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from importlib.resources.abc import Traversable
 from pathlib import Path
-from typing import Protocol
 
 from jev_trading_lab.core.time import datetime_to_utc_us, validate_utc_us
 
@@ -43,19 +45,6 @@ class MigrationError(RuntimeError):
     """Raised when the immutable migration contract is violated."""
 
 
-class _Traversable(Protocol):
-    @property
-    def name(self) -> str: ...
-
-    def is_dir(self) -> bool: ...
-
-    def is_file(self) -> bool: ...
-
-    def iterdir(self) -> Iterator[_Traversable]: ...
-
-    def read_bytes(self) -> bytes: ...
-
-
 @dataclass(frozen=True, slots=True)
 class Migration:
     version: int
@@ -68,33 +57,70 @@ def _utc_now_us() -> int:
     return datetime_to_utc_us(datetime.now(UTC))
 
 
-def _validate_filesystem_resource(resource: _Traversable) -> None:
-    if not isinstance(resource, Path):
-        return
+def _read_filesystem_resource(resource: Path) -> bytes:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor: int | None = None
     try:
-        metadata = resource.lstat()
+        descriptor = os.open(resource, flags)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise MigrationError(
+                f"migration resource {resource.name!r} is not a regular file"
+            )
+        if before.st_uid != os.geteuid():
+            raise MigrationError(
+                f"migration resource {resource.name!r} is not owned by effective UID"
+            )
+        if not before.st_mode & (stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH):
+            raise MigrationError(f"migration resource {resource.name!r} is unreadable")
+        chunks: list[bytes] = []
+        remaining = MAX_MIGRATION_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino, before.st_size) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+        ):
+            raise MigrationError(
+                f"migration resource {resource.name!r} changed while reading"
+            )
     except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise MigrationError(
+                f"migration resource {resource.name!r} is a symlink"
+            ) from error
         raise MigrationError(
             f"migration resource {resource.name!r} is unreadable"
         ) from error
-    if stat.S_ISLNK(metadata.st_mode):
-        raise MigrationError(f"migration resource {resource.name!r} is a symlink")
-    if not stat.S_ISREG(metadata.st_mode):
-        raise MigrationError(
-            f"migration resource {resource.name!r} is not a regular file"
-        )
-    if not metadata.st_mode & (stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH):
-        raise MigrationError(f"migration resource {resource.name!r} is unreadable")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return content
 
 
-def _read_resource(resource: _Traversable) -> bytes:
-    _validate_filesystem_resource(resource)
-    try:
-        content = resource.read_bytes()
-    except OSError as error:
-        raise MigrationError(
-            f"migration resource {resource.name!r} is unreadable"
-        ) from error
+def _read_resource(resource: Traversable) -> bytes:
+    if isinstance(resource, Path):
+        content = _read_filesystem_resource(resource)
+    else:
+        try:
+            with resource.open("rb") as stream:
+                content = stream.read(MAX_MIGRATION_BYTES + 1)
+        except OSError as error:
+            raise MigrationError(
+                f"migration resource {resource.name!r} is unreadable"
+            ) from error
     if len(content) > MAX_MIGRATION_BYTES:
         raise MigrationError(
             f"migration resource {resource.name!r} exceeds maximum size "
@@ -148,6 +174,8 @@ def load_migrations(package: str = _DEFAULT_PACKAGE) -> tuple[Migration, ...]:
         )
 
     migrations.sort(key=lambda migration: migration.version)
+    if not migrations:
+        raise MigrationError("migration package must contain at least migration 001")
     actual = [migration.version for migration in migrations]
     expected = list(range(1, len(migrations) + 1))
     if actual != expected:
@@ -241,7 +269,7 @@ def _validated_statements(migration: Migration) -> tuple[str, ...]:
 def _metadata_table_exists(connection: sqlite3.Connection) -> bool:
     return (
         connection.execute(
-            "SELECT 1 FROM sqlite_schema "
+            "SELECT 1 FROM main.sqlite_schema "
             "WHERE type = 'table' AND name = 'schema_migrations'"
         ).fetchone()
         is not None
@@ -253,7 +281,7 @@ def _applied_rows(connection: sqlite3.Connection) -> list[tuple[int, str, str]]:
         return []
     try:
         rows = connection.execute(
-            "SELECT version, name, sha256 FROM schema_migrations ORDER BY version"
+            "SELECT version, name, sha256 FROM main.schema_migrations ORDER BY version"
         ).fetchall()
     except sqlite3.DatabaseError as error:
         raise MigrationError("schema_migrations metadata is invalid") from error
@@ -301,9 +329,15 @@ def apply_migrations(
     package: str = _DEFAULT_PACKAGE,
     clock: Callable[[], int] = _utc_now_us,
 ) -> None:
-    """Validate all applied resources, then apply pending migrations in order."""
+    """Apply migrations using an idle autocommit connection and owned transactions."""
     if not isinstance(connection, sqlite3.Connection):
         raise TypeError("connection must be sqlite3.Connection")
+    if connection.isolation_level is not None:
+        raise MigrationError(
+            "migration connection must use autocommit isolation_level=None"
+        )
+    if connection.in_transaction:
+        raise MigrationError("cannot migrate inside an active caller transaction")
     if not callable(clock):
         raise TypeError("migration clock must be callable")
     migrations = load_migrations(package)
@@ -311,18 +345,21 @@ def apply_migrations(
     _validate_applied(_applied_rows(connection), migrations)
 
     for migration, statements in zip(migrations, migration_statements, strict=True):
+        owned_transaction = False
         try:
             connection.execute("BEGIN IMMEDIATE")
+            owned_transaction = True
             applied = _applied_rows(connection)
             _validate_applied(applied, migrations)
             if migration.version <= len(applied):
                 connection.execute("COMMIT")
+                owned_transaction = False
                 continue
             for statement in statements:
                 connection.execute(statement)
             applied_at_us = _timestamp(clock)
             connection.execute(
-                "INSERT INTO schema_migrations "
+                "INSERT INTO main.schema_migrations "
                 "(version, name, sha256, applied_at_us) VALUES (?, ?, ?, ?)",
                 (
                     migration.version,
@@ -332,7 +369,8 @@ def apply_migrations(
                 ),
             )
             connection.execute("COMMIT")
+            owned_transaction = False
         except BaseException:
-            if connection.in_transaction:
+            if owned_transaction and connection.in_transaction:
                 connection.execute("ROLLBACK")
             raise

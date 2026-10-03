@@ -32,6 +32,11 @@ EXPECTED_CONFIG_HASHES = {
         "091c49428f15eb99fcea3a54b444b9fde929681e5ddfeaaadc4d4ebfa94438db"
     )
 }
+EXPECTED_OPERATIONAL_HASHES = {
+    "scripts/wheel_migration_smoke.py": (
+        "b51775c3e0f2067208b83042c37191222ebed66e9a6356e846b05a5784a272ee"
+    )
+}
 EXPECTED_SOURCE_HASHES = {
     "src/jev_trading_lab/artifacts/xnys-schedule-2020-2036.json": (
         "ade5009ba938836a5d17e298b0e704fc3635b8b1eef329ba4b43cba5c40fc978"
@@ -64,16 +69,16 @@ EXPECTED_SOURCE_HASHES = {
         "be5cdea878ba9575ad6a83bc43819e3c1cbaecdf8ad351b2d8374f94b6c496e9"
     ),
     "src/jev_trading_lab/persistence/db.py": (
-        "934b840cd7a294490cea7d0d31fd68fba1897a65c74c4fb151171681b38b4a42"
+        "5a90e686498a1ca441fead1ba6af3fa119b1e96402b2591061a254925e27e91a"
     ),
     "src/jev_trading_lab/persistence/migrations.py": (
-        "1fd52c3b4e0bd6b5763a9b375514f929162f78f69a17f0de3192fe783ed8444c"
+        "8b067d5d5dd3cb13f429f5b4b90a80dd490e6c4c3733ffcce27b9bcc129d4762"
     ),
     "src/jev_trading_lab/persistence/schema/__init__.py": (
         "5f19444569734cd60895d22219e7e2481fd00efb6054fb1d4cf9f7b38e26e4a5"
     ),
     "src/jev_trading_lab/persistence/schema/001_migration_metadata.sql": (
-        "5c76b89eaebb14e7155de6a76d12bb9bc67fb7519d4019e7f673196e2f9de347"
+        "606d8997178d5c2cdd2b1b500b196c77e67bafa5a0a042e9e04e539b3b76c6bc"
     ),
     "src/jev_trading_lab/stocks/__init__.py": (
         "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"
@@ -244,7 +249,8 @@ jobs:
           uv run pip-audit --strict --requirement audit-requirements.txt
           --no-deps --disable-pip
       - run: uv build --no-build-isolation
-      # Clean-wheel migration/render smoke becomes mandatory when those resources exist.
+      - run: uv run python scripts/wheel_migration_smoke.py
+      # Clean-wheel render smoke becomes mandatory when those resources exist.
 '''.encode()
 
 
@@ -399,7 +405,10 @@ def _check_workflow_and_trees(violations: list[str]) -> None:
     _walk_exact_tree(
         "scripts",
         {"scripts"},
-        {"scripts/policy_preflight.py": script_hash},
+        {
+            "scripts/policy_preflight.py": script_hash,
+            **EXPECTED_OPERATIONAL_HASHES,
+        },
         violations,
     )
     ops = ROOT / "ops"

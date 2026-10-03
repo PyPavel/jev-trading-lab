@@ -130,6 +130,11 @@ _APPROVED_CONFIG_HASHES = {
         "091c49428f15eb99fcea3a54b444b9fde929681e5ddfeaaadc4d4ebfa94438db"
     )
 }
+_APPROVED_OPERATIONAL_HASHES = {
+    "scripts/wheel_migration_smoke.py": (
+        "b51775c3e0f2067208b83042c37191222ebed66e9a6356e846b05a5784a272ee"
+    )
+}
 _APPROVED_SOURCE_HASHES = {
     "src/jev_trading_lab/artifacts/xnys-schedule-2020-2036.json": (
         "ade5009ba938836a5d17e298b0e704fc3635b8b1eef329ba4b43cba5c40fc978"
@@ -162,16 +167,16 @@ _APPROVED_SOURCE_HASHES = {
         "be5cdea878ba9575ad6a83bc43819e3c1cbaecdf8ad351b2d8374f94b6c496e9"
     ),
     "src/jev_trading_lab/persistence/db.py": (
-        "934b840cd7a294490cea7d0d31fd68fba1897a65c74c4fb151171681b38b4a42"
+        "5a90e686498a1ca441fead1ba6af3fa119b1e96402b2591061a254925e27e91a"
     ),
     "src/jev_trading_lab/persistence/migrations.py": (
-        "1fd52c3b4e0bd6b5763a9b375514f929162f78f69a17f0de3192fe783ed8444c"
+        "8b067d5d5dd3cb13f429f5b4b90a80dd490e6c4c3733ffcce27b9bcc129d4762"
     ),
     "src/jev_trading_lab/persistence/schema/__init__.py": (
         "5f19444569734cd60895d22219e7e2481fd00efb6054fb1d4cf9f7b38e26e4a5"
     ),
     "src/jev_trading_lab/persistence/schema/001_migration_metadata.sql": (
-        "5c76b89eaebb14e7155de6a76d12bb9bc67fb7519d4019e7f673196e2f9de347"
+        "606d8997178d5c2cdd2b1b500b196c77e67bafa5a0a042e9e04e539b3b76c6bc"
     ),
     "src/jev_trading_lab/stocks/__init__.py": (
         "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"
@@ -230,10 +235,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "94df662df0636c18f4e629d96eb7420b0649b91f9d270e95a59dbcffb73e1858"
+    "126f951b6943e2f6133696cc84278c5537e23bc948fab7fc398261ff9cff2eb1"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "538bcf2e8f186a50589e5a57315db4adfc3c088728d0d307166a7e42fea5cd32"
+    "36495a30c80ab856d79a3fdef0a0fe408aecf03c31c8fe7da54e5063018cc4f0"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = [
     "exchange-calendars==4.11.2",
@@ -456,7 +461,10 @@ def _optional_dependency_violations(
 def _operational_policy_violations(root: Path) -> list[str]:
     violations: list[str] = []
     allowed_dirs = {"scripts"}
-    allowed_hashes = {"scripts/policy_preflight.py": _APPROVED_PREFLIGHT_HASH}
+    allowed_hashes = {
+        "scripts/policy_preflight.py": _APPROVED_PREFLIGHT_HASH,
+        **_APPROVED_OPERATIONAL_HASHES,
+    }
     seen: set[str] = set()
     for directory_name in ("scripts", "ops"):
         pending = [root / directory_name]
@@ -672,9 +680,10 @@ def _initialize_approved_source_fixture(tmp_path: Path) -> Path:
     workflow = tmp_path / ".github/workflows/ci.yml"
     workflow.parent.mkdir(parents=True)
     workflow.write_bytes((ROOT / ".github/workflows/ci.yml").read_bytes())
-    script = tmp_path / "scripts/policy_preflight.py"
-    script.parent.mkdir()
-    script.write_bytes((ROOT / "scripts/policy_preflight.py").read_bytes())
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    for name in ("policy_preflight.py", "wheel_migration_smoke.py"):
+        (scripts / name).write_bytes((ROOT / "scripts" / name).read_bytes())
     config = tmp_path / "config/phase1.example.json"
     config.parent.mkdir()
     config.write_bytes((ROOT / "config/phase1.example.json").read_bytes())
@@ -1344,6 +1353,19 @@ def test_ci_uses_immutable_actions_and_locked_audit() -> None:
     assert "--no-deps --disable-pip" in workflow
     assert "run: uv build --no-build-isolation" in workflow
     assert "run: uv build\n" not in workflow
+
+
+def test_ci_builds_before_actual_wheel_migration_smoke() -> None:
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    build = "run: uv build --no-build-isolation"
+    smoke = "run: uv run python scripts/wheel_migration_smoke.py"
+    assert smoke in workflow
+    assert workflow.index(build) < workflow.index(smoke)
+
+    script = ROOT / "scripts/wheel_migration_smoke.py"
+    assert script.is_file()
+    approved_hash = _APPROVED_OPERATIONAL_HASHES[script.relative_to(ROOT).as_posix()]
+    assert hashlib.sha256(script.read_bytes()).hexdigest() == approved_hash
 
 
 def test_workflow_hash_accepts_current_reviewed_workflow() -> None:
