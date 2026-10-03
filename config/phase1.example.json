@@ -61,7 +61,7 @@
       "tools_enabled": false,
       "fallback_enabled": false,
       "immutable_snapshot": true,
-      "schema_version": "phase1-schema-v1"
+      "schema_version": "phase1-openai-response-schema-v1"
     },
     "jev": {
       "provider": "TypeSafe",
@@ -80,14 +80,12 @@
       "tools_enabled": false,
       "fallback_enabled": false,
       "immutable_snapshot": true,
-      "schema_version": "phase1-schema-v1"
+      "schema_version": "phase1-jev-response-schema-v1"
     }
   },
   "model_input_policy": {
     "openai_prompt_template_version": "phase1-openai-prompt-v1",
     "openai_prompt_template_sha256": "2440691f645cc9e1b96a6a78a7164da6d05b5f0d830f16ea4774dbd5bdb4b172",
-    "openai_schema_version": "phase1-openai-schema-v1",
-    "openai_schema_sha256": "4a14277c2dcc2026644b293a44d92c86129bac3a0bfcd96d0c03e7ac17cbbf85",
     "evidence_delimiter_version": "phase1-evidence-delimiter-v1",
     "evidence_delimiter_sha256": "23d428983d6e3e7a4db7f88af27f9ece3043876c8010a58fd6a8bcc3003de0b1",
     "jev_state_template_version": "phase1-jev-state-v1",

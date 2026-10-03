@@ -36,17 +36,38 @@ _NonEmpty = Annotated[str, StringConstraints(min_length=1)]
 _CREATION_SENTINEL = object()
 _UNRESOLVED_IDENTITY_MARKERS = frozenset(
     {
+        "example",
+        "placeholder",
+        "todo",
+        "tbd",
+        "change",
         "changeme",
         "unknown",
         "dummy",
         "fake",
         "notset",
         "unset",
+        "replace",
         "replaceme",
         "xxx",
         "pending",
         "sample",
-        "testonly",
+        "test",
+        "only",
+        "none",
+        "null",
+        "na",
+        "notapplicable",
+    }
+)
+_UNRESOLVED_IDENTITY_SEQUENCES = frozenset(
+    {
+        ("change", "me"),
+        ("not", "applicable"),
+        ("not", "set"),
+        ("replace", "me"),
+        ("test", "only"),
+        ("n", "a"),
     }
 )
 
@@ -249,8 +270,6 @@ class _ModelContract(_StrictModel):
 class _ModelInputPolicyContract(_StrictModel):
     openai_prompt_template_version: _NonEmpty
     openai_prompt_template_sha256: _SHA256
-    openai_schema_version: _NonEmpty
-    openai_schema_sha256: _SHA256
     evidence_delimiter_version: _NonEmpty
     evidence_delimiter_sha256: _SHA256
     jev_state_template_version: _NonEmpty
@@ -1155,22 +1174,18 @@ def _format_validation_error(error: ValidationError) -> ValueError:
     return ValueError("manifest validation failed:\n" + "\n".join(messages))
 
 
-def _normalized_marker(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", value.casefold())
-
-
 def _has_unresolved_marker(value: str) -> bool:
-    normalized = _normalized_marker(value)
-    components = {
-        _normalized_marker(component)
+    components = tuple(
+        component
         for component in re.split(r"[^a-z0-9]+", value.casefold())
         if component
-    }
-    return (
-        "example" in normalized
-        or normalized.startswith(("placeholder", "todo", "tbd"))
-        or any(marker in normalized for marker in _UNRESOLVED_IDENTITY_MARKERS)
-        or bool(components & _UNRESOLVED_IDENTITY_MARKERS)
+    )
+    if any(component in _UNRESOLVED_IDENTITY_MARKERS for component in components):
+        return True
+    return any(
+        components[index : index + len(sequence)] == sequence
+        for sequence in _UNRESOLVED_IDENTITY_SEQUENCES
+        for index in range(len(components) - len(sequence) + 1)
     )
 
 
@@ -1192,10 +1207,20 @@ def _find_identity_placeholder(root: object) -> str | None:
             )
         elif type(value) is str:
             field = path.rsplit(".", 1)[-1].casefold()
-            identity_field = any(
-                token in field
-                for token in ("revision", "fingerprint", "artifact", "model", "hash")
-            ) or field.endswith("version")
+            identity_field = (
+                any(
+                    token in field
+                    for token in (
+                        "revision",
+                        "fingerprint",
+                        "artifact",
+                        "model",
+                        "hash",
+                    )
+                )
+                or field == "sdk_package"
+                or field.endswith("version")
+            )
             if identity_field and _has_unresolved_marker(value):
                 return f"{path} contains placeholder marker {value!r}"
             if field.endswith("sha256") and _is_repeated_hash(value):

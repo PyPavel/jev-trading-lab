@@ -251,8 +251,6 @@ def test_required_limits_present(path: str, expected: int) -> None:
         "model_input_policy",
         "model_input_policy.openai_prompt_template_version",
         "model_input_policy.openai_prompt_template_sha256",
-        "model_input_policy.openai_schema_version",
-        "model_input_policy.openai_schema_sha256",
         "model_input_policy.evidence_delimiter_version",
         "model_input_policy.evidence_delimiter_sha256",
         "model_input_policy.jev_state_template_version",
@@ -591,6 +589,88 @@ def test_activation_rejects_normalized_revision_markers(marker: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "marker",
+    (
+        "example",
+        "placeholder",
+        "todo",
+        "tbd",
+        "change",
+        "changeme",
+        "unknown",
+        "dummy",
+        "fake",
+        "replace",
+        "notset",
+        "unset",
+        "pending",
+        "sample",
+        "none",
+        "null",
+        "na",
+        "notapplicable",
+        "change-me",
+        "not-applicable",
+        "not-set",
+        "replace-me",
+        "test",
+        "only",
+        "test-only",
+        "n/a",
+    ),
+)
+@pytest.mark.parametrize(
+    "placement", ("{marker}-rev", "rev-{marker}-2026", "rev-{marker}")
+)
+def test_activation_rejects_unresolved_marker_components_anywhere(
+    marker: str, placement: str
+) -> None:
+    value = _activation_value()
+    replacement = placement.format(marker=marker)
+    value["models"]["openai"]["expected_revision"] = replacement
+    with pytest.raises(ValueError, match="expected_revision.*placeholder"):
+        _parse_value(value)
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    (
+        ("models.openai.expected_fingerprint", "not-applicable"),
+        ("models.openai.sdk_package", "TODO"),
+        ("models.openai.sdk_version", "real-todo-2026"),
+        ("baselines.polymarket_control_artifact_id", "real-todo-2026"),
+        ("baselines.polymarket_control_artifact_version", "real-todo-2026"),
+        ("model_input_policy.openai_prompt_template_version", "real-todo-2026"),
+        ("model_input_policy.evidence_delimiter_version", "real-todo-2026"),
+        ("model_input_policy.jev_state_template_version", "real-todo-2026"),
+        ("model_input_policy.jev_question_set_version", "real-todo-2026"),
+        ("providers.polymarket_catalog.contract_version", "real-todo-2026"),
+        (
+            "providers.data_fallbacks.treasury_last_published_prior.rule_version",
+            "real-todo-2026",
+        ),
+        ("calendar.tm_rule_version", "real-todo-2026"),
+    ),
+)
+def test_activation_rejects_unresolved_markers_in_every_identity_class(
+    path: str, replacement: str
+) -> None:
+    value = _activation_value()
+    _set_path(value, path, replacement)
+    with pytest.raises(ValueError, match=f"{path}.*placeholder"):
+        _parse_value(value)
+
+
+def test_activation_accepts_real_shaped_identity_components() -> None:
+    value = _activation_value()
+    value["models"]["openai"]["expected_revision"] = "rev-notional-contest-2026"
+    value["models"]["openai"]["sdk_package"] = "contest-client"
+    value["models"]["openai"]["sdk_version"] = "sdk-v2.1"
+    value["calendar"]["tm_rule_version"] = "phase1-replacement-policy-v2"
+    _parse_value(value).assert_activation_candidate()
+
+
+@pytest.mark.parametrize(
     ("path", "replacement"),
     (
         ("models.openai.expected_fingerprint", "RePlAcE_Me"),
@@ -617,8 +697,6 @@ def test_model_input_policy_is_required_content_addressed_and_identity_bound() -
         "openai_prompt_template_sha256": hashlib.sha256(
             b"openai-prompt-v1"
         ).hexdigest(),
-        "openai_schema_version": "phase1-openai-schema-v1",
-        "openai_schema_sha256": hashlib.sha256(b"openai-schema-v1").hexdigest(),
         "evidence_delimiter_version": "phase1-evidence-delimiter-v1",
         "evidence_delimiter_sha256": hashlib.sha256(
             b"evidence-delimiter-v1"
@@ -630,7 +708,25 @@ def test_model_input_policy_is_required_content_addressed_and_identity_bound() -
     }
     value = _example()
     assert value["model_input_policy"] == policy
+    assert (
+        value["models"]["openai"]["schema_version"]
+        == "phase1-openai-response-schema-v1"
+    )
+    assert value["models"]["jev"]["schema_version"] == "phase1-jev-response-schema-v1"
+    assert value["model_input_policy"]["jev_question_set_version"] == (
+        "phase1-jev-questions-v1"
+    )
+    assert "openai_schema_version" not in value["model_input_policy"]
+    assert "openai_schema_sha256" not in value["model_input_policy"]
     original = _parse_value(value)
+
+    divergent = _example()
+    divergent["model_input_policy"]["openai_schema_version"] = "other-schema-v2"
+    divergent["model_input_policy"]["openai_schema_sha256"] = hashlib.sha256(
+        b"other-schema-v2"
+    ).hexdigest()
+    with pytest.raises(ValueError, match="openai_schema"):
+        _parse_value(divergent)
 
     for field in policy:
         missing = _example()

@@ -21,7 +21,7 @@ EXPECTED_SOURCE_DIRS = frozenset(
 EXPECTED_CONFIG_DIRS = frozenset({"config"})
 EXPECTED_CONFIG_HASHES = {
     "config/phase1.example.json": (
-        "894f5ca704da66c3d256af4b4cd132321e069732f2c397259120cd9f942d184c"
+        "e690c1b7c8df2bd6c9d7be4b3ff9edc5266bb639eacf4ab23e9dd969006307a8"
     )
 }
 EXPECTED_SOURCE_HASHES = {
@@ -35,7 +35,7 @@ EXPECTED_SOURCE_HASHES = {
         "0e73742a406e112f269e7b8d5fd205c448eb4fbf49541cab3c669bf7b4dc0dd4"
     ),
     "src/jev_trading_lab/core/manifest.py": (
-        "4239390f992cf7b6a125f0f1616cb9e465c34672fdd1ec1b7306421bfcded2f0"
+        "c60c589ded4a97e4a7350cd527d68d922f5ae3357ce23059c6953b0926433844"
     ),
     "src/jev_trading_lab/core/observations.py": (
         "dbad9fa1099b527a640e68fc105641757ef2ef2fd68a504e208dda06958391ec"
