@@ -4,7 +4,7 @@
 
 **PENDING INDEPENDENT RE-REVIEW**
 
-All remaining Task 6 database and migration trust findings were addressed and verified locally. No independent re-review has approved this revision.
+All reported Task 6 adversarial findings were addressed and verified locally. No independent re-review has approved this revision.
 
 ## Production commits
 
@@ -12,60 +12,55 @@ All remaining Task 6 database and migration trust findings were addressed and ve
 847cbc1 feat(persistence): add checked SQLite migrations
 40dcc21 fix(persistence): harden database and migrations
 5e05789 fix(persistence): bind database and migration trust
+88dc9fd fix(persistence): close descriptor and authorizer races
 ```
 
 ## Review findings resolved
 
-- **Database inode and parent trust:** `connect_database` now opens SQLite through `/proc/self/fd/<retained-parent-fd>/<filename>`. `SecureConnection` owns that validated parent descriptor until `close()`. The connect path snapshots `/proc/self/fd`, verifies the newly opened SQLite main descriptor by `fstat` device/inode against the descriptor-relative `O_NOFOLLOW` pre-open, verifies SQLite's resolved main path, and closes connection/descriptors on every rejection path. Exact A/B inode restoration, parent replacement, retained-fd lifetime, and leak probes are covered.
-- **WAL/SHM trust:** descriptor-relative checks reject pre-existing sidecar symlinks, special files, wrong owner, multiple links, and modes other than exact `0600`. WAL activation runs under a serialized, narrowly scoped `0177` umask, restores the prior umask, and rechecks sidecars immediately after activation and during final storage validation. Pre-existing `0644`, symlink, hardlink, and activation-race probes are covered.
-- **Migration resource trust:** filesystem package directories must be non-symlink directories owned by root/effective UID and not group/other writable. Migration files use one `O_NOFOLLOW` descriptor, require root/effective-UID ownership, one link, and no group/other writes, use a bounded chunk read, and compare device, inode, size, mtime_ns, ctime_ns, mode, UID, and link count before/after. Equal-size and mixed-byte in-place rewrites are rejected. Archive `Traversable` resources retain bounded streaming and rely on the exact lock/hash-protected wheel artifact.
-- **Main-only migration writes:** migration connections reject attached databases before loading/applying. A scoped SQLite authorizer denies ATTACH/DETACH, TEMP object operations, and schema/data writes outside `main`; it is cleared in `finally` under the documented dedicated-connection contract. Parser defense also rejects `CREATE TEMP`, `CREATE TEMPORARY`, and explicit TEMP schema statements. TEMP and auxiliary migration failures roll back without metadata or off-main objects and remain absent after reconnect.
-- **Timestamp integrity:** migration 001 now requires built-in SQLite integer storage with `applied_at_us` in the applied-migration domain `0..253402300799999999`. Application metadata reads validate exact integer type and range. `0` is accepted; `-1` and signed-64 maximum are rejected by direct constraints and detected as corruption on reconnect.
-- **Prior fixes preserved:** caller transactions are rejected before owned transaction handling; metadata remains `main`-qualified; empty chains fail; local filesystems fail closed; private parents remain exact `0700`; migration filename checks and installed-wheel smoke remain green.
-- **Policy updates:** exact source, migration SQL, preflight, and workflow hashes were deliberately updated only after behavior stabilized.
+- **Database descriptor and dedicated-directory trust:** `connect_database` retains an effective-UID-owned exact-`0700` parent descriptor and connects through `/proc/self/fd/<dirfd>/<basename>`. Descriptor-relative scans require the physical directory to contain only the database basename and its `-wal`/`-shm` sidecars. A `/proc/self/fd` census made before connect verifies the lowest new regular descriptor as SQLite's main database, requires its device/inode to equal the securely prepared inode, rejects duplicate/ambiguous database candidates, validates every new sidecar descriptor, and rejects any extra new regular descriptor in the retained directory. The census is repeated after WAL activation while connect setup is serialized. Exact A/B swap/restore with a decoy FD, deleted replacement inode with a decoy FD, renamed-away unsafe sidecar, unrelated-FD acceptance, and 100-cycle leak probes are covered.
+- **Security boundary:** this is a strong dedicated-directory invariant, not a claim that stdlib SQLite can defeat every same-UID hostile process. A same-UID actor that swaps, renames, or unlinks an opened database/sidecar is detected through retained-directory state plus actual new-FD metadata. Any descriptor ambiguity fails closed. The parent descriptor remains retained for connection lifetime.
+- **Migration parent TOCTOU:** filesystem package directories are traversed component-by-component with `O_DIRECTORY|O_NOFOLLOW` and `dir_fd`; each descriptor is retained through all resource reads. Every component requires root/effective-UID ownership and no group/world write bit, and its device/inode/mode/UID/ctime snapshot is revalidated after loading. Migration files are opened by basename with `O_NOFOLLOW` relative to the retained schema descriptor; no absolute pathname reopen occurs. Descriptor cleanup is unconditional. A schema-directory swap/restore race fails before attacker SQL executes or metadata is recorded. Archive `Traversable` resources retain bounded streaming and rely on exact locked/hash-protected wheel bytes.
+- **Main-only authorizer:** `PRAGMA database_list` must be exactly `main`, optionally followed only by fileless `temp`; attached databases remain rejected. The authorizer stays active from before migration statements through timestamp generation, metadata insertion, and `COMMIT`, and is cleared only after commit or rollback. It denies all TEMP create/drop actions, ATTACH/DETACH, REINDEX, ANALYZE, and write-capable actions whose database is not `main`. Parser defense recognizes quoted and unquoted TEMP schema qualification plus `CREATE TEMP`/`CREATE TEMPORARY`; SQLite's authorizer remains authoritative. Exact `REINDEX "temp".idx` and a pre-existing TEMP trigger attempting to write `temp.sink` during metadata insertion both fail with no metadata row or main payload after reconnect.
+- **Timestamp integrity independently preserved:** migration SQL requires `typeof(applied_at_us) = 'integer'` and range `0..253402300799999999`; direct `-1` and signed-64 maximum inserts fail. `_applied_rows` requires exact built-in `int` and the same current-era range. Reconnect corruption probes remain green.
+- **Policy updates:** exact source, preflight, and workflow hashes were updated after behavior stabilized. Migration SQL was unchanged because its existing timestamp constraint was already correct.
 
 ## TDD RED evidence
 
-Each reviewer reproduction was added and run individually before production changes. Every probe exited 1 with the intended failure:
+The exact new reviewer reproductions were run before production changes. The combined command exited 1 with seven intended failures and two controls already passing:
 
 ```text
-test_connection_retains_private_parent_descriptor_until_close: 1 failed
-test_database_inode_swap_restored_before_path_recheck_is_rejected: 1 failed
-test_parent_path_swap_cannot_redirect_descriptor_relative_connect: 1 failed
-test_preexisting_unsafe_sidecar_mode_is_rejected: 2 failed
-test_preexisting_sidecar_symlink_is_rejected: 2 failed
-test_preexisting_sidecar_hardlink_is_rejected: 2 failed
-test_sidecar_created_racing_wal_activation_is_rejected: 1 failed
-test_world_writable_migration_package_directory_is_rejected: 1 failed
-test_group_writable_migration_file_is_rejected: 1 failed
-test_equal_size_resource_rewrite_during_read_is_rejected: 1 failed
-test_mixed_resource_bytes_from_in_place_rewrite_are_rejected: 1 failed
-test_migration_rejects_pre_attached_auxiliary_database: 1 failed
-test_create_temp_migration_is_denied_and_rolled_back: 1 failed
-test_schema_rejects_invalid_applied_timestamp: 2 failed
-test_reconnect_detects_corrupt_applied_timestamp: 2 failed
+FAILED test_database_parent_rejects_unexpected_entry
+FAILED test_decoy_fd_cannot_hide_sqlite_opening_replaced_inode
+FAILED test_deleted_sqlite_inode_cannot_be_hidden_by_decoy_fd
+FAILED test_unsafe_open_sidecar_renamed_away_is_rejected
+FAILED test_schema_directory_swap_restore_is_rejected_before_sql_executes
+FAILED test_quoted_temp_reindex_is_denied_without_metadata
+FAILED test_temp_trigger_cannot_write_during_metadata_insert
+7 failed, 2 passed in 0.31s
 ```
 
-The exact source-policy preflight was also witnessed RED after source/SQL changes and before hash updates:
+The two passing controls were `test_unrelated_new_regular_fd_does_not_block_connection` and `test_connection_open_close_cycles_do_not_leak_descriptors`. The first migration-race RED reached attacker SQL and then failed with `sqlite3.OperationalError: no such table: main.schema_migrations`, proving the untrusted replacement resource was read before the descriptor-relative fix. The explicit quoted non-main schema parser reproduction also failed RED with `sqlite3.OperationalError: unknown database "aux"` before the parser defense was added.
 
-```text
-policy preflight: src/jev_trading_lab/persistence/schema/001_migration_metadata.sql: SHA-256 does not match approved content
-policy preflight: src/jev_trading_lab/persistence/migrations.py: SHA-256 does not match approved content
-policy preflight: src/jev_trading_lab/persistence/db.py: SHA-256 does not match approved content
-```
+Exact source-policy preflight was witnessed RED before hash updates because `db.py` and `migrations.py` no longer matched approved SHA-256 values. Hashes were updated only after focused behavior was green.
 
 ## GREEN evidence
 
 ```text
 env PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/persistence/test_migrations.py -q
-110 passed in 0.26s
+119 passed in 0.33s
 
 env PYTHONDONTWRITEBYTECODE=1 uv run pytest \
   tests/persistence/test_migrations.py tests/test_package_policy.py -q
-166 passed in 1.63s
+176 passed in 1.63s
 
 env PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
-561 passed in 3.83s
+571 passed in 3.68s
+
+env PYTHONDONTWRITEBYTECODE=1 uv run pytest \
+  tests/persistence/test_migrations.py::test_connection_open_close_cycles_do_not_leak_descriptors \
+  tests/persistence/test_migrations.py::test_schema_rejects_invalid_applied_timestamp \
+  tests/persistence/test_migrations.py::test_reconnect_detects_corrupt_applied_timestamp -q
+5 passed in 0.21s
 ```
 
 ## Verification gates
@@ -80,7 +75,7 @@ uv lock --check
 Resolved 64 packages in 1ms
 
 uv sync --frozen --all-groups
-Checked 63 packages in 0.61ms
+Checked 63 packages in 0.59ms
 
 env PYTHONDONTWRITEBYTECODE=1 uv run ruff check .
 All checks passed!
@@ -110,9 +105,7 @@ Installed-wheel migration smoke passed.
 env PYTHONDONTWRITEBYTECODE=1 uv run pytest \
   tests/test_package_policy.py::test_migration_sql_is_packaged_in_wheel_and_sdist \
   tests/test_package_policy.py::test_built_artifacts_exclude_repository_and_host_junk -q
-2 passed in 0.43s
-
-100 connection open/close cycles: no fd leak
+2 passed in 0.40s
 
 git diff --check
 exit 0
