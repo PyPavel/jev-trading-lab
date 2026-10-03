@@ -2,9 +2,9 @@
 
 ## Status
 
-**PENDING INDEPENDENT RE-REVIEW**
+**FINAL APPROVED / COMPLETE**
 
-The numeric-host/scoped-IPv6 URI MAJOR is fixed and locally verified. Task 4 remains blocked until independent spec/adversarial and quality re-reviews report zero blocking findings.
+This document records implementation, remediation, verification, and final independent approval evidence.
 
 ## Scope
 
@@ -359,6 +359,31 @@ exit 0
 - No dependency or lock file changed. No approved design, plan, or review file changed.
 - Production/tests/policy changes and this delivery evidence are isolated in separate commits.
 
-## Review state
+## Final independent review verdicts
 
-**PENDING INDEPENDENT RE-REVIEW.** Task 4 remains blocked until independent re-reviews report zero blocking findings and this delivery record completes the established review cycle.
+### Spec and adversarial review: PASS
+
+The independent spec/adversarial reviewer reported **PASS**, with zero BLOCKER and zero MAJOR findings. The reviewer verified rejection of all 20 tested ambiguous numeric-host forms and all 4 tested scoped-IPv6 forms, acceptance of the original valid URI matrix, and the complete 183-test suite.
+
+### Quality review: APPROVED
+
+The independent quality reviewer reported **APPROVED**, with zero BLOCKER and zero MAJOR findings. The reviewer ran a parser differential across `urllib`, `httpx`, `urllib3`, and WHATWG implementations: 54,677 valid generated cases were accepted with no semantic host or port differences.
+
+## Final reviewed commit chain
+
+```text
+24f9a5a27a05d48a58c6d4ed5950e4fb0acdee4e feat(core): add identities time and observation metadata
+877c37573df3702f1d941a785614eede4ee89348 docs(delivery): record task 003 evidence
+45f8069260dd5de3a3ca8bafeac01357b982e771 fix(core): enforce observation and ID invariants
+8dc90d4e0c7ef5629b71255c950bb3b1445f546f docs(delivery): update task 003 review evidence
+5a6c81c71dc6a995baaa056b46c35feca7a25ddc fix(core): restrict observation sources to valid HTTPS URLs
+f7cb58d75d48af2f6841d4d46da34ac52c096666 docs(delivery): update task 003 URI review
+bd425a7d843a06c20301318a39d92a1c2e3c650d fix(core): reject ambiguous numeric observation hosts
+404de03f6e1238061929de81644907be6cc69277 docs(delivery): update task 003 host review
+```
+
+The approval evidence commit containing this section follows `404de03` and changes only `docs/delivery/task-003.md`.
+
+## Final status
+
+**FINAL APPROVED / COMPLETE.** Both required independent reviews report zero BLOCKER and zero MAJOR findings. Task 3 is complete; Task 4 may proceed under its own reviewed change-control cycle.
