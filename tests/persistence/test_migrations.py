@@ -1599,6 +1599,102 @@ def test_mount_resolver_result_is_validated(tmp_path: Path, invalid: object) -> 
         )
 
 
+def test_default_mount_resolution_cannot_pollute_another_connection_census(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_resolver = db_module._linux_mount_resolver
+    real_connect = db_module.sqlite3.connect
+    first_at_connect = threading.Event()
+    release_first_connect = threading.Event()
+    second_resolver_open = threading.Event()
+    release_second_resolver = threading.Event()
+    second_thread: int | None = None
+
+    def overlapping_resolver(path: Path) -> str:
+        if threading.get_ident() != second_thread:
+            return real_resolver(path)
+        descriptor = os.open("/proc/self/mountinfo", os.O_RDONLY)
+        try:
+            second_resolver_open.set()
+            assert release_second_resolver.wait(timeout=5)
+            return real_resolver(path)
+        finally:
+            os.close(descriptor)
+
+    def pause_first_after_census(*args: object, **kwargs: object) -> sqlite3.Connection:
+        first_at_connect.set()
+        assert release_first_connect.wait(timeout=5)
+        return real_connect(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(db_module, "_linux_mount_resolver", overlapping_resolver)
+    monkeypatch.setattr(db_module.sqlite3, "connect", pause_first_after_census)
+    before = set(_proc_fd_targets())
+
+    def connect_first() -> BaseException | None:
+        try:
+            connection = connect_database(
+                tmp_path / "first" / "db.sqlite3", busy_timeout_ms=1_000
+            )
+        except BaseException as error:
+            return error
+        else:
+            connection.close()
+            return None
+        finally:
+            release_second_resolver.set()
+
+    def connect_second() -> BaseException | None:
+        nonlocal second_thread
+        second_thread = threading.get_ident()
+        try:
+            connection = connect_database(
+                tmp_path / "second" / "db.sqlite3", busy_timeout_ms=1_000
+            )
+        except BaseException as error:
+            return error
+        else:
+            connection.close()
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(connect_first)
+        assert first_at_connect.wait(timeout=5)
+        second = executor.submit(connect_second)
+        resolver_overlapped = second_resolver_open.wait(timeout=0.2)
+        release_first_connect.set()
+        first_error = first.result(timeout=5)
+        second_error = second.result(timeout=5)
+
+    assert not resolver_overlapped
+    assert first_error is None
+    assert second_error is None
+    assert second_resolver_open.is_set()
+    assert set(_proc_fd_targets()) == before
+
+
+def test_concurrent_default_connections_repeatedly_leave_fds_unchanged(
+    tmp_path: Path,
+) -> None:
+    before = set(_proc_fd_targets())
+
+    def connect_and_close(database: Path) -> None:
+        connection = connect_database(database, busy_timeout_ms=1_000)
+        connection.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        for attempt in range(25):
+            futures = [
+                executor.submit(
+                    connect_and_close,
+                    tmp_path / f"run-{attempt}-{worker}" / "db.sqlite3",
+                )
+                for worker in range(2)
+            ]
+            for future in futures:
+                future.result(timeout=5)
+            assert set(_proc_fd_targets()) == before
+
+
 def test_concurrent_library_connection_attempts_serialize_fd_activity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

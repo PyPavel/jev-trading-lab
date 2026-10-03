@@ -502,10 +502,12 @@ def connect_database(
     if path.name in {"", ".", ".."}:
         raise ValueError("database path must name a file")
 
-    resolver = mount_resolver or _linux_mount_resolver
-    filesystem = _resolve_filesystem(path.parent, resolver)
+    filesystem = ""
+    if mount_resolver is not None:
+        filesystem = _resolve_filesystem(path.parent, mount_resolver)
     with _connection_fd_activity():
         if mount_resolver is None:
+            filesystem = _resolve_filesystem(path.parent, _linux_mount_resolver)
             _validate_filesystem(path.parent, filesystem)
         parent_descriptor = _open_private_parent(path.parent)
         parent_metadata = os.fstat(parent_descriptor)
