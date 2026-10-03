@@ -3,6 +3,9 @@
 Future migrations that create immutable tables must install their UPDATE/DELETE
 abort triggers and lineage constraints in the same migration. Each migration is
 committed independently, so no migration prefix may expose an unguarded table.
+Filesystem package resources require trusted parent metadata; archive Traversables
+use bounded streams and rely on the exact locked, hash-protected wheel artifact.
+Migration connections are dedicated: this runner owns and clears the authorizer.
 """
 
 from __future__ import annotations
@@ -20,7 +23,11 @@ from datetime import UTC, datetime
 from importlib.resources.abc import Traversable
 from pathlib import Path
 
-from jev_trading_lab.core.time import datetime_to_utc_us, validate_utc_us
+from jev_trading_lab.core.time import (
+    MAX_DATETIME_US,
+    datetime_to_utc_us,
+    validate_utc_us,
+)
 
 MAX_MIGRATION_BYTES = 1_048_576
 _DEFAULT_PACKAGE = "jev_trading_lab.persistence.schema"
@@ -37,6 +44,35 @@ _FORBIDDEN_FIRST_KEYWORDS = frozenset(
         "ROLLBACK",
         "SAVEPOINT",
         "VACUUM",
+    }
+)
+_TEMP_SQL = re.compile(r"\b(?:CREATE\s+TEMP(?:ORARY)?|TEMP\s*\.)\b", re.IGNORECASE)
+_WRITE_ACTIONS = frozenset(
+    {
+        sqlite3.SQLITE_ALTER_TABLE,
+        sqlite3.SQLITE_CREATE_INDEX,
+        sqlite3.SQLITE_CREATE_TABLE,
+        sqlite3.SQLITE_CREATE_TRIGGER,
+        sqlite3.SQLITE_CREATE_VIEW,
+        sqlite3.SQLITE_DELETE,
+        sqlite3.SQLITE_DROP_INDEX,
+        sqlite3.SQLITE_DROP_TABLE,
+        sqlite3.SQLITE_DROP_TRIGGER,
+        sqlite3.SQLITE_DROP_VIEW,
+        sqlite3.SQLITE_INSERT,
+        sqlite3.SQLITE_UPDATE,
+    }
+)
+_TEMP_ACTIONS = frozenset(
+    {
+        sqlite3.SQLITE_CREATE_TEMP_INDEX,
+        sqlite3.SQLITE_CREATE_TEMP_TABLE,
+        sqlite3.SQLITE_CREATE_TEMP_TRIGGER,
+        sqlite3.SQLITE_CREATE_TEMP_VIEW,
+        sqlite3.SQLITE_DROP_TEMP_INDEX,
+        sqlite3.SQLITE_DROP_TEMP_TABLE,
+        sqlite3.SQLITE_DROP_TEMP_TRIGGER,
+        sqlite3.SQLITE_DROP_TEMP_VIEW,
     }
 )
 
@@ -57,7 +93,48 @@ def _utc_now_us() -> int:
     return datetime_to_utc_us(datetime.now(UTC))
 
 
+def _trusted_resource_parents(resource: Path) -> None:
+    current = resource.parent
+    while True:
+        try:
+            metadata = current.lstat()
+        except OSError as error:
+            raise MigrationError(
+                f"migration package directory {current} is unreadable"
+            ) from error
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise MigrationError(
+                f"migration package directory {current} is a symlink or non-directory"
+            )
+        if metadata.st_uid not in {0, os.geteuid()}:
+            raise MigrationError(
+                f"migration package directory {current} has an untrusted owner"
+            )
+        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise MigrationError(
+                f"migration package directory {current} is group/other writable"
+            )
+        parent = current.parent
+        if not (parent / "__init__.py").exists():
+            return
+        current = parent
+
+
+def _resource_snapshot(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_nlink,
+    )
+
+
 def _read_filesystem_resource(resource: Path) -> bytes:
+    _trusted_resource_parents(resource)
     flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
@@ -72,9 +149,17 @@ def _read_filesystem_resource(resource: Path) -> bytes:
             raise MigrationError(
                 f"migration resource {resource.name!r} is not a regular file"
             )
-        if before.st_uid != os.geteuid():
+        if before.st_uid not in {0, os.geteuid()}:
             raise MigrationError(
-                f"migration resource {resource.name!r} is not owned by effective UID"
+                f"migration resource {resource.name!r} has an untrusted owner"
+            )
+        if before.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise MigrationError(
+                f"migration resource {resource.name!r} is group/other writable"
+            )
+        if before.st_nlink != 1:
+            raise MigrationError(
+                f"migration resource {resource.name!r} must have one link"
             )
         if not before.st_mode & (stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH):
             raise MigrationError(f"migration resource {resource.name!r} is unreadable")
@@ -88,11 +173,7 @@ def _read_filesystem_resource(resource: Path) -> bytes:
             remaining -= len(chunk)
         content = b"".join(chunks)
         after = os.fstat(descriptor)
-        if (before.st_dev, before.st_ino, before.st_size) != (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-        ):
+        if _resource_snapshot(before) != _resource_snapshot(after):
             raise MigrationError(
                 f"migration resource {resource.name!r} changed while reading"
             )
@@ -263,6 +344,10 @@ def _validated_statements(migration: Migration) -> tuple[str, ...]:
             raise MigrationError(
                 f"migration {migration.name!r} contains forbidden SQL {keyword}"
             )
+        if _TEMP_SQL.search(statement):
+            raise MigrationError(
+                f"migration {migration.name!r} contains forbidden TEMP SQL"
+            )
     return statements
 
 
@@ -276,26 +361,35 @@ def _metadata_table_exists(connection: sqlite3.Connection) -> bool:
     )
 
 
-def _applied_rows(connection: sqlite3.Connection) -> list[tuple[int, str, str]]:
+def _applied_rows(connection: sqlite3.Connection) -> list[tuple[int, str, str, int]]:
     if not _metadata_table_exists(connection):
         return []
     try:
         rows = connection.execute(
-            "SELECT version, name, sha256 FROM main.schema_migrations ORDER BY version"
+            "SELECT version, name, sha256, applied_at_us "
+            "FROM main.schema_migrations ORDER BY version"
         ).fetchall()
     except sqlite3.DatabaseError as error:
         raise MigrationError("schema_migrations metadata is invalid") from error
-    result: list[tuple[int, str, str]] = []
+    result: list[tuple[int, str, str, int]] = []
     for row in rows:
-        version, name, sha256 = row
-        if type(version) is not int or type(name) is not str or type(sha256) is not str:
-            raise MigrationError("applied migration metadata has invalid types")
-        result.append((version, name, sha256))
+        version, name, sha256, applied_at_us = row
+        if (
+            type(version) is not int
+            or type(name) is not str
+            or type(sha256) is not str
+            or type(applied_at_us) is not int
+            or not 0 <= applied_at_us <= MAX_DATETIME_US
+        ):
+            raise MigrationError(
+                "applied migration metadata has invalid types or values"
+            )
+        result.append((version, name, sha256, applied_at_us))
     return result
 
 
 def _validate_applied(
-    applied: list[tuple[int, str, str]], migrations: tuple[Migration, ...]
+    applied: list[tuple[int, str, str, int]], migrations: tuple[Migration, ...]
 ) -> None:
     versions = [row[0] for row in applied]
     if versions != list(range(1, len(versions) + 1)):
@@ -308,7 +402,7 @@ def _validate_applied(
         )
     for row, migration in zip(applied, migrations, strict=False):
         expected = (migration.version, migration.name, migration.sha256)
-        if row != expected:
+        if row[:3] != expected:
             raise MigrationError(
                 f"applied migration {row[0]:03d} name or checksum differs from package"
             )
@@ -320,7 +414,32 @@ def _timestamp(clock: Callable[[], int]) -> int:
         raise TypeError(
             "migration clock must return a built-in integer UTC microsecond value"
         )
-    return validate_utc_us(value)
+    validate_utc_us(value)
+    if value < 0:
+        raise ValueError("migration timestamp cannot predate the Unix epoch")
+    return value
+
+
+def _require_main_only(connection: sqlite3.Connection) -> None:
+    names = {row[1] for row in connection.execute("PRAGMA database_list").fetchall()}
+    if not names <= {"main", "temp"}:
+        raise MigrationError("migration connection has an auxiliary database attached")
+
+
+def _migration_authorizer(
+    action: int,
+    _argument1: str | None,
+    _argument2: str | None,
+    database: str | None,
+    _trigger: str | None,
+) -> int:
+    if action in {sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH}:
+        return sqlite3.SQLITE_DENY
+    if action in _TEMP_ACTIONS:
+        return sqlite3.SQLITE_DENY
+    if action in _WRITE_ACTIONS and database != "main":
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
 
 
 def apply_migrations(
@@ -340,6 +459,7 @@ def apply_migrations(
         raise MigrationError("cannot migrate inside an active caller transaction")
     if not callable(clock):
         raise TypeError("migration clock must be callable")
+    _require_main_only(connection)
     migrations = load_migrations(package)
     migration_statements = tuple(_validated_statements(item) for item in migrations)
     _validate_applied(_applied_rows(connection), migrations)
@@ -355,8 +475,18 @@ def apply_migrations(
                 connection.execute("COMMIT")
                 owned_transaction = False
                 continue
-            for statement in statements:
-                connection.execute(statement)
+            connection.set_authorizer(_migration_authorizer)
+            try:
+                for statement in statements:
+                    connection.execute(statement)
+            except sqlite3.DatabaseError as error:
+                if "authorized" in str(error).casefold():
+                    raise MigrationError(
+                        f"migration {migration.name!r} contains unauthorized SQL"
+                    ) from error
+                raise
+            finally:
+                connection.set_authorizer(None)
             applied_at_us = _timestamp(clock)
             connection.execute(
                 "INSERT INTO main.schema_migrations "

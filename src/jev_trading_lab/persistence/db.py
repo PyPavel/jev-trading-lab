@@ -6,6 +6,7 @@ import errno
 import os
 import sqlite3
 import stat
+import threading
 import time
 from pathlib import Path
 from typing import Protocol
@@ -31,6 +32,8 @@ _MOUNTINFO_ESCAPES = {
     "\\012": "\n",
     "\\134": "\\",
 }
+_UMASK_LOCK = threading.Lock()
+_CONNECT_LOCK = threading.Lock()
 
 
 class DatabaseConfigurationError(RuntimeError):
@@ -39,6 +42,20 @@ class DatabaseConfigurationError(RuntimeError):
 
 class MountResolver(Protocol):
     def __call__(self, path: Path) -> str: ...
+
+
+class SecureConnection(sqlite3.Connection):
+    """SQLite connection that owns its validated parent directory descriptor."""
+
+    _parent_descriptor: int | None = None
+
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            if self._parent_descriptor is not None:
+                os.close(self._parent_descriptor)
+                self._parent_descriptor = None
 
 
 def _decode_mountinfo_path(value: str) -> str:
@@ -198,6 +215,107 @@ def _prepare_database_file(path: Path, parent_descriptor: int) -> tuple[int, int
             os.close(descriptor)
 
 
+def _open_fd_identities() -> dict[int, tuple[int, int]]:
+    identities: dict[int, tuple[int, int]] = {}
+    try:
+        entries = os.scandir("/proc/self/fd")
+    except OSError as error:
+        raise DatabaseConfigurationError(
+            f"cannot inspect SQLite file descriptors: {error}"
+        ) from error
+    with entries:
+        for entry in entries:
+            try:
+                descriptor = int(entry.name)
+                metadata = os.fstat(descriptor)
+            except (OSError, ValueError):
+                continue
+            identities[descriptor] = (metadata.st_dev, metadata.st_ino)
+    return identities
+
+
+def _verify_main_database_fd(
+    before: dict[int, tuple[int, int]], expected: tuple[int, int]
+) -> None:
+    opened = _open_fd_identities()
+    matching = [
+        descriptor
+        for descriptor, identity in opened.items()
+        if before.get(descriptor) != identity and identity == expected
+    ]
+    if len(matching) != 1:
+        raise DatabaseConfigurationError(
+            "SQLite main database fd does not match the validated inode"
+        )
+
+
+def _verify_main_database_path(connection: sqlite3.Connection, path: Path) -> None:
+    rows = connection.execute("PRAGMA database_list").fetchall()
+    main = [row[2] for row in rows if row[1] == "main"]
+    if main != [str(path)]:
+        raise DatabaseConfigurationError(
+            "SQLite resolved main database outside the validated parent"
+        )
+
+
+def _sidecar_names(path: Path) -> tuple[str, str]:
+    return f"{path.name}-wal", f"{path.name}-shm"
+
+
+def _validate_sidecar(metadata: os.stat_result, name: str) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise DatabaseConfigurationError(f"database sidecar {name!r} is not regular")
+    if metadata.st_uid != os.geteuid():
+        raise DatabaseConfigurationError(
+            f"database sidecar {name!r} is not owned by effective UID"
+        )
+    if metadata.st_nlink != 1:
+        raise DatabaseConfigurationError(
+            f"database sidecar {name!r} must not have a hard link"
+        )
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise DatabaseConfigurationError(
+            f"database sidecar {name!r} must have mode 0600"
+        )
+
+
+def _check_sidecars(path: Path, parent_descriptor: int) -> None:
+    for name in _sidecar_names(path):
+        try:
+            metadata = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise DatabaseConfigurationError(
+                f"cannot inspect database sidecar {name!r}: {error}"
+            ) from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise DatabaseConfigurationError(f"database sidecar {name!r} is a symlink")
+        _validate_sidecar(metadata, name)
+
+
+def _activate_wal(
+    connection: sqlite3.Connection, timeout: int
+) -> sqlite3.Row | tuple[object, ...] | None:
+    deadline = time.monotonic() + timeout / 1_000
+    with _UMASK_LOCK:
+        previous_umask = os.umask(0o177)
+        try:
+            while True:
+                try:
+                    row = connection.execute("PRAGMA journal_mode = WAL").fetchone()
+                    return None if row is None else tuple(row)
+                except sqlite3.OperationalError as error:
+                    if (
+                        "locked" not in str(error).casefold()
+                        or time.monotonic() >= deadline
+                    ):
+                        raise
+                    time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+        finally:
+            os.umask(previous_umask)
+
+
 def _recheck_storage(
     path: Path,
     parent_descriptor: int,
@@ -212,15 +330,14 @@ def _recheck_storage(
         raise DatabaseConfigurationError(
             f"database storage changed while opening: {error}"
         ) from error
-    actual_parent = (pathname_parent.st_dev, pathname_parent.st_ino)
-    if actual_parent != parent_identity or actual_parent != (
-        descriptor_parent.st_dev,
-        descriptor_parent.st_ino,
-    ):
+    if (descriptor_parent.st_dev, descriptor_parent.st_ino) != parent_identity or (
+        pathname_parent.st_dev,
+        pathname_parent.st_ino,
+    ) != parent_identity:
         raise DatabaseConfigurationError("database parent changed while opening")
     if (
-        pathname_parent.st_uid != os.geteuid()
-        or stat.S_IMODE(pathname_parent.st_mode) != 0o700
+        descriptor_parent.st_uid != os.geteuid()
+        or stat.S_IMODE(descriptor_parent.st_mode) != 0o700
     ):
         raise DatabaseConfigurationError(
             "database parent security changed while opening"
@@ -228,6 +345,7 @@ def _recheck_storage(
     _validate_database_metadata(database, path)
     if (database.st_dev, database.st_ino) != file_identity:
         raise DatabaseConfigurationError("database file changed while opening")
+    _check_sidecars(path, parent_descriptor)
 
 
 def _verify_pragma(
@@ -273,38 +391,42 @@ def connect_database(
     parent_descriptor = _open_private_parent(path.parent)
     parent_metadata = os.fstat(parent_descriptor)
     parent_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
-    connection: sqlite3.Connection | None = None
+    connection: SecureConnection | None = None
+    transferred_parent = False
     try:
         _validate_filesystem(path.parent, resolver)
         file_identity = _prepare_database_file(path, parent_descriptor)
-        connection = sqlite3.connect(
-            supplied,
-            timeout=timeout / 1_000,
-            isolation_level=None,
-            uri=False,
-            check_same_thread=True,
-        )
+        _check_sidecars(path, parent_descriptor)
+        descriptor_path = f"/proc/self/fd/{parent_descriptor}/{path.name}"
+        with _CONNECT_LOCK:
+            before_fds = _open_fd_identities()
+            connection = sqlite3.connect(
+                descriptor_path,
+                timeout=timeout / 1_000,
+                isolation_level=None,
+                uri=False,
+                check_same_thread=True,
+                factory=SecureConnection,
+            )
+            if not isinstance(connection, SecureConnection):
+                raise DatabaseConfigurationError(
+                    "SQLite did not create a secure connection"
+                )
+            connection._parent_descriptor = parent_descriptor
+            transferred_parent = True
+            _verify_main_database_fd(before_fds, file_identity)
+        _verify_main_database_path(connection, path)
         _recheck_storage(path, parent_descriptor, parent_identity, file_identity)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         _verify_pragma(connection, "foreign_keys", 1, label="foreign_keys")
-        deadline = time.monotonic() + timeout / 1_000
-        while True:
-            try:
-                journal = connection.execute("PRAGMA journal_mode = WAL").fetchone()
-                break
-            except sqlite3.OperationalError as error:
-                if (
-                    "locked" not in str(error).casefold()
-                    or time.monotonic() >= deadline
-                ):
-                    raise
-                time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+        journal = _activate_wal(connection, timeout)
         if journal is None or str(journal[0]).casefold() != "wal":
             actual = None if journal is None else journal[0]
             raise DatabaseConfigurationError(
                 f"SQLite WAL setup failed: received {actual!r}"
             )
+        _check_sidecars(path, parent_descriptor)
         connection.execute(f"PRAGMA busy_timeout = {timeout}")
         _verify_pragma(connection, "busy_timeout", timeout, label="busy_timeout")
         connection.execute("PRAGMA synchronous = FULL")
@@ -318,4 +440,5 @@ def connect_database(
             connection.close()
         raise
     finally:
-        os.close(parent_descriptor)
+        if not transferred_parent:
+            os.close(parent_descriptor)

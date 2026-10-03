@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from jev_trading_lab.core.time import MAX_DATETIME_US
 from jev_trading_lab.persistence import db as db_module
 from jev_trading_lab.persistence import migrations as migration_module
 from jev_trading_lab.persistence.db import (
@@ -213,16 +214,25 @@ def test_sqlite_too_old_fails_before_open(
 def test_pragma_setup_failure_closes_connection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    connection = sqlite3.connect(":memory:", isolation_level=None)
-    monkeypatch.setattr(
-        db_module.sqlite3,
-        "connect",
-        lambda *_args, **_kwargs: connection,
-    )
+    real_connect = sqlite3.connect
+    connection: sqlite3.Connection | None = None
 
-    with pytest.raises(DatabaseConfigurationError, match="WAL"):
+    def memory_connect(*_args: object, **kwargs: object) -> sqlite3.Connection:
+        nonlocal connection
+        factory = kwargs["factory"]
+        assert isinstance(factory, type)
+        connection = real_connect(  # type: ignore[call-overload]
+            ":memory:", isolation_level=None, factory=factory
+        )
+        assert connection is not None
+        return connection
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", memory_connect)
+
+    with pytest.raises(DatabaseConfigurationError, match="inode"):
         _connect(tmp_path / "db.sqlite3")
 
+    assert connection is not None
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
         connection.execute("SELECT 1")
 
@@ -726,7 +736,7 @@ def test_parent_replacement_during_connect_is_rejected(
         return real_connect(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(db_module.sqlite3, "connect", replace_parent)
-    with pytest.raises(DatabaseConfigurationError, match="parent changed"):
+    with pytest.raises(DatabaseConfigurationError, match="validated parent"):
         _connect(database)
 
 
@@ -745,7 +755,7 @@ def test_database_path_replacement_during_connect_is_rejected(
         return real_connect(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(db_module.sqlite3, "connect", replace_database)
-    with pytest.raises(DatabaseConfigurationError, match="database file changed"):
+    with pytest.raises(DatabaseConfigurationError, match="validated inode"):
         _connect(database)
 
 
@@ -934,3 +944,376 @@ def test_archive_resource_read_is_bounded_to_maximum_plus_one() -> None:
         migration_module._read_resource(resource)  # type: ignore[arg-type]
     assert not resource.read_bytes_called
     assert resource.stream.bytes_returned == MAX_MIGRATION_BYTES + 1
+
+
+def _proc_fd_targets() -> dict[int, str]:
+    targets: dict[int, str] = {}
+    for entry in Path("/proc/self/fd").iterdir():
+        try:
+            targets[int(entry.name)] = os.readlink(entry)
+        except (FileNotFoundError, OSError, ValueError):
+            continue
+    return targets
+
+
+def test_connection_retains_private_parent_descriptor_until_close(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "private" / "db.sqlite3"
+    before = _proc_fd_targets()
+
+    connection = _connect(database)
+    during = _proc_fd_targets()
+    parent_fds = [
+        descriptor
+        for descriptor, target in during.items()
+        if descriptor not in before and target == str(database.parent)
+    ]
+    assert len(parent_fds) == 1
+
+    connection.close()
+    assert parent_fds[0] not in _proc_fd_targets()
+
+
+def test_database_inode_swap_restored_before_path_recheck_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    database = parent / "db.sqlite3"
+    database.touch(mode=0o600)
+    replacement = parent / "replacement.sqlite3"
+    replacement.touch(mode=0o600)
+    parked_original = parent / "original.sqlite3"
+    parked_replacement = parent / "opened.sqlite3"
+    real_connect = sqlite3.connect
+
+    def swap_for_sqlite(*args: object, **kwargs: object) -> sqlite3.Connection:
+        database.rename(parked_original)
+        replacement.rename(database)
+        connection = real_connect(*args, **kwargs)  # type: ignore[arg-type]
+        database.rename(parked_replacement)
+        parked_original.rename(database)
+        return connection
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", swap_for_sqlite)
+    before = set(_proc_fd_targets())
+    with pytest.raises(DatabaseConfigurationError, match="inode"):
+        _connect(database)
+    assert set(_proc_fd_targets()) == before
+
+
+def test_parent_path_swap_cannot_redirect_descriptor_relative_connect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    database = parent / "db.sqlite3"
+    original = sqlite3.connect(database)
+    original.execute("CREATE TABLE identity (value TEXT NOT NULL)")
+    original.execute("INSERT INTO identity VALUES ('original')")
+    original.commit()
+    original.close()
+    database.chmod(0o600)
+
+    replacement_parent = tmp_path / "replacement"
+    replacement_parent.mkdir(mode=0o700)
+    replacement_database = replacement_parent / database.name
+    replacement = sqlite3.connect(replacement_database)
+    replacement.execute("CREATE TABLE identity (value TEXT NOT NULL)")
+    replacement.execute("INSERT INTO identity VALUES ('replacement')")
+    replacement.commit()
+    replacement.close()
+    replacement_database.chmod(0o600)
+
+    parked_original = tmp_path / "parked-original"
+    parked_replacement = tmp_path / "parked-replacement"
+    real_connect = sqlite3.connect
+
+    def swap_parent_for_sqlite(*args: object, **kwargs: object) -> sqlite3.Connection:
+        parent.rename(parked_original)
+        replacement_parent.rename(parent)
+        connection = real_connect(*args, **kwargs)  # type: ignore[arg-type]
+        parent.rename(parked_replacement)
+        parked_original.rename(parent)
+        return connection
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", swap_parent_for_sqlite)
+    with pytest.raises(DatabaseConfigurationError, match="validated parent"):
+        _connect(database)
+
+
+@pytest.mark.parametrize("suffix", ("-wal", "-shm"))
+def test_preexisting_unsafe_sidecar_mode_is_rejected(
+    tmp_path: Path, suffix: str
+) -> None:
+    database = tmp_path / "private" / "db.sqlite3"
+    database.parent.mkdir(mode=0o700)
+    database.touch(mode=0o600)
+    sidecar = Path(f"{database}{suffix}")
+    sidecar.touch(mode=0o644)
+    sidecar.chmod(0o644)
+
+    with pytest.raises(DatabaseConfigurationError, match="sidecar.*0600"):
+        _connect(database)
+    assert stat.S_IMODE(sidecar.stat().st_mode) == 0o644
+
+
+@pytest.mark.parametrize("suffix", ("-wal", "-shm"))
+def test_preexisting_sidecar_symlink_is_rejected(tmp_path: Path, suffix: str) -> None:
+    database = tmp_path / "private" / "db.sqlite3"
+    database.parent.mkdir(mode=0o700)
+    database.touch(mode=0o600)
+    target = database.parent / "target"
+    target.touch(mode=0o600)
+    Path(f"{database}{suffix}").symlink_to(target)
+
+    with pytest.raises(DatabaseConfigurationError, match="sidecar.*symlink"):
+        _connect(database)
+
+
+@pytest.mark.parametrize("suffix", ("-wal", "-shm"))
+def test_preexisting_sidecar_hardlink_is_rejected(tmp_path: Path, suffix: str) -> None:
+    database = tmp_path / "private" / "db.sqlite3"
+    database.parent.mkdir(mode=0o700)
+    database.touch(mode=0o600)
+    target = database.parent / "target"
+    target.touch(mode=0o600)
+    Path(f"{database}{suffix}").hardlink_to(target)
+
+    with pytest.raises(DatabaseConfigurationError, match="sidecar.*hard link"):
+        _connect(database)
+
+
+def test_sidecar_created_racing_wal_activation_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "private" / "db.sqlite3"
+    real_connect = sqlite3.connect
+
+    class RacingConnection(sqlite3.Connection):
+        raced = False
+
+        def execute(self, sql: str, parameters: object = (), /) -> sqlite3.Cursor:
+            if sql == "PRAGMA journal_mode = WAL" and not self.raced:
+                self.raced = True
+                sidecar = Path(f"{database}-wal")
+                sidecar.touch(mode=0o644)
+                sidecar.chmod(0o644)
+            return super().execute(sql, parameters)  # type: ignore[arg-type]
+
+    def racing_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        class SecureRacingConnection(RacingConnection, db_module.SecureConnection):
+            pass
+
+        kwargs["factory"] = SecureRacingConnection
+        return real_connect(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", racing_connect)
+    with pytest.raises(DatabaseConfigurationError, match="sidecar.*0600"):
+        _connect(database)
+
+
+def test_world_writable_migration_package_directory_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package, schema = _package(tmp_path, monkeypatch, {"001_ok.sql": b"SELECT 1;\n"})
+    schema.chmod(0o777)
+
+    with pytest.raises(MigrationError, match="package directory.*writable"):
+        load_migrations(package)
+
+
+def test_group_writable_migration_file_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package, schema = _package(tmp_path, monkeypatch, {"001_ok.sql": b"SELECT 1;\n"})
+    migration = schema / "001_ok.sql"
+    migration.chmod(0o660)
+
+    with pytest.raises(MigrationError, match="resource.*writable"):
+        load_migrations(package)
+
+
+def test_equal_size_resource_rewrite_during_read_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resource = tmp_path / "001_race.sql"
+    original = b"A" * 1024
+    resource.write_bytes(original)
+    real_read = os.read
+    mutated = False
+
+    def rewriting_read(descriptor: int, size: int) -> bytes:
+        nonlocal mutated
+        content = real_read(descriptor, size)
+        if content and not mutated:
+            mutated = True
+            resource.write_bytes(b"B" * len(original))
+        return content
+
+    monkeypatch.setattr(migration_module.os, "read", rewriting_read)
+    with pytest.raises(MigrationError, match="changed while reading"):
+        migration_module._read_filesystem_resource(resource)
+    assert mutated
+
+
+def test_mixed_resource_bytes_from_in_place_rewrite_are_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resource = tmp_path / "001_race.sql"
+    resource.write_bytes(b"A" * (65_536 * 2))
+    real_read = os.read
+    reads = 0
+
+    def rewriting_read(descriptor: int, size: int) -> bytes:
+        nonlocal reads
+        content = real_read(descriptor, size)
+        reads += 1
+        if reads == 1:
+            with resource.open("r+b") as stream:
+                stream.seek(65_536)
+                stream.write(b"B" * 65_536)
+        return content
+
+    monkeypatch.setattr(migration_module.os, "read", rewriting_read)
+    with pytest.raises(MigrationError, match="changed while reading"):
+        migration_module._read_filesystem_resource(resource)
+    assert reads >= 2
+
+
+def test_migration_rejects_pre_attached_auxiliary_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package, _schema = _package(
+        tmp_path,
+        monkeypatch,
+        {
+            "001_migration_metadata.sql": SCHEMA_SQL,
+            "002_off_main.sql": b"CREATE TABLE aux.off_main (id INTEGER);\n",
+        },
+    )
+    database = tmp_path / "db.sqlite3"
+    auxiliary = tmp_path / "aux.sqlite3"
+    connection = _connect(database)
+    try:
+        connection.execute("ATTACH DATABASE ? AS aux", (str(auxiliary),))
+        with pytest.raises(MigrationError, match="auxiliary database"):
+            apply_migrations(connection, package=package, clock=lambda: 1_000_000)
+        assert not connection.in_transaction
+        assert (
+            connection.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE name = 'schema_migrations'"
+            ).fetchone()
+            is None
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM aux.sqlite_schema WHERE name = 'off_main'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+
+    reopened = sqlite3.connect(auxiliary)
+    try:
+        assert (
+            reopened.execute(
+                "SELECT 1 FROM sqlite_schema WHERE name = 'off_main'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        reopened.close()
+
+
+def test_create_temp_migration_is_denied_and_rolled_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package, _schema = _package(
+        tmp_path,
+        monkeypatch,
+        {
+            "001_migration_metadata.sql": SCHEMA_SQL,
+            "002_temp.sql": b"CREATE TEMP TABLE off_main (id INTEGER);\n",
+        },
+    )
+    database = tmp_path / "db.sqlite3"
+    connection = _connect(database)
+    try:
+        with pytest.raises(MigrationError, match="TEMP|authorized"):
+            apply_migrations(connection, package=package, clock=lambda: 1_000_000)
+        assert not connection.in_transaction
+        assert (
+            connection.execute(
+                "SELECT 1 FROM temp.sqlite_schema WHERE name = 'off_main'"
+            ).fetchone()
+            is None
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE name = 'schema_migrations'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+
+    reopened = _connect(database)
+    try:
+        assert (
+            reopened.execute(
+                "SELECT 1 FROM temp.sqlite_schema WHERE name = 'off_main'"
+            ).fetchone()
+            is None
+        )
+        assert (
+            reopened.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE name = 'schema_migrations'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("invalid", (-1, 2**63 - 1))
+def test_schema_rejects_invalid_applied_timestamp(tmp_path: Path, invalid: int) -> None:
+    connection = _connect(tmp_path / "db.sqlite3")
+    try:
+        apply_migrations(connection, clock=lambda: 0)
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO main.schema_migrations "
+                "(version, name, sha256, applied_at_us) VALUES (?, ?, ?, ?)",
+                (2, "002_valid.sql", "a" * 64, invalid),
+            )
+        assert _applied(connection)[0][3] == 0
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("invalid", (-1, 2**63 - 1))
+def test_reconnect_detects_corrupt_applied_timestamp(
+    tmp_path: Path, invalid: int
+) -> None:
+    database = tmp_path / "db.sqlite3"
+    connection = _connect(database)
+    try:
+        apply_migrations(connection, clock=lambda: 0)
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "UPDATE main.schema_migrations SET applied_at_us = ? WHERE version = 1",
+            (invalid,),
+        )
+        connection.execute("PRAGMA ignore_check_constraints = OFF")
+    finally:
+        connection.close()
+
+    reopened = _connect(database)
+    try:
+        with pytest.raises(MigrationError, match="applied migration metadata"):
+            apply_migrations(reopened, clock=lambda: MAX_DATETIME_US)
+    finally:
+        reopened.close()

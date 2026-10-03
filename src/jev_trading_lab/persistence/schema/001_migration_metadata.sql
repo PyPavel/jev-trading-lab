@@ -15,5 +15,8 @@ CREATE TABLE main.schema_migrations (
         length(sha256) = 64
         AND sha256 NOT GLOB '*[^0-9a-f]*'
     ),
-    applied_at_us INTEGER NOT NULL
+    applied_at_us INTEGER NOT NULL CHECK (
+        typeof(applied_at_us) = 'integer'
+        AND applied_at_us BETWEEN 0 AND 253402300799999999
+    )
 ) STRICT, WITHOUT ROWID;
