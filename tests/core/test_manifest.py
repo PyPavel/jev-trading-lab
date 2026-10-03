@@ -562,53 +562,69 @@ def test_activation_candidate_rejects_examples_and_placeholders() -> None:
     candidate.assert_activation_candidate()
 
 
+_STRONG_MARKERS = (
+    "example",
+    "xxx",
+    "placeholder",
+    "todo",
+    "tbd",
+    "changeme",
+    "unknown",
+    "dummy",
+    "fake",
+    "notapplicable",
+    "notset",
+    "unset",
+    "replaceme",
+    "pending",
+)
+
+
 @pytest.mark.parametrize(
-    "marker",
-    (
-        "CHANGE_ME",
-        "changeme",
-        "unknown",
-        "dummy",
-        "fake",
-        "not-set",
-        "not_set",
-        "notset",
-        "unset",
-        "replace-me",
-        "pending",
-        "rev-change_me-2026",
+    "token",
+    tuple(
+        candidate
+        for marker in _STRONG_MARKERS
+        for candidate in (marker, f"{marker}2026")
     ),
 )
-def test_activation_rejects_normalized_revision_markers(marker: str) -> None:
+def test_activation_rejects_exact_or_digit_suffixed_unresolved_tokens(
+    token: str,
+) -> None:
     value = _activation_value()
-    value["models"]["openai"]["expected_revision"] = marker
+    value["models"]["openai"]["expected_revision"] = f"rev-20261002-{token}-a1"
     with pytest.raises(ValueError, match="expected_revision.*placeholder"):
         _parse_value(value)
 
 
 @pytest.mark.parametrize(
-    ("path", "replacement"),
+    "phrase",
     (
-        ("models.openai.expected_revision", "placeholder2026"),
-        ("calendar.tm_rule_version", "phase1-changeme123-v1"),
-        ("models.openai.expected_fingerprint", "fp_todo2026_a91b7c4d"),
-        ("statistics.power_simulation_version", "phase1-not_applicable_2026-v1"),
+        "change-me",
+        "change-me2026",
+        "replace-me",
+        "replace-me2026",
+        "not-applicable",
+        "not-applicable2026",
+        "not-set",
+        "not-set2026",
+        "test-only",
+        "test-only2026",
     ),
 )
-def test_activation_rejects_compacted_unresolved_markers(
-    path: str, replacement: str
-) -> None:
+def test_activation_rejects_unresolved_token_phrases(phrase: str) -> None:
     value = _activation_value()
-    _set_path(value, path, replacement)
-    with pytest.raises(ValueError, match=f"{path}.*placeholder"):
+    value["calendar"]["tm_rule_version"] = f"phase1-{phrase}-v1"
+    with pytest.raises(ValueError, match="tm_rule_version.*placeholder"):
         _parse_value(value)
 
 
 @pytest.mark.parametrize(
     ("path", "replacement"),
     (
-        ("models.openai.expected_fingerprint", "fp_replaceme2026_a91b7c4d"),
-        ("models.openai.sdk_package", "todo2026client"),
+        ("models.jev.request_model_snapshot", "jev-phase1-example-2026-10-02"),
+        ("models.openai.expected_fingerprint", "fp-replaceme2026-a91b7c4d"),
+        ("models.openai.sdk_package", "todo2026-client"),
         ("baselines.polymarket_control_artifact_id", "control-unset2026-v1"),
         ("baselines.polymarket_control_artifact_version", "control-dummy2026-v1"),
         ("model_input_policy.openai_prompt_template_version", "prompt-fake2026-v1"),
@@ -628,6 +644,8 @@ def test_activation_rejects_unresolved_markers_in_every_identity_class(
 ) -> None:
     value = _activation_value()
     _set_path(value, path, replacement)
+    if path == "models.jev.request_model_snapshot":
+        value["models"]["jev"]["expected_returned_model_id"] = replacement
     with pytest.raises(ValueError, match=f"{path}.*placeholder"):
         _parse_value(value)
 
@@ -641,14 +659,17 @@ def test_activation_rejects_unresolved_markers_in_every_identity_class(
         ("models.openai.expected_fingerprint", "none"),
         ("baselines.stock_control_artifact_version", "null"),
         ("baselines.stock_control_artifact_id", "na"),
+        ("models.openai.expected_revision", "n-a"),
+        ("models.openai.expected_revision", "n_a"),
+        ("models.openai.expected_revision", "N/A"),
     ),
 )
-def test_activation_rejects_exact_generic_identity_values(
+def test_activation_rejects_separator_insensitive_generic_identity_values(
     path: str, replacement: str
 ) -> None:
     value = _activation_value()
     _set_path(value, path, replacement)
-    with pytest.raises(ValueError, match=f"{path}.*placeholder"):
+    with pytest.raises(ValueError, match=f"{path}.*generic identity"):
         _parse_value(value)
 
 
@@ -658,9 +679,14 @@ def test_activation_rejects_exact_generic_identity_values(
         ("calendar.tm_rule_version", "phase1-permutation-test-v1"),
         ("stocks.candidate_rule_version", "phase1-sample-calendar-v1"),
         ("statistics.power_simulation_version", "phase1-change-detection-v1"),
+        ("statistics.power_simulation_version", "phase1-current-regime-v1"),
+        ("calendar.tm_rule_version", "phase1-sunset-policy-v1"),
+        ("calendar.tm_rule_version", "phase1-depending-policy-v1"),
+        ("calendar.tm_rule_version", "phase1-contest-policy-v1"),
+        ("calendar.tm_rule_version", "phase1-changelog-policy-v1"),
     ),
 )
-def test_activation_accepts_legitimate_rule_identity_components(
+def test_activation_accepts_legitimate_identity_tokens(
     path: str, replacement: str
 ) -> None:
     value = _activation_value()
@@ -674,8 +700,6 @@ def test_activation_accepts_harmless_marker_substrings() -> None:
     value["models"]["openai"]["expected_fingerprint"] = "fp_changelog2026_a91b7c4d"
     value["models"]["openai"]["sdk_package"] = "contest-client"
     value["models"]["openai"]["sdk_version"] = "2.1.0"
-    value["calendar"]["tm_rule_version"] = "phase1-sample-rate-v2"
-    value["statistics"]["power_simulation_version"] = "phase1-current-regime-v1"
     _parse_value(value).assert_activation_candidate()
 
 
@@ -699,6 +723,50 @@ def test_activation_rejects_malformed_field_specific_identities(
 
 
 @pytest.mark.parametrize(
+    "sdk_version",
+    ("01.2.3", "1.02.3", "1.2.03"),
+)
+def test_activation_rejects_noncanonical_semver(sdk_version: str) -> None:
+    value = _activation_value()
+    value["models"]["openai"]["sdk_version"] = sdk_version
+    with pytest.raises(ValueError, match="sdk_version.*malformed"):
+        _parse_value(value)
+
+
+@pytest.mark.parametrize("sdk_version", ("0.0.0", "3.12.0", "10.20.30"))
+def test_activation_accepts_canonical_semver(sdk_version: str) -> None:
+    value = _activation_value()
+    value["models"]["openai"]["sdk_version"] = sdk_version
+    _parse_value(value).assert_activation_candidate()
+
+
+@pytest.mark.parametrize(
+    "repeated_hash",
+    (
+        "a" * 64,
+        "ab" * 32,
+        "abcd" * 16,
+        "01234567" * 8,
+        "0123456789abcdef" * 4,
+        "0123456789abcdef89abcdef01234567" * 2,
+    ),
+)
+def test_activation_rejects_periodic_sha256_identities(repeated_hash: str) -> None:
+    value = _activation_value()
+    value["statistics"]["power_simulation_sha256"] = repeated_hash
+    with pytest.raises(ValueError, match="power_simulation_sha256.*repeated hash"):
+        _parse_value(value)
+
+
+def test_activation_accepts_nonperiodic_sha256_identity() -> None:
+    value = _activation_value()
+    value["statistics"]["power_simulation_sha256"] = hashlib.sha256(
+        b"reviewed-power-simulation"
+    ).hexdigest()
+    _parse_value(value).assert_activation_candidate()
+
+
+@pytest.mark.parametrize(
     ("path", "replacement"),
     (
         ("models.openai.expected_fingerprint", "RePlAcE_Me"),
@@ -706,8 +774,6 @@ def test_activation_rejects_malformed_field_specific_identities(
         ("baselines.stock_control_artifact_id", "bad artifact!"),
         ("baselines.stock_control_artifact_version", "test_only"),
         ("statistics.power_simulation_version", "bad version!"),
-        ("statistics.power_simulation_sha256", "a" * 64),
-        ("statistics.expected_block_length_artifact_sha256", "deadbeef" * 8),
     ),
 )
 def test_activation_rejects_field_aware_identity_placeholders(
@@ -717,6 +783,39 @@ def test_activation_rejects_field_aware_identity_placeholders(
     _set_path(value, path, replacement)
     with pytest.raises(ValueError, match=f"{path}.*placeholder"):
         _parse_value(value)
+
+
+def test_provider_response_schema_identities_are_distinct() -> None:
+    value = _activation_value()
+    jev_questions = (
+        value["model_input_policy"]["jev_question_set_version"],
+        value["model_input_policy"]["jev_question_set_sha256"],
+    )
+    value["models"]["jev"]["schema_version"] = value["models"]["openai"][
+        "schema_version"
+    ]
+    value["models"]["jev"]["schema_sha256"] = value["models"]["openai"]["schema_sha256"]
+
+    with pytest.raises(ValueError, match="response schema.*distinct"):
+        _parse_value(value)
+
+    assert jev_questions == (
+        value["model_input_policy"]["jev_question_set_version"],
+        value["model_input_policy"]["jev_question_set_sha256"],
+    )
+
+
+def test_provider_response_schema_hashes_must_differ() -> None:
+    value = _activation_value()
+    value["models"]["jev"]["schema_sha256"] = value["models"]["openai"]["schema_sha256"]
+    with pytest.raises(ValueError, match="response schema hashes must differ"):
+        _parse_value(value)
+
+    value = _activation_value()
+    value["models"]["jev"]["schema_version"] = value["models"]["openai"][
+        "schema_version"
+    ]
+    _parse_value(value).assert_activation_candidate()
 
 
 def test_model_input_policy_is_required_content_addressed_and_identity_bound() -> None:

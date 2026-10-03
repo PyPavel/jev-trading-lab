@@ -36,10 +36,12 @@ _NonEmpty = Annotated[str, StringConstraints(min_length=1)]
 _CREATION_SENTINEL = object()
 _STRONG_UNRESOLVED_IDENTITY_MARKERS = frozenset(
     {
+        "example",
+        "xxx",
         "placeholder",
-        "changeme",
         "todo",
         "tbd",
+        "changeme",
         "unknown",
         "dummy",
         "fake",
@@ -50,10 +52,19 @@ _STRONG_UNRESOLVED_IDENTITY_MARKERS = frozenset(
         "pending",
     }
 )
+_UNRESOLVED_IDENTITY_PHRASES = (
+    ("change", "me"),
+    ("replace", "me"),
+    ("not", "applicable"),
+    ("not", "set"),
+    ("test", "only"),
+)
 _GENERIC_IDENTITY_VALUES = frozenset(
     {"latest", "current", "default", "none", "null", "na"}
 )
-_SEMANTIC_VERSION_PATTERN = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+_SEMANTIC_VERSION_PATTERN = re.compile(
+    r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+)
 _VERSIONED_SLUG_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*-v[1-9][0-9]*")
 _PROVIDER_IDENTITY_PATTERN = re.compile(
     r"(?=[a-z0-9._:-]*[0-9])[a-z0-9][a-z0-9._:-]{10,}[a-z0-9]"
@@ -302,6 +313,12 @@ class _ModelContracts(_StrictModel):
                 raise ValueError(
                     f"{provider} model snapshot date must be a real calendar date"
                 ) from error
+        openai_schema = (self.openai.schema_version, self.openai.schema_sha256)
+        jev_schema = (self.jev.schema_version, self.jev.schema_sha256)
+        if openai_schema == jev_schema:
+            raise ValueError("provider response schema identities must be distinct")
+        if self.openai.schema_sha256 == self.jev.schema_sha256:
+            raise ValueError("provider response schema hashes must differ")
         return self
 
 
@@ -1162,13 +1179,29 @@ def _format_validation_error(error: ValidationError) -> ValueError:
     return ValueError("manifest validation failed:\n" + "\n".join(messages))
 
 
+def _token_matches_marker(token: str, marker: str) -> bool:
+    suffix = token.removeprefix(marker)
+    return token == marker or (token.startswith(marker) and suffix.isdigit())
+
+
 def _has_unresolved_marker(value: str) -> bool:
-    compacted = re.sub(r"[^a-z0-9]+", "", value.casefold())
-    return any(marker in compacted for marker in _STRONG_UNRESOLVED_IDENTITY_MARKERS)
+    tokens = tuple(filter(None, re.split(r"[^a-z0-9]+", value.casefold())))
+    if any(
+        _token_matches_marker(token, marker)
+        for token in tokens
+        for marker in _STRONG_UNRESOLVED_IDENTITY_MARKERS
+    ):
+        return True
+    return any(
+        tokens[index : index + len(phrase) - 1] == phrase[:-1]
+        and _token_matches_marker(tokens[index + len(phrase) - 1], phrase[-1])
+        for phrase in _UNRESOLVED_IDENTITY_PHRASES
+        for index in range(len(tokens) - len(phrase) + 1)
+    )
 
 
 def _is_repeated_hash(value: str) -> bool:
-    return any(value == value[:width] * (64 // width) for width in range(1, 17))
+    return any(value == value[:width] * (64 // width) for width in (1, 2, 4, 8, 16, 32))
 
 
 def _identity_error(path: str, value: str) -> str | None:
@@ -1185,7 +1218,8 @@ def _identity_error(path: str, value: str) -> str | None:
         return None
     if _has_unresolved_marker(value):
         return f"{path} contains placeholder marker {value!r}"
-    if value.casefold() in _GENERIC_IDENTITY_VALUES:
+    compacted = re.sub(r"[^a-z0-9]+", "", value.casefold())
+    if compacted in _GENERIC_IDENTITY_VALUES:
         return f"{path} contains placeholder generic identity {value!r}"
     if field.endswith("sha256"):
         if _is_repeated_hash(value):
@@ -1213,7 +1247,7 @@ def _find_identity_placeholder(root: object) -> str | None:
     while pending:
         path, value = pending.pop()
         if type(value) is dict:
-            for key, child in value.items():
+            for key, child in reversed(value.items()):
                 child_path = f"{path}.{key}" if path else key
                 pending.append((child_path, child))
         elif type(value) is list:

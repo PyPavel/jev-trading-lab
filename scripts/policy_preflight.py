@@ -35,7 +35,7 @@ EXPECTED_SOURCE_HASHES = {
         "0e73742a406e112f269e7b8d5fd205c448eb4fbf49541cab3c669bf7b4dc0dd4"
     ),
     "src/jev_trading_lab/core/manifest.py": (
-        "a78db5a3da5ace729fedc2661ecaac7854cd831cd7daa349f246ba08e788592c"
+        "5ab6afa23825f47ea45cc6e7d63b8d6d878d4bf9a96e119ee564ff32c01004fd"
     ),
     "src/jev_trading_lab/core/observations.py": (
         "dbad9fa1099b527a640e68fc105641757ef2ef2fd68a504e208dda06958391ec"

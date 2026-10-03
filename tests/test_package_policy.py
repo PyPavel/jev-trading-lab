@@ -85,7 +85,7 @@ _APPROVED_SOURCE_HASHES = {
         "0e73742a406e112f269e7b8d5fd205c448eb4fbf49541cab3c669bf7b4dc0dd4"
     ),
     "src/jev_trading_lab/core/manifest.py": (
-        "a78db5a3da5ace729fedc2661ecaac7854cd831cd7daa349f246ba08e788592c"
+        "5ab6afa23825f47ea45cc6e7d63b8d6d878d4bf9a96e119ee564ff32c01004fd"
     ),
     "src/jev_trading_lab/core/observations.py": (
         "dbad9fa1099b527a640e68fc105641757ef2ef2fd68a504e208dda06958391ec"
@@ -146,10 +146,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "9834fee5135633a8610a44a7f3cda5f9ff47d8fdf50fd362853475fd80c15952"
+    "f9c263154dda9d3e6a578117332fe4c0434b45fd002c1d1d1bd1f8d2bb816677"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "e90fbcf77b41c4f89ccf728356de340c05fd04b36a58943831c7a3a5159243db"
+    "e9286991a7c0c931818f2a63e623a6eec26970d460613f4467b2ed1b4559ae62"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = ["pydantic>=2.12,<3", "typer>=0.19,<1"]
 _ALLOWED_DEPENDENCY_GROUPS = {
