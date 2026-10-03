@@ -13,20 +13,34 @@
     "maturation_calendar_days": 30,
     "maturation_trading_days": 10,
     "tm_rule": "tenth_nyse_session_strictly_after_e_plus_30_calendar_days",
-    "tm_rule_version": "phase1-v1"
+    "tm_rule_version": "phase1-v1",
+    "package_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+    "content_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+    "tm_rule_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   },
   "accounts": {
     "currency": "USD",
     "initial_capital_microdollars": 10000000000,
     "risk_unit_microdollars": 50000000,
-    "polymarket_arms": ["AI", "DETERMINISTIC", "CASH"],
-    "stock_arms": ["AI", "DETERMINISTIC", "CASH", "EXPOSURE_MATCHED_PASSIVE"],
+    "polymarket_arms": [
+      "AI",
+      "DETERMINISTIC",
+      "CASH"
+    ],
+    "stock_arms": [
+      "AI",
+      "DETERMINISTIC",
+      "CASH",
+      "EXPOSURE_MATCHED_PASSIVE"
+    ],
     "cash_yield": {
       "series": "DGS3MO",
       "source": "FRED",
       "observation_rule": "last_published_prior_observation",
       "first_retrieval_controls_availability": true,
-      "revision_backdating_allowed": false
+      "revision_backdating_allowed": false,
+      "rule_version": "phase1-cash-yield-v1",
+      "rule_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
     }
   },
   "models": {
@@ -45,7 +59,9 @@
       "top_p_micros": 1000000,
       "seed": 42001,
       "tools_enabled": false,
-      "fallback_enabled": false
+      "fallback_enabled": false,
+      "immutable_snapshot": true,
+      "schema_version": "phase1-schema-v1"
     },
     "jev": {
       "provider": "TypeSafe",
@@ -62,7 +78,9 @@
       "top_p_micros": 1000000,
       "seed": 42002,
       "tools_enabled": false,
-      "fallback_enabled": false
+      "fallback_enabled": false,
+      "immutable_snapshot": true,
+      "schema_version": "phase1-schema-v1"
     }
   },
   "providers": {
@@ -72,7 +90,9 @@
       "timestamp_semantics": "first_successful_retrieval_utc",
       "precedence": 1,
       "validation": "phase1_gamma_market_schema_v1",
-      "fallback_enabled": false
+      "fallback_enabled": false,
+      "contract_version": "phase1-provider-contract-v1",
+      "contract_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
     },
     "polymarket_books": {
       "source_name": "Polymarket CLOB",
@@ -80,7 +100,9 @@
       "timestamp_semantics": "server_and_first_successful_client_retrieval_utc",
       "precedence": 1,
       "validation": "phase1_clob_book_schema_v1",
-      "fallback_enabled": false
+      "fallback_enabled": false,
+      "contract_version": "phase1-provider-contract-v1",
+      "contract_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
     },
     "polymarket_resolution": {
       "source_name": "Polymarket Gamma and stated resolution source",
@@ -88,7 +110,9 @@
       "timestamp_semantics": "official_resolution_and_first_successful_retrieval_utc",
       "precedence": 1,
       "validation": "phase1_resolution_schema_v1",
-      "fallback_enabled": false
+      "fallback_enabled": false,
+      "contract_version": "phase1-provider-contract-v1",
+      "contract_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
     },
     "stock_ohlcv_actions": {
       "source_name": "Yahoo Finance chart v8",
@@ -96,7 +120,9 @@
       "timestamp_semantics": "exchange_date_and_first_successful_retrieval_utc",
       "precedence": 1,
       "validation": "phase1_yahoo_chart_schema_v1",
-      "fallback_enabled": false
+      "fallback_enabled": false,
+      "contract_version": "phase1-provider-contract-v1",
+      "contract_sha256": "4444444444444444444444444444444444444444444444444444444444444444"
     },
     "sp100_membership": {
       "source_name": "Frozen Wikipedia S&P 100 artifact",
@@ -104,7 +130,9 @@
       "timestamp_semantics": "frozen_first_successful_retrieval_utc",
       "precedence": 1,
       "validation": "phase1_sp100_table_schema_v1",
-      "fallback_enabled": false
+      "fallback_enabled": false,
+      "contract_version": "phase1-provider-contract-v1",
+      "contract_sha256": "5555555555555555555555555555555555555555555555555555555555555555"
     },
     "treasury_cash_yield": {
       "source_name": "FRED DGS3MO",
@@ -112,15 +140,24 @@
       "timestamp_semantics": "observation_date_and_first_successful_retrieval_utc",
       "precedence": 1,
       "validation": "phase1_fred_dgs3mo_schema_v1",
-      "fallback_enabled": true
+      "fallback_enabled": true,
+      "contract_version": "phase1-provider-contract-v1",
+      "contract_sha256": "6666666666666666666666666666666666666666666666666666666666666666"
     },
     "sec_evidence": {
       "source_name": "SEC EDGAR",
       "endpoint": "https://data.sec.gov/submissions/CIK##########.json",
       "timestamp_semantics": "accepted_timestamp_and_first_successful_retrieval_utc",
       "precedence": 1,
-      "validation": "phase1_sec_submission_schema_v1",
-      "fallback_enabled": false
+      "validation": "phase1_sec_evidence_schema_v1",
+      "fallback_enabled": false,
+      "contract_version": "phase1-provider-contract-v1",
+      "contract_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+      "endpoints": [
+        "https://data.sec.gov/submissions/CIK##########.json",
+        "https://www.sec.gov/Archives/edgar/data/{cik}/{accession_no_dashes}/{primary_document}",
+        "https://data.sec.gov/api/xbrl/companyfacts/CIK##########.json"
+      ]
     },
     "issuer_news": {
       "source_name": "Issuer RSS and Google News RSS discovery",
@@ -128,7 +165,21 @@
       "timestamp_semantics": "original_publication_and_first_successful_retrieval_utc",
       "precedence": 2,
       "validation": "phase1_original_source_retrieval_v1",
-      "fallback_enabled": false
+      "fallback_enabled": false,
+      "contract_version": "phase1-provider-contract-v1",
+      "contract_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+      "allowed_source_classes": [
+        "issuer_investor_relations_rss_atom",
+        "google_news_rss_discovery_only",
+        "original_publisher_https"
+      ],
+      "allowed_domains": [
+        "news.google.com",
+        "sec.gov",
+        "www.sec.gov"
+      ],
+      "allowlist_version": "phase1-issuer-evidence-allowlist-v1",
+      "allowlist_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
     },
     "nyse_calendar": {
       "source_name": "exchange-calendars",
@@ -136,7 +187,9 @@
       "timestamp_semantics": "pinned_package_session_schedule",
       "precedence": 1,
       "validation": "phase1_xnys_calendar_v1",
-      "fallback_enabled": false
+      "fallback_enabled": false,
+      "contract_version": "phase1-provider-contract-v1",
+      "contract_sha256": "9999999999999999999999999999999999999999999999999999999999999999"
     },
     "stock_spread_model": {
       "source_name": "Frozen Phase-1 spread model",
@@ -144,7 +197,9 @@
       "timestamp_semantics": "registration_time_artifact",
       "precedence": 1,
       "validation": "half_spread_5bps_slippage_5bps",
-      "fallback_enabled": false
+      "fallback_enabled": false,
+      "contract_version": "phase1-provider-contract-v1",
+      "contract_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     },
     "borrow_locate": {
       "source_name": "none approved",
@@ -152,7 +207,9 @@
       "timestamp_semantics": "not_applicable",
       "precedence": 1,
       "validation": "shorts_disabled",
-      "fallback_enabled": false
+      "fallback_enabled": false,
+      "contract_version": "phase1-provider-contract-v1",
+      "contract_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     },
     "data_fallbacks": {
       "treasury_last_published_prior": {
@@ -161,7 +218,14 @@
         "timestamp_semantics": "latest_published_observation_strictly_prior_to_valuation",
         "precedence": 2,
         "validation": "manifest_freshness_and_first_retrieval_v1",
-        "enabled": true
+        "enabled": true,
+        "mapping": [
+          "observation_date_to_observation_date",
+          "value_to_yield_percent",
+          "first_retrieved_at_to_available_at"
+        ],
+        "rule_version": "phase1-treasury-fallback-v1",
+        "rule_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
       }
     }
   },
@@ -169,7 +233,9 @@
     "sufficiency_probability_micros": 700000,
     "ambiguity_probability_micros": 300000,
     "action_probability_micros": 550000,
-    "runner_up_margin_probability_micros": 150000
+    "runner_up_margin_probability_micros": 150000,
+    "rule_version": "phase1-ai-thresholds-v1",
+    "rule_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
   },
   "quotas": {
     "max_new_opportunities_per_cycle": 3,
@@ -192,12 +258,26 @@
       "stock_entry_micros": 350000,
       "stock_review_micros": 150000,
       "priority_rule": "scheduled_slot_then_semantic_subject_id"
-    }
+    },
+    "retry_jitter_seed": 20261002,
+    "retry_jitter_policy": "seeded_uniform_plus_or_minus_fraction_of_backoff",
+    "rule_version": "phase1-quota-policy-v1",
+    "rule_sha256": "6666666666666666666666666666666666666666666666666666666666666666"
   },
   "polymarket": {
     "scan_interval_minutes": 15,
-    "accepted_categories": ["business", "crypto", "economy", "politics", "science", "technology", "world"],
-    "excluded_categories": ["sports"],
+    "accepted_categories": [
+      "business",
+      "crypto",
+      "economy",
+      "politics",
+      "science",
+      "technology",
+      "world"
+    ],
+    "excluded_categories": [
+      "sports"
+    ],
     "min_resolution_hours": 1,
     "max_resolution_days": 30,
     "min_trailing_24h_volume_microdollars": 10000000000,
@@ -205,7 +285,11 @@
     "max_spread_probability_micros": 40000,
     "cluster_algorithm": "normalized_resolution_source_question_v1",
     "cluster_version": "phase1-v1",
-    "cluster_tie_breakers": ["trailing_24h_usd_volume_desc", "qualifying_depth_desc", "market_id_asc"],
+    "cluster_tie_breakers": [
+      "trailing_24h_usd_volume_desc",
+      "qualifying_depth_desc",
+      "market_id_asc"
+    ],
     "opportunity_rule": "first_eligible_slot_per_cluster_no_reentry",
     "book_max_age_seconds": 60,
     "min_gross_edge_probability_micros": 50000,
@@ -223,7 +307,31 @@
     "max_holding_calendar_days": 7,
     "review_interval_minutes": 15,
     "depth_haircut_micros": 500000,
-    "quantity_beyond_depth_marks_zero": true
+    "quantity_beyond_depth_marks_zero": true,
+    "cluster_metadata_fields": [
+      "condition_id",
+      "market_id",
+      "token_ids",
+      "categories",
+      "tags",
+      "question",
+      "rules",
+      "resolution_source",
+      "end_at",
+      "active",
+      "closed",
+      "volume_24h_usd",
+      "liquidity"
+    ],
+    "cluster_normalization_version": "phase1-cluster-normalization-v1",
+    "cluster_rule_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sigma_sampling_interval_minutes": 15,
+    "sigma_lookback_calendar_days": 7,
+    "sigma_missing_snapshot_rule": "omit_missing_slots_no_forward_fill_minimum_48_observations",
+    "sigma_estimator_version": "phase1-sigma-v1",
+    "sigma_rule_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "policy_version": "phase1-polymarket-policy-v1",
+    "policy_sha256": "7777777777777777777777777777777777777777777777777777777777777777"
   },
   "stocks": {
     "universe": "S&P 100",
@@ -245,22 +353,53 @@
     "adverse_slippage_micros": 500,
     "max_holding_trading_days": 10,
     "review_cadence": "after_each_official_close",
-    "common_exit_rules": ["two_atr_stop", "three_atr_target", "ten_trading_days", "unmodelable_corporate_action", "invalid_pricing"],
+    "common_exit_rules": [
+      "two_atr_stop",
+      "three_atr_target",
+      "ten_trading_days",
+      "unmodelable_corporate_action",
+      "invalid_pricing"
+    ],
     "fill_rule": "next_official_open_after_publication",
     "stop_target_collision_rule": "stop_first",
-    "gap_fill_rule": "official_open"
+    "gap_fill_rule": "official_open",
+    "membership_artifact_version": "phase1-sp100-v1",
+    "candidate_rule_version": "phase1-stock-candidate-v1",
+    "candidate_rule_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "policy_version": "phase1-stock-policy-v1",
+    "policy_sha256": "8888888888888888888888888888888888888888888888888888888888888888"
   },
   "costs": {
     "shared_ai_deterministic_split_micros": 500000,
-    "ai_direct_costs": ["openai", "jev", "evidence_retrieval", "paid_evidence_data", "incremental_ai_infrastructure"],
-    "deterministic_direct_costs": ["deterministic_specific"],
+    "ai_direct_costs": [
+      "openai",
+      "jev",
+      "evidence_retrieval",
+      "paid_evidence_data",
+      "incremental_ai_infrastructure"
+    ],
+    "deterministic_direct_costs": [
+      "deterministic_specific"
+    ],
     "weekly_allocation_rule": "direct_to_opportunity_then_equal_within_utc_enrollment_week_residual_retained",
-    "uncertain_cost_stress_multipliers_micros": [500000, 1000000, 1500000],
+    "uncertain_cost_stress_multipliers_micros": [
+      500000,
+      1000000,
+      1500000
+    ],
     "joint_adverse_cost_multiplier_micros": 1500000,
     "joint_adverse_depth_haircut_micros": 500000,
     "zero_bid_valuation_rule": "quantity_beyond_executable_bid_depth_marks_zero",
     "statutory_fees_scale": false,
-    "cash_yield_scales": false
+    "cash_yield_scales": false,
+    "truly_shared_costs": [
+      "market_data",
+      "scheduler",
+      "storage",
+      "reporting"
+    ],
+    "rule_version": "phase1-cost-allocation-v1",
+    "rule_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
   },
   "baselines": {
     "cash_series": "DGS3MO",
@@ -273,14 +412,22 @@
     "stock_control_artifact_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
     "stock_prevalence_artifact_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
     "polymarket_forecast_baseline": "common_t3_executable_midpoint",
-    "stock_forecast_baseline": "frozen_pre_run_candidate_prevalence"
+    "stock_forecast_baseline": "frozen_pre_run_candidate_prevalence",
+    "stock_passive_oef_ticker": "OEF",
+    "stock_passive_oef_instrument": "iShares S&P 100 ETF total return",
+    "stock_passive_oef_source_contract": "yahoo_chart_v8_adjusted_for_explicit_actions",
+    "polymarket_control_artifact_version": "phase1-poly-control-v1",
+    "stock_control_artifact_version": "phase1-stock-control-v1",
+    "stock_prevalence_artifact_version": "phase1-stock-prevalence-v1"
   },
   "endpoint": {
     "tm_rule": "tenth_nyse_session_strictly_after_e_plus_30_calendar_days",
     "daily_valuation_time_utc": "21:00:00",
     "no_entry_after_enrollment_end": true,
     "classification_uses_fixed_tm": true,
-    "later_settlements_are_supplemental": true
+    "later_settlements_are_supplemental": true,
+    "rule_version": "phase1-endpoint-v1",
+    "rule_sha256": "4444444444444444444444444444444444444444444444444444444444444444"
   },
   "statistics": {
     "risk_unit_microdollars": 50000000,
@@ -301,9 +448,51 @@
     "weekly_loss_floor_probability_micros": -10000,
     "count_retention_probability_micros": 600000,
     "dollar_day_retention_probability_micros": 600000,
-    "classification_precedence": ["OPERATIONALLY_INFEASIBLE", "INCONCLUSIVE", "PROMISING", "NO_EVIDENCE"],
+    "classification_precedence": [
+      "OPERATIONALLY_INFEASIBLE",
+      "INCONCLUSIVE",
+      "PROMISING",
+      "NO_EVIDENCE"
+    ],
     "simultaneous_lower_bound_order_statistic": 97500,
-    "max_total_bootstrap_draws": 999990
+    "max_total_bootstrap_draws": 999990,
+    "expected_block_length_artifact_version": "phase1-block-length-v1",
+    "confirmatory_duration_rule": "max_26_weeks_and_b_min",
+    "b_min_weeks": 26,
+    "power_input_fields": [
+      "paired_variance",
+      "cross_stream_dependence",
+      "serial_dependence",
+      "abstention",
+      "missingness"
+    ],
+    "alternative_theta_probability_micros": [
+      60000,
+      60000
+    ],
+    "power_simulation_version": "phase1-power-v1",
+    "power_simulation_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "positive_cumulative_incremental_economic_pnl_required": true,
+    "polymarket_cash_return_gate_required": true,
+    "stock_cash_return_gate_required": true,
+    "stock_passive_return_gate_required": true,
+    "base_and_joint_adverse_must_pass_and_match": true,
+    "zero_deterministic_retention_denominator_result": "INCONCLUSIVE",
+    "numeric_information_requirements": [
+      "complete_enrollment_and_fixed_tm_analysis",
+      "finite_theta_for_both_streams",
+      "valid_base_and_joint_adverse_replays",
+      "nonzero_deterministic_count_retention_denominator",
+      "nonzero_deterministic_dollar_day_retention_denominator",
+      "99999_valid_bootstrap_replicates_within_999990_draws",
+      "power_simulation_artifact_with_b_min"
+    ],
+    "missing_probability_rule": "substitute_frozen_baseline",
+    "ece_bins": 10,
+    "ece_bin_rule": "equal_width",
+    "missing_label_bound_rule": "joint_paired_score_difference_admissible_endpoint_bounds",
+    "rule_version": "phase1-statistics-v1",
+    "rule_sha256": "5555555555555555555555555555555555555555555555555555555555555555"
   },
   "runtime": {
     "writer_processes": 1,
@@ -312,6 +501,7 @@
     "restore_rto_hours": 2,
     "restore_drill_cadence": "before_registration_and_monthly",
     "polymarket_review_cadence_minutes": 15,
-    "stock_review_cadence": "after_each_official_close"
+    "stock_review_cadence": "after_each_official_close",
+    "sqlite_busy_timeout_ms": 5000
   }
 }

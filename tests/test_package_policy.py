@@ -71,7 +71,7 @@ _APPROVED_SOURCE_DIRS = frozenset(
 _APPROVED_CONFIG_DIRS = frozenset({"config"})
 _APPROVED_CONFIG_HASHES = {
     "config/phase1.example.json": (
-        "7f4d0c04af6ed7b19952cba9be9f827117261cc573e77b7404f3fe6ae2037a1c"
+        "7fa861959c2e96d068a7414cbfe803aea338672719f655983aff3f4b3e36e541"
     )
 }
 _APPROVED_SOURCE_HASHES = {
@@ -85,7 +85,7 @@ _APPROVED_SOURCE_HASHES = {
         "0e73742a406e112f269e7b8d5fd205c448eb4fbf49541cab3c669bf7b4dc0dd4"
     ),
     "src/jev_trading_lab/core/manifest.py": (
-        "675c0aa9e1489d29753c3b7f3e5a5bc756b363e5e64e4fa3a1f2be9f3b29a07c"
+        "174633a54685fbf6b5fb6926696aca720ee00667acfc3441d0c2f16ada23494b"
     ),
     "src/jev_trading_lab/core/observations.py": (
         "dbad9fa1099b527a640e68fc105641757ef2ef2fd68a504e208dda06958391ec"
@@ -146,10 +146,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "a33883350e207506dd05f80f065c3cf817545708b87052eaef55daf31a283967"
+    "86118a45c1f9449e9ff97a2047d0fc7c09e55d00cd7b7a4565aaf67d9810fb52"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "95de5d60ce44d1c2bb8131f93163eb14b802f5abfdf9024db75001e353aad25d"
+    "113abb1a672882349eb3ba79136e46f1410cb8b23d16558e6abf1817995d7b9b"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = ["pydantic>=2.12,<3", "typer>=0.19,<1"]
 _ALLOWED_DEPENDENCY_GROUPS = {

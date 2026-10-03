@@ -92,7 +92,7 @@ def test_manifest_hash_stable() -> None:
             for item in value.values():
                 assert_canonical(item)
 
-    assert_canonical(parsed.model_dump(mode="json"))
+    assert_canonical(parsed.to_dict())
 
 
 def test_alias_and_unknown_key_rejected() -> None:
@@ -130,7 +130,7 @@ def test_alias_and_unknown_key_rejected() -> None:
 
     for _label, value in invalid_cases:
         with pytest.raises(ValueError):
-            module.Manifest.model_validate(value)
+            _parse_value(value)
 
     duplicate = b'{"schema_version":1,"schema_version":1}'
     with pytest.raises(ValueError, match="duplicate JSON key.*schema_version"):
@@ -144,15 +144,16 @@ def test_alias_and_unknown_key_rejected() -> None:
 
 def test_validation_policy_cannot_be_weakened_by_caller() -> None:
     module = _manifest_module()
+    assert not hasattr(module.Manifest, "model_validate")
+
     unknown = _example()
     unknown["unreviewed"] = True
     wrong_type = _example()
     wrong_type["quotas"]["max_attempts_per_stage"] = "3"
-
     with pytest.raises(ValueError):
-        module.Manifest.model_validate(unknown, extra="allow")
+        _parse_value(unknown)
     with pytest.raises(ValueError):
-        module.Manifest.model_validate(wrong_type, strict=False)
+        _parse_value(wrong_type)
 
 
 @pytest.mark.parametrize(
@@ -176,7 +177,6 @@ def test_validation_policy_cannot_be_weakened_by_caller() -> None:
     ),
 )
 def test_required_limits_present(path: str, expected: int) -> None:
-    module = _manifest_module()
     value = _example()
     target: Any = value
     for part in path.split("."):
@@ -185,7 +185,7 @@ def test_required_limits_present(path: str, expected: int) -> None:
     _delete_path(value, path)
 
     with pytest.raises(ValueError) as caught:
-        module.Manifest.model_validate(value)
+        _parse_value(value)
 
     assert path.split(".")[-1] in str(caught.value)
 
@@ -260,12 +260,11 @@ def test_required_limits_present(path: str, expected: int) -> None:
     ),
 )
 def test_complete_nested_required_sections(path: str) -> None:
-    module = _manifest_module()
     value = _example()
     _delete_path(value, path)
 
     with pytest.raises(ValueError) as caught:
-        module.Manifest.model_validate(value)
+        _parse_value(value)
 
     assert path.split(".")[-1] in str(caught.value)
 
@@ -301,7 +300,10 @@ def test_strict_exact_builtin_integer_acceptance(bad: object) -> None:
     value["quotas"]["max_attempts_per_stage"] = bad
 
     with pytest.raises(ValueError):
-        module.Manifest.model_validate(value)
+        if type(bad) in {int, bool, str, float}:
+            _parse_value(value)
+        else:
+            module._ManifestModel.model_validate(value)
 
 
 def test_strict_builtin_primitives_accept_valid_json_values() -> None:
@@ -312,7 +314,7 @@ def test_strict_builtin_primitives_accept_valid_json_values() -> None:
     assert type(manifest.run.mode) is str
     assert type(manifest.run.example_only) is bool
     assert type(manifest.polymarket.accepted_categories) is tuple
-    assert type(manifest.providers.data_fallbacks) is module.DataFallbackContracts
+    assert type(manifest.providers.data_fallbacks) is module._DataFallbackContracts
 
 
 def test_path_and_file_loader_failures(tmp_path: Path) -> None:
@@ -407,12 +409,11 @@ def test_validation_errors_are_deterministic_and_actionable() -> None:
 def test_validator_matrix_rejects_non_phase1_contract(
     path: str, replacement: object
 ) -> None:
-    module = _manifest_module()
     value = _example()
     _set_path(value, path, replacement)
 
     with pytest.raises(ValueError) as caught:
-        module.Manifest.model_validate(value)
+        _parse_value(value)
 
     message = str(caught.value)
     assert path.split(".")[0] in message
@@ -421,22 +422,340 @@ def test_validator_matrix_rejects_non_phase1_contract(
 def test_no_generic_dict_escape_hatches() -> None:
     module = _manifest_module()
     models = [
-        module.Manifest,
-        module.RunContract,
-        module.CalendarContract,
-        module.AccountsContract,
-        module.ModelContracts,
-        module.ModelContract,
-        module.ProviderContracts,
-        module.Quotas,
-        module.PolymarketContract,
-        module.StockContract,
-        module.CostContract,
-        module.BaselineContract,
-        module.EndpointContract,
-        module.StatisticsContract,
-        module.RuntimeContract,
+        module._ManifestModel,
+        module._RunContract,
+        module._CalendarContract,
+        module._AccountsContract,
+        module._ModelContracts,
+        module._ModelContract,
+        module._ProviderContracts,
+        module._Quotas,
+        module._PolymarketContract,
+        module._StockContract,
+        module._CostContract,
+        module._BaselineContract,
+        module._EndpointContract,
+        module._StatisticsContract,
+        module._RuntimeContract,
     ]
     for model in models:
         for field in model.model_fields.values():
             assert field.annotation is not dict
+
+
+def _parse_value(value: dict[str, Any]) -> Any:
+    return _manifest_module().parse_manifest_bytes(
+        json.dumps(value, ensure_ascii=False).encode("utf-8")
+    )
+
+
+def test_public_manifest_has_parser_only_trust_boundary() -> None:
+    import copy
+
+    from pydantic import BaseModel, TypeAdapter
+
+    module = _manifest_module()
+    manifest = module.load_manifest(EXAMPLE)
+
+    assert not issubclass(module.Manifest, BaseModel)
+    assert not hasattr(manifest, "__dict__")
+    for bypass in (
+        "model_validate",
+        "model_validate_json",
+        "model_construct",
+        "model_copy",
+        "__pydantic_validator__",
+    ):
+        assert not hasattr(module.Manifest, bypass)
+        assert not hasattr(manifest, bypass)
+    with pytest.raises(TypeError):
+        module.Manifest()
+    with pytest.raises(Exception):
+        TypeAdapter(module.Manifest)
+
+    copied = copy.copy(manifest)
+    assert copied.to_dict() == manifest.to_dict()
+    assert module.revalidate_manifest(copied) == manifest
+
+
+def test_canonical_bytes_round_trip_and_revalidation_is_authority() -> None:
+    module = _manifest_module()
+    manifest = module.load_manifest(EXAMPLE)
+
+    assert module.parse_manifest_bytes(manifest.canonical_bytes) == manifest
+    assert manifest.canonical_bytes == json.dumps(
+        manifest.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    assert module.revalidate_manifest(manifest) == manifest
+
+    object.__setattr__(manifest, "_manifest_id", "manifest:" + "0" * 64)
+    with pytest.raises(ValueError, match="revalidation"):
+        module.revalidate_manifest(manifest)
+
+    manifest = module.load_manifest(EXAMPLE)
+    object.__setattr__(manifest, "_canonical_bytes", b"{}")
+    with pytest.raises(ValueError, match="revalidation"):
+        module.revalidate_manifest(manifest)
+
+    manifest = module.load_manifest(EXAMPLE)
+    object.__setattr__(manifest, "_model", object())
+    with pytest.raises(ValueError, match="revalidation"):
+        module.revalidate_manifest(manifest)
+
+
+def test_activation_candidate_rejects_examples_and_placeholders() -> None:
+    module = _manifest_module()
+    manifest = module.load_manifest(EXAMPLE)
+    with pytest.raises(ValueError, match="example_only"):
+        manifest.assert_activation_candidate()
+
+    value = _example()
+    value["run"]["example_only"] = False
+    with pytest.raises(ValueError, match="placeholder"):
+        _parse_value(value)
+
+
+def test_required_review_contract_fields_and_exact_design_literals() -> None:
+    expected: dict[str, object] = {
+        "calendar.package_sha256": "8" * 64,
+        "calendar.content_sha256": "9" * 64,
+        "accounts.cash_yield.rule_version": "phase1-cash-yield-v1",
+        "accounts.cash_yield.rule_sha256": "1" * 64,
+        "ai_thresholds.rule_version": "phase1-ai-thresholds-v1",
+        "ai_thresholds.rule_sha256": "2" * 64,
+        "quotas.rule_version": "phase1-quota-policy-v1",
+        "quotas.rule_sha256": "6" * 64,
+        "polymarket.policy_version": "phase1-polymarket-policy-v1",
+        "polymarket.policy_sha256": "7" * 64,
+        "stocks.policy_version": "phase1-stock-policy-v1",
+        "stocks.policy_sha256": "8" * 64,
+        "providers.data_fallbacks.treasury_last_published_prior.mapping": (
+            "observation_date_to_observation_date",
+            "value_to_yield_percent",
+            "first_retrieved_at_to_available_at",
+        ),
+        "polymarket.cluster_metadata_fields": (
+            "condition_id",
+            "market_id",
+            "token_ids",
+            "categories",
+            "tags",
+            "question",
+            "rules",
+            "resolution_source",
+            "end_at",
+            "active",
+            "closed",
+            "volume_24h_usd",
+            "liquidity",
+        ),
+        "polymarket.cluster_normalization_version": "phase1-cluster-normalization-v1",
+        "polymarket.cluster_rule_sha256": "a" * 64,
+        "polymarket.sigma_sampling_interval_minutes": 15,
+        "polymarket.sigma_lookback_calendar_days": 7,
+        "polymarket.sigma_missing_snapshot_rule": (
+            "omit_missing_slots_no_forward_fill_minimum_48_observations"
+        ),
+        "polymarket.sigma_estimator_version": "phase1-sigma-v1",
+        "polymarket.sigma_rule_sha256": "b" * 64,
+        "costs.ai_direct_costs": (
+            "openai",
+            "jev",
+            "evidence_retrieval",
+            "paid_evidence_data",
+            "incremental_ai_infrastructure",
+        ),
+        "costs.deterministic_direct_costs": ("deterministic_specific",),
+        "costs.truly_shared_costs": (
+            "market_data",
+            "scheduler",
+            "storage",
+            "reporting",
+        ),
+        "costs.rule_version": "phase1-cost-allocation-v1",
+        "costs.rule_sha256": "3" * 64,
+        "endpoint.rule_version": "phase1-endpoint-v1",
+        "endpoint.rule_sha256": "4" * 64,
+        "statistics.rule_version": "phase1-statistics-v1",
+        "statistics.rule_sha256": "5" * 64,
+        "baselines.stock_passive_oef_ticker": "OEF",
+        "baselines.stock_passive_oef_instrument": "iShares S&P 100 ETF total return",
+        "baselines.stock_passive_oef_source_contract": (
+            "yahoo_chart_v8_adjusted_for_explicit_actions"
+        ),
+        "runtime.sqlite_busy_timeout_ms": 5000,
+        "quotas.retry_jitter_seed": 20261002,
+        "quotas.retry_jitter_policy": (
+            "seeded_uniform_plus_or_minus_fraction_of_backoff"
+        ),
+        "statistics.positive_cumulative_incremental_economic_pnl_required": True,
+        "statistics.polymarket_cash_return_gate_required": True,
+        "statistics.stock_cash_return_gate_required": True,
+        "statistics.stock_passive_return_gate_required": True,
+        "statistics.base_and_joint_adverse_must_pass_and_match": True,
+        "statistics.zero_deterministic_retention_denominator_result": "INCONCLUSIVE",
+        "statistics.missing_probability_rule": "substitute_frozen_baseline",
+        "statistics.ece_bins": 10,
+        "statistics.ece_bin_rule": "equal_width",
+        "statistics.missing_label_bound_rule": (
+            "joint_paired_score_difference_admissible_endpoint_bounds"
+        ),
+        "statistics.confirmatory_duration_rule": "max_26_weeks_and_b_min",
+        "statistics.power_input_fields": (
+            "paired_variance",
+            "cross_stream_dependence",
+            "serial_dependence",
+            "abstention",
+            "missingness",
+        ),
+        "statistics.alternative_theta_probability_micros": (60_000, 60_000),
+    }
+    value = _example()
+    manifest = _manifest_module().load_manifest(EXAMPLE)
+    as_dict = manifest.to_dict()
+    for path, expected_value in expected.items():
+        target: Any = as_dict
+        for part in path.split("."):
+            target = target[part]
+        if isinstance(expected_value, tuple):
+            target = tuple(target)
+        assert target == expected_value, path
+
+        changed = _example()
+        _delete_path(changed, path)
+        with pytest.raises(ValueError, match=path.split(".")[-1]):
+            _parse_value(changed)
+
+    assert value == _example()
+
+
+def test_provider_contracts_are_exact_and_sec_evidence_is_complete() -> None:
+    manifest = _manifest_module().load_manifest(EXAMPLE)
+    assert manifest.providers.sec_evidence.endpoints == (
+        "https://data.sec.gov/submissions/CIK##########.json",
+        "https://www.sec.gov/Archives/edgar/data/{cik}/{accession_no_dashes}/{primary_document}",
+        "https://data.sec.gov/api/xbrl/companyfacts/CIK##########.json",
+    )
+    assert manifest.providers.issuer_news.allowed_source_classes == (
+        "issuer_investor_relations_rss_atom",
+        "google_news_rss_discovery_only",
+        "original_publisher_https",
+    )
+    assert manifest.providers.issuer_news.allowed_domains == (
+        "news.google.com",
+        "sec.gov",
+        "www.sec.gov",
+    )
+
+    for path, replacement in (
+        ("providers.polymarket_catalog.timestamp_semantics", "backdated"),
+        ("providers.polymarket_books.precedence", 2),
+        ("providers.sec_evidence.validation", "accept_anything"),
+        (
+            "providers.data_fallbacks.treasury_last_published_prior.endpoint",
+            "https://evil.test",
+        ),
+        (
+            "providers.data_fallbacks.treasury_last_published_prior.timestamp_semantics",
+            "backdated",
+        ),
+        ("providers.data_fallbacks.treasury_last_published_prior.precedence", 1),
+        ("providers.data_fallbacks.treasury_last_published_prior.validation", "none"),
+        (
+            "providers.data_fallbacks.treasury_last_published_prior.mapping",
+            ["value_to_evil"],
+        ),
+    ):
+        value = _example()
+        _set_path(value, path, replacement)
+        with pytest.raises(ValueError):
+            _parse_value(value)
+
+
+def test_categories_and_model_snapshots_reject_ambiguous_inputs() -> None:
+    for categories in ([], ["business", "business"], ["Business"], ["Sports"]):
+        value = _example()
+        value["polymarket"]["accepted_categories"] = categories
+        with pytest.raises(ValueError):
+            _parse_value(value)
+
+    for provider, bad_ids in (
+        ("openai", ("gpt-5", "gpt-4o", "gpt-5-latest", "default")),
+        ("jev", ("jev", "jev-latest", "systemone", "current")),
+    ):
+        for bad_id in bad_ids:
+            value = _example()
+            value["models"][provider]["request_model_snapshot"] = bad_id
+            value["models"][provider]["expected_returned_model_id"] = bad_id
+            with pytest.raises(ValueError):
+                _parse_value(value)
+
+
+def test_statistics_information_contract_is_exact() -> None:
+    manifest = _manifest_module().load_manifest(EXAMPLE)
+    assert manifest.statistics.numeric_information_requirements == (
+        "complete_enrollment_and_fixed_tm_analysis",
+        "finite_theta_for_both_streams",
+        "valid_base_and_joint_adverse_replays",
+        "nonzero_deterministic_count_retention_denominator",
+        "nonzero_deterministic_dollar_day_retention_denominator",
+        "99999_valid_bootstrap_replicates_within_999990_draws",
+        "power_simulation_artifact_with_b_min",
+    )
+    assert manifest.statistics.classification_precedence == (
+        "OPERATIONALLY_INFEASIBLE",
+        "INCONCLUSIVE",
+        "PROMISING",
+        "NO_EVIDENCE",
+    )
+
+
+def test_parser_rejects_excessive_structure_and_caps_sorted_errors() -> None:
+    module = _manifest_module()
+    nested = b"{" + b'"x":{' * 1100 + b'"y":1' + b"}" * 1101
+    with pytest.raises(ValueError, match="nesting depth"):
+        module.parse_manifest_bytes(nested)
+
+    value = _example()
+    value["polymarket"]["accepted_categories"] = [""] * 40_000
+    with pytest.raises(ValueError, match="container items"):
+        _parse_value(value)
+
+    left = _example()
+    left["z_unknown"] = 1
+    left["a_unknown"] = 2
+    right = _example()
+    right["a_unknown"] = 2
+    right["z_unknown"] = 1
+    messages = []
+    for value in (left, right):
+        with pytest.raises(ValueError) as caught:
+            _parse_value(value)
+        messages.append(str(caught.value))
+    assert messages[0] == messages[1]
+    assert len(messages[0].splitlines()) <= module.MAX_VALIDATION_ERRORS + 2
+
+
+def test_loader_reads_bounded_descriptor_once_and_detects_size_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _manifest_module()
+    path = tmp_path / "manifest.json"
+    path.write_bytes(EXAMPLE.read_bytes())
+    original_fstat = module.os.fstat
+    calls = 0
+
+    def changing_fstat(fd: int) -> os.stat_result:
+        nonlocal calls
+        calls += 1
+        result = original_fstat(fd)
+        if calls == 2:
+            fields = list(result)
+            fields[6] += 1
+            return os.stat_result(fields)
+        return result
+
+    monkeypatch.setattr(module.os, "fstat", changing_fstat)
+    with pytest.raises(ValueError, match="changed while reading"):
+        module.load_manifest(path)
+    assert calls == 2
