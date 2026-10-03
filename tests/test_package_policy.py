@@ -117,6 +117,10 @@ _ALLOWED_TOOL_CONFIG = {
     "mypy": {"python_version": "3.12", "strict": True, "files": ["src"]},
 }
 _ALLOWED_ENTRY_POINTS = {"jev-lab": "jev_trading_lab.cli:app"}
+_ALLOWED_BUILD_SYSTEM = {
+    "requires": ["hatchling==1.27.0"],
+    "build-backend": "hatchling.build",
+}
 _APPROVED_WORKFLOW_HASH = (
     "b83b99f09d72d41b28a10116ed5cc20efb316e86d6e4bbccfaf396a40e1442b9"
 )
@@ -253,6 +257,59 @@ def _optional_dependency_violations(
     return [f"{location}: {label} are not allowed: {', '.join(names) or groups}"]
 
 
+def _operational_policy_violations(root: Path) -> list[str]:
+    violations: list[str] = []
+    for directory_name in ("scripts", "ops"):
+        pending = [root / directory_name]
+        while pending:
+            path = pending.pop()
+            relative = path.relative_to(root).as_posix()
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                violations.append(
+                    f"{relative}: operational path is unreadable: {error}"
+                )
+                continue
+
+            if stat.S_ISLNK(metadata.st_mode):
+                violations.append(f"{relative}: operational symlink is not allowlisted")
+            elif stat.S_ISDIR(metadata.st_mode):
+                violations.append(
+                    f"{relative}: operational directory is not allowlisted"
+                )
+                if not metadata.st_mode & (stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH):
+                    violations.append(
+                        f"{relative}: operational directory is unreadable"
+                    )
+                    continue
+                try:
+                    with os.scandir(path) as entries:
+                        pending.extend(Path(entry.path) for entry in entries)
+                except OSError as error:
+                    violations.append(
+                        f"{relative}: operational directory is unreadable: {error}"
+                    )
+            elif stat.S_ISREG(metadata.st_mode):
+                violations.append(f"{relative}: operational file is not allowlisted")
+                if not metadata.st_mode & (stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH):
+                    violations.append(f"{relative}: operational file is unreadable")
+                    continue
+                try:
+                    path.read_text(encoding="utf-8")
+                except (OSError, UnicodeError) as error:
+                    violations.append(
+                        f"{relative}: operational file is unreadable UTF-8: {error}"
+                    )
+            else:
+                violations.append(
+                    f"{relative}: special operational file is not allowed"
+                )
+    return violations
+
+
 def _runtime_policy_violations(root: Path) -> list[str]:
     project_data = _project_data(root)
     project = project_data.get("project", {})
@@ -262,6 +319,11 @@ def _runtime_policy_violations(root: Path) -> list[str]:
         f"pyproject.toml: runtime dependency not allowlisted: {name}"
         for name in sorted(runtime_names - allowed_runtime)
     ]
+    build_system = project_data.get("build-system", {})
+    if build_system != _ALLOWED_BUILD_SYSTEM:
+        violations.append(
+            f"pyproject.toml: build-system not allowlisted: {build_system}"
+        )
     violations.extend(
         _dependency_group_violations(
             project_data.get("dependency-groups", {}), location="pyproject.toml"
@@ -340,14 +402,7 @@ def _runtime_policy_violations(root: Path) -> list[str]:
             )
 
     violations.extend(_source_policy_violations(root))
-    for directory_name in ("scripts", "ops"):
-        directory = root / directory_name
-        if not directory.is_dir():
-            continue
-        for path in directory.rglob("*"):
-            if path.is_file():
-                relative = path.relative_to(root).as_posix()
-                violations.append(f"{relative}: operational path is not allowlisted")
+    violations.extend(_operational_policy_violations(root))
     return violations
 
 
@@ -423,6 +478,36 @@ def test_git_ignored_symlink_to_external_package_is_rejected(tmp_path: Path) -> 
     violations = _source_policy_violations(tmp_path)
 
     assert any("src/external" in item and "symlink" in item for item in violations), (
+        violations
+    )
+
+
+@pytest.mark.parametrize("directory_name", ("scripts", "ops"))
+def test_git_ignored_operational_directory_symlink_is_rejected(
+    directory_name: str, tmp_path: Path
+) -> None:
+    (tmp_path / "pyproject.toml").write_bytes((ROOT / "pyproject.toml").read_bytes())
+    _initialize_ignored_source_fixture(tmp_path)
+    relative = f"{directory_name}/external"
+    with (tmp_path / ".gitignore").open("a", encoding="utf-8") as ignore_file:
+        ignore_file.write(f"{relative}\n")
+    external = tmp_path / "external-operations"
+    external.mkdir()
+    (external / "live.sh").write_text("#!/bin/sh\nexec live-order\n", encoding="utf-8")
+    guarded = tmp_path / directory_name
+    guarded.mkdir()
+    (guarded / "external").symlink_to(external, target_is_directory=True)
+    subprocess.run(
+        ["git", "check-ignore", relative],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    violations = _runtime_policy_violations(tmp_path)
+
+    assert any(relative in item and "symlink" in item for item in violations), (
         violations
     )
 
@@ -660,11 +745,33 @@ def test_required_dev_toolchain_is_declared_and_locked() -> None:
         assert required in locked
 
 
+def test_backend_path_build_system_is_rejected(tmp_path: Path) -> None:
+    project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    project = project.replace(
+        'build-backend = "hatchling.build"\n',
+        'build-backend = "hatchling.build"\nbackend-path = ["."]\n',
+        1,
+    )
+    (tmp_path / "pyproject.toml").write_text(project, encoding="utf-8")
+    _initialize_approved_source_fixture(tmp_path)
+    backend = tmp_path / "hatchling/build.py"
+    backend.parent.mkdir()
+    backend.write_text(
+        "raise RuntimeError('local backend executed')\n", encoding="utf-8"
+    )
+
+    violations = _runtime_policy_violations(tmp_path)
+
+    assert any("build-system" in item for item in violations), violations
+
+
 def test_locked_build_configuration() -> None:
     project_data = _project_data()
     build_system = project_data.get("build-system", {})
-    assert build_system.get("build-backend") == "hatchling.build"
-    assert build_system.get("requires") == ["hatchling==1.27.0"]
+    assert build_system == {
+        "requires": ["hatchling==1.27.0"],
+        "build-backend": "hatchling.build",
+    }
     wheel = (
         project_data.get("tool", {})
         .get("hatch", {})
