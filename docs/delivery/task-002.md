@@ -2,9 +2,9 @@
 
 ## Status
 
-**PENDING INDEPENDENT RE-REVIEW**
+**FINAL APPROVED / COMPLETE**
 
-This document records implementation and self-review evidence only. It does not claim independent approval.
+This document records implementation, remediation, verification, and final independent approval evidence.
 
 ## Scope
 
@@ -303,4 +303,31 @@ git diff --check
 exit 0
 ```
 
-No dependency or lock file changed. No approved design, plan, or review file changed. Task 002 remains pending independent re-review; Task 3 must not start.
+No dependency or lock file changed. No approved design, plan, or review file changed. Task 002 remained pending independent re-review at this checkpoint; Task 3 had not started.
+
+## Final independent review verdicts
+
+### Spec and adversarial review: PASS
+
+The independent spec/adversarial reviewer reported **PASS**, with zero BLOCKER and zero MAJOR findings. The reviewer verified 100 hostile exact-integer and cross-tag checks, low-precision `Decimal` behavior, signed 64-bit persistence bounds, policy preflight, the complete 76-test suite, Ruff lint and formatting, strict mypy, frozen lock and sync checks, dependency audit, no-isolation build, reviewed diff, and a clean worktree.
+
+### Quality review: APPROVED
+
+The independent quality reviewer reported **APPROVED**, with zero BLOCKER and zero MAJOR findings. The reviewer verified the same hostile integer and cross-tag boundary coverage, exact low-precision decimal conversion, signed 64-bit limits, fail-closed preflight, all 76 tests, Ruff lint and formatting, strict mypy, frozen lock and sync checks, dependency audit, no-isolation build, reviewed diff, and a clean worktree.
+
+## Final reviewed commit chain
+
+```text
+30e9ebddf429663f057e883edf14de49342a7c3e feat(core): add fixed-point economic values
+778b74aead018682de481f93aa182859db101071 docs(delivery): record task 002 evidence
+6ea66296bf5071d67ed82264baa03b0f639bd861 fix(core): enforce fixed-point invariants
+96cdd0f0619dde6004ca1958dce06158a2f1537b docs(delivery): update task 002 review evidence
+c304e83facb7d62cbc5f619978bed1acf6c8ddd0 fix(core): reject tagged and subclass integer inputs
+b7afbfdc762bbb795055d9273a7d471af04d609f docs(delivery): update task 002 integer review
+```
+
+The approval evidence commit containing this section follows `b7afbfd` and changes only `docs/delivery/task-002.md`.
+
+## Final status
+
+**FINAL APPROVED / COMPLETE.** Both required independent reviews report zero BLOCKER and zero MAJOR findings. Task 2 is complete; Task 3 may proceed under its own reviewed change-control cycle.
