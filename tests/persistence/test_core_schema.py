@@ -287,10 +287,11 @@ def test_manifest_and_run_immutable() -> None:
 
 def test_migration_002_schema_contract_and_same_migration_guards() -> None:
     migrations = load_migrations()
-    assert [(item.version, item.name) for item in migrations] == [
+    assert [(item.version, item.name) for item in migrations[:2]] == [
         (1, "001_migration_metadata.sql"),
         (2, "002_core_entities.sql"),
     ]
+    assert migrations[2].name == "003_append_only_guards.sql"
     connection = _connection()
     try:
         tables = {

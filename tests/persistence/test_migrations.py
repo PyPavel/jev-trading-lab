@@ -46,6 +46,9 @@ SCHEMA_SQL = (
 CORE_SCHEMA_SQL = (
     ROOT / "src/jev_trading_lab/persistence/schema/002_core_entities.sql"
 ).read_bytes()
+JOURNAL_SCHEMA_SQL = (
+    ROOT / "src/jev_trading_lab/persistence/schema/003_append_only_guards.sql"
+).read_bytes()
 
 
 def _package(
@@ -279,6 +282,8 @@ def test_clean_database_applies_full_packaged_prefix(tmp_path: Path) -> None:
             "opportunities",
             "observations",
             "artifact_refs",
+            "journal_entities",
+            "journal_events",
         }
         assert _applied(connection) == [
             (
@@ -293,6 +298,12 @@ def test_clean_database_applies_full_packaged_prefix(tmp_path: Path) -> None:
                 hashlib.sha256(CORE_SCHEMA_SQL).hexdigest(),
                 1_700_000_000_000_000,
             ),
+            (
+                3,
+                "003_append_only_guards.sql",
+                hashlib.sha256(JOURNAL_SCHEMA_SQL).hexdigest(),
+                1_700_000_000_000_000,
+            ),
         ]
     finally:
         connection.close()
@@ -303,8 +314,12 @@ def test_repeated_migration_application_is_idempotent(tmp_path: Path) -> None:
     try:
         apply_migrations(connection, clock=lambda: 1_000_000)
         apply_migrations(connection, clock=lambda: 2_000_000)
-        assert len(_applied(connection)) == 2
-        assert [row[3] for row in _applied(connection)] == [1_000_000, 1_000_000]
+        assert len(_applied(connection)) == 3
+        assert [row[3] for row in _applied(connection)] == [
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        ]
     finally:
         connection.close()
 
@@ -649,7 +664,7 @@ def test_concurrent_migration_attempts_serialize(tmp_path: Path) -> None:
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(lambda _index: migrate(), range(2)))
 
-    assert len(results[0]) == 2
+    assert len(results[0]) == 3
     assert results[0] == results[1]
 
 
@@ -871,6 +886,7 @@ def test_temp_schema_migrations_cannot_shadow_main(tmp_path: Path) -> None:
         assert [tuple(row) for row in rows] == [
             (1, "001_migration_metadata.sql"),
             (2, "002_core_entities.sql"),
+            (3, "003_append_only_guards.sql"),
         ]
     finally:
         connection.close()
@@ -882,7 +898,7 @@ def test_temp_schema_migrations_cannot_shadow_main(tmp_path: Path) -> None:
             reopened.execute("SELECT count(*) FROM main.schema_migrations").fetchone()[
                 0
             ]
-            == 2
+            == 3
         )
     finally:
         reopened.close()

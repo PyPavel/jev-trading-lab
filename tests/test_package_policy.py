@@ -57,6 +57,7 @@ def test_calendar_schedule_artifact_is_packaged_in_wheel_and_sdist() -> None:
     (
         "jev_trading_lab/persistence/schema/001_migration_metadata.sql",
         "jev_trading_lab/persistence/schema/002_core_entities.sql",
+        "jev_trading_lab/persistence/schema/003_append_only_guards.sql",
     ),
 )
 def test_migration_sql_is_packaged_in_wheel_and_sdist(migration: str) -> None:
@@ -138,7 +139,7 @@ _APPROVED_CONFIG_HASHES = {
 }
 _APPROVED_OPERATIONAL_HASHES = {
     "scripts/wheel_migration_smoke.py": (
-        "765dec8a9589555f1c063def6108533799245d5dcc3d66dcc4e182c026bc4a2c"
+        "cbb3e3ee84bbddd62cd4f0321f5f4675503cf0721c1bd06beaf9d2216c62b4a4"
     )
 }
 _APPROVED_SOURCE_HASHES = {
@@ -175,6 +176,9 @@ _APPROVED_SOURCE_HASHES = {
     "src/jev_trading_lab/persistence/core_repo.py": (
         "b4c2a856b006ee6bde860e8abff04c209915eb420e1c55425805e3e25042d133"
     ),
+    "src/jev_trading_lab/persistence/journal.py": (
+        "133d3ef50acc9c2207e696fa6f04faf8dd2c53fd3c32195c039652205a49d03d"
+    ),
     "src/jev_trading_lab/persistence/db.py": (
         "fd36815c21f9bbb26601b6b898570fa7864a1f6780ccb158345c54809424e93b"
     ),
@@ -189,6 +193,9 @@ _APPROVED_SOURCE_HASHES = {
     ),
     "src/jev_trading_lab/persistence/schema/002_core_entities.sql": (
         "9026b984313d972dec6c3db8b442e4324f2a7f02ec71bd555c0c17f8ed362c54"
+    ),
+    "src/jev_trading_lab/persistence/schema/003_append_only_guards.sql": (
+        "c1dac6ccfd4d96c1157f872683473f2f18994416a21447e07387ad882e870aa2"
     ),
     "src/jev_trading_lab/stocks/__init__.py": (
         "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"
@@ -247,10 +254,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "a450ccff4f074a2c9ff23196fd064361d48d20397f09f3de59d00aa5398ce1d9"
+    "217d7c50107a0772184eb487e3f4bae26d54b27259bad0a03c1d6e87ddf55016"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "a58001d86742b26fca1ec969495529bfa1d0f2ec24aedf582ba9aa4211a52403"
+    "3f6d7374cc708fbcdcc3260e3b306c4ba71a9054af1ccd4176b627de8ff9cad0"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = [
     "exchange-calendars==4.11.2",
@@ -680,11 +687,13 @@ def _initialize_approved_source_fixture(tmp_path: Path) -> Path:
         "core/values.py",
         "persistence/__init__.py",
         "persistence/core_repo.py",
+        "persistence/journal.py",
         "persistence/db.py",
         "persistence/migrations.py",
         "persistence/schema/__init__.py",
         "persistence/schema/001_migration_metadata.sql",
         "persistence/schema/002_core_entities.sql",
+        "persistence/schema/003_append_only_guards.sql",
         "stocks/__init__.py",
         "stocks/calendar.py",
     ):
@@ -1509,10 +1518,12 @@ def test_built_artifacts_exclude_repository_and_host_junk(tmp_path: Path) -> Non
         "jev_trading_lab/persistence/__init__.py",
         "jev_trading_lab/persistence/core_repo.py",
         "jev_trading_lab/persistence/db.py",
+        "jev_trading_lab/persistence/journal.py",
         "jev_trading_lab/persistence/migrations.py",
         "jev_trading_lab/persistence/schema/__init__.py",
         "jev_trading_lab/persistence/schema/001_migration_metadata.sql",
         "jev_trading_lab/persistence/schema/002_core_entities.sql",
+        "jev_trading_lab/persistence/schema/003_append_only_guards.sql",
         "jev_trading_lab/stocks/__init__.py",
         "jev_trading_lab/stocks/calendar.py",
     }

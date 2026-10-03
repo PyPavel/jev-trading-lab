@@ -45,10 +45,11 @@ from jev_trading_lab.persistence.db import connect_database
 from jev_trading_lab.persistence.migrations import apply_migrations, load_migrations
 
 migrations = load_migrations()
-assert [item.version for item in migrations] == [1, 2]
+assert [item.version for item in migrations] == [1, 2, 3]
 assert [item.name for item in migrations] == [
     "001_migration_metadata.sql",
     "002_core_entities.sql",
+    "003_append_only_guards.sql",
 ]
 assert all(
     item.sha256 == hashlib.sha256(item.sql.encode()).hexdigest()
