@@ -1438,7 +1438,7 @@ def test_unsafe_open_sidecar_renamed_away_is_rejected(
             os.close(descriptor)
 
 
-def test_unrelated_regular_fd_opened_during_connect_fails_closed(
+def test_cooperative_new_fd_during_connect_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     database = tmp_path / "private" / "db.sqlite3"
@@ -1449,11 +1449,7 @@ def test_unrelated_regular_fd_opened_during_connect_fails_closed(
 
     def open_unrelated_fd(*args: object, **kwargs: object) -> sqlite3.Connection:
         connection = real_connect(*args, **kwargs)  # type: ignore[arg-type]
-        opener = threading.Thread(
-            target=lambda: held.append(os.open(unrelated, os.O_RDONLY))
-        )
-        opener.start()
-        opener.join()
+        held.append(os.open(unrelated, os.O_RDONLY))
         return connection
 
     monkeypatch.setattr(db_module.sqlite3, "connect", open_unrelated_fd)
@@ -1463,6 +1459,75 @@ def test_unrelated_regular_fd_opened_during_connect_fails_closed(
     finally:
         for descriptor in held:
             os.close(descriptor)
+
+
+def test_raw_same_process_fd_aba_bypassing_connect_lock_is_outside_boundary(
+    tmp_path: Path,
+) -> None:
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_text("same inode", encoding="utf-8")
+    descriptor = os.open(sentinel, os.O_RDONLY)
+    before = db_module._open_fd_identities()
+    os.close(descriptor)
+    replacement = os.open(sentinel, os.O_RDONLY)
+    try:
+        if replacement != descriptor:
+            os.dup2(replacement, descriptor)
+            os.close(replacement)
+            replacement = descriptor
+        candidates = db_module._new_regular_descriptors(before)
+        assert all(candidate[0] != descriptor for candidate in candidates)
+    finally:
+        os.close(replacement)
+
+
+def test_descriptor_census_documents_cooperative_lock_boundary() -> None:
+    boundary = db_module._connection_fd_activity.__doc__
+    assert boundary is not None
+    assert "ABA" in boundary
+    assert "bypasses this lock" in boundary
+    assert "not a sandbox" in boundary
+
+
+def test_concurrent_library_connection_attempts_serialize_fd_activity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_open_parent = db_module._open_private_parent
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def recording_open_parent(parent: Path) -> int:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call = calls
+        if call == 1:
+            first_entered.set()
+            assert release_first.wait(timeout=5)
+        else:
+            second_entered.set()
+        return real_open_parent(parent)
+
+    monkeypatch.setattr(db_module, "_open_private_parent", recording_open_parent)
+
+    def connect_and_close(name: str) -> None:
+        connection = _connect(tmp_path / name / "db.sqlite3")
+        connection.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(connect_and_close, "first")
+        assert first_entered.wait(timeout=5)
+        second = executor.submit(connect_and_close, "second")
+        overlapped = second_entered.wait(timeout=0.2)
+        release_first.set()
+        first.result(timeout=5)
+        second.result(timeout=5)
+
+    assert not overlapped
+    assert second_entered.is_set()
 
 
 def test_dropped_connection_releases_parent_descriptor(tmp_path: Path) -> None:
@@ -1537,6 +1602,88 @@ def test_connection_open_close_cycles_do_not_leak_descriptors(tmp_path: Path) ->
         connection = _connect(database)
         connection.close()
     assert set(_proc_fd_targets()) == before
+
+
+def test_migration_enumeration_swap_restore_cannot_omit_trusted_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package, schema = _package(
+        tmp_path / "package",
+        monkeypatch,
+        {
+            "001_safe.sql": b"SELECT 1;\n",
+            "002_required.sql": b"SELECT 2;\n",
+        },
+    )
+    attacker = tmp_path / "attacker-schema"
+    attacker.mkdir()
+    (attacker / "__init__.py").write_text("", encoding="utf-8")
+    (attacker / "001_safe.sql").write_text("SELECT 9;\n", encoding="utf-8")
+    parked = tmp_path / "parked-schema"
+    returned_attacker = tmp_path / "returned-attacker"
+    real_iterdir = Path.iterdir
+    swapped = False
+
+    def swapping_iterdir(path: Path):  # type: ignore[no-untyped-def]
+        nonlocal swapped
+        if path == schema and not swapped:
+            swapped = True
+            schema.rename(parked)
+            attacker.rename(schema)
+            resources = tuple(real_iterdir(path))
+            schema.rename(returned_attacker)
+            parked.rename(schema)
+            return iter(resources)
+        return real_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", swapping_iterdir)
+
+    migrations = load_migrations(package)
+
+    assert not swapped
+    assert [migration.version for migration in migrations] == [1, 2]
+    assert migrations[0].sql == "SELECT 1;\n"
+
+
+def test_migration_enumeration_uses_retained_directory_fd_during_injection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package, schema = _package(
+        tmp_path / "package",
+        monkeypatch,
+        {
+            "001_safe.sql": b"SELECT 1;\n",
+            "002_required.sql": b"SELECT 2;\n",
+        },
+    )
+    attacker = tmp_path / "attacker-schema"
+    attacker.mkdir()
+    (attacker / "__init__.py").write_text("", encoding="utf-8")
+    (attacker / "001_safe.sql").write_text("SELECT 9;\n", encoding="utf-8")
+    (attacker / "003_injected.sql").write_text("SELECT 3;\n", encoding="utf-8")
+    parked = tmp_path / "parked-schema"
+    returned_attacker = tmp_path / "returned-attacker"
+    real_listdir = os.listdir
+    swapped = False
+
+    def swapping_listdir(path: object) -> list[str]:
+        nonlocal swapped
+        if isinstance(path, int) and not swapped:
+            swapped = True
+            schema.rename(parked)
+            attacker.rename(schema)
+            names = real_listdir(path)
+            schema.rename(returned_attacker)
+            parked.rename(schema)
+            return names
+        return real_listdir(path)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(migration_module.os, "listdir", swapping_listdir)
+
+    with pytest.raises(MigrationError, match="directory.*changed"):
+        load_migrations(package)
+
+    assert swapped
 
 
 def test_schema_directory_swap_restore_is_rejected_before_sql_executes(

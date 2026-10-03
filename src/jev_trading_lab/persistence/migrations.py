@@ -139,7 +139,7 @@ def _validate_resource_directory(metadata: os.stat_result, path: Path) -> None:
 
 
 def _open_resource_directories(
-    root: Path, package: str, root_snapshot: tuple[int, ...]
+    root: Path, package: str
 ) -> list[tuple[int, tuple[int, ...], Path]]:
     package_parts = tuple(package.split("."))
     if tuple(root.parts[-len(package_parts) :]) != package_parts:
@@ -162,10 +162,6 @@ def _open_resource_directories(
             _validate_resource_directory(metadata, current_path)
             opened.append((child, _directory_snapshot(metadata), current_path))
             current = child
-        if opened[-1][1] != root_snapshot:
-            raise MigrationError(
-                f"migration package directory {root} changed while loading"
-            )
         return opened
     except OSError as error:
         for descriptor, _snapshot, _path in opened:
@@ -299,34 +295,61 @@ def load_migrations(package: str = _DEFAULT_PACKAGE) -> tuple[Migration, ...]:
         raise TypeError("migration package must be a non-empty string")
     try:
         root = importlib.resources.files(package)
-        resources = tuple(root.iterdir())
     except (ImportError, ModuleNotFoundError, OSError) as error:
         raise MigrationError(f"cannot load migration package {package!r}") from error
 
     directories: list[tuple[int, tuple[int, ...], Path]] = []
-    if isinstance(root, Path):
-        try:
-            root_metadata = root.lstat()
-        except OSError as error:
-            raise MigrationError(
-                f"migration package directory {root} is unreadable"
-            ) from error
-        directories = _open_resource_directories(
-            root, package, _directory_snapshot(root_metadata)
-        )
+    filesystem_root: Path | None = root if isinstance(root, Path) else None
+    filesystem_names: tuple[str, ...] | None = None
+    archive_resources: tuple[Traversable, ...] = ()
+    try:
+        if filesystem_root is not None:
+            directories = _open_resource_directories(filesystem_root, package)
+            _revalidate_resource_directories(directories)
+            filesystem_names = tuple(os.listdir(directories[-1][0]))
+            _revalidate_resource_directories(directories)
+        else:
+            archive_resources = tuple(root.iterdir())
+    except (ImportError, ModuleNotFoundError, OSError) as error:
+        for descriptor, _snapshot, _path in directories:
+            os.close(descriptor)
+        raise MigrationError(f"cannot load migration package {package!r}") from error
+    except BaseException:
+        for descriptor, _snapshot, _path in directories:
+            os.close(descriptor)
+        raise
 
     migrations: list[Migration] = []
     versions: set[int] = set()
+    resources: tuple[tuple[str, Traversable | None], ...]
+    if filesystem_names is not None:
+        resources = tuple((name, None) for name in filesystem_names)
+    else:
+        resources = tuple((resource.name, resource) for resource in archive_resources)
     try:
-        for resource in resources:
-            name = resource.name
-            if name == "__init__.py":
-                if isinstance(resource, Path):
-                    _read_filesystem_resource(resource, directories[-1][0])
+        for name, archive_resource in resources:
+            if name == "__pycache__":
+                if archive_resource is not None:
+                    if archive_resource.is_dir():
+                        continue
                 else:
-                    _read_resource(resource)
-                continue
-            if name == "__pycache__" and resource.is_dir():
+                    metadata = os.stat(
+                        name,
+                        dir_fd=directories[-1][0],
+                        follow_symlinks=False,
+                    )
+                    if stat.S_ISDIR(metadata.st_mode):
+                        continue
+            if name == "__init__.py":
+                if archive_resource is None:
+                    _revalidate_resource_directories(directories)
+                    assert filesystem_root is not None
+                    _read_filesystem_resource(
+                        filesystem_root / name, directories[-1][0]
+                    )
+                    _revalidate_resource_directories(directories)
+                else:
+                    _read_resource(archive_resource)
                 continue
             match = _FILENAME.fullmatch(name)
             if match is None:
@@ -339,10 +362,15 @@ def load_migrations(package: str = _DEFAULT_PACKAGE) -> tuple[Migration, ...]:
             if version in versions:
                 raise MigrationError(f"duplicate migration version {version:03d}")
             versions.add(version)
-            if isinstance(resource, Path):
-                content = _read_filesystem_resource(resource, directories[-1][0])
+            if archive_resource is None:
+                _revalidate_resource_directories(directories)
+                assert filesystem_root is not None
+                content = _read_filesystem_resource(
+                    filesystem_root / name, directories[-1][0]
+                )
+                _revalidate_resource_directories(directories)
             else:
-                content = _read_resource(resource)
+                content = _read_resource(archive_resource)
             try:
                 sql = content.decode("utf-8")
             except UnicodeDecodeError as error:
@@ -358,6 +386,8 @@ def load_migrations(package: str = _DEFAULT_PACKAGE) -> tuple[Migration, ...]:
                 )
             )
         _revalidate_resource_directories(directories)
+    except OSError as error:
+        raise MigrationError(f"cannot load migration package {package!r}") from error
     finally:
         for descriptor, _snapshot, _path in directories:
             os.close(descriptor)

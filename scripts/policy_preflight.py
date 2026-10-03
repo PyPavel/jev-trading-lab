@@ -69,10 +69,10 @@ EXPECTED_SOURCE_HASHES = {
         "be5cdea878ba9575ad6a83bc43819e3c1cbaecdf8ad351b2d8374f94b6c496e9"
     ),
     "src/jev_trading_lab/persistence/db.py": (
-        "37e490b3664924aeb4bb9df1dede80f99c388222cdb05002b3b23b62ed3b3eea"
+        "d4702087efc2a6aa99691b8d002509ba211f9c896289a47d59eff72858696d82"
     ),
     "src/jev_trading_lab/persistence/migrations.py": (
-        "7e082fde7a60ae7575104ef5394630fbbce2fc01089c668ec6eb58efa8477114"
+        "14ef2054cc27d54090d0f05de00cb9a8b511e592d6d35ec09980984f89582840"
     ),
     "src/jev_trading_lab/persistence/schema/__init__.py": (
         "5f19444569734cd60895d22219e7e2481fd00efb6054fb1d4cf9f7b38e26e4a5"

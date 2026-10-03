@@ -8,6 +8,8 @@ import sqlite3
 import stat
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Protocol
 
@@ -34,6 +36,20 @@ _MOUNTINFO_ESCAPES = {
 }
 _UMASK_LOCK = threading.Lock()
 _CONNECT_LOCK = threading.Lock()
+
+
+@contextmanager
+def _connection_fd_activity() -> Iterator[None]:
+    """Serialize supported library connection and FD activity.
+
+    The descriptor census detects FDs created while this lock is held. Raw
+    same-process code that bypasses this lock can close/reopen an FD with the
+    same number and inode (ABA); that adversarial activity is outside the
+    supported boundary. This library is not a sandbox for malicious in-process
+    code.
+    """
+    with _CONNECT_LOCK:
+        yield
 
 
 class DatabaseConfigurationError(RuntimeError):
@@ -478,68 +494,66 @@ def connect_database(
         raise ValueError("database path must name a file")
 
     resolver = mount_resolver or _linux_mount_resolver
-    _validate_filesystem(path.parent, resolver)
-    parent_descriptor = _open_private_parent(path.parent)
-    parent_metadata = os.fstat(parent_descriptor)
-    parent_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
-    connection: SecureConnection | None = None
-    transferred_parent = False
-    connect_lock_held = False
-    try:
+    with _connection_fd_activity():
         _validate_filesystem(path.parent, resolver)
-        file_identity = _prepare_database_file(path, parent_descriptor)
-        _check_directory_entries(path, parent_descriptor)
-        _check_sidecars(path, parent_descriptor)
-        descriptor_path = f"/proc/self/fd/{parent_descriptor}/{path.name}"
-        _CONNECT_LOCK.acquire()
-        connect_lock_held = True
-        before_fds = _open_fd_identities()
-        connection = sqlite3.connect(
-            descriptor_path,
-            timeout=timeout / 1_000,
-            isolation_level=None,
-            uri=False,
-            check_same_thread=True,
-            factory=SecureConnection,
-        )
-        if not isinstance(connection, SecureConnection):
-            raise DatabaseConfigurationError(
-                "SQLite did not create a secure connection"
+        parent_descriptor = _open_private_parent(path.parent)
+        parent_metadata = os.fstat(parent_descriptor)
+        parent_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
+        connection: SecureConnection | None = None
+        transferred_parent = False
+        try:
+            _validate_filesystem(path.parent, resolver)
+            file_identity = _prepare_database_file(path, parent_descriptor)
+            _check_directory_entries(path, parent_descriptor)
+            _check_sidecars(path, parent_descriptor)
+            descriptor_path = f"/proc/self/fd/{parent_descriptor}/{path.name}"
+            before_fds = _open_fd_identities()
+            connection = sqlite3.connect(
+                descriptor_path,
+                timeout=timeout / 1_000,
+                isolation_level=None,
+                uri=False,
+                check_same_thread=True,
+                factory=SecureConnection,
             )
-        connection._parent_descriptor = parent_descriptor
-        transferred_parent = True
-        _verify_sqlite_descriptors(before_fds, file_identity, path, parent_descriptor)
-        _verify_main_database_path(connection, path)
-        _check_directory_entries(path, parent_descriptor)
-        _recheck_storage(path, parent_descriptor, parent_identity, file_identity)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        _verify_pragma(connection, "foreign_keys", 1, label="foreign_keys")
-        journal = _activate_wal(connection, timeout)
-        if journal is None or str(journal[0]).casefold() != "wal":
-            actual = None if journal is None else journal[0]
-            raise DatabaseConfigurationError(
-                f"SQLite WAL setup failed: received {actual!r}"
+            if not isinstance(connection, SecureConnection):
+                raise DatabaseConfigurationError(
+                    "SQLite did not create a secure connection"
+                )
+            connection._parent_descriptor = parent_descriptor
+            transferred_parent = True
+            _verify_sqlite_descriptors(
+                before_fds, file_identity, path, parent_descriptor
             )
-        _check_directory_entries(path, parent_descriptor)
-        _verify_sqlite_descriptors(before_fds, file_identity, path, parent_descriptor)
-        _check_sidecars(path, parent_descriptor)
-        connection.execute(f"PRAGMA busy_timeout = {timeout}")
-        _verify_pragma(connection, "busy_timeout", timeout, label="busy_timeout")
-        connection.execute("PRAGMA synchronous = FULL")
-        _verify_pragma(connection, "synchronous", 2, label="synchronous")
-        connection.execute("PRAGMA trusted_schema = OFF")
-        _verify_pragma(connection, "trusted_schema", 0, label="trusted_schema")
-        _recheck_storage(path, parent_descriptor, parent_identity, file_identity)
-        _CONNECT_LOCK.release()
-        connect_lock_held = False
-        return connection
-    except BaseException:
-        if connection is not None:
-            connection.close()
-        raise
-    finally:
-        if connect_lock_held:
-            _CONNECT_LOCK.release()
-        if not transferred_parent:
-            os.close(parent_descriptor)
+            _verify_main_database_path(connection, path)
+            _check_directory_entries(path, parent_descriptor)
+            _recheck_storage(path, parent_descriptor, parent_identity, file_identity)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            _verify_pragma(connection, "foreign_keys", 1, label="foreign_keys")
+            journal = _activate_wal(connection, timeout)
+            if journal is None or str(journal[0]).casefold() != "wal":
+                actual = None if journal is None else journal[0]
+                raise DatabaseConfigurationError(
+                    f"SQLite WAL setup failed: received {actual!r}"
+                )
+            _check_directory_entries(path, parent_descriptor)
+            _verify_sqlite_descriptors(
+                before_fds, file_identity, path, parent_descriptor
+            )
+            _check_sidecars(path, parent_descriptor)
+            connection.execute(f"PRAGMA busy_timeout = {timeout}")
+            _verify_pragma(connection, "busy_timeout", timeout, label="busy_timeout")
+            connection.execute("PRAGMA synchronous = FULL")
+            _verify_pragma(connection, "synchronous", 2, label="synchronous")
+            connection.execute("PRAGMA trusted_schema = OFF")
+            _verify_pragma(connection, "trusted_schema", 0, label="trusted_schema")
+            _recheck_storage(path, parent_descriptor, parent_identity, file_identity)
+            return connection
+        except BaseException:
+            if connection is not None:
+                connection.close()
+            raise
+        finally:
+            if not transferred_parent:
+                os.close(parent_descriptor)
