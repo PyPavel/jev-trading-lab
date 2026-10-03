@@ -2,7 +2,9 @@
 
 ## Status
 
-**REVIEW FINDINGS FIXED / PENDING INDEPENDENT REVIEW**
+**FINAL APPROVED / COMPLETE**
+
+This document records implementation, remediation, verification, and final independent approval evidence.
 
 ## Code commits
 
@@ -107,4 +109,29 @@ exit 0
 
 ## Scope
 
-No design, implementation plan, provider-contract research, or review files changed. No push performed. Task 6 remains blocked pending independent Task 5 review.
+No design, implementation plan, provider-contract research, or review files changed. No push performed.
+
+## Final independent review verdicts
+
+### Spec and adversarial review: PASS
+
+The independent spec/adversarial reviewer reported **PASS**, with zero findings. The reviewer verified the complete 449-test suite, 28 adversarial probes, and all 4,122 authoritative calendar rows.
+
+### Quality and model-risk review: APPROVED
+
+The independent quality/model-risk reviewer reported **APPROVED**, with zero findings at `8cf694e`. The reviewer verified the authoritative artifact, trust boundary, package bytes, and required gates.
+
+## Final reviewed commit chain
+
+```text
+75addb455908e21b81183636d9e4857556c4fbd8 feat(core): freeze experiment run window
+88e82be05d86cd27a0ab3596b727e5be6dc67316 docs(delivery): record task 005 evidence
+3ff6a02979e46eab1c176895565742e9a78f0ea8 fix(core): make run window calendar authoritative
+8cf694efc172625b96d41c6ea013c28b0523062a docs(delivery): update task 005 review evidence
+```
+
+The approval evidence commit containing this section follows `8cf694e` and changes only `docs/delivery/task-005.md`.
+
+## Final status
+
+**FINAL APPROVED / COMPLETE.** Both required independent reviews report zero findings. Task 5 is complete; Task 6 may proceed under its own reviewed change-control cycle.
