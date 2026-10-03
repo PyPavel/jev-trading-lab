@@ -75,6 +75,15 @@ _APPROVED_SOURCE_HASHES = {
     "src/jev_trading_lab/cli.py": (
         "e1018e68f8902660a347c842866c321a42bad08d3f332cdf7f32bf0029cc84d9"
     ),
+    "src/jev_trading_lab/core/ids.py": (
+        "634ae960f5a25a3b1257965ff78b106fceed95890a7badcd532e9fc4ecfdfd0a"
+    ),
+    "src/jev_trading_lab/core/observations.py": (
+        "3bc501f97c86b559ac6864bc66814489adbab3551fbb893a9a38784cd954761f"
+    ),
+    "src/jev_trading_lab/core/time.py": (
+        "edbc66ad7acf0bfb2da0a2d4038cbdc914474f33482a723161155ea81744312e"
+    ),
     "src/jev_trading_lab/core/values.py": (
         "806e4d4681da763cd78efa8b636ad51be74f61b425c9ad833b44781d43b10087"
     ),
@@ -128,10 +137,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "ce094984e7857443b0fa262c3d704b3dd47142781f835233047150b8d2a85eac"
+    "653ac45d765d7566c9f59a50480b409e01236ee9bdef41fc439c66896bc99f12"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "c6fd5cd818c9c0f8b5c991180a5a99954bf2fcac4f69440806feada71c61f01b"
+    "b4308b8bca2cdaa190b273e696ae756156b9f35fba282c59c77cc0180e44bde4"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = ["typer>=0.19,<1"]
 _ALLOWED_DEPENDENCY_GROUPS = {
@@ -467,7 +476,14 @@ def test_no_live_execution_surface() -> None:
 def _initialize_approved_source_fixture(tmp_path: Path) -> Path:
     package = tmp_path / "src/jev_trading_lab"
     package.mkdir(parents=True)
-    for relative in ("__init__.py", "cli.py", "core/values.py"):
+    for relative in (
+        "__init__.py",
+        "cli.py",
+        "core/ids.py",
+        "core/observations.py",
+        "core/time.py",
+        "core/values.py",
+    ):
         target = package / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes((SRC / "jev_trading_lab" / relative).read_bytes())
@@ -1260,6 +1276,9 @@ def test_built_artifacts_exclude_repository_and_host_junk(tmp_path: Path) -> Non
     assert package_files == {
         "jev_trading_lab/__init__.py",
         "jev_trading_lab/cli.py",
+        "jev_trading_lab/core/ids.py",
+        "jev_trading_lab/core/observations.py",
+        "jev_trading_lab/core/time.py",
         "jev_trading_lab/core/values.py",
     }
     assert not _wheel_entry_point_violations(wheel)
