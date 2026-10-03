@@ -18,6 +18,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Verify policy preflight
+        run: echo "8b31202946edadb2caf36ac26e7e4a14f337746e4a17f972504401266d60efe8  scripts/policy_preflight.py" | sha256sum -c -
+      - name: Run policy preflight before dependency tooling
+        run: python3 -I scripts/policy_preflight.py
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
         with:
           version: "0.11.7"
@@ -31,7 +35,11 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run mypy src
-      - run: uv export --frozen --all-groups --no-emit-project --format requirements-txt --output-file audit-requirements.txt
-      - run: uv run pip-audit --strict --requirement audit-requirements.txt --no-deps --disable-pip
+      - run: >
+          uv export --frozen --all-groups --no-emit-project
+          --format requirements-txt --output-file audit-requirements.txt
+      - run: >
+          uv run pip-audit --strict --requirement audit-requirements.txt
+          --no-deps --disable-pip
       - run: uv build --no-build-isolation
       # Clean-wheel migration/render smoke becomes mandatory when those resources exist.

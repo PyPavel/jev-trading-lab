@@ -7,6 +7,7 @@ import importlib.util
 import os
 import py_compile
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -122,22 +123,25 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "b83b99f09d72d41b28a10116ed5cc20efb316e86d6e4bbccfaf396a40e1442b9"
+    "cdc8f8bbb79bf9732d7d56d6762391d71611f7001960507510a6a90628906245"
 )
+_APPROVED_PREFLIGHT_HASH = (
+    "8b31202946edadb2caf36ac26e7e4a14f337746e4a17f972504401266d60efe8"
+)
+_ALLOWED_RUNTIME_REQUIREMENTS = ["typer>=0.19,<1"]
 _ALLOWED_DEPENDENCY_GROUPS = {
-    "dev": frozenset(
-        {
-            "hatchling",
-            "hypothesis",
-            "mypy",
-            "pip-audit",
-            "pytest",
-            "pytest-asyncio",
-            "respx",
-            "ruff",
-        }
-    )
+    "dev": [
+        "hatchling==1.27.0",
+        "hypothesis>=6.140,<7",
+        "mypy>=1.18,<2",
+        "pip-audit>=2.9,<3",
+        "pytest>=9.0.3,<10",
+        "pytest-asyncio>=1.2,<2",
+        "respx>=0.22,<1",
+        "ruff>=0.13,<1",
+    ]
 }
+_APPROVED_REGISTRY_SOURCE = {"registry": "https://pypi.org/simple"}
 
 
 def _source_policy_violations(root: Path) -> list[str]:
@@ -225,16 +229,22 @@ def _dependency_group_violations(
     if not isinstance(groups, dict):
         return [f"{location}: dependency groups must be a table"] if groups else []
     violations: list[str] = []
+    label = "locked dependency group" if locked else "dependency group"
     for group, requirements in groups.items():
         allowed = _ALLOWED_DEPENDENCY_GROUPS.get(group)
         names = _dependency_names(requirements)
-        label = "locked dependency group" if locked else "dependency group"
         if allowed is None:
             violations.append(f"{location}: {label} not allowlisted: {group}")
-        else:
-            violations.extend(
-                f"{location}: {label} {group} dependency not allowlisted: {name}"
-                for name in sorted(names - allowed)
+            continue
+        allowed_names = _dependency_names(allowed)
+        violations.extend(
+            f"{location}: {label} {group} dependency not allowlisted: {name}"
+            for name in sorted(names - allowed_names)
+        )
+        if not locked and requirements != allowed:
+            violations.append(
+                f"{location}: {label} {group} requirements differ from exact "
+                "approved strings"
             )
     return violations
 
@@ -259,6 +269,9 @@ def _optional_dependency_violations(
 
 def _operational_policy_violations(root: Path) -> list[str]:
     violations: list[str] = []
+    allowed_dirs = {"scripts"}
+    allowed_hashes = {"scripts/policy_preflight.py": _APPROVED_PREFLIGHT_HASH}
+    seen: set[str] = set()
     for directory_name in ("scripts", "ops"):
         pending = [root / directory_name]
         while pending:
@@ -273,13 +286,15 @@ def _operational_policy_violations(root: Path) -> list[str]:
                     f"{relative}: operational path is unreadable: {error}"
                 )
                 continue
+            seen.add(relative)
 
             if stat.S_ISLNK(metadata.st_mode):
                 violations.append(f"{relative}: operational symlink is not allowlisted")
             elif stat.S_ISDIR(metadata.st_mode):
-                violations.append(
-                    f"{relative}: operational directory is not allowlisted"
-                )
+                if relative not in allowed_dirs:
+                    violations.append(
+                        f"{relative}: operational directory is not allowlisted"
+                    )
                 if not metadata.st_mode & (stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH):
                     violations.append(
                         f"{relative}: operational directory is unreadable"
@@ -293,20 +308,37 @@ def _operational_policy_violations(root: Path) -> list[str]:
                         f"{relative}: operational directory is unreadable: {error}"
                     )
             elif stat.S_ISREG(metadata.st_mode):
-                violations.append(f"{relative}: operational file is not allowlisted")
+                approved_hash = allowed_hashes.get(relative)
+                if approved_hash is None:
+                    violations.append(
+                        f"{relative}: operational file is not allowlisted"
+                    )
                 if not metadata.st_mode & (stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH):
                     violations.append(f"{relative}: operational file is unreadable")
                     continue
                 try:
-                    path.read_text(encoding="utf-8")
+                    content = path.read_bytes()
+                    content.decode("utf-8")
                 except (OSError, UnicodeError) as error:
                     violations.append(
                         f"{relative}: operational file is unreadable UTF-8: {error}"
+                    )
+                    continue
+                if (
+                    approved_hash
+                    and hashlib.sha256(content).hexdigest() != approved_hash
+                ):
+                    violations.append(
+                        f"{relative}: SHA-256 does not match approved operational file"
                     )
             else:
                 violations.append(
                     f"{relative}: special operational file is not allowed"
                 )
+    violations.extend(
+        f"{relative}: approved operational path is missing"
+        for relative in sorted((allowed_dirs | allowed_hashes.keys()) - seen)
+    )
     return violations
 
 
@@ -314,11 +346,17 @@ def _runtime_policy_violations(root: Path) -> list[str]:
     project_data = _project_data(root)
     project = project_data.get("project", {})
     allowed_runtime = {"typer"}
-    runtime_names = _dependency_names(project.get("dependencies", []))
+    runtime_requirements = project.get("dependencies", [])
+    runtime_names = _dependency_names(runtime_requirements)
     violations = [
         f"pyproject.toml: runtime dependency not allowlisted: {name}"
         for name in sorted(runtime_names - allowed_runtime)
     ]
+    if runtime_requirements != _ALLOWED_RUNTIME_REQUIREMENTS:
+        violations.append(
+            "pyproject.toml: runtime dependency source or requirement differs from "
+            "exact approved strings"
+        )
     build_system = project_data.get("build-system", {})
     if build_system != _ALLOWED_BUILD_SYSTEM:
         violations.append(
@@ -355,11 +393,22 @@ def _runtime_policy_violations(root: Path) -> list[str]:
             violations.append(f"uv.lock: unreadable or invalid UTF-8 TOML: {error}")
             lock_data = {}
         project_name = project.get("name")
+        packages = lock_data.get("package", [])
+        for package in packages:
+            if (
+                isinstance(package, dict)
+                and package.get("name") != project_name
+                and package.get("source") != _APPROVED_REGISTRY_SOURCE
+            ):
+                violations.append(
+                    "uv.lock: third-party package "
+                    f"{package.get('name')!r} has unapproved dependency source"
+                )
         project_package = next(
             (
                 package
-                for package in lock_data.get("package", [])
-                if package.get("name") == project_name
+                for package in packages
+                if isinstance(package, dict) and package.get("name") == project_name
             ),
             None,
         )
@@ -415,6 +464,12 @@ def _initialize_approved_source_fixture(tmp_path: Path) -> Path:
     package.mkdir(parents=True)
     for name in ("__init__.py", "cli.py"):
         (package / name).write_bytes((SRC / "jev_trading_lab" / name).read_bytes())
+    workflow = tmp_path / ".github/workflows/ci.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_bytes((ROOT / ".github/workflows/ci.yml").read_bytes())
+    script = tmp_path / "scripts/policy_preflight.py"
+    script.parent.mkdir()
+    script.write_bytes((ROOT / "scripts/policy_preflight.py").read_bytes())
     return package
 
 
@@ -495,7 +550,7 @@ def test_git_ignored_operational_directory_symlink_is_rejected(
     external.mkdir()
     (external / "live.sh").write_text("#!/bin/sh\nexec live-order\n", encoding="utf-8")
     guarded = tmp_path / directory_name
-    guarded.mkdir()
+    guarded.mkdir(exist_ok=True)
     (guarded / "external").symlink_to(external, target_is_directory=True)
     subprocess.run(
         ["git", "check-ignore", relative],
@@ -725,6 +780,178 @@ def test_lock_optional_dependencies_are_rejected(tmp_path: Path) -> None:
     ), violations
 
 
+def _copy_preflight_fixture(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for relative in ("pyproject.toml", "uv.lock"):
+        (repo / relative).write_bytes((ROOT / relative).read_bytes())
+    for relative in (".github/workflows/ci.yml",):
+        target = repo / relative
+        target.parent.mkdir(parents=True)
+        target.write_bytes((ROOT / relative).read_bytes())
+    shutil.copytree(ROOT / "src", repo / "src")
+    scripts = ROOT / "scripts"
+    if scripts.exists():
+        shutil.copytree(scripts, repo / "scripts", symlinks=True)
+    return repo
+
+
+def _run_preflight(repo: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["python3", "-I", "scripts/policy_preflight.py"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": ""},
+        check=False,
+    )
+
+
+def test_same_name_local_typer_valid_lock_is_rejected(tmp_path: Path) -> None:
+    repo = _copy_preflight_fixture(tmp_path)
+    vendor = repo / "vendor/typer"
+    vendor.mkdir(parents=True)
+    (vendor / "pyproject.toml").write_text(
+        '[project]\nname="typer"\nversion="0.19.2"\n'
+        '[build-system]\nrequires=[]\nbuild-backend="vendor_backend"\n'
+        'backend-path=["."]\n',
+        encoding="utf-8",
+    )
+    (vendor / "vendor_backend.py").write_text(
+        "def build_wheel(*args):\n    raise RuntimeError('not built during lock')\n",
+        encoding="utf-8",
+    )
+    project = (repo / "pyproject.toml").read_text(encoding="utf-8")
+    project = project.replace('"typer>=0.19,<1"', f'"typer @ {vendor.as_uri()}"', 1)
+    (repo / "pyproject.toml").write_text(project, encoding="utf-8")
+    subprocess.run(["uv", "lock"], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["uv", "lock", "--check"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    violations = _runtime_policy_violations(repo)
+    preflight = _run_preflight(repo)
+
+    assert any("dependency source" in item for item in violations), violations
+    assert preflight.returncode != 0
+    assert "pyproject.toml" in preflight.stderr
+    assert "uv.lock" in preflight.stderr
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        "typer @ file:///tmp/vendor/typer",
+        "typer @ https://example.test/typer-0.19.2.tar.gz",
+        "typer @ git+https://example.test/typer.git@reviewed",
+        "typer @ ./vendor/typer",
+    ),
+)
+def test_preflight_rejects_non_registry_requirement_sources(
+    replacement: str, tmp_path: Path
+) -> None:
+    repo = _copy_preflight_fixture(tmp_path)
+    project = (repo / "pyproject.toml").read_text(encoding="utf-8")
+    (repo / "pyproject.toml").write_text(
+        project.replace("typer>=0.19,<1", replacement, 1), encoding="utf-8"
+    )
+
+    result = _run_preflight(repo)
+
+    assert result.returncode != 0
+    assert "pyproject.toml" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "source_config",
+    (
+        '[tool.uv.sources]\ntyper={path="vendor/typer", editable=true}\n',
+        '[[tool.uv.index]]\nname="alternate"\nurl="https://example.test/simple"\n'
+        '[tool.uv.sources]\ntyper={index="alternate"}\n',
+    ),
+)
+def test_preflight_rejects_editable_or_alternate_index_source(
+    source_config: str, tmp_path: Path
+) -> None:
+    repo = _copy_preflight_fixture(tmp_path)
+    with (repo / "pyproject.toml").open("a", encoding="utf-8") as project:
+        project.write(source_config)
+
+    result = _run_preflight(repo)
+
+    assert result.returncode != 0
+    assert "pyproject.toml" in result.stderr
+
+
+def test_preflight_rejects_non_registry_lock_source(tmp_path: Path) -> None:
+    repo = _copy_preflight_fixture(tmp_path)
+    lock = (repo / "uv.lock").read_text(encoding="utf-8")
+    typer_registry = (
+        'name = "typer"\nversion = "0.27.2"\n'
+        'source = { registry = "https://pypi.org/simple" }'
+    )
+    lock = lock.replace(
+        typer_registry,
+        'name = "typer"\nversion = "0.27.2"\nsource = { directory = "vendor/typer" }',
+        1,
+    )
+    (repo / "uv.lock").write_text(lock, encoding="utf-8")
+
+    result = _run_preflight(repo)
+
+    assert result.returncode != 0
+    assert "uv.lock" in result.stderr
+
+
+def test_ci_order_preflight_blocks_local_backend_before_uv(tmp_path: Path) -> None:
+    repo = _copy_preflight_fixture(tmp_path)
+    marker = repo / "backend-executed"
+    project = (repo / "pyproject.toml").read_text(encoding="utf-8")
+    project = project.replace(
+        'build-backend = "hatchling.build"',
+        'build-backend = "malicious"\nbackend-path = ["backend"]',
+        1,
+    )
+    (repo / "pyproject.toml").write_text(project, encoding="utf-8")
+    backend = repo / "backend/malicious.py"
+    backend.parent.mkdir()
+    backend.write_text(
+        "from pathlib import Path\n"
+        "Path('backend-executed').write_text('executed')\n"
+        "from hatchling.build import *  # noqa: F403\n",
+        encoding="utf-8",
+    )
+
+    preflight = repo / "scripts/policy_preflight.py"
+    if preflight.is_file():
+        result = _run_preflight(repo)
+    else:
+        result = subprocess.CompletedProcess(["preflight-missing"], 0, "", "")
+    if result.returncode == 0:
+        subprocess.run(
+            ["uv", "lock", "--check"],
+            cwd=repo,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["uv", "sync", "--frozen", "--all-groups"],
+            cwd=repo,
+            env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(tmp_path / "venv")},
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    assert result.returncode != 0
+    assert not marker.exists(), "local backend executed before policy rejection"
+
+
 def test_required_dev_toolchain_is_declared_and_locked() -> None:
     project_data = _project_data()
     dev_requirements = project_data["dependency-groups"]["dev"]
@@ -804,14 +1031,21 @@ def test_ci_uses_immutable_actions_and_locked_audit() -> None:
     assert "persist-credentials: false" in checkout_block
     assert "permissions:\n  contents: read" in workflow
     assert 'PYTHONDONTWRITEBYTECODE: "1"' in workflow
-    assert (
-        "uv export --frozen --all-groups --no-emit-project "
-        "--format requirements-txt --output-file audit-requirements.txt"
-    ) in workflow
-    assert (
-        "uv run pip-audit --strict --requirement audit-requirements.txt "
-        "--no-deps --disable-pip"
-    ) in workflow
+    hash_check = (
+        f'echo "{_APPROVED_PREFLIGHT_HASH}  scripts/policy_preflight.py" '
+        "| sha256sum -c -"
+    )
+    preflight = "run: python3 -I scripts/policy_preflight.py"
+    assert hash_check in workflow
+    assert preflight in workflow
+    assert workflow.index(hash_check) < workflow.index(preflight)
+    assert workflow.index(preflight) < workflow.index("astral-sh/setup-uv")
+    assert workflow.index(preflight) < workflow.index("uv lock --check")
+    assert workflow.index(preflight) < workflow.index("uv sync --frozen --all-groups")
+    assert "uv export --frozen --all-groups --no-emit-project" in workflow
+    assert "--format requirements-txt --output-file audit-requirements.txt" in workflow
+    assert "uv run pip-audit --strict --requirement audit-requirements.txt" in workflow
+    assert "--no-deps --disable-pip" in workflow
     assert "run: uv build --no-build-isolation" in workflow
     assert "run: uv build\n" not in workflow
 
@@ -827,7 +1061,6 @@ def test_workflow_hash_rejects_appended_run_step(tmp_path: Path) -> None:
     (tmp_path / "pyproject.toml").write_bytes((ROOT / "pyproject.toml").read_bytes())
     _initialize_approved_source_fixture(tmp_path)
     workflow = tmp_path / ".github/workflows/ci.yml"
-    workflow.parent.mkdir(parents=True)
     reviewed = (ROOT / ".github/workflows/ci.yml").read_bytes()
     workflow.write_bytes(
         reviewed + b"      - run: curl -X POST https://example.test/orders\n"
