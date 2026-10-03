@@ -20,6 +20,7 @@ Review-finding corrections:
 0476dd3 fix(core): close manifest trust and policy gaps
 be86be2cf9a764b7b9120c5008ac46fc6451707c fix(core): freeze model input and activation identities
 b85d8fc00942730c2819c9583c48574da1b5ff46 fix(core): close activation and schema identity gaps
+bdfda7566dfd94e6409e92d7c54e36287c089600 fix(core): make activation identity checks field-aware
 ```
 
 ## Review findings resolved
@@ -36,6 +37,8 @@ b85d8fc00942730c2819c9583c48574da1b5ff46 fix(core): close activation and schema 
 - Made each model contract the sole response-schema identity owner. Removed duplicate OpenAI schema identity from `model_input_policy`, rejected legacy/divergent duplicate fields, named OpenAI and Jev response schemas distinctly, and retained the independently frozen Jev question-set identity.
 - Hardened parsing with iterative depth/item/string limits, deterministic sorted/capped validation errors, and deterministic `RecursionError` conversion.
 - Hardened file loading to open once, `fstat()` the descriptor before/after, read only `MAX_MANIFEST_BYTES + 1`, and reject practical size/identity races.
+- Corrected the identity classifier's sole major review finding with field-aware rules. Strong unresolved markers are now detected after lowercase alphanumeric compaction, so separator-free and suffixed forms such as `placeholder2026`, `changeme123`, `todo2026`, and `not_applicable_2026` fail across activation identity fields. Generic moving values (`latest`, `current`, `default`, `none`, `null`, `na`) fail only when they are the complete normalized value.
+- Removed weak global `test`, `sample`, and `change` bans. Versioned rule identities such as `phase1-permutation-test-v1`, `phase1-sample-calendar-v1`, `phase1-change-detection-v1`, and `phase1-current-regime-v1` now pass. Field contracts independently require strict semantic SDK/calendar package versions, reviewed lowercase version/artifact slugs ending in `-vN`, structurally nontrivial provider revisions/fingerprints, exact SHA-256 shape, and existing provider-specific dated model snapshots. These regexes establish structure and minimum entropy only; provider metadata truth remains the later `assert_activation_candidate`/registration comparison.
 - Preserved exact source/config policy. Updated only reviewed hashes, preflight hash, workflow-embedded preflight hash, and workflow hash. Dependencies and `uv.lock` are unchanged.
 
 ## TDD RED evidence
@@ -102,6 +105,15 @@ uv run pytest tests/core/test_manifest.py::test_model_input_policy_is_required_c
 Expected distinct authoritative `phase1-openai-response-schema-v1`; found ambiguous `phase1-schema-v1`.
 ```
 
+The field-aware classifier correction was likewise added test-first. The mandatory focused RED was:
+
+```text
+env PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/core/test_manifest.py::test_activation_rejects_compacted_unresolved_markers tests/core/test_manifest.py::test_activation_rejects_unresolved_markers_in_every_identity_class tests/core/test_manifest.py::test_activation_rejects_exact_generic_identity_values tests/core/test_manifest.py::test_activation_accepts_legitimate_rule_identity_components tests/core/test_manifest.py::test_activation_accepts_harmless_marker_substrings tests/core/test_manifest.py::test_activation_rejects_malformed_field_specific_identities -q
+26 failed, 4 passed in 0.64s
+```
+
+Failures reproduced both sides of the major finding: embedded/concatenated unresolved markers and exact generic values were accepted, while legitimate `test`, `sample`, and `change` rule-name components were rejected. SDK, revision/fingerprint, rule-version, and artifact-ID structure checks also failed before production changes.
+
 ## Focused GREEN evidence
 
 ```text
@@ -110,6 +122,12 @@ uv run pytest tests/core/test_manifest.py::test_activation_rejects_unresolved_ma
 
 uv run pytest tests/test_package_policy.py -q
 53 passed in 1.11s
+
+env PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/core/test_manifest.py::test_activation_rejects_compacted_unresolved_markers tests/core/test_manifest.py::test_activation_rejects_unresolved_markers_in_every_identity_class tests/core/test_manifest.py::test_activation_rejects_exact_generic_identity_values tests/core/test_manifest.py::test_activation_accepts_legitimate_rule_identity_components tests/core/test_manifest.py::test_activation_accepts_harmless_marker_substrings tests/core/test_manifest.py::test_activation_rejects_malformed_field_specific_identities -q
+30 passed in 0.27s
+
+env PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/core/test_manifest.py -q
+202 passed in 0.87s
 ```
 
 Adversarial coverage includes Pydantic inherited bypass absence, constructor rejection, `TypeAdapter(Manifest)` rejection, no `__dict__`, object-copy safety, canonical round-trip, deliberate `object.__setattr__` tampering caught by revalidation, parser-valid/example-only activation rejection, a valid sanitized activation fixture, reserved alias components under mixed case/separators, impossible snapshot dates, every requested unresolved token/phrase in prefix/embedded/suffix positions, revisions/fingerprints/SDK identities/artifact identities/model-input versions/provider revisions/rule versions, valid real-shaped substring controls, rejected legacy/divergent OpenAI policy-schema keys, distinct model response-schema identities, retained Jev question-set identity, manifest identity mutation, case/duplicate categories, exact Treasury/provider contracts, 1,100-level nesting, 40,000 invalid categories within the byte cap, deterministic key-order-independent errors, capped error output, and simulated descriptor-size race.
@@ -126,10 +144,10 @@ uv lock --check
 Resolved 55 packages in 1ms
 
 uv sync --frozen --all-groups
-Checked 54 packages in 0.56ms
+Checked 54 packages in 0.60ms
 
 env PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
-451 passed in 2.31s
+387 passed in 2.03s
 
 uv run ruff check .
 All checks passed!
@@ -140,15 +158,19 @@ uv run ruff format --check .
 uv run mypy src
 Success: no issues found in 7 source files
 
-uv export --frozen --all-groups --no-emit-project --format requirements-txt --output-file /tmp/jev-task-004-activation-audit.txt --quiet
+uv export --frozen --all-groups --no-emit-project --format requirements-txt --output-file /tmp/jev-task-004-identity-classifier-audit.txt --quiet
 exit 0
 
-uv run pip-audit --strict --requirement /tmp/jev-task-004-activation-audit.txt --no-deps --disable-pip
+uv run pip-audit --strict --requirement /tmp/jev-task-004-identity-classifier-audit.txt --no-deps --disable-pip
 No known vulnerabilities found
 
 uv build --no-build-isolation
 Successfully built dist/jev_trading_lab-0.1.0.tar.gz
 Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
+
+artifact inspection
+wheel manifest True example_config False
+sdist manifest True example_config False
 
 git diff --check
 exit 0
@@ -158,6 +180,6 @@ exit 0
 
 ## Scope and handoff
 
-No design, plan, provider-research, or review file changed. No dependency changed. The checked-in example remains `example_only=true` and structurally valid with explicit placeholder values. Task 14 registration must revalidate canonical bytes and call `assert_activation_candidate()` before persistence or activation.
+No design, plan, provider-research, or review file changed. No dependency changed. The checked-in example remains `example_only=true` and structurally valid with explicit placeholder values; its Jev SDK version was normalized to strict semantic form. Task 14 registration must revalidate canonical bytes and call `assert_activation_candidate()` before persistence or activation.
 
 Independent spec/adversarial and quality/security re-reviews have not yet been recorded. Status remains **PENDING INDEPENDENT RE-REVIEW**.
