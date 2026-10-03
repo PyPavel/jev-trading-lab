@@ -11,20 +11,24 @@ jobs:
   quality:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@v6
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
         with:
           version: "0.11.7"
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - run: uv python install 3.12
+      - run: uv lock --check
       - run: uv sync --frozen --all-groups
       - run: uv run pytest -q
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run mypy src
+      - run: uv export --frozen --all-groups --no-emit-project --format requirements-txt --output-file audit-requirements.txt
+      - run: uv run pip-audit --strict --requirement audit-requirements.txt --no-deps --disable-pip
       - run: uv build
       # Clean-wheel migration/render smoke becomes mandatory when those resources exist.

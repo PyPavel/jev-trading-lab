@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.27,<2"]
+requires = ["hatchling==1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -22,8 +22,13 @@ jev-lab = "jev_trading_lab.cli:app"
 
 [dependency-groups]
 dev = [
+    "hatchling==1.27.0",
+    "hypothesis>=6.140,<7",
     "mypy>=1.18,<2",
-    "pytest>=8.4,<9",
+    "pip-audit>=2.9,<3",
+    "pytest>=9.0.3,<10",
+    "pytest-asyncio>=1.2,<2",
+    "respx>=0.22,<1",
     "ruff>=0.13,<1",
 ]
 
