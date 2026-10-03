@@ -46,7 +46,18 @@ _FORBIDDEN_FIRST_KEYWORDS = frozenset(
         "VACUUM",
     }
 )
-_TEMP_SQL = re.compile(r"\b(?:CREATE\s+TEMP(?:ORARY)?|TEMP\s*\.)\b", re.IGNORECASE)
+_TEMP_SQL = re.compile(
+    r"(?:\bCREATE\s+TEMP(?:ORARY)?\b|(?:\btemp\b|\"temp\"|\[temp\]|`temp`)\s*\.)",
+    re.IGNORECASE,
+)
+_EXPLICIT_SCHEMA_SQL = re.compile(
+    r"^\s*(?:CREATE\s+(?:UNIQUE\s+)?(?:TABLE|INDEX|TRIGGER|VIEW)|"
+    r"DROP\s+(?:TABLE|INDEX|TRIGGER|VIEW)|ALTER\s+TABLE|INSERT\s+INTO|"
+    r"UPDATE|DELETE\s+FROM|REINDEX)\s+"
+    r"(?:(?:IF\s+(?:NOT\s+)?EXISTS)\s+)?"
+    r"(?P<schema>[A-Za-z_][A-Za-z0-9_]*|\"[^\"]+\"|\[[^\]]+\]|`[^`]+`)\s*\.",
+    re.IGNORECASE,
+)
 _WRITE_ACTIONS = frozenset(
     {
         sqlite3.SQLITE_ALTER_TABLE,
@@ -93,31 +104,93 @@ def _utc_now_us() -> int:
     return datetime_to_utc_us(datetime.now(UTC))
 
 
-def _trusted_resource_parents(resource: Path) -> None:
-    current = resource.parent
-    while True:
-        try:
-            metadata = current.lstat()
-        except OSError as error:
+def _directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+def _directory_snapshot(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_ctime_ns,
+    )
+
+
+def _validate_resource_directory(metadata: os.stat_result, path: Path) -> None:
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise MigrationError(
+            f"migration package directory {path} is a symlink or non-directory"
+        )
+    if metadata.st_uid not in {0, os.geteuid()}:
+        raise MigrationError(
+            f"migration package directory {path} has an untrusted owner"
+        )
+    if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise MigrationError(
+            f"migration package directory {path} is group/other writable"
+        )
+
+
+def _open_resource_directories(
+    root: Path, package: str, root_snapshot: tuple[int, ...]
+) -> list[tuple[int, tuple[int, ...], Path]]:
+    package_parts = tuple(package.split("."))
+    if tuple(root.parts[-len(package_parts) :]) != package_parts:
+        raise MigrationError("migration package path does not match package name")
+    base = root.parents[len(package_parts) - 1]
+    try:
+        current = os.open(base, _directory_flags())
+    except OSError as error:
+        raise MigrationError(
+            f"migration package directory {base} is unreadable"
+        ) from error
+    opened: list[tuple[int, tuple[int, ...], Path]] = []
+    base_descriptor = current
+    try:
+        current_path = base
+        for component in package_parts:
+            current_path /= component
+            child = os.open(component, _directory_flags(), dir_fd=current)
+            metadata = os.fstat(child)
+            _validate_resource_directory(metadata, current_path)
+            opened.append((child, _directory_snapshot(metadata), current_path))
+            current = child
+        if opened[-1][1] != root_snapshot:
             raise MigrationError(
-                f"migration package directory {current} is unreadable"
-            ) from error
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-            raise MigrationError(
-                f"migration package directory {current} is a symlink or non-directory"
+                f"migration package directory {root} changed while loading"
             )
-        if metadata.st_uid not in {0, os.geteuid()}:
+        return opened
+    except OSError as error:
+        for descriptor, _snapshot, _path in opened:
+            os.close(descriptor)
+        raise MigrationError(
+            f"migration package directory {root} is a symlink or unreadable"
+        ) from error
+    except BaseException:
+        for descriptor, _snapshot, _path in opened:
+            os.close(descriptor)
+        raise
+    finally:
+        os.close(base_descriptor)
+
+
+def _revalidate_resource_directories(
+    opened: list[tuple[int, tuple[int, ...], Path]],
+) -> None:
+    for descriptor, snapshot, path in opened:
+        metadata = os.fstat(descriptor)
+        _validate_resource_directory(metadata, path)
+        if _directory_snapshot(metadata) != snapshot:
             raise MigrationError(
-                f"migration package directory {current} has an untrusted owner"
+                f"migration package directory {path} changed while loading"
             )
-        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            raise MigrationError(
-                f"migration package directory {current} is group/other writable"
-            )
-        parent = current.parent
-        if not (parent / "__init__.py").exists():
-            return
-        current = parent
 
 
 def _resource_snapshot(metadata: os.stat_result) -> tuple[int, ...]:
@@ -133,8 +206,9 @@ def _resource_snapshot(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _read_filesystem_resource(resource: Path) -> bytes:
-    _trusted_resource_parents(resource)
+def _read_filesystem_resource(
+    resource: Path, parent_descriptor: int | None = None
+) -> bytes:
     flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
@@ -143,7 +217,11 @@ def _read_filesystem_resource(resource: Path) -> bytes:
     )
     descriptor: int | None = None
     try:
-        descriptor = os.open(resource, flags)
+        descriptor = os.open(
+            resource.name if parent_descriptor is not None else resource,
+            flags,
+            dir_fd=parent_descriptor,
+        )
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
             raise MigrationError(
@@ -188,6 +266,11 @@ def _read_filesystem_resource(resource: Path) -> bytes:
     finally:
         if descriptor is not None:
             os.close(descriptor)
+    if len(content) > MAX_MIGRATION_BYTES:
+        raise MigrationError(
+            f"migration resource {resource.name!r} exceeds maximum size "
+            f"{MAX_MIGRATION_BYTES}"
+        )
     return content
 
 
@@ -220,39 +303,64 @@ def load_migrations(package: str = _DEFAULT_PACKAGE) -> tuple[Migration, ...]:
     except (ImportError, ModuleNotFoundError, OSError) as error:
         raise MigrationError(f"cannot load migration package {package!r}") from error
 
+    directories: list[tuple[int, tuple[int, ...], Path]] = []
+    if isinstance(root, Path):
+        try:
+            root_metadata = root.lstat()
+        except OSError as error:
+            raise MigrationError(
+                f"migration package directory {root} is unreadable"
+            ) from error
+        directories = _open_resource_directories(
+            root, package, _directory_snapshot(root_metadata)
+        )
+
     migrations: list[Migration] = []
     versions: set[int] = set()
-    for resource in resources:
-        name = resource.name
-        if name == "__init__.py":
-            _read_resource(resource)
-            continue
-        if name == "__pycache__" and resource.is_dir():
-            continue
-        match = _FILENAME.fullmatch(name)
-        if match is None:
-            raise MigrationError(
-                f"invalid migration filename or unexpected resource: {name!r}"
+    try:
+        for resource in resources:
+            name = resource.name
+            if name == "__init__.py":
+                if isinstance(resource, Path):
+                    _read_filesystem_resource(resource, directories[-1][0])
+                else:
+                    _read_resource(resource)
+                continue
+            if name == "__pycache__" and resource.is_dir():
+                continue
+            match = _FILENAME.fullmatch(name)
+            if match is None:
+                raise MigrationError(
+                    f"invalid migration filename or unexpected resource: {name!r}"
+                )
+            version = int(match.group("version"))
+            if version == 0:
+                raise MigrationError(f"invalid migration filename: {name!r}")
+            if version in versions:
+                raise MigrationError(f"duplicate migration version {version:03d}")
+            versions.add(version)
+            if isinstance(resource, Path):
+                content = _read_filesystem_resource(resource, directories[-1][0])
+            else:
+                content = _read_resource(resource)
+            try:
+                sql = content.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise MigrationError(
+                    f"migration {name!r} is not valid UTF-8"
+                ) from error
+            migrations.append(
+                Migration(
+                    version=version,
+                    name=name,
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    sql=sql,
+                )
             )
-        version = int(match.group("version"))
-        if version == 0:
-            raise MigrationError(f"invalid migration filename: {name!r}")
-        if version in versions:
-            raise MigrationError(f"duplicate migration version {version:03d}")
-        versions.add(version)
-        content = _read_resource(resource)
-        try:
-            sql = content.decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise MigrationError(f"migration {name!r} is not valid UTF-8") from error
-        migrations.append(
-            Migration(
-                version=version,
-                name=name,
-                sha256=hashlib.sha256(content).hexdigest(),
-                sql=sql,
-            )
-        )
+        _revalidate_resource_directories(directories)
+    finally:
+        for descriptor, _snapshot, _path in directories:
+            os.close(descriptor)
 
     migrations.sort(key=lambda migration: migration.version)
     if not migrations:
@@ -348,6 +456,13 @@ def _validated_statements(migration: Migration) -> tuple[str, ...]:
             raise MigrationError(
                 f"migration {migration.name!r} contains forbidden TEMP SQL"
             )
+        schema = _EXPLICIT_SCHEMA_SQL.match(statement)
+        if schema is not None:
+            name = schema.group("schema").strip('"[]`').casefold()
+            if name != "main":
+                raise MigrationError(
+                    f"migration {migration.name!r} contains non-main schema SQL"
+                )
     return statements
 
 
@@ -421,8 +536,11 @@ def _timestamp(clock: Callable[[], int]) -> int:
 
 
 def _require_main_only(connection: sqlite3.Connection) -> None:
-    names = {row[1] for row in connection.execute("PRAGMA database_list").fetchall()}
-    if not names <= {"main", "temp"}:
+    rows = connection.execute("PRAGMA database_list").fetchall()
+    databases = [(row[1], row[2]) for row in rows]
+    if not databases or databases[0][0] != "main":
+        raise MigrationError("migration connection has an invalid main database")
+    if databases[1:] not in ([], [("temp", "")]):
         raise MigrationError("migration connection has an auxiliary database attached")
 
 
@@ -433,7 +551,12 @@ def _migration_authorizer(
     database: str | None,
     _trigger: str | None,
 ) -> int:
-    if action in {sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH}:
+    if action in {
+        sqlite3.SQLITE_ANALYZE,
+        sqlite3.SQLITE_ATTACH,
+        sqlite3.SQLITE_DETACH,
+        sqlite3.SQLITE_REINDEX,
+    }:
         return sqlite3.SQLITE_DENY
     if action in _TEMP_ACTIONS:
         return sqlite3.SQLITE_DENY
@@ -466,6 +589,7 @@ def apply_migrations(
 
     for migration, statements in zip(migrations, migration_statements, strict=True):
         owned_transaction = False
+        authorizer_active = False
         try:
             connection.execute("BEGIN IMMEDIATE")
             owned_transaction = True
@@ -476,31 +600,33 @@ def apply_migrations(
                 owned_transaction = False
                 continue
             connection.set_authorizer(_migration_authorizer)
+            authorizer_active = True
             try:
                 for statement in statements:
                     connection.execute(statement)
+                applied_at_us = _timestamp(clock)
+                connection.execute(
+                    "INSERT INTO main.schema_migrations "
+                    "(version, name, sha256, applied_at_us) VALUES (?, ?, ?, ?)",
+                    (
+                        migration.version,
+                        migration.name,
+                        migration.sha256,
+                        applied_at_us,
+                    ),
+                )
+                connection.execute("COMMIT")
+                owned_transaction = False
             except sqlite3.DatabaseError as error:
                 if "authorized" in str(error).casefold():
                     raise MigrationError(
                         f"migration {migration.name!r} contains unauthorized SQL"
                     ) from error
                 raise
-            finally:
-                connection.set_authorizer(None)
-            applied_at_us = _timestamp(clock)
-            connection.execute(
-                "INSERT INTO main.schema_migrations "
-                "(version, name, sha256, applied_at_us) VALUES (?, ?, ?, ?)",
-                (
-                    migration.version,
-                    migration.name,
-                    migration.sha256,
-                    applied_at_us,
-                ),
-            )
-            connection.execute("COMMIT")
-            owned_transaction = False
         except BaseException:
             if owned_transaction and connection.in_transaction:
                 connection.execute("ROLLBACK")
             raise
+        finally:
+            if authorizer_active:
+                connection.set_authorizer(None)

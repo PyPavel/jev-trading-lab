@@ -234,18 +234,83 @@ def _open_fd_identities() -> dict[int, tuple[int, int]]:
     return identities
 
 
-def _verify_main_database_fd(
-    before: dict[int, tuple[int, int]], expected: tuple[int, int]
+def _new_regular_descriptors(
+    before: dict[int, tuple[int, int]],
+) -> list[tuple[int, os.stat_result, str]]:
+    descriptors: list[tuple[int, os.stat_result, str]] = []
+    for descriptor, identity in _open_fd_identities().items():
+        if before.get(descriptor) == identity:
+            continue
+        try:
+            metadata = os.fstat(descriptor)
+            target = os.readlink(f"/proc/self/fd/{descriptor}")
+        except OSError:
+            continue
+        if stat.S_ISREG(metadata.st_mode):
+            descriptors.append((descriptor, metadata, target))
+    return sorted(descriptors)
+
+
+def _target_path(target: str) -> Path:
+    deleted = " (deleted)"
+    return Path(target[: -len(deleted)] if target.endswith(deleted) else target)
+
+
+def _verify_sqlite_descriptors(
+    before: dict[int, tuple[int, int]],
+    expected: tuple[int, int],
+    path: Path,
+    parent_descriptor: int,
 ) -> None:
-    opened = _open_fd_identities()
-    matching = [
-        descriptor
-        for descriptor, identity in opened.items()
-        if before.get(descriptor) != identity and identity == expected
-    ]
-    if len(matching) != 1:
+    candidates = _new_regular_descriptors(before)
+    if not candidates:
         raise DatabaseConfigurationError(
             "SQLite main database fd does not match the validated inode"
+        )
+
+    _descriptor, main_metadata, _target = candidates[0]
+    _validate_database_metadata(main_metadata, path)
+    if (main_metadata.st_dev, main_metadata.st_ino) != expected:
+        raise DatabaseConfigurationError(
+            "SQLite main database fd does not match the validated inode"
+        )
+
+    parent_target = Path(os.readlink(f"/proc/self/fd/{parent_descriptor}"))
+    sidecars = set(_sidecar_names(path))
+    for _descriptor, metadata, target in candidates[1:]:
+        candidate_path = _target_path(target)
+        if (metadata.st_dev, metadata.st_ino) == expected:
+            raise DatabaseConfigurationError("SQLite database descriptor ambiguity")
+        try:
+            candidate_path.relative_to(parent_target)
+        except ValueError:
+            continue
+        if candidate_path.parent != parent_target:
+            continue
+        if candidate_path.name not in sidecars:
+            name = candidate_path.name
+            raise DatabaseConfigurationError(
+                f"unexpected regular descriptor in database directory: {name!r}"
+            )
+        _validate_sidecar(metadata, candidate_path.name)
+        if metadata.st_nlink == 0:
+            raise DatabaseConfigurationError(
+                f"database sidecar {candidate_path.name!r} was deleted while opening"
+            )
+
+
+def _check_directory_entries(path: Path, parent_descriptor: int) -> None:
+    allowed = {path.name, *_sidecar_names(path)}
+    try:
+        entries = set(os.listdir(parent_descriptor))
+    except OSError as error:
+        raise DatabaseConfigurationError(
+            f"cannot inspect database directory entries: {error}"
+        ) from error
+    unexpected = entries - allowed
+    if unexpected:
+        raise DatabaseConfigurationError(
+            f"database directory contains unexpected entry: {min(unexpected)!r}"
         )
 
 
@@ -393,29 +458,33 @@ def connect_database(
     parent_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
     connection: SecureConnection | None = None
     transferred_parent = False
+    connect_lock_held = False
     try:
         _validate_filesystem(path.parent, resolver)
         file_identity = _prepare_database_file(path, parent_descriptor)
+        _check_directory_entries(path, parent_descriptor)
         _check_sidecars(path, parent_descriptor)
         descriptor_path = f"/proc/self/fd/{parent_descriptor}/{path.name}"
-        with _CONNECT_LOCK:
-            before_fds = _open_fd_identities()
-            connection = sqlite3.connect(
-                descriptor_path,
-                timeout=timeout / 1_000,
-                isolation_level=None,
-                uri=False,
-                check_same_thread=True,
-                factory=SecureConnection,
+        _CONNECT_LOCK.acquire()
+        connect_lock_held = True
+        before_fds = _open_fd_identities()
+        connection = sqlite3.connect(
+            descriptor_path,
+            timeout=timeout / 1_000,
+            isolation_level=None,
+            uri=False,
+            check_same_thread=True,
+            factory=SecureConnection,
+        )
+        if not isinstance(connection, SecureConnection):
+            raise DatabaseConfigurationError(
+                "SQLite did not create a secure connection"
             )
-            if not isinstance(connection, SecureConnection):
-                raise DatabaseConfigurationError(
-                    "SQLite did not create a secure connection"
-                )
-            connection._parent_descriptor = parent_descriptor
-            transferred_parent = True
-            _verify_main_database_fd(before_fds, file_identity)
+        connection._parent_descriptor = parent_descriptor
+        transferred_parent = True
+        _verify_sqlite_descriptors(before_fds, file_identity, path, parent_descriptor)
         _verify_main_database_path(connection, path)
+        _check_directory_entries(path, parent_descriptor)
         _recheck_storage(path, parent_descriptor, parent_identity, file_identity)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
@@ -426,6 +495,8 @@ def connect_database(
             raise DatabaseConfigurationError(
                 f"SQLite WAL setup failed: received {actual!r}"
             )
+        _check_directory_entries(path, parent_descriptor)
+        _verify_sqlite_descriptors(before_fds, file_identity, path, parent_descriptor)
         _check_sidecars(path, parent_descriptor)
         connection.execute(f"PRAGMA busy_timeout = {timeout}")
         _verify_pragma(connection, "busy_timeout", timeout, label="busy_timeout")
@@ -434,11 +505,15 @@ def connect_database(
         connection.execute("PRAGMA trusted_schema = OFF")
         _verify_pragma(connection, "trusted_schema", 0, label="trusted_schema")
         _recheck_storage(path, parent_descriptor, parent_identity, file_identity)
+        _CONNECT_LOCK.release()
+        connect_lock_held = False
         return connection
     except BaseException:
         if connection is not None:
             connection.close()
         raise
     finally:
+        if connect_lock_held:
+            _CONNECT_LOCK.release()
         if not transferred_parent:
             os.close(parent_descriptor)

@@ -206,7 +206,7 @@ def test_sqlite_too_old_fails_before_open(
     monkeypatch.setattr(db_module.sqlite3, "sqlite_version_info", (3, 36, 0))
     monkeypatch.setattr(db_module.sqlite3, "connect", forbidden_open)
     with pytest.raises(DatabaseConfigurationError, match=r"SQLite >= 3\.37\.0"):
-        _connect(tmp_path / "db.sqlite3")
+        _connect(tmp_path / "private" / "db.sqlite3")
     assert MIN_SQLITE_VERSION == (3, 37, 0)
     assert not opened
 
@@ -230,7 +230,7 @@ def test_pragma_setup_failure_closes_connection(
     monkeypatch.setattr(db_module.sqlite3, "connect", memory_connect)
 
     with pytest.raises(DatabaseConfigurationError, match="inode"):
-        _connect(tmp_path / "db.sqlite3")
+        _connect(tmp_path / "private" / "db.sqlite3")
 
     assert connection is not None
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
@@ -238,7 +238,7 @@ def test_pragma_setup_failure_closes_connection(
 
 
 def test_clean_database_applies_only_migration_metadata(tmp_path: Path) -> None:
-    connection = _connect(tmp_path / "db.sqlite3")
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         apply_migrations(connection, clock=lambda: 1_700_000_000_000_000)
         objects = connection.execute(
@@ -260,7 +260,7 @@ def test_clean_database_applies_only_migration_metadata(tmp_path: Path) -> None:
 
 
 def test_repeated_migration_application_is_idempotent(tmp_path: Path) -> None:
-    connection = _connect(tmp_path / "db.sqlite3")
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         apply_migrations(connection, clock=lambda: 1_000_000)
         apply_migrations(connection, clock=lambda: 2_000_000)
@@ -277,7 +277,7 @@ def test_migration_checksum_change_rejected(
     package, schema = _package(
         tmp_path, monkeypatch, {"001_migration_metadata.sql": SCHEMA_SQL}
     )
-    connection = _connect(tmp_path / "db.sqlite3")
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         apply_migrations(connection, package=package, clock=lambda: 1_000_000)
         if change == "bytes":
@@ -311,7 +311,7 @@ def test_installed_wheel_loads_sql(
     resource = importlib.resources.files(f"{package}.schema") / migration_name
     assert not isinstance(resource, Path)
 
-    connection = _connect(tmp_path / "db.sqlite3")
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         apply_migrations(
             connection, package=f"{package}.schema", clock=lambda: 1_234_567
@@ -422,7 +422,7 @@ def test_failed_second_statement_rolls_back_entire_migration(
             ),
         },
     )
-    connection = _connect(tmp_path / "db.sqlite3")
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         with pytest.raises(sqlite3.OperationalError, match="no such table"):
             apply_migrations(connection, package=package, clock=lambda: 1_000_000)
@@ -462,7 +462,7 @@ INSERT INTO guarded (id, value) VALUES (1, 'original');
             "002_guard.sql": trigger_sql,
         },
     )
-    connection = _connect(tmp_path / "db.sqlite3")
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         apply_migrations(connection, package=package, clock=lambda: 1_000_000)
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
@@ -498,7 +498,7 @@ def test_transaction_control_and_attach_sql_rejected(
             "002_forbidden.sql": forbidden.encode(),
         },
     )
-    connection = _connect(tmp_path / "db.sqlite3")
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         with pytest.raises(MigrationError, match="forbidden SQL"):
             apply_migrations(connection, package=package, clock=lambda: 1_000_000)
@@ -528,7 +528,7 @@ INSERT INTO policy_words VALUES (
         monkeypatch,
         {"001_migration_metadata.sql": SCHEMA_SQL, "002_words.sql": sql},
     )
-    connection = _connect(tmp_path / "db.sqlite3")
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         apply_migrations(connection, package=package, clock=lambda: 1_000_000)
         row = connection.execute("SELECT count(*) FROM policy_words").fetchone()
@@ -550,7 +550,7 @@ def test_invalid_applied_migration_chain_rejected(
     versions: list[int],
     match: str,
 ) -> None:
-    connection = _connect(tmp_path / "db.sqlite3")
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         apply_migrations(connection, clock=lambda: 1_000_000)
         for version in versions[1:]:
@@ -576,7 +576,7 @@ def test_clock_must_return_builtin_integer_and_rolls_back(
     package, _schema = _package(
         tmp_path, monkeypatch, {"001_migration_metadata.sql": SCHEMA_SQL}
     )
-    connection = _connect(tmp_path / "db.sqlite3")
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         with pytest.raises(TypeError, match="clock"):
             apply_migrations(connection, package=package, clock=lambda: True)
@@ -591,7 +591,7 @@ def test_clock_must_return_builtin_integer_and_rolls_back(
 
 
 def test_concurrent_migration_attempts_serialize(tmp_path: Path) -> None:
-    database = tmp_path / "db.sqlite3"
+    database = tmp_path / "private" / "db.sqlite3"
     barrier = threading.Barrier(2)
 
     def migrate() -> list[tuple[object, ...]]:
@@ -774,7 +774,7 @@ def test_database_sidecars_remain_private(tmp_path: Path) -> None:
 
 
 def test_apply_rejects_caller_transaction_without_rollback(tmp_path: Path) -> None:
-    connection = _connect(tmp_path / "db.sqlite3")
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         connection.execute("CREATE TABLE caller_data (value TEXT NOT NULL) STRICT")
         connection.execute("BEGIN")
@@ -804,7 +804,7 @@ def test_apply_requires_autocommit_connection_contract() -> None:
 
 
 def test_temp_schema_migrations_cannot_shadow_main(tmp_path: Path) -> None:
-    connection = _connect(tmp_path / "db.sqlite3")
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         connection.execute(
             "CREATE TEMP TABLE schema_migrations "
@@ -829,7 +829,7 @@ def test_temp_schema_migrations_cannot_shadow_main(tmp_path: Path) -> None:
     finally:
         connection.close()
 
-    reopened = _connect(tmp_path / "db.sqlite3")
+    reopened = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         apply_migrations(reopened, clock=lambda: 2_000_000)
         assert (
@@ -846,7 +846,7 @@ def test_empty_migration_package_fails_before_database_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     package, _schema = _package(tmp_path, monkeypatch, {})
-    connection = _connect(tmp_path / "db.sqlite3")
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         with pytest.raises(MigrationError, match="at least migration 001"):
             apply_migrations(connection, package=package)
@@ -876,7 +876,7 @@ def test_empty_migration_package_fails_before_database_mutation(
 def test_schema_rejects_hostile_or_mismatched_migration_names(
     tmp_path: Path, version: int, name: str
 ) -> None:
-    connection = _connect(tmp_path / "db.sqlite3")
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         apply_migrations(connection, clock=lambda: 1_000_000)
         with pytest.raises(sqlite3.IntegrityError):
@@ -903,7 +903,7 @@ def test_filesystem_resource_replacement_with_symlink_is_rejected(
         path: object, flags: int, *args: object, **kwargs: object
     ) -> int:
         nonlocal replaced
-        if Path(path) == migration and not replaced:
+        if path == migration.name and kwargs.get("dir_fd") is not None and not replaced:
             replaced = True
             migration.unlink()
             migration.symlink_to(target)
@@ -982,10 +982,10 @@ def test_database_inode_swap_restored_before_path_recheck_is_rejected(
     parent.mkdir(mode=0o700)
     database = parent / "db.sqlite3"
     database.touch(mode=0o600)
-    replacement = parent / "replacement.sqlite3"
+    replacement = tmp_path / "replacement.sqlite3"
     replacement.touch(mode=0o600)
-    parked_original = parent / "original.sqlite3"
-    parked_replacement = parent / "opened.sqlite3"
+    parked_original = tmp_path / "original.sqlite3"
+    parked_replacement = tmp_path / "opened.sqlite3"
     real_connect = sqlite3.connect
 
     def swap_for_sqlite(*args: object, **kwargs: object) -> sqlite3.Connection:
@@ -1064,7 +1064,7 @@ def test_preexisting_sidecar_symlink_is_rejected(tmp_path: Path, suffix: str) ->
     database = tmp_path / "private" / "db.sqlite3"
     database.parent.mkdir(mode=0o700)
     database.touch(mode=0o600)
-    target = database.parent / "target"
+    target = tmp_path / "target"
     target.touch(mode=0o600)
     Path(f"{database}{suffix}").symlink_to(target)
 
@@ -1077,7 +1077,7 @@ def test_preexisting_sidecar_hardlink_is_rejected(tmp_path: Path, suffix: str) -
     database = tmp_path / "private" / "db.sqlite3"
     database.parent.mkdir(mode=0o700)
     database.touch(mode=0o600)
-    target = database.parent / "target"
+    target = tmp_path / "target"
     target.touch(mode=0o600)
     Path(f"{database}{suffix}").hardlink_to(target)
 
@@ -1193,7 +1193,7 @@ def test_migration_rejects_pre_attached_auxiliary_database(
             "002_off_main.sql": b"CREATE TABLE aux.off_main (id INTEGER);\n",
         },
     )
-    database = tmp_path / "db.sqlite3"
+    database = tmp_path / "private" / "db.sqlite3"
     auxiliary = tmp_path / "aux.sqlite3"
     connection = _connect(database)
     try:
@@ -1239,7 +1239,7 @@ def test_create_temp_migration_is_denied_and_rolled_back(
             "002_temp.sql": b"CREATE TEMP TABLE off_main (id INTEGER);\n",
         },
     )
-    database = tmp_path / "db.sqlite3"
+    database = tmp_path / "private" / "db.sqlite3"
     connection = _connect(database)
     try:
         with pytest.raises(MigrationError, match="TEMP|authorized"):
@@ -1280,7 +1280,7 @@ def test_create_temp_migration_is_denied_and_rolled_back(
 
 @pytest.mark.parametrize("invalid", (-1, 2**63 - 1))
 def test_schema_rejects_invalid_applied_timestamp(tmp_path: Path, invalid: int) -> None:
-    connection = _connect(tmp_path / "db.sqlite3")
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         apply_migrations(connection, clock=lambda: 0)
         with pytest.raises(sqlite3.IntegrityError):
@@ -1298,7 +1298,7 @@ def test_schema_rejects_invalid_applied_timestamp(tmp_path: Path, invalid: int) 
 def test_reconnect_detects_corrupt_applied_timestamp(
     tmp_path: Path, invalid: int
 ) -> None:
-    database = tmp_path / "db.sqlite3"
+    database = tmp_path / "private" / "db.sqlite3"
     connection = _connect(database)
     try:
         apply_migrations(connection, clock=lambda: 0)
@@ -1315,5 +1315,321 @@ def test_reconnect_detects_corrupt_applied_timestamp(
     try:
         with pytest.raises(MigrationError, match="applied migration metadata"):
             apply_migrations(reopened, clock=lambda: MAX_DATETIME_US)
+    finally:
+        reopened.close()
+
+
+def test_database_parent_rejects_unexpected_entry(tmp_path: Path) -> None:
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    (parent / "parked.sqlite3").touch(mode=0o600)
+
+    with pytest.raises(DatabaseConfigurationError, match="unexpected entry"):
+        _connect(parent / "db.sqlite3")
+
+
+def test_decoy_fd_cannot_hide_sqlite_opening_replaced_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    database = parent / "db.sqlite3"
+    database.touch(mode=0o600)
+    replacement = tmp_path / "replacement.sqlite3"
+    replacement.touch(mode=0o600)
+    parked_original = tmp_path / "original.sqlite3"
+    parked_replacement = tmp_path / "opened.sqlite3"
+    held: list[int] = []
+    real_connect = sqlite3.connect
+
+    def swap_and_open_decoy(*args: object, **kwargs: object) -> sqlite3.Connection:
+        database.rename(parked_original)
+        replacement.rename(database)
+        connection = real_connect(*args, **kwargs)  # type: ignore[arg-type]
+        database.rename(parked_replacement)
+        parked_original.rename(database)
+        held.append(os.open(database, os.O_RDONLY))
+        return connection
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", swap_and_open_decoy)
+    before = set(_proc_fd_targets())
+    try:
+        with pytest.raises(DatabaseConfigurationError, match="inode|ambiguity"):
+            _connect(database)
+    finally:
+        for descriptor in held:
+            os.close(descriptor)
+    assert set(_proc_fd_targets()) == before
+
+
+def test_deleted_sqlite_inode_cannot_be_hidden_by_decoy_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    database = parent / "db.sqlite3"
+    database.touch(mode=0o600)
+    replacement = tmp_path / "replacement.sqlite3"
+    replacement.touch(mode=0o600)
+    parked_original = tmp_path / "original.sqlite3"
+    parked_replacement = tmp_path / "opened.sqlite3"
+    held: list[int] = []
+    real_connect = sqlite3.connect
+
+    def swap_unlink_and_open_decoy(
+        *args: object, **kwargs: object
+    ) -> sqlite3.Connection:
+        database.rename(parked_original)
+        replacement.rename(database)
+        connection = real_connect(*args, **kwargs)  # type: ignore[arg-type]
+        database.rename(parked_replacement)
+        parked_original.rename(database)
+        parked_replacement.unlink()
+        held.append(os.open(database, os.O_RDONLY))
+        return connection
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", swap_unlink_and_open_decoy)
+    before = set(_proc_fd_targets())
+    try:
+        with pytest.raises(DatabaseConfigurationError, match="inode|ambiguity"):
+            _connect(database)
+    finally:
+        for descriptor in held:
+            os.close(descriptor)
+    assert set(_proc_fd_targets()) == before
+
+
+def test_unsafe_open_sidecar_renamed_away_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "private" / "db.sqlite3"
+    held: list[int] = []
+    real_connect = sqlite3.connect
+
+    class RacingConnection(sqlite3.Connection):
+        raced = False
+
+        def execute(self, sql: str, parameters: object = (), /) -> sqlite3.Cursor:
+            if sql == "PRAGMA journal_mode = WAL" and not self.raced:
+                self.raced = True
+                sidecar = Path(f"{database}-wal")
+                sidecar.touch(mode=0o666)
+                sidecar.chmod(0o666)
+                held.append(os.open(sidecar, os.O_RDONLY))
+                parked = database.parent / "parked-wal"
+                sidecar.rename(parked)
+                parked.unlink()
+            return super().execute(sql, parameters)  # type: ignore[arg-type]
+
+    def racing_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        class SecureRacingConnection(RacingConnection, db_module.SecureConnection):
+            pass
+
+        kwargs["factory"] = SecureRacingConnection
+        return real_connect(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", racing_connect)
+    try:
+        with pytest.raises(DatabaseConfigurationError, match="sidecar|descriptor"):
+            _connect(database)
+    finally:
+        for descriptor in held:
+            os.close(descriptor)
+
+
+def test_unrelated_new_regular_fd_does_not_block_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "private" / "db.sqlite3"
+    unrelated = tmp_path / "unrelated"
+    unrelated.write_text("safe", encoding="utf-8")
+    held: list[int] = []
+    real_connect = sqlite3.connect
+
+    def open_unrelated_fd(*args: object, **kwargs: object) -> sqlite3.Connection:
+        connection = real_connect(*args, **kwargs)  # type: ignore[arg-type]
+        held.append(os.open(unrelated, os.O_RDONLY))
+        return connection
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", open_unrelated_fd)
+    connection = _connect(database)
+    try:
+        assert connection.execute("SELECT 1").fetchone()[0] == 1
+    finally:
+        connection.close()
+        for descriptor in held:
+            os.close(descriptor)
+
+
+def test_connection_open_close_cycles_do_not_leak_descriptors(tmp_path: Path) -> None:
+    database = tmp_path / "private" / "db.sqlite3"
+    before = set(_proc_fd_targets())
+    for _ in range(100):
+        connection = _connect(database)
+        connection.close()
+    assert set(_proc_fd_targets()) == before
+
+
+def test_schema_directory_swap_restore_is_rejected_before_sql_executes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package, schema = _package(
+        tmp_path / "package",
+        monkeypatch,
+        {"001_safe.sql": SCHEMA_SQL},
+    )
+    attacker = tmp_path / "attacker-schema"
+    attacker.mkdir()
+    (attacker / "__init__.py").write_text("", encoding="utf-8")
+    (attacker / "001_safe.sql").write_text(
+        "CREATE TABLE main.attacker_ran (value TEXT);", encoding="utf-8"
+    )
+    parked = tmp_path / "parked-schema"
+    returned_attacker = tmp_path / "returned-attacker"
+    migration = schema / "001_safe.sql"
+    real_open = os.open
+    replaced = False
+
+    def replacing_open(
+        path: object, flags: int, *args: object, **kwargs: object
+    ) -> int:
+        nonlocal replaced
+        if path == migration.name and kwargs.get("dir_fd") is not None and not replaced:
+            replaced = True
+            schema.rename(parked)
+            attacker.rename(schema)
+            descriptor = real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+            schema.rename(returned_attacker)
+            parked.rename(schema)
+            return descriptor
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(migration_module.os, "open", replacing_open)
+    connection = _connect(tmp_path / "database" / "db.sqlite3")
+    try:
+        with pytest.raises(MigrationError, match="directory.*changed"):
+            apply_migrations(connection, package=package, clock=lambda: 1_000_000)
+        assert replaced
+        assert (
+            connection.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE name = 'attacker_ran'"
+            ).fetchone()
+            is None
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE name = 'schema_migrations'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+
+
+def test_explicit_non_main_schema_is_rejected_before_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package, _schema = _package(
+        tmp_path,
+        monkeypatch,
+        {
+            "001_migration_metadata.sql": SCHEMA_SQL,
+            "002_aux.sql": b'CREATE TABLE "aux".off_main (value TEXT);\n',
+        },
+    )
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
+    try:
+        with pytest.raises(MigrationError, match="non-main schema"):
+            apply_migrations(connection, package=package, clock=lambda: 1_000_000)
+        assert not connection.in_transaction
+        assert (
+            connection.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE name = 'schema_migrations'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+
+
+def test_quoted_temp_reindex_is_denied_without_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package, _schema = _package(
+        tmp_path,
+        monkeypatch,
+        {
+            "001_migration_metadata.sql": SCHEMA_SQL,
+            "002_reindex.sql": b'REINDEX "temp".idx;\n',
+        },
+    )
+    connection = _connect(tmp_path / "database" / "db.sqlite3")
+    try:
+        connection.execute("CREATE TEMP TABLE sink (value TEXT)")
+        connection.execute("CREATE INDEX temp.idx ON sink(value)")
+        with pytest.raises(MigrationError, match="TEMP|authorized"):
+            apply_migrations(connection, package=package, clock=lambda: 1_000_000)
+        assert (
+            connection.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE name = 'schema_migrations'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+
+
+def test_temp_trigger_cannot_write_during_metadata_insert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package, _schema = _package(
+        tmp_path,
+        monkeypatch,
+        {"001_payload.sql": b"CREATE TABLE main.payload (value TEXT);\n"},
+    )
+    database = tmp_path / "database" / "db.sqlite3"
+    connection = _connect(database)
+    try:
+        connection.executescript(SCHEMA_SQL.decode("utf-8"))
+        connection.execute("CREATE TEMP TABLE sink (version INTEGER)")
+        connection.execute(
+            "CREATE TEMP TRIGGER capture_metadata "
+            "AFTER INSERT ON main.schema_migrations "
+            "BEGIN INSERT INTO sink VALUES (NEW.version); END"
+        )
+
+        with pytest.raises(MigrationError, match="authorized"):
+            apply_migrations(connection, package=package, clock=lambda: 1_000_000)
+
+        assert connection.execute("SELECT count(*) FROM temp.sink").fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM main.schema_migrations"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE name = 'payload'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+
+    reopened = _connect(database)
+    try:
+        assert (
+            reopened.execute("SELECT count(*) FROM main.schema_migrations").fetchone()[
+                0
+            ]
+            == 0
+        )
+        assert (
+            reopened.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE name = 'payload'"
+            ).fetchone()
+            is None
+        )
     finally:
         reopened.close()

@@ -167,10 +167,10 @@ _APPROVED_SOURCE_HASHES = {
         "be5cdea878ba9575ad6a83bc43819e3c1cbaecdf8ad351b2d8374f94b6c496e9"
     ),
     "src/jev_trading_lab/persistence/db.py": (
-        "324a3c9630cce0dbbea5e179620efb4e0e9922a666cd4c5c73fb8571d9dc788e"
+        "c259048ebcee67e3728cd07341de2d970773a14641f46c13fb62e0ebc3ba8659"
     ),
     "src/jev_trading_lab/persistence/migrations.py": (
-        "15fe2782e04e6e95ec7d45d2aa5160984d0b04b5c4c28e566e2bbc8c0a136a1f"
+        "7e082fde7a60ae7575104ef5394630fbbce2fc01089c668ec6eb58efa8477114"
     ),
     "src/jev_trading_lab/persistence/schema/__init__.py": (
         "5f19444569734cd60895d22219e7e2481fd00efb6054fb1d4cf9f7b38e26e4a5"
@@ -235,10 +235,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "93d3539a2b79df9262482611f2296a678468f0ebdc764a0ead569080168ba843"
+    "db015efca9856b71aa61ee6c0efda0a05c76dacf2cabd1361e7c1463690bf940"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "fba53c75aeed38a6717a07b769fd8475e654816e3f77cd30a8c9a67c138df972"
+    "e5fb01c476796fdf5571534c3d56e24a7b9a76ba94cffeba16c0ce9f3dcf8955"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = [
     "exchange-calendars==4.11.2",
