@@ -1,10 +1,23 @@
 from __future__ import annotations
 
 import importlib
+import sqlite3
 from decimal import Decimal, localcontext
 from types import ModuleType
 
 import pytest
+
+
+class _AlwaysInRangeInt(int):
+    def __ge__(self, other: object) -> bool:
+        return True
+
+    def __le__(self, other: object) -> bool:
+        return True
+
+
+class _CustomInt(int):
+    pass
 
 
 def _values() -> ModuleType:
@@ -123,6 +136,71 @@ def test_tagged_constructors_enforce_domain_invariants() -> None:
     forged_invalid_money = int.__new__(values.MicroDollars, -1)
     with pytest.raises(ValueError):
         values.decimal_dollars(forged_invalid_money)
+
+
+def test_tagged_constructors_reject_hostile_int_subclass() -> None:
+    values = _values()
+
+    with pytest.raises(TypeError):
+        values.MicroDollars(_AlwaysInRangeInt(-1))
+
+
+@pytest.mark.parametrize(
+    ("constructor_name", "source_name"),
+    (
+        ("MicroDollars", "ProbabilityMicros"),
+        ("MicroDollars", "PriceMicros"),
+        ("ProbabilityMicros", "MicroDollars"),
+        ("ProbabilityMicros", "PriceMicros"),
+        ("PriceMicros", "MicroDollars"),
+        ("PriceMicros", "ProbabilityMicros"),
+    ),
+)
+def test_tagged_constructors_reject_cross_tag_inputs(
+    constructor_name: str, source_name: str
+) -> None:
+    values = _values()
+    constructor = getattr(values, constructor_name)
+    source = getattr(values, source_name)(1)
+
+    with pytest.raises(TypeError):
+        constructor(source)
+
+
+def test_scaled_quantity_rejects_custom_and_tagged_integer_inputs() -> None:
+    values = _values()
+    tagged = values.MicroDollars(1)
+
+    for units, scale in (
+        (_CustomInt(1), 1),
+        (tagged, 1),
+        (1, _CustomInt(1)),
+        (1, tagged),
+    ):
+        with pytest.raises(TypeError):
+            values.ScaledQuantity(units=units, scale=scale)
+
+    with pytest.raises(TypeError):
+        values.scaled_quantity("1", scale=_CustomInt(1))
+    with pytest.raises(TypeError):
+        values.scaled_quantity("1", scale=tagged)
+
+
+def test_hostile_int_subclass_cannot_persist_negative_micro_dollars() -> None:
+    values = _values()
+
+    try:
+        amount = values.MicroDollars(_AlwaysInRangeInt(-1))
+    except TypeError:
+        return
+
+    with sqlite3.connect(":memory:") as connection:
+        connection.execute("CREATE TABLE amounts (value INTEGER NOT NULL)")
+        connection.execute("INSERT INTO amounts VALUES (?)", (amount,))
+        persisted = connection.execute("SELECT value FROM amounts").fetchone()
+
+    assert persisted is not None
+    assert persisted[0] >= 0, "constructor allowed a negative value to reach SQLite"
 
 
 def test_sqlite_integer_limit_is_accepted_and_overflow_rejected() -> None:

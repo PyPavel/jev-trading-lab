@@ -20,7 +20,7 @@ ROUNDING_POLICY = ROUND_HALF_EVEN
 
 
 def _validate_integer(value: int, *, name: str, minimum: int, maximum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
+    if type(value) is not int:
         raise TypeError(f"{name} must be an integer")
     if not minimum <= value <= maximum:
         raise ValueError(f"{name} must be between {minimum} and {maximum}")
@@ -118,10 +118,10 @@ def micro_dollars(value: Decimal | str) -> MicroDollars:
 
 def decimal_dollars(value: MicroDollars) -> Decimal:
     """Convert integer millionths of a dollar to an exact decimal amount."""
-    if not isinstance(value, MicroDollars):
+    if type(value) is not MicroDollars:
         raise TypeError("value must be MicroDollars")
     integer = _validate_integer(
-        value, name="micro-dollars", minimum=MIN_INT64, maximum=MAX_INT64
+        int(value), name="micro-dollars", minimum=MIN_INT64, maximum=MAX_INT64
     )
     digits = tuple(int(digit) for digit in str(integer))
     return Decimal((0, digits, -6))

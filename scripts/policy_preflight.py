@@ -26,7 +26,7 @@ EXPECTED_SOURCE_HASHES = {
         "e1018e68f8902660a347c842866c321a42bad08d3f332cdf7f32bf0029cc84d9"
     ),
     "src/jev_trading_lab/core/values.py": (
-        "7f389e2a496b4a9e1f62001b229e3a41a79b2ab3d30a9917502e34aec3b618f4"
+        "806e4d4681da763cd78efa8b636ad51be74f61b425c9ad833b44781d43b10087"
     ),
 }
 EXPECTED_PROJECT = {
