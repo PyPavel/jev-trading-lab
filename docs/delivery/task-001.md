@@ -15,6 +15,7 @@ c14463db0cee4b46fb27e5536ec2fd123d2fcd30 fix(build): harden paper-only package p
 fe13916                                docs(delivery): update task 001 security rereview
 10433a2ec8211fb444c1775657f4b26503c2b0d5 fix(build): close paper-policy provenance gaps
 e48a5578c97155675a0b2ca29d2586a959e2df53 fix(build): reject mutated bindings and bytecode
+395ad157a3c6ba01ec47a7286cba58fcfca444ce fix(build): freeze task1 source capability surface
 ```
 
 The earlier evidence commit remains in history. Its PASS verdict was premature and is superseded by this document.
@@ -429,6 +430,100 @@ Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
 
 `git diff --check` produced no output. Physical `src/` checks after the gates found no `__pycache__` directory or `.pyc` file.
 
+## Frozen-source review findings
+
+A later adversarial review found that the increasingly complex AST and Git-enumeration policy still had MAJOR bypasses:
+
+1. `match` capture could rebind the approved `app` name without an AST store target recognized by the scanner.
+2. Subscript mutation such as `typer.__dict__["Typer"] = exec` could alter an approved imported capability without an attribute-store node.
+3. Git-ignored readable Python under `src/` was physically present and executable but omitted from policy enumeration.
+4. A Git-ignored symlink under `src/` could point outside the approved tree to a package or bytecode surface.
+
+The old scanner bypasses were reproduced directly from commit `42247b2` before replacement:
+
+```text
+match-capture BYPASS []
+nested-subscript-mutation BYPASS []
+```
+
+## Frozen-source RED evidence
+
+New policy controls were run before implementation. Commands:
+
+```console
+PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/test_package_policy.py::test_exact_source_hash_rejects_current_ast_bypasses -q
+PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/test_package_policy.py::test_git_ignored_readable_python_is_rejected -q
+PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/test_package_policy.py::test_git_ignored_symlink_to_external_package_is_rejected -q
+PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/test_package_policy.py::test_git_ignored_pycache_rejects_unchecked_hash_bytecode -q
+```
+
+Observed output:
+
+```text
+2 failed in 0.17s
+1 failed in 0.17s
+1 failed in 0.18s
+1 passed in 0.12s
+```
+
+The hash assertions failed because the old policy had no exact-source hashes. The ignored readable Python and ignored symlink assertions failed because Git enumeration omitted both physical paths. The pre-existing ignored unchecked-hash bytecode control already passed after `e48a557`; it was retained and strengthened to require both unapproved-file and bytecode violations.
+
+## Frozen-source fix
+
+Production fix commit:
+
+```text
+395ad157a3c6ba01ec47a7286cba58fcfca444ce fix(build): freeze task1 source capability surface
+```
+
+Changes:
+
+- Deleted the ad-hoc AST import, call, provenance, and binding analyzer.
+- Added one physical `lstat`/`scandir` walk of `src/` independent of Git ignore, without following symlinks.
+- Approved only directories `src` and `src/jev_trading_lab` and files `src/jev_trading_lab/__init__.py` and `src/jev_trading_lab/cli.py`.
+- Froze exact SHA-256 values for both approved files. Any source mutation now fails without semantic interpretation.
+- Rejected symlinks, extra files/directories, `__pycache__`, `.pyc`/`.pyo`, unreadable/non-UTF8 files, special files, and missing approved paths.
+- Retained exact dependency-group, lock, optional-dependency, entry-point, tool-config, workflow, operational-path, audit, and build checks.
+- Retained positive controls for arbitrary source mutation, both current AST bypasses, ignored readable Python, ignored external symlinks, ignored unchecked-hash bytecode, nonUTF8/unreadable/special paths, and physical extras.
+
+This is a current-source change-control gate, not a runtime sandbox. Future implementation tasks must deliberately update the approved source path set and hashes under their own RED policy tests and review.
+
+## Frozen-source final verification
+
+Commands were run sequentially from the repository root after the final code change and exited 0:
+
+```console
+uv lock --check
+uv sync --frozen --all-groups
+uv run pytest -q
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src
+uv export --frozen --all-groups --no-emit-project --format requirements-txt --output-file /tmp/jev-audit-requirements.txt
+uv run pip-audit --strict --requirement /tmp/jev-audit-requirements.txt --no-deps --disable-pip
+uv build --no-build-isolation
+git diff --check
+```
+
+Observed output:
+
+```text
+Resolved 51 packages in 1ms
+Checked 50 packages in 0.49ms
+...............................                                          [100%]
+31 passed in 0.25s
+All checks passed!
+6 files already formatted
+Success: no issues found in 2 source files
+No known vulnerabilities found
+Building source distribution...
+Building wheel from source distribution...
+Successfully built dist/jev_trading_lab-0.1.0.tar.gz
+Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
+```
+
+`git diff --check` produced no output. A separate `lstat`/`scandir` verification found exactly `src`, `src/jev_trading_lab`, `src/jev_trading_lab/__init__.py`, and `src/jev_trading_lab/cli.py`, with no symlink or special file.
+
 ## Review status
 
-**PENDING FINAL INDEPENDENT RE-REVIEW.** One security reviewer approved the prior change, but this adversarial spec review found the two MAJOR issues now addressed in `e48a557`. Task 1 must not advance to Task 2 until final independent spec-compliance and quality/security re-review report zero BLOCKER or MAJOR findings.
+**PENDING FINAL INDEPENDENT RE-REVIEW.** The frozen-source change addresses the latest MAJOR bypasses, but Task 1 must not advance to Task 2 until independent spec-compliance and quality/security review reports zero BLOCKER or MAJOR findings.
