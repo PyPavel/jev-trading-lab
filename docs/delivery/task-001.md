@@ -16,6 +16,7 @@ fe13916                                docs(delivery): update task 001 security 
 10433a2ec8211fb444c1775657f4b26503c2b0d5 fix(build): close paper-policy provenance gaps
 e48a5578c97155675a0b2ca29d2586a959e2df53 fix(build): reject mutated bindings and bytecode
 395ad157a3c6ba01ec47a7286cba58fcfca444ce fix(build): freeze task1 source capability surface
+acdcd86d90ce77a429af8a31e862fb7bbdf5ff24 fix(build): freeze workflow and entry surfaces
 ```
 
 The earlier evidence commit remains in history. Its PASS verdict was premature and is superseded by this document.
@@ -505,7 +506,7 @@ uv build --no-build-isolation
 git diff --check
 ```
 
-Observed output:
+Observed output, abridged to gate summaries (the `pip-audit` warnings were omitted in this historical excerpt):
 
 ```text
 Resolved 51 packages in 1ms
@@ -527,3 +528,87 @@ Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
 ## Review status
 
 **PENDING FINAL INDEPENDENT RE-REVIEW.** The frozen-source change addresses the latest MAJOR bypasses, but Task 1 must not advance to Task 2 until independent spec-compliance and quality/security review reports zero BLOCKER or MAJOR findings.
+
+## Workflow, entry-point, and artifact review findings
+
+A subsequent independent review found two remaining MAJOR policy gaps and two MINOR evidence/artifact issues:
+
+1. The workflow policy checked required fragments but allowed arbitrary appended steps, including a live order POST.
+2. The package policy checked `[project.scripts]` but not `[project.gui-scripts]` or arbitrary `[project.entry-points.*]` executable surfaces.
+3. The sdist included the worktree `.git` pointer containing an absolute host path.
+4. The preceding frozen-source verification excerpt omitted `pip-audit` warning lines without marking the output as abridged.
+
+## Workflow review RED evidence
+
+Mandatory controls were added before implementation. Command:
+
+```console
+uv run pytest tests/test_package_policy.py -k 'workflow_hash or unapproved_entry_point_tables or wheel_metadata or built_artifacts' -q
+```
+
+Observed expected failures:
+
+```text
+.FFF.F                                                                   [100%]
+4 failed, 2 passed, 31 deselected in 0.43s
+```
+
+The failures proved that an appended workflow run step and both extra entry-point table forms passed policy, and that the current sdist contained `jev_trading_lab-0.1.0/.git`. The synthetic wheel metadata positive control passed by detecting `gui_scripts`; the current-workflow hash control passed before the policy was wired into the repository scan.
+
+## Workflow review fix
+
+Production fix commit:
+
+```text
+acdcd86d90ce77a429af8a31e862fb7bbdf5ff24 fix(build): freeze workflow and entry surfaces
+```
+
+Changes:
+
+- Froze the exact reviewed `.github/workflows/ci.yml` SHA-256 and made missing, unreadable, or mutated workflow content a policy violation.
+- Rejected `[project.gui-scripts]` and `[project.entry-points.*]` while preserving only `jev-lab = "jev_trading_lab.cli:app"` in `[project.scripts]`.
+- Added wheel `entry_points.txt` inspection requiring the exact approved `console_scripts` mapping.
+- Configured Hatch sdist inclusion and build exclusions to omit VCS metadata, caches, build output, and bytecode.
+- Added artifact inspection for `.git`, `/home/`, credential markers, caches, `dist`, bytecode, exact wheel package files, and exact wheel entry points.
+
+## Workflow review final verification
+
+Commands were run sequentially from the repository root and exited 0:
+
+```console
+uv lock --check
+uv sync --frozen --all-groups
+uv run pytest -q
+uv run ruff format --check .
+uv run ruff check .
+uv run mypy src
+uv export --frozen --all-groups --no-emit-project --format requirements-txt --output-file /tmp/jev-audit-requirements.txt
+uv run pip-audit --strict --requirement /tmp/jev-audit-requirements.txt --no-deps --disable-pip
+uv build --no-build-isolation
+git diff --check
+```
+
+Observed output, accurately abridged to gate summaries:
+
+```text
+Resolved 51 packages in 1ms
+Checked 50 packages in 0.52ms
+.....................................                                    [100%]
+37 passed in 0.44s
+6 files already formatted
+All checks passed!
+Success: no issues found in 2 source files
+WARNING:pip_audit._cli:--no-deps is supported, but users are encouraged to fully hash their pinned dependencies
+WARNING:pip_audit._cli:Consider using a tool like `pip-compile`: https://pip-tools.readthedocs.io/en/latest/#using-hashes
+No known vulnerabilities found
+Building source distribution...
+Building wheel from source distribution...
+Successfully built dist/jev_trading_lab-0.1.0.tar.gz
+Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
+```
+
+`git diff --check` produced no output. Direct tar/wheel inspection found no forbidden names or `/home/` content. The wheel contained only the two approved package files plus distribution metadata, and the sdist contained only package source, project metadata/notices/readme, generated package metadata, and Hatchling's generated `.gitignore` (not VCS metadata or a worktree pointer).
+
+## Review status
+
+**PENDING FINAL INDEPENDENT RE-REVIEW.** Task 1 must not advance to Task 2 until independent spec-compliance and quality/security review reports zero BLOCKER or MAJOR findings.
