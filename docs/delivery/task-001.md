@@ -907,6 +907,29 @@ wheel_package_files=['jev_trading_lab/__init__.py', 'jev_trading_lab/cli.py']
 
 `git diff --check` produced no output. The code commit changed only `.github/workflows/ci.yml`, `scripts/policy_preflight.py`, and `tests/test_package_policy.py`. No approved design, plan, or review file changed. Task 2 remains blocked.
 
-## Review status
+## Final independent review verdicts
 
-**PENDING FINAL INDEPENDENT RE-REVIEW.** Task 1 must not advance to Task 2 until independent spec-compliance and quality/security review reports zero BLOCKER or MAJOR findings.
+### Spec and adversarial review: PASS
+
+The independent spec/adversarial reviewer reported **PASS**, with zero BLOCKER and zero MAJOR findings. The reviewer verified production commit `a43c3b7e40931ef3dcc97196a59dad97009977ae` and delivery commit `0518e70`, reproduced the `file://` lock-artifact mutation case, and confirmed that the stdlib-only preflight rejected the mutated lock before `uv` ran. The malicious wheel payload was not executed. The reviewer also confirmed all 51 tests passed and the worktree was clean.
+
+### Quality and security review: APPROVED
+
+The independent quality/security reviewer reported **APPROVED**, with zero BLOCKER and zero MAJOR findings. The reviewer verified the stdlib preflight, three material regression controls, the complete 51-test suite, frozen lock checks, Ruff lint and formatting, strict mypy, `pip-audit`, the no-isolation build, the reviewed diff, and a clean worktree.
+
+## Final reviewed commit chain
+
+```text
+a43c3b7e40931ef3dcc97196a59dad97009977ae fix(build): freeze reviewed dependency lock
+0518e70                                docs(delivery): update task 001 lock review
+```
+
+The approval evidence commit containing this section follows `0518e70` and changes only `docs/delivery/task-001.md`.
+
+## Final trust boundary
+
+Task 1 establishes reviewed change-control for the frozen source, workflow, dependency metadata, and complete lock bytes. It does not claim protection against a malicious joint change that alters both a protected artifact and its corresponding embedded or reviewed hash contract.
+
+## Final status
+
+**FINAL APPROVED / COMPLETE.** Both required independent reviews report zero BLOCKER and zero MAJOR findings. Task 1 is complete; Task 2 may proceed under its own reviewed change-control cycle.
