@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 import importlib
 import importlib.util
+import os
+import py_compile
 import re
 import stat
 import subprocess
@@ -16,6 +18,10 @@ from typer.testing import CliRunner
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
+
+
+def test_test_process_disables_bytecode_writes() -> None:
+    assert sys.dont_write_bytecode
 
 
 def test_package_imports() -> None:
@@ -206,6 +212,77 @@ def _python_bindings(
     return bindings, violations
 
 
+def _allowed_binding_targets(tree: ast.Module, relative: str) -> set[ast.AST]:
+    allowed: set[ast.AST] = set()
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        allowed_app = (
+            relative == "src/jev_trading_lab/cli.py"
+            and isinstance(target, ast.Name)
+            and target.id == "app"
+            and isinstance(node.value, ast.Call)
+            and _call_path(node.value.func) == "typer.Typer"
+        )
+        allowed_version = (
+            relative == "src/jev_trading_lab/__init__.py"
+            and isinstance(target, ast.Name)
+            and target.id == "__version__"
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        )
+        if allowed_app or allowed_version:
+            allowed.add(target)
+    return allowed
+
+
+def _binding_policy_violations(tree: ast.Module, relative: str) -> list[str]:
+    allowed_targets = _allowed_binding_targets(tree, relative)
+    allowed_functions = (
+        {"research", "main"} if relative == "src/jev_trading_lab/cli.py" else set()
+    )
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.alias) and node.asname is not None:
+            violations.append(f"{relative}: import alias is not allowlisted")
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            if node not in allowed_targets:
+                violations.append(
+                    f"{relative}: binding target {node.id} is not allowlisted"
+                )
+        elif isinstance(node, ast.Attribute) and isinstance(
+            node.ctx, (ast.Store, ast.Del)
+        ):
+            violations.append(
+                f"{relative}: attribute mutation {_call_path(node) or node.attr} "
+                "is not allowlisted"
+            )
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if (
+                node not in tree.body
+                or not isinstance(node, ast.FunctionDef)
+                or node.name not in allowed_functions
+            ):
+                violations.append(
+                    f"{relative}: declaration {node.name} is not allowlisted"
+                )
+        elif isinstance(node, ast.arg):
+            violations.append(
+                f"{relative}: binding target {node.arg} is not allowlisted"
+            )
+        elif isinstance(node, ast.ExceptHandler) and node.name is not None:
+            violations.append(
+                f"{relative}: binding target {node.name} is not allowlisted"
+            )
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            for name in node.names:
+                violations.append(
+                    f"{relative}: binding target {name} is not allowlisted"
+                )
+    return violations
+
+
 def _python_policy_violations(path: Path, root: Path) -> list[str]:
     relative = path.relative_to(root).as_posix()
     if relative not in _ALLOWED_SOURCE_IMPORTS:
@@ -220,21 +297,10 @@ def _python_policy_violations(path: Path, root: Path) -> list[str]:
         return [f"{relative}: source is not valid Python: {error}"]
 
     bindings, violations = _python_bindings(tree, relative)
+    violations.extend(_binding_policy_violations(tree, relative))
     allowed_imports = _ALLOWED_SOURCE_IMPORTS[relative]
     allowed_calls = _ALLOWED_SOURCE_CALLS[relative]
-    allowed_app_assignment = next(
-        (
-            node.targets[0]
-            for node in tree.body
-            if isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id == "app"
-            and isinstance(node.value, ast.Call)
-            and _call_path(node.value.func) == "typer.Typer"
-        ),
-        None,
-    )
+    allowed_targets = _allowed_binding_targets(tree, relative)
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             for alias, imported in zip(node.names, _import_paths(node), strict=True):
@@ -258,10 +324,7 @@ def _python_policy_violations(path: Path, root: Path) -> list[str]:
             ):
                 violations.append(f"{relative}: protected binding {node.name} declared")
         elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-            if (
-                node.id in _PROTECTED_CALLABLE_BINDINGS
-                and node is not allowed_app_assignment
-            ):
+            if node.id in _PROTECTED_CALLABLE_BINDINGS and node not in allowed_targets:
                 violations.append(f"{relative}: protected binding {node.id} modified")
         elif isinstance(node, ast.arg) and node.arg in _PROTECTED_CALLABLE_BINDINGS:
             violations.append(f"{relative}: protected binding {node.arg} declared")
@@ -332,6 +395,41 @@ def _optional_dependency_violations(
     )
     label = "locked optional dependencies" if locked else "optional dependencies"
     return [f"{location}: {label} are not allowed: {', '.join(names) or groups}"]
+
+
+def _physical_source_violations(root: Path) -> list[str]:
+    source = root / "src"
+    violations: list[str] = []
+
+    def record_walk_error(error: OSError) -> None:
+        try:
+            relative = Path(error.filename or source).relative_to(root).as_posix()
+        except ValueError:
+            relative = str(error.filename or source)
+        violations.append(f"{relative}: production source is unreadable: {error}")
+
+    for directory, directory_names, file_names in os.walk(
+        source, topdown=True, onerror=record_walk_error, followlinks=False
+    ):
+        directory_path = Path(directory)
+        for name in directory_names:
+            path = directory_path / name
+            relative = path.relative_to(root).as_posix()
+            if name == "__pycache__":
+                violations.append(f"{relative}: production __pycache__ is not allowed")
+        for name in file_names:
+            path = directory_path / name
+            relative = path.relative_to(root).as_posix()
+            if path.suffix.casefold() in {".pyc", ".pyo"}:
+                violations.append(f"{relative}: production bytecode is not allowed")
+                continue
+            try:
+                path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as error:
+                violations.append(
+                    f"{relative}: production source is unreadable UTF-8: {error}"
+                )
+    return violations
 
 
 def _production_source_paths(root: Path) -> list[Path]:
@@ -442,6 +540,7 @@ def _runtime_policy_violations(root: Path) -> list[str]:
 
     source = root / "src"
     if source.is_dir():
+        violations.extend(_physical_source_violations(root))
         for path in _production_source_paths(root):
             relative = path.relative_to(root).as_posix()
             if "__pycache__" in path.parts:
@@ -704,9 +803,76 @@ def test_allowed_call_names_cannot_be_rebound(
 
 
 @pytest.mark.parametrize(
+    ("content", "expected"),
+    (
+        (
+            "import typer\n"
+            "class Evil:\n"
+            "    Typer = exec\n"
+            "for typer in [Evil]:\n"
+            "    pass\n"
+            "app = typer.Typer()\n"
+            "app()\n",
+            "binding target",
+        ),
+        (
+            "import typer\n"
+            "def main():\n"
+            "    typer.Typer = exec\n"
+            "    typer.Typer('pass')\n",
+            "attribute mutation",
+        ),
+        (
+            "import typer\n"
+            "class Evil:\n"
+            "    Typer = exec\n"
+            "with Evil as typer:\n"
+            "    pass\n"
+            "app = typer.Typer()\n"
+            "app()\n",
+            "binding target",
+        ),
+        (
+            "import typer\n"
+            "class Evil:\n"
+            "    Typer = exec\n"
+            "if (typer := Evil):\n"
+            "    pass\n"
+            "app = typer.Typer()\n"
+            "app()\n",
+            "binding target",
+        ),
+        (
+            "import typer\n"
+            "try:\n"
+            "    raise RuntimeError\n"
+            "except RuntimeError as typer:\n"
+            "    pass\n"
+            "app = typer.Typer()\n"
+            "app()\n",
+            "binding target",
+        ),
+    ),
+)
+def test_frozen_source_contract_rejects_binding_mutation(
+    content: str, expected: str, tmp_path: Path
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname="sample"\nversion="0.1.0"\ndependencies=["typer"]\n',
+        encoding="utf-8",
+    )
+    sample = tmp_path / "src/jev_trading_lab/cli.py"
+    sample.parent.mkdir(parents=True)
+    sample.write_text(content, encoding="utf-8")
+
+    violations = _runtime_policy_violations(tmp_path)
+
+    assert any(expected in violation for violation in violations), violations
+
+
+@pytest.mark.parametrize(
     "content",
     (
-        "typer.Typer = exec\napp = typer.Typer()\napp()\n",
         "app.__call__ = exec\napp()\n",
         "except_alias = exec\n",
     ),
@@ -823,21 +989,52 @@ def test_lock_optional_dependencies_are_rejected(tmp_path: Path) -> None:
     ), violations
 
 
-def test_production_pycache_rejects_non_utf8_executable_source(tmp_path: Path) -> None:
+def _initialize_ignored_bytecode_fixture(tmp_path: Path) -> None:
     (tmp_path / "pyproject.toml").write_text(
         '[project]\nname="sample"\nversion="0.1.0"\ndependencies=["typer"]\n',
         encoding="utf-8",
     )
-    sample = tmp_path / "src/__pycache__/live.py"
+    (tmp_path / ".gitignore").write_text("__pycache__/\n*.py[cod]\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "init", "--quiet", str(tmp_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_git_ignored_pycache_rejects_non_utf8_source(tmp_path: Path) -> None:
+    _initialize_ignored_bytecode_fixture(tmp_path)
+    sample = tmp_path / "src/jev_trading_lab/__pycache__/live.py"
     sample.parent.mkdir(parents=True)
     sample.write_bytes(b"#!/usr/bin/env python\n\xff\xfe\x00")
-    sample.chmod(sample.stat().st_mode | stat.S_IXUSR)
 
     violations = _runtime_policy_violations(tmp_path)
 
-    assert any("src/__pycache__/live.py" in violation for violation in violations), (
-        violations
+    assert any(
+        "src/jev_trading_lab/__pycache__/live.py" in item for item in violations
+    ), violations
+
+
+def test_git_ignored_pycache_rejects_unchecked_hash_bytecode(tmp_path: Path) -> None:
+    _initialize_ignored_bytecode_fixture(tmp_path)
+    source = tmp_path / "malicious.py"
+    bytecode = tmp_path / "src/jev_trading_lab/__pycache__/malicious.pyc"
+    bytecode.parent.mkdir(parents=True)
+    source.write_text("exec(compile('pass', '<payload>', 'exec'))\n", encoding="utf-8")
+    py_compile.compile(
+        str(source),
+        cfile=str(bytecode),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
     )
+    source.unlink()
+
+    violations = _runtime_policy_violations(tmp_path)
+
+    assert any(
+        "src/jev_trading_lab/__pycache__/malicious.pyc" in item for item in violations
+    ), violations
 
 
 def test_fail_closed_shell_surface_rejects_composed_curl_post(tmp_path: Path) -> None:
@@ -942,6 +1139,7 @@ def test_ci_uses_immutable_actions_and_locked_audit() -> None:
     checkout_block = workflow.split("astral-sh/setup-uv", maxsplit=1)[0]
     assert "persist-credentials: false" in checkout_block
     assert "permissions:\n  contents: read" in workflow
+    assert 'PYTHONDONTWRITEBYTECODE: "1"' in workflow
     assert (
         "uv export --frozen --all-groups --no-emit-project "
         "--format requirements-txt --output-file audit-requirements.txt"
