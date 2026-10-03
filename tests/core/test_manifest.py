@@ -58,13 +58,14 @@ def _activation_value() -> dict[str, Any]:
         expected_fingerprint="fp_7f4d9a2c18b6e305",
     )
     value["models"]["jev"].update(
+        sdk_version="3.12.0",
         request_model_snapshot="jev-systemone-phase1-2026-10-02",
         expected_returned_model_id="jev-systemone-phase1-2026-10-02",
         expected_revision="rev-20261002-jev-b2",
         expected_fingerprint="fp_5a8e1d7c92f403b6",
     )
-    value["baselines"]["polymarket_control_artifact_id"] = "poly-control-20261002-a1"
-    value["baselines"]["stock_control_artifact_id"] = "stock-control-20261002-b2"
+    value["baselines"]["polymarket_control_artifact_id"] = "poly-control-20261002-a1-v1"
+    value["baselines"]["stock_control_artifact_id"] = "stock-control-20261002-b2-v1"
 
     def replace_hashes(item: object, path: str = "") -> None:
         if isinstance(item, dict):
@@ -574,10 +575,7 @@ def test_activation_candidate_rejects_examples_and_placeholders() -> None:
         "notset",
         "unset",
         "replace-me",
-        "xxx",
         "pending",
-        "sample",
-        "test-only",
         "rev-change_me-2026",
     ),
 )
@@ -589,67 +587,40 @@ def test_activation_rejects_normalized_revision_markers(marker: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "marker",
+    ("path", "replacement"),
     (
-        "example",
-        "placeholder",
-        "todo",
-        "tbd",
-        "change",
-        "changeme",
-        "unknown",
-        "dummy",
-        "fake",
-        "replace",
-        "notset",
-        "unset",
-        "pending",
-        "sample",
-        "none",
-        "null",
-        "na",
-        "notapplicable",
-        "change-me",
-        "not-applicable",
-        "not-set",
-        "replace-me",
-        "test",
-        "only",
-        "test-only",
-        "n/a",
+        ("models.openai.expected_revision", "placeholder2026"),
+        ("calendar.tm_rule_version", "phase1-changeme123-v1"),
+        ("models.openai.expected_fingerprint", "fp_todo2026_a91b7c4d"),
+        ("statistics.power_simulation_version", "phase1-not_applicable_2026-v1"),
     ),
 )
-@pytest.mark.parametrize(
-    "placement", ("{marker}-rev", "rev-{marker}-2026", "rev-{marker}")
-)
-def test_activation_rejects_unresolved_marker_components_anywhere(
-    marker: str, placement: str
+def test_activation_rejects_compacted_unresolved_markers(
+    path: str, replacement: str
 ) -> None:
     value = _activation_value()
-    replacement = placement.format(marker=marker)
-    value["models"]["openai"]["expected_revision"] = replacement
-    with pytest.raises(ValueError, match="expected_revision.*placeholder"):
+    _set_path(value, path, replacement)
+    with pytest.raises(ValueError, match=f"{path}.*placeholder"):
         _parse_value(value)
 
 
 @pytest.mark.parametrize(
     ("path", "replacement"),
     (
-        ("models.openai.expected_fingerprint", "not-applicable"),
-        ("models.openai.sdk_package", "TODO"),
-        ("models.openai.sdk_version", "real-todo-2026"),
-        ("baselines.polymarket_control_artifact_id", "real-todo-2026"),
-        ("baselines.polymarket_control_artifact_version", "real-todo-2026"),
-        ("model_input_policy.openai_prompt_template_version", "real-todo-2026"),
-        ("model_input_policy.evidence_delimiter_version", "real-todo-2026"),
-        ("model_input_policy.jev_state_template_version", "real-todo-2026"),
-        ("model_input_policy.jev_question_set_version", "real-todo-2026"),
-        ("providers.polymarket_catalog.contract_version", "real-todo-2026"),
+        ("models.openai.expected_fingerprint", "fp_replaceme2026_a91b7c4d"),
+        ("models.openai.sdk_package", "todo2026client"),
+        ("baselines.polymarket_control_artifact_id", "control-unset2026-v1"),
+        ("baselines.polymarket_control_artifact_version", "control-dummy2026-v1"),
+        ("model_input_policy.openai_prompt_template_version", "prompt-fake2026-v1"),
+        ("model_input_policy.evidence_delimiter_version", "delimiter-tbd2026-v1"),
+        ("model_input_policy.jev_state_template_version", "state-unknown2026-v1"),
+        ("model_input_policy.jev_question_set_version", "questions-pending2026-v1"),
+        ("providers.polymarket_catalog.contract_version", "contract-notset2026-v1"),
         (
             "providers.data_fallbacks.treasury_last_published_prior.rule_version",
-            "real-todo-2026",
+            "treasury-placeholder2026-v1",
         ),
-        ("calendar.tm_rule_version", "real-todo-2026"),
+        ("calendar.tm_rule_version", "phase1-changeme2026-v1"),
     ),
 )
 def test_activation_rejects_unresolved_markers_in_every_identity_class(
@@ -661,13 +632,70 @@ def test_activation_rejects_unresolved_markers_in_every_identity_class(
         _parse_value(value)
 
 
-def test_activation_accepts_real_shaped_identity_components() -> None:
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    (
+        ("models.openai.expected_revision", "latest"),
+        ("models.openai.sdk_version", "current"),
+        ("calendar.tm_rule_version", "default"),
+        ("models.openai.expected_fingerprint", "none"),
+        ("baselines.stock_control_artifact_version", "null"),
+        ("baselines.stock_control_artifact_id", "na"),
+    ),
+)
+def test_activation_rejects_exact_generic_identity_values(
+    path: str, replacement: str
+) -> None:
     value = _activation_value()
-    value["models"]["openai"]["expected_revision"] = "rev-notional-contest-2026"
-    value["models"]["openai"]["sdk_package"] = "contest-client"
-    value["models"]["openai"]["sdk_version"] = "sdk-v2.1"
-    value["calendar"]["tm_rule_version"] = "phase1-replacement-policy-v2"
+    _set_path(value, path, replacement)
+    with pytest.raises(ValueError, match=f"{path}.*placeholder"):
+        _parse_value(value)
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    (
+        ("calendar.tm_rule_version", "phase1-permutation-test-v1"),
+        ("stocks.candidate_rule_version", "phase1-sample-calendar-v1"),
+        ("statistics.power_simulation_version", "phase1-change-detection-v1"),
+    ),
+)
+def test_activation_accepts_legitimate_rule_identity_components(
+    path: str, replacement: str
+) -> None:
+    value = _activation_value()
+    _set_path(value, path, replacement)
     _parse_value(value).assert_activation_candidate()
+
+
+def test_activation_accepts_harmless_marker_substrings() -> None:
+    value = _activation_value()
+    value["models"]["openai"]["expected_revision"] = "rev-notional-contest-20261002"
+    value["models"]["openai"]["expected_fingerprint"] = "fp_changelog2026_a91b7c4d"
+    value["models"]["openai"]["sdk_package"] = "contest-client"
+    value["models"]["openai"]["sdk_version"] = "2.1.0"
+    value["calendar"]["tm_rule_version"] = "phase1-sample-rate-v2"
+    value["statistics"]["power_simulation_version"] = "phase1-current-regime-v1"
+    _parse_value(value).assert_activation_candidate()
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    (
+        ("models.openai.sdk_version", "sdk-v2.1"),
+        ("models.openai.expected_revision", "rev1"),
+        ("models.openai.expected_fingerprint", "fingerprint-review"),
+        ("calendar.tm_rule_version", "phase1-calendar"),
+        ("baselines.stock_control_artifact_id", "stock-control-20261002-b2"),
+    ),
+)
+def test_activation_rejects_malformed_field_specific_identities(
+    path: str, replacement: str
+) -> None:
+    value = _activation_value()
+    _set_path(value, path, replacement)
+    with pytest.raises(ValueError, match=f"{path}.*placeholder"):
+        _parse_value(value)
 
 
 @pytest.mark.parametrize(

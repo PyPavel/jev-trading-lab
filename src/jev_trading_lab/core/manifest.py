@@ -34,41 +34,29 @@ MAX_VALIDATION_ERRORS = 20
 _SHA256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 _NonEmpty = Annotated[str, StringConstraints(min_length=1)]
 _CREATION_SENTINEL = object()
-_UNRESOLVED_IDENTITY_MARKERS = frozenset(
+_STRONG_UNRESOLVED_IDENTITY_MARKERS = frozenset(
     {
-        "example",
         "placeholder",
+        "changeme",
         "todo",
         "tbd",
-        "change",
-        "changeme",
         "unknown",
         "dummy",
         "fake",
+        "notapplicable",
         "notset",
         "unset",
-        "replace",
         "replaceme",
-        "xxx",
         "pending",
-        "sample",
-        "test",
-        "only",
-        "none",
-        "null",
-        "na",
-        "notapplicable",
     }
 )
-_UNRESOLVED_IDENTITY_SEQUENCES = frozenset(
-    {
-        ("change", "me"),
-        ("not", "applicable"),
-        ("not", "set"),
-        ("replace", "me"),
-        ("test", "only"),
-        ("n", "a"),
-    }
+_GENERIC_IDENTITY_VALUES = frozenset(
+    {"latest", "current", "default", "none", "null", "na"}
+)
+_SEMANTIC_VERSION_PATTERN = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+_VERSIONED_SLUG_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*-v[1-9][0-9]*")
+_PROVIDER_IDENTITY_PATTERN = re.compile(
+    r"(?=[a-z0-9._:-]*[0-9])[a-z0-9][a-z0-9._:-]{10,}[a-z0-9]"
 )
 
 
@@ -1175,22 +1163,49 @@ def _format_validation_error(error: ValidationError) -> ValueError:
 
 
 def _has_unresolved_marker(value: str) -> bool:
-    components = tuple(
-        component
-        for component in re.split(r"[^a-z0-9]+", value.casefold())
-        if component
-    )
-    if any(component in _UNRESOLVED_IDENTITY_MARKERS for component in components):
-        return True
-    return any(
-        components[index : index + len(sequence)] == sequence
-        for sequence in _UNRESOLVED_IDENTITY_SEQUENCES
-        for index in range(len(components) - len(sequence) + 1)
-    )
+    compacted = re.sub(r"[^a-z0-9]+", "", value.casefold())
+    return any(marker in compacted for marker in _STRONG_UNRESOLVED_IDENTITY_MARKERS)
 
 
 def _is_repeated_hash(value: str) -> bool:
     return any(value == value[:width] * (64 // width) for width in range(1, 17))
+
+
+def _identity_error(path: str, value: str) -> str | None:
+    field = path.rsplit(".", 1)[-1].casefold()
+    identity_field = (
+        any(
+            token in field
+            for token in ("revision", "fingerprint", "artifact", "model", "hash")
+        )
+        or field == "sdk_package"
+        or field.endswith(("version", "sha256"))
+    )
+    if not identity_field:
+        return None
+    if _has_unresolved_marker(value):
+        return f"{path} contains placeholder marker {value!r}"
+    if value.casefold() in _GENERIC_IDENTITY_VALUES:
+        return f"{path} contains placeholder generic identity {value!r}"
+    if field.endswith("sha256"):
+        if _is_repeated_hash(value):
+            return f"{path} contains placeholder repeated hash {value!r}"
+        return None
+    if field == "api_version":
+        return None
+    if field in {"sdk_version", "exchange_calendars_version"}:
+        valid = _SEMANTIC_VERSION_PATTERN.fullmatch(value) is not None
+    elif field in {"expected_revision", "expected_fingerprint"}:
+        valid = _PROVIDER_IDENTITY_PATTERN.fullmatch(value) is not None
+    elif field.endswith("version") or (
+        "artifact" in field and not field.endswith("sha256")
+    ):
+        valid = _VERSIONED_SLUG_PATTERN.fullmatch(value) is not None
+    else:
+        valid = re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{1,}", value) is not None
+    if not valid:
+        return f"{path} contains placeholder or malformed identity {value!r}"
+    return None
 
 
 def _find_identity_placeholder(root: object) -> str | None:
@@ -1206,35 +1221,9 @@ def _find_identity_placeholder(root: object) -> str | None:
                 (f"{path}[{index}]", child) for index, child in enumerate(value)
             )
         elif type(value) is str:
-            field = path.rsplit(".", 1)[-1].casefold()
-            identity_field = (
-                any(
-                    token in field
-                    for token in (
-                        "revision",
-                        "fingerprint",
-                        "artifact",
-                        "model",
-                        "hash",
-                    )
-                )
-                or field == "sdk_package"
-                or field.endswith("version")
-            )
-            if identity_field and _has_unresolved_marker(value):
-                return f"{path} contains placeholder marker {value!r}"
-            if field.endswith("sha256") and _is_repeated_hash(value):
-                return f"{path} contains placeholder repeated hash {value!r}"
-            structured_identity = (
-                field in {"expected_revision", "expected_fingerprint"}
-                or field.endswith("version")
-                or ("artifact" in field and not field.endswith("sha256"))
-            )
-            if (
-                structured_identity
-                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{1,}", value) is None
-            ):
-                return f"{path} contains placeholder or malformed identity {value!r}"
+            error = _identity_error(path, value)
+            if error is not None:
+                return error
     return None
 
 

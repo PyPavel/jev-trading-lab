@@ -68,7 +68,7 @@
       "endpoint": "https://api.typesafe.ai/v1/systemone",
       "api_version": "v1",
       "sdk_package": "stdlib_https",
-      "sdk_version": "python-3.12",
+      "sdk_version": "3.12.0",
       "request_model_snapshot": "jev-phase1-example-2026-10-02",
       "expected_returned_model_id": "jev-phase1-example-2026-10-02",
       "expected_revision": "EXAMPLE_JEV_REVISION",
