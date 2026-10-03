@@ -103,6 +103,18 @@ def test_connection_pragmas(tmp_path: Path) -> None:
     assert stat.S_IMODE(database.stat().st_mode) == 0o600
 
 
+def test_secure_connection_retains_immutable_busy_timeout(tmp_path: Path) -> None:
+    connection = _connect(tmp_path / "private" / "db.sqlite3", timeout=4_321)
+    try:
+        assert connection.busy_timeout_ms == 4_321  # type: ignore[attr-defined]
+        with pytest.raises(AttributeError):
+            connection.busy_timeout_ms = 1  # type: ignore[attr-defined]
+        with pytest.raises(AttributeError):
+            connection._busy_timeout_ms = 1  # type: ignore[attr-defined]
+    finally:
+        connection.close()
+
+
 @pytest.mark.parametrize("invalid", [True, "1000", 0, -1, 2**31])
 def test_connection_rejects_invalid_busy_timeout(
     tmp_path: Path, invalid: object

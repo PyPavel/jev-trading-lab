@@ -68,8 +68,22 @@ class SecureConnection(sqlite3.Connection):
     """SQLite connection that owns its validated parent directory descriptor."""
 
     _parent_descriptor: int | None = None
+    _busy_timeout_ms: int | None = None
     _close_descriptor = staticmethod(os.close)
     _close_sqlite = sqlite3.Connection.close
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_busy_timeout_ms" and self._busy_timeout_ms is not None:
+            raise AttributeError("busy timeout is immutable")
+        super().__setattr__(name, value)
+
+    @property
+    def busy_timeout_ms(self) -> int:
+        """Return the frozen busy timeout configured by ``connect_database``."""
+        timeout = self._busy_timeout_ms
+        if timeout is None:
+            raise DatabaseConfigurationError("busy timeout has not been configured")
+        return timeout
 
     def close(self) -> None:
         try:
@@ -562,6 +576,7 @@ def connect_database(
             _check_sidecars(path, parent_descriptor)
             connection.execute(f"PRAGMA busy_timeout = {timeout}")
             _verify_pragma(connection, "busy_timeout", timeout, label="busy_timeout")
+            connection._busy_timeout_ms = timeout
             connection.execute("PRAGMA synchronous = FULL")
             _verify_pragma(connection, "synchronous", 2, label="synchronous")
             connection.execute("PRAGMA trusted_schema = OFF")

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -43,11 +45,17 @@ HEX_B = "b" * 64
 HEX_C = "c" * 64
 
 
-def _connection(path: str = ":memory:") -> sqlite3.Connection:
+def _connection(path: str | None = None) -> sqlite3.Connection:
+    if path is None or path == ":memory:":
+        descriptor, path = tempfile.mkstemp(suffix=".sqlite3")
+        os.close(descriptor)
     connection = sqlite3.connect(path, isolation_level=None, timeout=5)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA recursive_triggers = ON")
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA synchronous = FULL")
+    connection.execute("PRAGMA busy_timeout = 5000")
     connection.execute("PRAGMA trusted_schema = OFF")
     apply_migrations(connection, clock=lambda: 1_700_000_000_000_000)
     return connection
@@ -106,7 +114,7 @@ def _window(manifest: Manifest) -> RunWindow:
 
 
 def _registered(connection: sqlite3.Connection) -> tuple[CoreRepository, str]:
-    repository = CoreRepository(connection)
+    repository = CoreRepository(connection, expected_busy_timeout_ms=5000)
     manifest = _manifest()
     run_id = repository.insert_run(
         manifest=manifest,
@@ -395,7 +403,7 @@ def test_database_rejects_hostile_ids_types_bounds_and_fixedpoint() -> None:
 
 def test_manifest_and_window_tampering_is_revalidated() -> None:
     connection = _connection()
-    repository = CoreRepository(connection)
+    repository = CoreRepository(connection, expected_busy_timeout_ms=5000)
     manifest = _manifest()
     window = _window(manifest)
     try:
@@ -413,7 +421,7 @@ def test_manifest_and_window_tampering_is_revalidated() -> None:
 
 def test_observation_supersession_constraints_are_authoritative() -> None:
     connection = _connection()
-    repository = CoreRepository(connection)
+    repository = CoreRepository(connection, expected_busy_timeout_ms=5000)
     logical_key = hashlib.sha256(b"logical").hexdigest()
     original = ObservationMetadata(
         source_uri="https://example.test/item",
@@ -494,7 +502,7 @@ def test_observation_supersession_constraints_are_authoritative() -> None:
 )
 def test_artifact_path_and_metadata_validation(path: str) -> None:
     connection = _connection()
-    repository = CoreRepository(connection)
+    repository = CoreRepository(connection, expected_busy_timeout_ms=5000)
     try:
         with pytest.raises((TypeError, ValueError), match="path"):
             repository.insert_artifact_ref(
@@ -510,7 +518,7 @@ def test_artifact_path_and_metadata_validation(path: str) -> None:
 
 def test_artifact_idempotency_and_conflict() -> None:
     connection = _connection()
-    repository = CoreRepository(connection)
+    repository = CoreRepository(connection, expected_busy_timeout_ms=5000)
     try:
         artifact_id = repository.insert_artifact_ref(
             kind="provider_payload",
@@ -549,7 +557,7 @@ def test_artifact_idempotency_and_conflict() -> None:
 
 def test_repository_rejects_active_caller_transaction_without_rollback() -> None:
     connection = _connection()
-    repository = CoreRepository(connection)
+    repository = CoreRepository(connection, expected_busy_timeout_ms=5000)
     try:
         connection.execute("BEGIN")
         connection.execute("CREATE TEMP TABLE caller_state(value TEXT)")
@@ -568,7 +576,7 @@ def test_repository_rejects_active_caller_transaction_without_rollback() -> None
 
 def test_run_insert_failure_rolls_back_manifest_and_window() -> None:
     connection = _connection()
-    repository = CoreRepository(connection)
+    repository = CoreRepository(connection, expected_busy_timeout_ms=5000)
     manifest = _manifest()
     try:
         connection.execute(
@@ -717,6 +725,51 @@ def test_observation_replace_rejects_two_node_and_long_cycles() -> None:
         connection.close()
 
 
+@pytest.mark.parametrize(
+    ("pragma", "drift"),
+    (
+        ("foreign_keys", "OFF"),
+        ("recursive_triggers", "OFF"),
+        ("trusted_schema", "ON"),
+        ("journal_mode", "DELETE"),
+        ("synchronous", "NORMAL"),
+        ("busy_timeout", "1234"),
+    ),
+)
+@pytest.mark.parametrize("after_success", (False, True))
+def test_repository_rejects_complete_pragma_drift_without_side_effects(
+    pragma: str, drift: str, after_success: bool
+) -> None:
+    connection = _connection()
+    repository = CoreRepository(connection, expected_busy_timeout_ms=5000)
+    manifest = _manifest()
+    try:
+        if after_success:
+            repository.insert_manifest(manifest)
+        connection.execute(f"PRAGMA {pragma} = {drift}")
+        with pytest.raises(CoreRepositoryError, match=pragma):
+            if after_success:
+                repository.insert_run_window(_window(manifest), manifest)
+            else:
+                repository.insert_manifest(manifest)
+        assert connection.execute("SELECT count(*) FROM manifests").fetchone()[
+            0
+        ] == int(after_success)
+        assert connection.execute("SELECT count(*) FROM run_windows").fetchone()[0] == 0
+        assert not connection.in_transaction
+    finally:
+        connection.close()
+
+
+def test_plain_sqlite_repository_requires_explicit_expected_busy_timeout() -> None:
+    connection = _connection()
+    try:
+        with pytest.raises(ValueError, match="expected_busy_timeout_ms"):
+            CoreRepository(connection)
+    finally:
+        connection.close()
+
+
 @pytest.mark.parametrize("pragma", ("foreign_keys", "recursive_triggers"))
 def test_repository_rejects_pragma_drift_before_account_write(pragma: str) -> None:
     connection = _connection()
@@ -771,7 +824,7 @@ def test_repository_authoritatively_revalidates_tampered_observation(
     attribute: str, value: object
 ) -> None:
     connection = _connection()
-    repository = CoreRepository(connection)
+    repository = CoreRepository(connection, expected_busy_timeout_ms=5000)
     observation = ObservationMetadata(
         source_uri="https://example.test/x",
         published_at_us=None,
@@ -790,9 +843,9 @@ def test_repository_authoritatively_revalidates_tampered_observation(
         connection.close()
 
 
-def test_repository_rejects_forged_observation_wrapper_and_id() -> None:
+def test_repository_accepts_semantically_valid_forged_observation_wrapper() -> None:
     connection = _connection()
-    repository = CoreRepository(connection)
+    repository = CoreRepository(connection, expected_busy_timeout_ms=5000)
     forged = object.__new__(ObservationMetadata)
     object.__setattr__(forged, "source_uri", "https://example.test/forged")
     object.__setattr__(forged, "published_at_us", None)
@@ -801,15 +854,47 @@ def test_repository_rejects_forged_observation_wrapper_and_id() -> None:
     object.__setattr__(forged, "content_sha256", HEX_A)
     object.__setattr__(forged, "supersedes_id", None)
     try:
-        with pytest.raises(ValueError, match="observation revalidation"):
-            repository.insert_observation(forged, logical_key=HEX_B)
+        observation_id = repository.insert_observation(forged, logical_key=HEX_B)
+        row = connection.execute(
+            "SELECT source_uri, content_sha256 FROM observations "
+            "WHERE observation_id = ?",
+            (observation_id,),
+        ).fetchone()
+        assert tuple(row) == ("https://example.test/forged", HEX_A)
+    finally:
+        connection.close()
+
+
+def test_repository_rejects_simultaneous_observation_field_tampering() -> None:
+    connection = _connection()
+    repository = CoreRepository(connection, expected_busy_timeout_ms=5000)
+    observation = ObservationMetadata(
+        source_uri="https://example.test/original",
+        published_at_us=100,
+        retrieved_at_us=200,
+        status=ObservationStatus.OK,
+        content_sha256=HEX_A,
+    )
+    object.__setattr__(observation, "source_uri", "http://example.test/evil")
+    object.__setattr__(observation, "status", "ok")
+    object.__setattr__(observation, "content_sha256", "A" * 64)
+    object.__setattr__(observation, "retrieved_at_us", True)
+    object.__setattr__(observation, "supersedes_id", HEX_B)
+    with pytest.raises(AttributeError):
+        object.__setattr__(observation, "_constructor_proof", HEX_C)
+    try:
+        with pytest.raises((TypeError, ValueError), match="observation"):
+            repository.insert_observation(observation, logical_key=HEX_B)
+        assert (
+            connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 0
+        )
     finally:
         connection.close()
 
 
 def test_repository_reconstructs_correction_predecessor_from_database() -> None:
     connection = _connection()
-    repository = CoreRepository(connection)
+    repository = CoreRepository(connection, expected_busy_timeout_ms=5000)
     original = ObservationMetadata(
         source_uri="https://example.test/original",
         published_at_us=None,
@@ -901,7 +986,9 @@ def test_artifact_path_is_unique_and_valid_nested_path_passes() -> None:
             "INSERT INTO artifact_refs VALUES (?,?,?,?,?,?,?)",
             (HEX_A, "snapshot", HEX_B, 1, 1, None, "a/b/c.bin"),
         )
-        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+        with pytest.raises(
+            sqlite3.IntegrityError, match="immutable-conflict:artifact_refs"
+        ):
             connection.execute(
                 "INSERT INTO artifact_refs VALUES (?,?,?,?,?,?,?)",
                 (HEX_C, "snapshot", HEX_A, 1, 1, None, "a/b/c.bin"),
@@ -1018,6 +1105,157 @@ def test_opportunity_identity_has_no_eligibility_episode() -> None:
         connection.close()
 
 
+SECONDARY_UNIQUE_IDENTITIES = {
+    "runs": (("manifest_id", "run_window_id", "dependency_lock_sha256"),),
+    "accounts": (("run_id", "stream", "arm", "currency"),),
+    "opportunities": (("run_id", "stream", "subject_id", "scheduled_for_us"),),
+    "observations": (("supersedes_id",),),
+    "artifact_refs": (("storage_relpath",),),
+}
+
+
+def test_every_secondary_unique_identity_has_insert_conflict_guard() -> None:
+    connection = _connection()
+    try:
+        discovered: dict[str, set[tuple[str, ...]]] = {}
+        for table in TABLES:
+            identities = set()
+            for index in connection.execute(f"PRAGMA index_list({table})"):
+                if index[2] and index[3] == "u":
+                    identities.add(
+                        tuple(
+                            row[2]
+                            for row in connection.execute(
+                                f"PRAGMA index_info({index[1]})"
+                            )
+                        )
+                    )
+            if identities:
+                discovered[table] = identities
+        assert discovered == {
+            table: set(identities)
+            for table, identities in SECONDARY_UNIQUE_IDENTITIES.items()
+        }
+        for table, identities in discovered.items():
+            trigger = " ".join(
+                connection.execute(
+                    "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?",
+                    (f"{table}_immutable_conflict",),
+                )
+                .fetchone()[0]
+                .split()
+            )
+            primary_key = connection.execute(f"PRAGMA table_info({table})").fetchone()[
+                1
+            ]
+            assert f"old.{primary_key} = NEW.{primary_key}" in trigger
+            for identity in identities:
+                guard = " AND ".join(
+                    f"old.{column} IS NEW.{column}" for column in identity
+                )
+                assert guard in trigger
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("table", "columns", "prepare"),
+    (
+        (
+            "runs",
+            ("run_id",),
+            lambda connection, ids: (HEX_C,),
+        ),
+        (
+            "accounts",
+            ("account_id",),
+            lambda connection, ids: (HEX_C,),
+        ),
+        (
+            "opportunities",
+            ("opportunity_id",),
+            lambda connection, ids: (HEX_C,),
+        ),
+        (
+            "artifact_refs",
+            ("artifact_id",),
+            lambda connection, ids: (
+                hashlib.sha256(b"different-artifact").hexdigest(),
+            ),
+        ),
+    ),
+)
+def test_insert_or_replace_rejects_different_primary_id_on_secondary_unique_identity(
+    table: str,
+    columns: tuple[str, ...],
+    prepare: Any,
+) -> None:
+    connection = _connection()
+    try:
+        _repository, ids = _populated_core(connection)
+        connection.execute("PRAGMA recursive_triggers = OFF")
+        table_columns = [
+            row[1] for row in connection.execute(f"PRAGMA table_info({table})")
+        ]
+        row = list(
+            connection.execute(
+                f"SELECT * FROM {table} WHERE {table_columns[0]} = ?", (ids[table],)
+            ).fetchone()
+        )
+        for column, value in zip(columns, prepare(connection, ids), strict=True):
+            row[table_columns.index(column)] = value
+        placeholders = ",".join("?" for _ in table_columns)
+        with pytest.raises(sqlite3.IntegrityError, match=f"immutable-conflict:{table}"):
+            connection.execute(
+                f"INSERT OR REPLACE INTO {table} VALUES ({placeholders})", row
+            )
+        assert connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 1
+        assert connection.execute(
+            f"SELECT 1 FROM {table} WHERE {table_columns[0]} = ?", (ids[table],)
+        ).fetchone()
+    finally:
+        connection.close()
+
+
+def test_replace_rejects_different_observation_id_for_existing_successor() -> None:
+    connection = _connection()
+    try:
+        repository, ids = _populated_core(connection)
+        original = repository._stored_observation(ids["observations"])
+        successor = correct_observation(
+            original,
+            retrieved_at_us=original.retrieved_at_us + 1,
+            content_sha256=hashlib.sha256(b"successor").hexdigest(),
+            supersedes_id=original.observation_id,
+        )
+        successor_id = repository.insert_observation(
+            successor, logical_key=HEX_A, run_id=ids["runs"]
+        )
+        replacement = list(
+            connection.execute(
+                "SELECT * FROM observations WHERE observation_id = ?", (successor_id,)
+            ).fetchone()
+        )
+        replacement[0] = hashlib.sha256(b"different-successor-id").hexdigest()
+        replacement[7] = hashlib.sha256(b"different-successor-content").hexdigest()
+        connection.execute("PRAGMA recursive_triggers = OFF")
+        with pytest.raises(
+            sqlite3.IntegrityError, match="immutable-conflict:observations"
+        ):
+            connection.execute(
+                "INSERT OR REPLACE INTO observations VALUES (?,?,?,?,?,?,?,?,?)",
+                replacement,
+            )
+        assert (
+            connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 2
+        )
+        assert connection.execute(
+            "SELECT 1 FROM observations WHERE observation_id = ?", (successor_id,)
+        ).fetchone()
+    finally:
+        connection.close()
+
+
 def test_concurrent_identical_insert_converges(tmp_path: Path) -> None:
     database = tmp_path / "core.sqlite3"
     setup = _connection(str(database))
@@ -1033,7 +1271,9 @@ def test_concurrent_identical_insert_converges(tmp_path: Path) -> None:
         connection.execute("PRAGMA trusted_schema=OFF")
         try:
             barrier.wait(timeout=5)
-            return CoreRepository(connection).insert_manifest(_manifest())
+            return CoreRepository(
+                connection, expected_busy_timeout_ms=5000
+            ).insert_manifest(_manifest())
         finally:
             connection.close()
 

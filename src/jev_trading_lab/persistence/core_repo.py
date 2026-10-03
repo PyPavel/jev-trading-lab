@@ -14,7 +14,11 @@ from jev_trading_lab.core.manifest import (
     parse_manifest_bytes,
     revalidate_manifest,
 )
-from jev_trading_lab.core.observations import ObservationMetadata, ObservationStatus
+from jev_trading_lab.core.observations import (
+    ObservationMetadata,
+    ObservationStatus,
+    revalidate_observation,
+)
 from jev_trading_lab.core.run_window import RunWindow, revalidate_run_window
 from jev_trading_lab.core.time import MAX_DATETIME_US, MIN_DATETIME_US, validate_utc_us
 from jev_trading_lab.core.values import MAX_INT64, MicroDollars
@@ -35,11 +39,14 @@ _ARTIFACT_KINDS = frozenset(
         "other",
     }
 )
-_PRAGMA_CONTRACT = (
+_STATIC_PRAGMA_CONTRACT = (
     ("foreign_keys", 1),
     ("recursive_triggers", 1),
     ("trusted_schema", 0),
+    ("journal_mode", "wal"),
+    ("synchronous", 2),
 )
+_MAX_BUSY_TIMEOUT_MS = 2_147_483_647
 
 
 class CoreRepositoryError(RuntimeError):
@@ -90,6 +97,7 @@ class CoreRepository:
         self,
         connection: sqlite3.Connection,
         *,
+        expected_busy_timeout_ms: int | None = None,
         clock: Callable[[], int] | None = None,
     ) -> None:
         if not isinstance(connection, sqlite3.Connection):
@@ -98,9 +106,20 @@ class CoreRepository:
             raise ValueError(
                 "repository connection must use autocommit isolation_level=None"
             )
+        if expected_busy_timeout_ms is None:
+            expected_busy_timeout_ms = getattr(connection, "busy_timeout_ms", None)
+        if type(expected_busy_timeout_ms) is not int:
+            raise ValueError(
+                "expected_busy_timeout_ms is required for plain sqlite connections"
+            )
+        if not 0 < expected_busy_timeout_ms <= _MAX_BUSY_TIMEOUT_MS:
+            raise ValueError(
+                f"expected_busy_timeout_ms must be between 1 and {_MAX_BUSY_TIMEOUT_MS}"
+            )
         if clock is not None and not callable(clock):
             raise TypeError("clock must be callable")
         self._connection = connection
+        self._expected_busy_timeout_ms = expected_busy_timeout_ms
         self._clock = clock or (lambda: int(datetime.now(UTC).timestamp() * 1_000_000))
 
     def _created_at_us(self) -> int:
@@ -115,9 +134,15 @@ class CoreRepository:
             raise CoreRepositoryError(
                 "cannot write inside an active caller transaction"
             )
-        for pragma, expected in _PRAGMA_CONTRACT:
+        contract = (
+            *_STATIC_PRAGMA_CONTRACT,
+            ("busy_timeout", self._expected_busy_timeout_ms),
+        )
+        for pragma, expected in contract:
             row = self._connection.execute(f"PRAGMA {pragma}").fetchone()
             actual = None if row is None else row[0]
+            if pragma == "journal_mode" and isinstance(actual, str):
+                actual = actual.casefold()
             if actual != expected:
                 raise CoreRepositoryError(
                     f"repository connection PRAGMA {pragma} drift: "
@@ -486,9 +511,8 @@ class CoreRepository:
         logical = _hex64(logical_key, name="logical_key")
         run = None if run_id is None else _hex64(run_id, name="run_id")
         try:
-            constructor_proof = observation._constructor_proof
             supersedes = observation.supersedes_id
-        except (AttributeError, TypeError, ValueError) as error:
+        except AttributeError as error:
             raise ValueError(
                 "observation revalidation failed: wrapper state"
             ) from error
@@ -497,19 +521,9 @@ class CoreRepository:
                 predecessor = (
                     None if supersedes is None else self._stored_observation(supersedes)
                 )
-                trusted = ObservationMetadata(
-                    source_uri=observation.source_uri,
-                    published_at_us=observation.published_at_us,
-                    retrieved_at_us=observation.retrieved_at_us,
-                    status=observation.status,
-                    content_sha256=observation.content_sha256,
-                    supersedes_id=supersedes,
-                    predecessor=predecessor,
-                )
+                trusted = revalidate_observation(observation, predecessor)
             except (TypeError, ValueError) as error:
                 raise ValueError("observation revalidation failed") from error
-            if trusted.observation_id != constructor_proof:
-                raise ValueError("observation revalidation failed: ID mismatch")
             columns = (
                 "observation_id",
                 "run_id",

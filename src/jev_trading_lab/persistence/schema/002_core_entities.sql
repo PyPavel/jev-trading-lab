@@ -373,61 +373,95 @@ BEGIN SELECT RAISE(ABORT, 'immutable-conflict:run_windows'); END;
 CREATE TRIGGER main.runs_immutable_conflict
 BEFORE INSERT ON runs
 WHEN EXISTS (
-    SELECT 1 FROM runs AS old WHERE old.run_id = NEW.run_id
-      AND (old.manifest_id IS NOT NEW.manifest_id
-           OR old.run_window_id IS NOT NEW.run_window_id
-           OR old.phase IS NOT NEW.phase
-           OR old.mode IS NOT NEW.mode
-           OR old.dependency_lock_sha256 IS NOT NEW.dependency_lock_sha256
-           OR old.registered_at_us IS NOT NEW.registered_at_us)
+    SELECT 1 FROM runs AS old WHERE (
+        old.run_id = NEW.run_id
+        AND (old.manifest_id IS NOT NEW.manifest_id
+             OR old.run_window_id IS NOT NEW.run_window_id
+             OR old.phase IS NOT NEW.phase
+             OR old.mode IS NOT NEW.mode
+             OR old.dependency_lock_sha256 IS NOT NEW.dependency_lock_sha256
+             OR old.registered_at_us IS NOT NEW.registered_at_us)
+    ) OR (
+        old.manifest_id IS NEW.manifest_id
+        AND old.run_window_id IS NEW.run_window_id
+        AND old.dependency_lock_sha256 IS NEW.dependency_lock_sha256
+        AND old.run_id IS NOT NEW.run_id
+    )
 )
 BEGIN SELECT RAISE(ABORT, 'immutable-conflict:runs'); END;
 CREATE TRIGGER main.accounts_immutable_conflict
 BEFORE INSERT ON accounts
 WHEN EXISTS (
-    SELECT 1 FROM accounts AS old WHERE old.account_id = NEW.account_id
-      AND (old.run_id IS NOT NEW.run_id
-           OR old.stream IS NOT NEW.stream
-           OR old.arm IS NOT NEW.arm
-           OR old.currency IS NOT NEW.currency
-           OR old.initial_capital_microdollars IS NOT NEW.initial_capital_microdollars)
+    SELECT 1 FROM accounts AS old WHERE (
+        old.account_id = NEW.account_id
+        AND (old.run_id IS NOT NEW.run_id
+             OR old.stream IS NOT NEW.stream
+             OR old.arm IS NOT NEW.arm
+             OR old.currency IS NOT NEW.currency
+             OR old.initial_capital_microdollars IS NOT NEW.initial_capital_microdollars)
+    ) OR (
+        old.run_id IS NEW.run_id
+        AND old.stream IS NEW.stream
+        AND old.arm IS NEW.arm
+        AND old.currency IS NEW.currency
+        AND old.account_id IS NOT NEW.account_id
+    )
 )
 BEGIN SELECT RAISE(ABORT, 'immutable-conflict:accounts'); END;
 CREATE TRIGGER main.opportunities_immutable_conflict
 BEFORE INSERT ON opportunities
 WHEN EXISTS (
-    SELECT 1 FROM opportunities AS old WHERE old.opportunity_id = NEW.opportunity_id
-      AND (old.run_id IS NOT NEW.run_id
-           OR old.stream IS NOT NEW.stream
-           OR old.subject_id IS NOT NEW.subject_id
-           OR old.scheduled_for_us IS NOT NEW.scheduled_for_us
-           OR old.snapshot_id IS NOT NEW.snapshot_id)
+    SELECT 1 FROM opportunities AS old WHERE (
+        old.opportunity_id = NEW.opportunity_id
+        AND (old.run_id IS NOT NEW.run_id
+             OR old.stream IS NOT NEW.stream
+             OR old.subject_id IS NOT NEW.subject_id
+             OR old.scheduled_for_us IS NOT NEW.scheduled_for_us
+             OR old.snapshot_id IS NOT NEW.snapshot_id)
+    ) OR (
+        old.run_id IS NEW.run_id
+        AND old.stream IS NEW.stream
+        AND old.subject_id IS NEW.subject_id
+        AND old.scheduled_for_us IS NEW.scheduled_for_us
+        AND old.opportunity_id IS NOT NEW.opportunity_id
+    )
 )
 BEGIN SELECT RAISE(ABORT, 'immutable-conflict:opportunities'); END;
 CREATE TRIGGER main.observations_immutable_conflict
 BEFORE INSERT ON observations
 WHEN EXISTS (
-    SELECT 1 FROM observations AS old WHERE old.observation_id = NEW.observation_id
-      AND (old.run_id IS NOT NEW.run_id
-           OR old.logical_key IS NOT NEW.logical_key
-           OR old.source_uri IS NOT NEW.source_uri
-           OR old.published_at_us IS NOT NEW.published_at_us
-           OR old.retrieved_at_us IS NOT NEW.retrieved_at_us
-           OR old.status IS NOT NEW.status
-           OR old.content_sha256 IS NOT NEW.content_sha256
-           OR old.supersedes_id IS NOT NEW.supersedes_id)
+    SELECT 1 FROM observations AS old WHERE (
+        old.observation_id = NEW.observation_id
+        AND (old.run_id IS NOT NEW.run_id
+             OR old.logical_key IS NOT NEW.logical_key
+             OR old.source_uri IS NOT NEW.source_uri
+             OR old.published_at_us IS NOT NEW.published_at_us
+             OR old.retrieved_at_us IS NOT NEW.retrieved_at_us
+             OR old.status IS NOT NEW.status
+             OR old.content_sha256 IS NOT NEW.content_sha256
+             OR old.supersedes_id IS NOT NEW.supersedes_id)
+    ) OR (
+        NEW.supersedes_id IS NOT NULL
+        AND old.supersedes_id IS NEW.supersedes_id
+        AND old.observation_id IS NOT NEW.observation_id
+    )
 )
 BEGIN SELECT RAISE(ABORT, 'immutable-conflict:observations'); END;
 CREATE TRIGGER main.artifact_refs_immutable_conflict
 BEFORE INSERT ON artifact_refs
 WHEN EXISTS (
-    SELECT 1 FROM artifact_refs AS old WHERE old.artifact_id = NEW.artifact_id
-      AND (old.kind IS NOT NEW.kind
-           OR old.content_sha256 IS NOT NEW.content_sha256
-           OR old.byte_size IS NOT NEW.byte_size
-           OR old.created_at_us IS NOT NEW.created_at_us
-           OR old.source_observation_id IS NOT NEW.source_observation_id
-           OR old.storage_relpath IS NOT NEW.storage_relpath)
+    SELECT 1 FROM artifact_refs AS old WHERE (
+        old.artifact_id = NEW.artifact_id
+        AND (old.kind IS NOT NEW.kind
+             OR old.content_sha256 IS NOT NEW.content_sha256
+             OR old.byte_size IS NOT NEW.byte_size
+             OR old.created_at_us IS NOT NEW.created_at_us
+             OR old.source_observation_id IS NOT NEW.source_observation_id
+             OR old.storage_relpath IS NOT NEW.storage_relpath)
+    ) OR (
+        old.storage_relpath IS NEW.storage_relpath
+        AND old.artifact_id IS NOT NEW.artifact_id
+    )
 )
 BEGIN SELECT RAISE(ABORT, 'immutable-conflict:artifact_refs'); END;
 

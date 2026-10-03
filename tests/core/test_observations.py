@@ -29,6 +29,60 @@ def _metadata(**changes: object) -> object:
     return observations.ObservationMetadata(**fields)
 
 
+def test_revalidation_returns_fresh_semantically_equivalent_observation() -> None:
+    observations = _module("jev_trading_lab.core.observations")
+    original = _metadata()
+
+    trusted = observations.revalidate_observation(original)
+
+    assert trusted == original
+    assert trusted.observation_id == original.observation_id
+    assert trusted is not original
+    assert not hasattr(trusted, "_constructor_proof")
+
+
+def test_revalidation_accepts_semantically_valid_forged_exact_wrapper() -> None:
+    observations = _module("jev_trading_lab.core.observations")
+    forged = object.__new__(observations.ObservationMetadata)
+    fields = {
+        "source_uri": "https://example.test/forged",
+        "published_at_us": None,
+        "retrieved_at_us": 200,
+        "status": observations.ObservationStatus.OK,
+        "content_sha256": HASH_A,
+        "supersedes_id": None,
+    }
+    for name, value in fields.items():
+        object.__setattr__(forged, name, value)
+
+    trusted = observations.revalidate_observation(forged)
+
+    assert trusted is not forged
+    assert trusted.observation_id == forged.observation_id
+    assert tuple(getattr(trusted, name) for name in fields) == tuple(fields.values())
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    (
+        ("source_uri", "http://example.test/x"),
+        ("status", "ok"),
+        ("content_sha256", "A" * 64),
+        ("retrieved_at_us", True),
+        ("supersedes_id", HASH_B),
+    ),
+)
+def test_revalidation_rejects_malicious_field_and_proof_mutation(
+    attribute: str, value: object
+) -> None:
+    observations = _module("jev_trading_lab.core.observations")
+    observation = _metadata()
+    object.__setattr__(observation, attribute, value)
+
+    with pytest.raises((TypeError, ValueError)):
+        observations.revalidate_observation(observation)
+
+
 def test_first_retrieval_is_immutable() -> None:
     original = _metadata()
 

@@ -161,7 +161,7 @@ _APPROVED_SOURCE_HASHES = {
         "f90c328655cec51fafcb9850f8a9a8ccecf24f78398ff746814118614e277e51"
     ),
     "src/jev_trading_lab/core/observations.py": (
-        "2e4f881368fbe797d3af7080cb627986146ade5e77abba1dd9187a87393f55a1"
+        "5c6f9d3c76c7f766b3170513dae374873b1df5970b4590e1ffa9c66367be2252"
     ),
     "src/jev_trading_lab/core/time.py": (
         "edbc66ad7acf0bfb2da0a2d4038cbdc914474f33482a723161155ea81744312e"
@@ -173,10 +173,10 @@ _APPROVED_SOURCE_HASHES = {
         "be5cdea878ba9575ad6a83bc43819e3c1cbaecdf8ad351b2d8374f94b6c496e9"
     ),
     "src/jev_trading_lab/persistence/core_repo.py": (
-        "8bdbc353ad2a5bc2a606f545ae47f49f0a4aea78e84bfb72ea78f9807e3fdefb"
+        "3de4542058bc385e8006c9fc466cd26fd407dc319fc566e10b9bd7e9b0e7c7c9"
     ),
     "src/jev_trading_lab/persistence/db.py": (
-        "f8547c84fc2e3f4cec1c4d7ca5a842abd7eae6ef29a7467d69c6e38dde659e98"
+        "aa239d8dce02f30db46961e069650717c9fbe232a7bc88157647e9af6161585d"
     ),
     "src/jev_trading_lab/persistence/migrations.py": (
         "fc574827a634bd4dd2cd7508015b066c7b39982ff56f599bfe0167d9013dd8fb"
@@ -188,7 +188,7 @@ _APPROVED_SOURCE_HASHES = {
         "1be6dbbcb20a6ab8efe016172d786280470fc7a450f403825e2a61e199a1cb48"
     ),
     "src/jev_trading_lab/persistence/schema/002_core_entities.sql": (
-        "188d2f8f02c8d5743d107018fb2759998e2b96e6b55e3fedeab2d0eb8297b30a"
+        "9026b984313d972dec6c3db8b442e4324f2a7f02ec71bd555c0c17f8ed362c54"
     ),
     "src/jev_trading_lab/stocks/__init__.py": (
         "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"
@@ -247,10 +247,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "f36609ff01102c449ed5d0a7d84e8b916e7da829ea27e5e31a5a31c46e298d73"
+    "a48e218a87ae3aabc96ba0247fce52731f221f7fe60fe0f9670f0551053071c8"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "81a3da3ea8d7c2eba179b582b5127667b2a2c664beaf2e0179bff2b5db1d56b1"
+    "ab681b792b7de90ad11306cef1d0f54e334b21b9612554b4a69bef45b2fd5925"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = [
     "exchange-calendars==4.11.2",

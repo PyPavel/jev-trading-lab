@@ -19,7 +19,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Verify policy preflight
-        run: echo "81a3da3ea8d7c2eba179b582b5127667b2a2c664beaf2e0179bff2b5db1d56b1  scripts/policy_preflight.py" | sha256sum -c -
+        run: echo "ab681b792b7de90ad11306cef1d0f54e334b21b9612554b4a69bef45b2fd5925  scripts/policy_preflight.py" | sha256sum -c -
       - name: Run policy preflight before dependency tooling
         run: python3 -I scripts/policy_preflight.py
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
