@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import importlib
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from types import ModuleType
 
 import pytest
@@ -84,3 +84,76 @@ def test_money_and_price_reject_negative_values() -> None:
         values.micro_dollars("-0.000001")
     with pytest.raises(ValueError):
         values.price_micros("-0.000001")
+
+
+def test_money_roundtrip_is_exact_under_low_decimal_precision() -> None:
+    values = _values()
+    maximum = values.MicroDollars(9_223_372_036_854_775_807)
+    expected = Decimal("9223372036854.775807")
+
+    for precision in (1, 2):
+        with localcontext() as context:
+            context.prec = precision
+            assert values.decimal_dollars(maximum) == expected
+
+
+def test_tagged_constructors_enforce_domain_invariants() -> None:
+    values = _values()
+
+    invalid_calls = (
+        lambda: values.MicroDollars(-1),
+        lambda: values.MicroDollars(True),
+        lambda: values.MicroDollars(values.MAX_INT64 + 1),
+        lambda: values.PriceMicros(-1),
+        lambda: values.PriceMicros(False),
+        lambda: values.ProbabilityMicros(-1),
+        lambda: values.ProbabilityMicros(values.MICRO + 1),
+        lambda: values.ProbabilityMicros(True),
+        lambda: values.ScaledQuantity(units=0, scale=1),
+        lambda: values.ScaledQuantity(units=1, scale=0),
+        lambda: values.ScaledQuantity(units=True, scale=1),
+        lambda: values.ScaledQuantity(units=1, scale=True),
+        lambda: values.ScaledQuantity(units=values.MAX_INT64 + 1, scale=1),
+        lambda: values.ScaledQuantity(units=1, scale=values.MAX_INT64 + 1),
+    )
+    for invalid_call in invalid_calls:
+        with pytest.raises((TypeError, ValueError)):
+            invalid_call()
+
+    forged_invalid_money = int.__new__(values.MicroDollars, -1)
+    with pytest.raises(ValueError):
+        values.decimal_dollars(forged_invalid_money)
+
+
+def test_sqlite_integer_limit_is_accepted_and_overflow_rejected() -> None:
+    values = _values()
+
+    assert values.MicroDollars(values.MAX_INT64) == values.MAX_INT64
+    assert values.PriceMicros(values.MAX_INT64) == values.MAX_INT64
+    assert (
+        values.ScaledQuantity(values.MAX_INT64, values.MAX_INT64).units
+        == values.MAX_INT64
+    )
+    assert values.micro_dollars("9223372036854.775807") == values.MAX_INT64
+    assert values.price_micros("9223372036854.775807") == values.MAX_INT64
+    assert (
+        values.scaled_quantity(str(values.MAX_INT64), scale=1).units == values.MAX_INT64
+    )
+
+    with pytest.raises(ValueError):
+        values.micro_dollars("9223372036854.775808")
+    with pytest.raises(ValueError):
+        values.price_micros("9223372036854.775808")
+    with pytest.raises(ValueError):
+        values.scaled_quantity(str(values.MAX_INT64 + 1), scale=1)
+
+
+def test_decimal_input_size_and_exponent_are_bounded() -> None:
+    values = _values()
+
+    with pytest.raises(ValueError):
+        values.micro_dollars("1e1000000")
+    with pytest.raises(ValueError):
+        values.micro_dollars("0." + "0" * values.MAX_DECIMAL_INPUT_LENGTH)
+    with pytest.raises(ValueError):
+        values.micro_dollars(Decimal((0, (1,), values.MAX_DECIMAL_EXPONENT + 1)))
