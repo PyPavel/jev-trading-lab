@@ -14,10 +14,11 @@ Initial implementation:
 3a2ede39d5cc4572f9a36ee4f3173fe4953c97e1 feat(core): define immutable run manifest
 ```
 
-Review-finding correction:
+Review-finding corrections:
 
 ```text
 0476dd3 fix(core): close manifest trust and policy gaps
+be86be2cf9a764b7b9120c5008ac46fc6451707c fix(core): freeze model input and activation identities
 ```
 
 ## Review findings resolved
@@ -27,7 +28,9 @@ Review-finding correction:
 - Added `assert_activation_candidate()`. It rejects `example_only`, placeholder markers, repeated placeholder hashes, and malformed/tampered wrapper state. Non-example manifests containing placeholders fail during parsing. Task 14 registration must call this method after revalidation.
 - Added all reviewed required experiment settings: exact fallback mapping/timestamp/precedence/validation; normalized cluster metadata and version/hash; sigma estimator inputs/rules/version/hash; exact direct/shared cost routing; classification, scoring, information, power, and adverse-replay gates; OEF contract; SQLite busy timeout; all SEC endpoints; issuer source/domain allowlists; calendar package/content hashes; deterministic retry jitter; rule/artifact versions and SHA-256 fields.
 - Tightened provider categories to lowercase, nonempty, unique tuples with case-insensitive sports rejection. Provider and Treasury contracts now freeze source, endpoint, timestamp, precedence, validation, and fallback behavior.
-- Added provider-specific dated immutable model snapshot validation plus stable expected revision/fingerprint fields. Known OpenAI and Jev moving aliases fail.
+- Added provider-specific dated immutable model snapshot validation plus stable expected revision/fingerprint fields. Snapshot IDs now reject `latest`, `current`, and `default` as case-insensitive token components anywhere in the ID, and validate the required suffix with `date.fromisoformat()` so impossible dates fail.
+- Replaced the broad activation placeholder scan with field-aware identity validation. Revision, fingerprint, artifact, model, hash, and version fields reject normalized unresolved markers; hashes reject trivial/repeated patterns; revision, fingerprint, version, and artifact identities require structured values. The checked-in example remains parser-valid only under `example_only=true`, while a sanitized non-example fixture passes activation.
+- Added required root `model_input_policy` identities for the OpenAI prompt template, OpenAI schema, evidence delimiter, Jev state template, and Jev question set. Every artifact has a required version and lowercase SHA-256; removal fails validation, mutation changes `manifest_id`, and activation rejects placeholder identities.
 - Hardened parsing with iterative depth/item/string limits, deterministic sorted/capped validation errors, and deterministic `RecursionError` conversion.
 - Hardened file loading to open once, `fstat()` the descriptor before/after, read only `MAX_MANIFEST_BYTES + 1`, and reject practical size/identity races.
 - Preserved exact source/config policy. Updated only reviewed hashes, preflight hash, workflow-embedded preflight hash, and workflow hash. Dependencies and `uv.lock` are unchanged.
@@ -62,17 +65,39 @@ KeyError: 'rule_version'
 
 The production schema and example were then extended minimally to satisfy the new contract.
 
+The final identity review was also test-first. Focused RED runs failed as intended:
+
+```text
+uv run pytest tests/core/test_manifest.py::test_model_snapshots_reject_reserved_alias_components_and_invalid_dates -q
+1 failed
+Failed: DID NOT RAISE ValueError
+
+uv run pytest tests/core/test_manifest.py::test_activation_candidate_rejects_examples_and_placeholders tests/core/test_manifest.py::test_activation_rejects_normalized_revision_markers tests/core/test_manifest.py::test_activation_rejects_field_aware_identity_placeholders -q
+19 failed, 1 passed
+Unresolved revision/fingerprint/artifact/version/hash markers were accepted.
+
+uv run pytest tests/core/test_manifest.py::test_model_input_policy_is_required_content_addressed_and_identity_bound tests/core/test_manifest.py::test_complete_nested_required_sections -q
+11 failed, 64 passed
+KeyError: 'model_input_policy'
+
+uv run pytest 'tests/core/test_manifest.py::test_activation_rejects_normalized_revision_markers[rev-change_me-2026]' -q
+1 failed
+Failed: DID NOT RAISE ValueError
+```
+
+Each focused case passed after its minimal implementation, including adversarial embedded normalized markers and malformed version/artifact identities.
+
 ## Focused GREEN evidence
 
 ```text
 uv run pytest tests/core/test_manifest.py -q
-142 passed in 0.60s
+177 passed in 0.72s
 
 uv run pytest tests/core/test_manifest.py tests/test_package_policy.py -q
-195 passed in 1.63s
+230 passed in 1.76s
 ```
 
-Adversarial coverage includes Pydantic inherited bypass absence, constructor rejection, `TypeAdapter(Manifest)` rejection, no `__dict__`, object-copy safety, canonical round-trip, deliberate `object.__setattr__` tampering caught by revalidation, example activation rejection, moving model aliases, case/duplicate categories, exact Treasury/provider contracts, 1,100-level nesting, 40,000 invalid categories within the byte cap, deterministic key-order-independent errors, capped error output, and simulated descriptor-size race.
+Adversarial coverage includes Pydantic inherited bypass absence, constructor rejection, `TypeAdapter(Manifest)` rejection, no `__dict__`, object-copy safety, canonical round-trip, deliberate `object.__setattr__` tampering caught by revalidation, parser-valid/example-only activation rejection, a valid sanitized activation fixture, reserved alias components under mixed case/separators, impossible snapshot dates, every reviewer-supplied unresolved marker in `expected_revision`, embedded markers, representative fingerprint/artifact/version/hash fields, required model-input policy removals, manifest identity mutation, case/duplicate categories, exact Treasury/provider contracts, 1,100-level nesting, 40,000 invalid categories within the byte cap, deterministic key-order-independent errors, capped error output, and simulated descriptor-size race.
 
 ## Full gate evidence
 
@@ -86,10 +111,10 @@ uv lock --check
 Resolved 55 packages in 1ms
 
 uv sync --frozen --all-groups
-Checked 54 packages in 0.52ms
+Checked 54 packages in 0.53ms
 
 env PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
-327 passed in 1.70s
+362 passed in 1.87s
 
 uv run ruff check .
 All checks passed!
