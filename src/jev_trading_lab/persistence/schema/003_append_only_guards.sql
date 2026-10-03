@@ -100,6 +100,49 @@ CREATE TABLE main.journal_events (
 
 CREATE INDEX main.journal_events_entity_idx ON journal_events(entity_id);
 
+-- CPython cannot mark create_function callbacks SQLITE_INNOCUOUS, so persistent
+-- schema objects cannot call them while trusted_schema=OFF. These equivalent
+-- application-defined collations remain usable with trusted_schema=OFF and fail
+-- closed with "no such collation sequence" on an unsupported raw connection.
+CREATE TRIGGER main.journal_entities_authenticate
+BEFORE INSERT ON journal_entities
+BEGIN
+    SELECT CASE WHEN hex(NEW.canonical_payload)
+        COLLATE jev_is_canonical_json <> 'valid'
+        THEN RAISE(ABORT, 'authentication:payload') END;
+    SELECT CASE WHEN lower(hex(NEW.canonical_payload)) || ':' || NEW.payload_sha256
+        COLLATE jev_sha256 <> 'valid'
+        THEN RAISE(ABORT, 'authentication:hash') END;
+    SELECT CASE WHEN json_array(
+        NEW.run_id,
+        NEW.entity_type,
+        NEW.logical_identity,
+        NEW.created_at_us,
+        NEW.payload_sha256
+    ) COLLATE jev_journal_entity_id <> NEW.entity_id
+        THEN RAISE(ABORT, 'authentication:id') END;
+END;
+
+CREATE TRIGGER main.journal_events_authenticate
+BEFORE INSERT ON journal_events
+BEGIN
+    SELECT CASE WHEN hex(NEW.canonical_payload)
+        COLLATE jev_is_canonical_json <> 'valid'
+        THEN RAISE(ABORT, 'authentication:payload') END;
+    SELECT CASE WHEN lower(hex(NEW.canonical_payload)) || ':' || NEW.payload_sha256
+        COLLATE jev_sha256 <> 'valid'
+        THEN RAISE(ABORT, 'authentication:hash') END;
+    SELECT CASE WHEN json_array(
+        NEW.entity_id,
+        NEW.event_type,
+        NEW.sequence,
+        NEW.occurred_at_us,
+        NEW.payload_sha256,
+        NEW.supersedes_event_id
+    ) COLLATE jev_journal_event_id <> NEW.event_id
+        THEN RAISE(ABORT, 'authentication:id') END;
+END;
+
 CREATE TRIGGER main.journal_events_validate_supersession
 BEFORE INSERT ON journal_events
 WHEN NEW.supersedes_event_id IS NOT NULL
@@ -126,20 +169,11 @@ BEGIN
     SELECT CASE WHEN EXISTS (
         SELECT 1 FROM journal_events AS predecessor
         WHERE predecessor.event_id = NEW.supersedes_event_id
-          AND predecessor.payload_sha256 = NEW.payload_sha256
+          AND (
+              predecessor.payload_sha256 = NEW.payload_sha256
+              OR predecessor.canonical_payload = NEW.canonical_payload
+          )
     ) THEN RAISE(ABORT, 'supersession:payload') END;
-    SELECT CASE WHEN EXISTS (
-        WITH RECURSIVE ancestry(event_id, supersedes_event_id) AS (
-            SELECT event_id, supersedes_event_id
-            FROM journal_events
-            WHERE event_id = NEW.supersedes_event_id
-            UNION
-            SELECT predecessor.event_id, predecessor.supersedes_event_id
-            FROM journal_events AS predecessor
-            JOIN ancestry ON predecessor.event_id = ancestry.supersedes_event_id
-        )
-        SELECT 1 FROM ancestry WHERE event_id = NEW.event_id
-    ) THEN RAISE(ABORT, 'supersession:cycle') END;
 END;
 
 CREATE TRIGGER main.journal_entities_immutable_conflict

@@ -22,6 +22,17 @@ from typer.testing import CliRunner
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
+_REQUIRE_BUILT_ARTIFACTS = os.environ.get("JEV_REQUIRE_BUILT_ARTIFACTS") == "1"
+
+
+def _built_artifacts() -> tuple[Path, Path]:
+    wheels = tuple((ROOT / "dist").glob("*.whl"))
+    sdists = tuple((ROOT / "dist").glob("*.tar.gz"))
+    if len(wheels) != 1 or len(sdists) != 1:
+        if _REQUIRE_BUILT_ARTIFACTS:
+            pytest.fail("exactly one wheel and one sdist are required after build")
+        pytest.skip("build artifacts are inspected after the build gate")
+    return wheels[0], sdists[0]
 
 
 def test_test_process_disables_bytecode_writes() -> None:
@@ -30,10 +41,7 @@ def test_test_process_disables_bytecode_writes() -> None:
 
 def test_calendar_schedule_artifact_is_packaged_in_wheel_and_sdist() -> None:
     artifact = "jev_trading_lab/artifacts/xnys-schedule-2020-2036.json"
-    wheels = tuple((ROOT / "dist").glob("*.whl"))
-    sdists = tuple((ROOT / "dist").glob("*.tar.gz"))
-    if not wheels or not sdists:
-        pytest.skip("build artifacts are inspected after the build gate")
+    wheel, sdist = _built_artifacts()
     newest_source = max(
         (ROOT / relative).stat().st_mtime_ns
         for relative in (
@@ -41,14 +49,13 @@ def test_calendar_schedule_artifact_is_packaged_in_wheel_and_sdist() -> None:
             "src/jev_trading_lab/artifacts/xnys-schedule-2020-2036.json",
         )
     )
-    if (
-        min(wheels[-1].stat().st_mtime_ns, sdists[-1].stat().st_mtime_ns)
-        < newest_source
-    ):
+    if min(wheel.stat().st_mtime_ns, sdist.stat().st_mtime_ns) < newest_source:
+        if _REQUIRE_BUILT_ARTIFACTS:
+            pytest.fail("built wheel or sdist is stale")
         pytest.skip("stale build artifacts are replaced by the build gate")
-    with zipfile.ZipFile(wheels[-1]) as archive:
+    with zipfile.ZipFile(wheel) as archive:
         assert artifact in archive.namelist()
-    with tarfile.open(sdists[-1]) as archive:
+    with tarfile.open(sdist) as archive:
         assert any(name.endswith("/src/" + artifact) for name in archive.getnames())
 
 
@@ -61,10 +68,7 @@ def test_calendar_schedule_artifact_is_packaged_in_wheel_and_sdist() -> None:
     ),
 )
 def test_migration_sql_is_packaged_in_wheel_and_sdist(migration: str) -> None:
-    wheels = tuple((ROOT / "dist").glob("*.whl"))
-    sdists = tuple((ROOT / "dist").glob("*.tar.gz"))
-    if not wheels or not sdists:
-        pytest.skip("build artifacts are inspected after the build gate")
+    wheel, sdist = _built_artifacts()
     newest_source = max(
         (ROOT / relative).stat().st_mtime_ns
         for relative in (
@@ -72,14 +76,13 @@ def test_migration_sql_is_packaged_in_wheel_and_sdist(migration: str) -> None:
             f"src/{migration}",
         )
     )
-    if (
-        min(wheels[-1].stat().st_mtime_ns, sdists[-1].stat().st_mtime_ns)
-        < newest_source
-    ):
+    if min(wheel.stat().st_mtime_ns, sdist.stat().st_mtime_ns) < newest_source:
+        if _REQUIRE_BUILT_ARTIFACTS:
+            pytest.fail("built wheel or sdist is stale")
         pytest.skip("stale build artifacts are replaced by the build gate")
-    with zipfile.ZipFile(wheels[-1]) as archive:
+    with zipfile.ZipFile(wheel) as archive:
         assert migration in archive.namelist()
-    with tarfile.open(sdists[-1]) as archive:
+    with tarfile.open(sdist) as archive:
         assert any(name.endswith("/src/" + migration) for name in archive.getnames())
 
 
@@ -139,7 +142,7 @@ _APPROVED_CONFIG_HASHES = {
 }
 _APPROVED_OPERATIONAL_HASHES = {
     "scripts/wheel_migration_smoke.py": (
-        "cbb3e3ee84bbddd62cd4f0321f5f4675503cf0721c1bd06beaf9d2216c62b4a4"
+        "e86e1baedf82f85d16af36e95a6d303714fc2a7c2b7997d8fc6ce2ba9ed14dc1"
     )
 }
 _APPROVED_SOURCE_HASHES = {
@@ -177,10 +180,13 @@ _APPROVED_SOURCE_HASHES = {
         "b4c2a856b006ee6bde860e8abff04c209915eb420e1c55425805e3e25042d133"
     ),
     "src/jev_trading_lab/persistence/journal.py": (
-        "133d3ef50acc9c2207e696fa6f04faf8dd2c53fd3c32195c039652205a49d03d"
+        "eb24c43d268cc4d399aa567d8928103b146192aac1e9b63a40cd046739d18c3b"
+    ),
+    "src/jev_trading_lab/persistence/journal_sql.py": (
+        "f948ec7a0ecc413082b121f461187a828d1ebea4e9e725081af2316845ba1967"
     ),
     "src/jev_trading_lab/persistence/db.py": (
-        "fd36815c21f9bbb26601b6b898570fa7864a1f6780ccb158345c54809424e93b"
+        "9adfb7e40f1d1be9016e2436f4d9f9c70d502daaf0bdd44fa5d2e6715192bb6f"
     ),
     "src/jev_trading_lab/persistence/migrations.py": (
         "fc574827a634bd4dd2cd7508015b066c7b39982ff56f599bfe0167d9013dd8fb"
@@ -195,7 +201,7 @@ _APPROVED_SOURCE_HASHES = {
         "9026b984313d972dec6c3db8b442e4324f2a7f02ec71bd555c0c17f8ed362c54"
     ),
     "src/jev_trading_lab/persistence/schema/003_append_only_guards.sql": (
-        "c1dac6ccfd4d96c1157f872683473f2f18994416a21447e07387ad882e870aa2"
+        "929b3ee2eafef744d0f457d23b139ef4b1d081e3402c0d9f0fb3ba797dcb1d7f"
     ),
     "src/jev_trading_lab/stocks/__init__.py": (
         "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"
@@ -254,10 +260,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "217d7c50107a0772184eb487e3f4bae26d54b27259bad0a03c1d6e87ddf55016"
+    "1878d3f8f60aa2ae06e8853c8604499119c75af19ca4ceba31260e4da11cdb70"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "3f6d7374cc708fbcdcc3260e3b306c4ba71a9054af1ccd4176b627de8ff9cad0"
+    "df82b6c3d8bf25038cb6c02067e527ef44011d493f928f42c8466af0a5dfd5fe"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = [
     "exchange-calendars==4.11.2",
@@ -688,6 +694,7 @@ def _initialize_approved_source_fixture(tmp_path: Path) -> Path:
         "persistence/__init__.py",
         "persistence/core_repo.py",
         "persistence/journal.py",
+        "persistence/journal_sql.py",
         "persistence/db.py",
         "persistence/migrations.py",
         "persistence/schema/__init__.py",
@@ -1378,12 +1385,51 @@ def test_ci_uses_immutable_actions_and_locked_audit() -> None:
     assert "run: uv build\n" not in workflow
 
 
-def test_ci_builds_before_actual_wheel_migration_smoke() -> None:
+def test_required_artifact_mode_fails_instead_of_skipping_missing_dist(
+    tmp_path: Path,
+) -> None:
+    source = (ROOT / "tests/test_package_policy.py").read_text(encoding="utf-8")
+    source = source.replace(
+        "ROOT = Path(__file__).resolve().parents[1]",
+        f"ROOT = Path({str(tmp_path)!r})",
+        1,
+    )
+    test_file = tmp_path / "test_required_artifacts.py"
+    test_file.write_text(source, encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            str(test_file),
+            "-q",
+            "-k",
+            "calendar_schedule_artifact_is_packaged",
+        ],
+        cwd=ROOT,
+        env={**os.environ, "JEV_REQUIRE_BUILT_ARTIFACTS": "1"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "exactly one wheel and one sdist are required" in result.stdout
+    assert "skipped" not in result.stdout.casefold()
+
+
+def test_ci_builds_before_required_artifact_policy_and_wheel_smoke() -> None:
     workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     build = "run: uv build --no-build-isolation"
+    artifact_policy = (
+        "run: JEV_REQUIRE_BUILT_ARTIFACTS=1 "
+        "uv run pytest tests/test_package_policy.py -q"
+    )
     smoke = "run: uv run python scripts/wheel_migration_smoke.py"
+    assert artifact_policy in workflow
     assert smoke in workflow
-    assert workflow.index(build) < workflow.index(smoke)
+    assert (
+        workflow.index(build) < workflow.index(artifact_policy) < workflow.index(smoke)
+    )
 
     script = ROOT / "scripts/wheel_migration_smoke.py"
     assert script.is_file()
@@ -1519,6 +1565,7 @@ def test_built_artifacts_exclude_repository_and_host_junk(tmp_path: Path) -> Non
         "jev_trading_lab/persistence/core_repo.py",
         "jev_trading_lab/persistence/db.py",
         "jev_trading_lab/persistence/journal.py",
+        "jev_trading_lab/persistence/journal_sql.py",
         "jev_trading_lab/persistence/migrations.py",
         "jev_trading_lab/persistence/schema/__init__.py",
         "jev_trading_lab/persistence/schema/001_migration_metadata.sql",

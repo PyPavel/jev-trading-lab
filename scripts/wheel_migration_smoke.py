@@ -41,6 +41,7 @@ import hashlib
 import sqlite3
 import tempfile
 from pathlib import Path
+from jev_trading_lab.core.ids import canonical_hash, canonical_json_bytes
 from jev_trading_lab.persistence.db import connect_database
 from jev_trading_lab.persistence.migrations import apply_migrations, load_migrations
 
@@ -70,9 +71,48 @@ with tempfile.TemporaryDirectory(prefix="jev-wheel-db-") as temporary:
         assert [tuple(row) for row in rows] == [
             (item.version, item.name, item.sha256) for item in migrations
         ]
+        run_id = "a" * 64
+        manifest_id = "b" * 64
+        window_id = "c" * 64
+        connection.execute(
+            "INSERT INTO manifests VALUES (?,?,?,?)", (manifest_id, b"{}", 1, 1)
+        )
+        connection.execute(
+            "INSERT INTO run_windows VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (window_id, b"{}", 0, 7257600000000, 7257600000001, "XNYS",
+             "America/New_York", "test", "d" * 64, "e" * 64, "test", "f" * 64),
+        )
+        connection.execute(
+            "INSERT INTO runs VALUES (?,?,?,?,?,?,?)",
+            (run_id, manifest_id, window_id, "phase1", "paper", "1" * 64, 1),
+        )
+        payload = canonical_json_bytes({"wheel": True})
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        entity_id = canonical_hash(
+            "journal-entity-v1",
+            {"run_id": run_id, "entity_type": "entity", "logical_identity": "2" * 64,
+             "created_at_us": 1, "payload_sha256": payload_sha256},
+        )
+        connection.execute(
+            "INSERT INTO journal_entities VALUES (?,?,?,?,?,?,?)",
+            (entity_id, run_id, "entity", "2" * 64, 1, payload_sha256, payload),
+        )
+        assert (
+            connection.execute("SELECT jev_sha256(?)", (payload,)).fetchone()[0]
+            == payload_sha256
+        )
+        try:
+            connection.execute(
+                "INSERT INTO journal_entities VALUES (?,?,?,?,?,?,?)",
+                ("3" * 64, run_id, "entity", "4" * 64, 1, "5" * 64, b"not-json"),
+            )
+        except sqlite3.IntegrityError:
+            pass
+        else:
+            raise AssertionError("installed wheel accepted unauthenticated journal row")
     finally:
         connection.close()
-print("Installed-wheel migration smoke passed.")
+print("Installed-wheel migration and journal authentication smoke passed.")
 """
         subprocess.run([str(python), "-I", "-c", code], cwd=outside, check=True)
     return 0

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from jev_trading_lab.core.ids import canonical_hash, canonical_json_bytes
 from jev_trading_lab.core.time import MAX_DATETIME_US, MIN_DATETIME_US
 from jev_trading_lab.persistence.db import SecureConnection
+from jev_trading_lab.persistence.journal_sql import register_journal_sql_functions
 
 _HEX = frozenset("0123456789abcdef")
 _SLUG = re.compile(r"[a-z](?:[a-z0-9]|_(?=[a-z0-9])){0,63}")
@@ -273,7 +274,14 @@ def _reconstruct_event(record: JournalEvent) -> JournalEvent:
 
 
 class AppendOnlyJournal:
-    """Append immutable records with owned transactions and database authority."""
+    """Append immutable records with owned transactions and database authority.
+
+    Supersession is acyclic without graph traversal: each new event may reference
+    only an already persisted predecessor, event primary keys are immutable, and
+    primary/alternate identity conflicts abort before ``INSERT OR REPLACE`` can
+    delete a row. A future event therefore cannot become an ancestor, while a
+    persisted event cannot later gain a back-edge.
+    """
 
     def __init__(
         self,
@@ -458,4 +466,5 @@ __all__ = [
     "JournalRepositoryError",
     "make_journal_entity",
     "make_journal_event",
+    "register_journal_sql_functions",
 ]

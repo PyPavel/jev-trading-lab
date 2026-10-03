@@ -563,6 +563,12 @@ def connect_database(
                 before_fds, file_identity, path, parent_descriptor
             )
             _verify_main_database_path(connection, path)
+            # Lazy import keeps the pure callback module outside db.py's storage layer.
+            from jev_trading_lab.persistence.journal_sql import (
+                register_journal_sql_functions,
+            )
+
+            register_journal_sql_functions(connection)
             _check_directory_entries(path, parent_descriptor)
             _recheck_storage(path, parent_descriptor, parent_identity, file_identity)
             connection.row_factory = sqlite3.Row

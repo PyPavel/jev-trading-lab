@@ -19,7 +19,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Verify policy preflight
-        run: echo "3f6d7374cc708fbcdcc3260e3b306c4ba71a9054af1ccd4176b627de8ff9cad0  scripts/policy_preflight.py" | sha256sum -c -
+        run: echo "df82b6c3d8bf25038cb6c02067e527ef44011d493f928f42c8466af0a5dfd5fe  scripts/policy_preflight.py" | sha256sum -c -
       - name: Run policy preflight before dependency tooling
         run: python3 -I scripts/policy_preflight.py
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
@@ -42,5 +42,6 @@ jobs:
           uv run pip-audit --strict --requirement audit-requirements.txt
           --no-deps --disable-pip
       - run: uv build --no-build-isolation
+      - run: JEV_REQUIRE_BUILT_ARTIFACTS=1 uv run pytest tests/test_package_policy.py -q
       - run: uv run python scripts/wheel_migration_smoke.py
       # Clean-wheel render smoke becomes mandatory when those resources exist.

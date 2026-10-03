@@ -34,7 +34,7 @@ EXPECTED_CONFIG_HASHES = {
 }
 EXPECTED_OPERATIONAL_HASHES = {
     "scripts/wheel_migration_smoke.py": (
-        "cbb3e3ee84bbddd62cd4f0321f5f4675503cf0721c1bd06beaf9d2216c62b4a4"
+        "e86e1baedf82f85d16af36e95a6d303714fc2a7c2b7997d8fc6ce2ba9ed14dc1"
     )
 }
 EXPECTED_SOURCE_HASHES = {
@@ -72,10 +72,13 @@ EXPECTED_SOURCE_HASHES = {
         "b4c2a856b006ee6bde860e8abff04c209915eb420e1c55425805e3e25042d133"
     ),
     "src/jev_trading_lab/persistence/journal.py": (
-        "133d3ef50acc9c2207e696fa6f04faf8dd2c53fd3c32195c039652205a49d03d"
+        "eb24c43d268cc4d399aa567d8928103b146192aac1e9b63a40cd046739d18c3b"
+    ),
+    "src/jev_trading_lab/persistence/journal_sql.py": (
+        "f948ec7a0ecc413082b121f461187a828d1ebea4e9e725081af2316845ba1967"
     ),
     "src/jev_trading_lab/persistence/db.py": (
-        "fd36815c21f9bbb26601b6b898570fa7864a1f6780ccb158345c54809424e93b"
+        "9adfb7e40f1d1be9016e2436f4d9f9c70d502daaf0bdd44fa5d2e6715192bb6f"
     ),
     "src/jev_trading_lab/persistence/migrations.py": (
         "fc574827a634bd4dd2cd7508015b066c7b39982ff56f599bfe0167d9013dd8fb"
@@ -90,7 +93,7 @@ EXPECTED_SOURCE_HASHES = {
         "9026b984313d972dec6c3db8b442e4324f2a7f02ec71bd555c0c17f8ed362c54"
     ),
     "src/jev_trading_lab/persistence/schema/003_append_only_guards.sql": (
-        "c1dac6ccfd4d96c1157f872683473f2f18994416a21447e07387ad882e870aa2"
+        "929b3ee2eafef744d0f457d23b139ef4b1d081e3402c0d9f0fb3ba797dcb1d7f"
     ),
     "src/jev_trading_lab/stocks/__init__.py": (
         "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"
@@ -261,6 +264,7 @@ jobs:
           uv run pip-audit --strict --requirement audit-requirements.txt
           --no-deps --disable-pip
       - run: uv build --no-build-isolation
+      - run: JEV_REQUIRE_BUILT_ARTIFACTS=1 uv run pytest tests/test_package_policy.py -q
       - run: uv run python scripts/wheel_migration_smoke.py
       # Clean-wheel render smoke becomes mandatory when those resources exist.
 '''.encode()
