@@ -2,9 +2,9 @@
 
 ## Status
 
-**PENDING INDEPENDENT RE-REVIEW**
+**FINAL APPROVED / COMPLETE**
 
-Production review fixes are committed through `bc7020190820d2b649aa935c44e009d194cf064c`. No push was performed. Independent spec/adversarial and quality/security re-review remain pending.
+Both required independent reviews approved the current revision at `c3d73e2bb76d7653a325dbd57233074d98b1c1f4`, with zero BLOCKER and zero MAJOR findings. No push was performed.
 
 ## Production commits
 
@@ -165,11 +165,31 @@ scripts/policy_preflight.py a58001d86742b26fca1ec969495529bfa1d0f2ec24aedf582ba9
 .github/workflows/ci.yml a450ccff4f074a2c9ff23196fd064361d48d20397f09f3de59d00aa5398ce1d9
 ```
 
-## Re-review handoff
+## Final independent review verdicts
 
-Required independent re-reviews:
+### Spec and adversarial review: PASS
 
-1. Spec/adversarial re-review of secondary UNIQUE `INSERT OR REPLACE` behavior with recursive triggers off, observation semantic revalidation and stored predecessor authority, secure timeout authority and explicit-mismatch rejection, and complete pre-write PRAGMA drift rejection.
-2. Quality/security re-review of trigger predicates, exact-type reconstruction, write-once/nondeletable timeout state for ordinary callers, strict plain-connection timeout validation, SQL construction, policy hash chain, package artifacts, and all verification gates above.
+The independent spec/adversarial reviewer reported **PASS**, with zero BLOCKER and zero MAJOR findings at `c3d73e2bb76d7653a325dbd57233074d98b1c1f4`. The reviewer verified secondary UNIQUE `INSERT OR REPLACE` rejection with recursive triggers off, observation semantic revalidation and stored predecessor authority, secure timeout authority and explicit-mismatch rejection, complete pre-write PRAGMA drift rejection, and the recorded verification gates.
 
-Current status remains **PENDING INDEPENDENT RE-REVIEW** until both re-reviews report zero blocking findings.
+### Quality and security review: APPROVED
+
+The independent quality/security reviewer reported **APPROVED**, with zero BLOCKER and zero MAJOR findings at `c3d73e2bb76d7653a325dbd57233074d98b1c1f4`. The reviewer verified trigger predicates, exact-type reconstruction, write-once and nondeletable timeout state for ordinary callers, strict plain-connection timeout validation, SQL construction, policy hash chain, package artifacts, and the recorded verification gates.
+
+## Final reviewed commit chain
+
+```text
+24cbbff4e6a45cfd98bef9175eab9bb249b6b452 feat(persistence): add immutable core schema
+27bc43b668fd9eaf2392c5d0c6903d0d43e9f323 docs(delivery): record task 007 evidence
+434f33e280a43653cf7379a01098d5afe9e2809f fix(persistence): enforce immutable core invariants
+a890e3ad1efc2c809c31ea92da7d554e33b60dd0 docs(delivery): update task 007 review evidence
+a490a0b54e18b3fc5c358f63270147821c1e6b04 fix(persistence): close core immutability gaps
+67845b1fb8f364a8afbc1c07996aea0bec599c87 docs(delivery): update task 007 immutability review
+bc7020190820d2b649aa935c44e009d194cf064c fix(persistence): preserve timeout authority
+c3d73e2bb76d7653a325dbd57233074d98b1c1f4 docs(delivery): update task 007 timeout review
+```
+
+The approval evidence commit containing this section follows `c3d73e2bb76d7653a325dbd57233074d98b1c1f4` and changes only `docs/delivery/task-007.md`.
+
+## Final status
+
+**FINAL APPROVED / COMPLETE.** Both required independent reviews report zero BLOCKER and zero MAJOR findings. Task 7 is complete.
