@@ -10,6 +10,7 @@ import json
 import os
 import re
 import stat
+from datetime import date
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self, get_args, get_origin
 
@@ -33,6 +34,21 @@ MAX_VALIDATION_ERRORS = 20
 _SHA256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 _NonEmpty = Annotated[str, StringConstraints(min_length=1)]
 _CREATION_SENTINEL = object()
+_UNRESOLVED_IDENTITY_MARKERS = frozenset(
+    {
+        "changeme",
+        "unknown",
+        "dummy",
+        "fake",
+        "notset",
+        "unset",
+        "replaceme",
+        "xxx",
+        "pending",
+        "sample",
+        "testonly",
+    }
+)
 
 
 def _tuple(value: object) -> object:
@@ -230,6 +246,19 @@ class _ModelContract(_StrictModel):
         return self
 
 
+class _ModelInputPolicyContract(_StrictModel):
+    openai_prompt_template_version: _NonEmpty
+    openai_prompt_template_sha256: _SHA256
+    openai_schema_version: _NonEmpty
+    openai_schema_sha256: _SHA256
+    evidence_delimiter_version: _NonEmpty
+    evidence_delimiter_sha256: _SHA256
+    jev_state_template_version: _NonEmpty
+    jev_state_template_sha256: _SHA256
+    jev_question_set_version: _NonEmpty
+    jev_question_set_sha256: _SHA256
+
+
 class _ModelContracts(_StrictModel):
     openai: _ModelContract
     jev: _ModelContract
@@ -253,8 +282,19 @@ class _ModelContracts(_StrictModel):
         for model, provider, endpoint, snapshot_pattern in expected:
             if (model.provider, model.endpoint) != (provider, endpoint):
                 raise ValueError(f"{provider} provider and endpoint must be exact")
-            if re.fullmatch(snapshot_pattern, model.request_model_snapshot) is None:
+            snapshot = model.request_model_snapshot
+            match = re.fullmatch(snapshot_pattern, snapshot)
+            if match is None:
                 raise ValueError(f"{provider} model must be a dated immutable snapshot")
+            components = set(re.split(r"[^a-z0-9]+", snapshot.casefold()))
+            if components & {"latest", "current", "default"}:
+                raise ValueError(f"{provider} model snapshot contains a reserved alias")
+            try:
+                date.fromisoformat(snapshot[-10:])
+            except ValueError as error:
+                raise ValueError(
+                    f"{provider} model snapshot date must be a real calendar date"
+                ) from error
         return self
 
 
@@ -938,6 +978,7 @@ class _ManifestModel(_StrictModel):
     calendar: _CalendarContract
     accounts: _AccountsContract
     models: _ModelContracts
+    model_input_policy: _ModelInputPolicyContract
     providers: _ProviderContracts
     ai_thresholds: _AiThresholds
     quotas: _Quotas
@@ -1025,6 +1066,10 @@ class Manifest:
         return self._model.models
 
     @property
+    def model_input_policy(self) -> _ModelInputPolicyContract:
+        return self._model.model_input_policy
+
+    @property
     def providers(self) -> _ProviderContracts:
         return self._model.providers
 
@@ -1073,7 +1118,7 @@ class Manifest:
         trusted = revalidate_manifest(self)
         if trusted.run.example_only:
             raise ValueError("example_only manifest cannot be activated")
-        marker = _find_placeholder(trusted.to_dict())
+        marker = _find_identity_placeholder(trusted.to_dict())
         if marker is not None:
             raise ValueError(
                 "activation candidate contains placeholder or unverifiable marker: "
@@ -1110,20 +1155,61 @@ def _format_validation_error(error: ValidationError) -> ValueError:
     return ValueError("manifest validation failed:\n" + "\n".join(messages))
 
 
-def _find_placeholder(root: object) -> str | None:
-    pending = [root]
+def _normalized_marker(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def _has_unresolved_marker(value: str) -> bool:
+    normalized = _normalized_marker(value)
+    components = {
+        _normalized_marker(component)
+        for component in re.split(r"[^a-z0-9]+", value.casefold())
+        if component
+    }
+    return (
+        "example" in normalized
+        or normalized.startswith(("placeholder", "todo", "tbd"))
+        or any(marker in normalized for marker in _UNRESOLVED_IDENTITY_MARKERS)
+        or bool(components & _UNRESOLVED_IDENTITY_MARKERS)
+    )
+
+
+def _is_repeated_hash(value: str) -> bool:
+    return any(value == value[:width] * (64 // width) for width in range(1, 17))
+
+
+def _find_identity_placeholder(root: object) -> str | None:
+    pending: list[tuple[str, object]] = [("", root)]
     while pending:
-        value = pending.pop()
+        path, value = pending.pop()
         if type(value) is dict:
-            pending.extend(value.values())
+            for key, child in value.items():
+                child_path = f"{path}.{key}" if path else key
+                pending.append((child_path, child))
         elif type(value) is list:
-            pending.extend(value)
+            pending.extend(
+                (f"{path}[{index}]", child) for index, child in enumerate(value)
+            )
         elif type(value) is str:
-            folded = value.casefold()
-            if "example" in folded or folded.startswith(("placeholder", "todo", "tbd")):
-                return value
-            if len(value) == 64 and len(set(value)) == 1:
-                return value
+            field = path.rsplit(".", 1)[-1].casefold()
+            identity_field = any(
+                token in field
+                for token in ("revision", "fingerprint", "artifact", "model", "hash")
+            ) or field.endswith("version")
+            if identity_field and _has_unresolved_marker(value):
+                return f"{path} contains placeholder marker {value!r}"
+            if field.endswith("sha256") and _is_repeated_hash(value):
+                return f"{path} contains placeholder repeated hash {value!r}"
+            structured_identity = (
+                field in {"expected_revision", "expected_fingerprint"}
+                or field.endswith("version")
+                or ("artifact" in field and not field.endswith("sha256"))
+            )
+            if (
+                structured_identity
+                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{1,}", value) is None
+            ):
+                return f"{path} contains placeholder or malformed identity {value!r}"
     return None
 
 
@@ -1166,7 +1252,7 @@ def parse_manifest_bytes(data: bytes) -> Manifest:
     canonical = canonical_json_bytes(model.model_dump(mode="json"))
     manifest = Manifest(_CREATION_SENTINEL, canonical, model)
     if not manifest.run.example_only:
-        marker = _find_placeholder(manifest.to_dict())
+        marker = _find_identity_placeholder(manifest.to_dict())
         if marker is not None:
             raise ValueError(
                 "non-example manifest contains placeholder or unverifiable marker: "

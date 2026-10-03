@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -46,6 +47,39 @@ def _delete_path(value: dict[str, Any], path: str) -> None:
         assert isinstance(child, dict)
         target = child
     del target[parts[-1]]
+
+
+def _activation_value() -> dict[str, Any]:
+    value = _example()
+    value["run"]["example_only"] = False
+    value["models"]["openai"].update(
+        sdk_version="1.93.0",
+        expected_revision="rev-20261002-openai-a1",
+        expected_fingerprint="fp_7f4d9a2c18b6e305",
+    )
+    value["models"]["jev"].update(
+        request_model_snapshot="jev-systemone-phase1-2026-10-02",
+        expected_returned_model_id="jev-systemone-phase1-2026-10-02",
+        expected_revision="rev-20261002-jev-b2",
+        expected_fingerprint="fp_5a8e1d7c92f403b6",
+    )
+    value["baselines"]["polymarket_control_artifact_id"] = "poly-control-20261002-a1"
+    value["baselines"]["stock_control_artifact_id"] = "stock-control-20261002-b2"
+
+    def replace_hashes(item: object, path: str = "") -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                child_path = f"{path}.{key}" if path else key
+                if key.endswith("sha256"):
+                    item[key] = hashlib.sha256(child_path.encode()).hexdigest()
+                else:
+                    replace_hashes(child, child_path)
+        elif isinstance(item, list):
+            for index, child in enumerate(item):
+                replace_hashes(child, f"{path}.{index}")
+
+    replace_hashes(value)
+    return value
 
 
 def test_manifest_hash_stable() -> None:
@@ -214,6 +248,17 @@ def test_required_limits_present(path: str, expected: int) -> None:
         "models.openai.expected_fingerprint",
         "models.openai.schema_sha256",
         "models.openai.temperature_micros",
+        "model_input_policy",
+        "model_input_policy.openai_prompt_template_version",
+        "model_input_policy.openai_prompt_template_sha256",
+        "model_input_policy.openai_schema_version",
+        "model_input_policy.openai_schema_sha256",
+        "model_input_policy.evidence_delimiter_version",
+        "model_input_policy.evidence_delimiter_sha256",
+        "model_input_policy.jev_state_template_version",
+        "model_input_policy.jev_state_template_sha256",
+        "model_input_policy.jev_question_set_version",
+        "model_input_policy.jev_question_set_sha256",
         "models.openai.top_p_micros",
         "models.openai.seed",
         "models.openai.tools_enabled",
@@ -514,6 +559,97 @@ def test_activation_candidate_rejects_examples_and_placeholders() -> None:
     with pytest.raises(ValueError, match="placeholder"):
         _parse_value(value)
 
+    candidate = _parse_value(_activation_value())
+    candidate.assert_activation_candidate()
+
+
+@pytest.mark.parametrize(
+    "marker",
+    (
+        "CHANGE_ME",
+        "changeme",
+        "unknown",
+        "dummy",
+        "fake",
+        "not-set",
+        "not_set",
+        "notset",
+        "unset",
+        "replace-me",
+        "xxx",
+        "pending",
+        "sample",
+        "test-only",
+        "rev-change_me-2026",
+    ),
+)
+def test_activation_rejects_normalized_revision_markers(marker: str) -> None:
+    value = _activation_value()
+    value["models"]["openai"]["expected_revision"] = marker
+    with pytest.raises(ValueError, match="expected_revision.*placeholder"):
+        _parse_value(value)
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    (
+        ("models.openai.expected_fingerprint", "RePlAcE_Me"),
+        ("baselines.polymarket_control_artifact_id", "sample"),
+        ("baselines.stock_control_artifact_id", "bad artifact!"),
+        ("baselines.stock_control_artifact_version", "test_only"),
+        ("statistics.power_simulation_version", "bad version!"),
+        ("statistics.power_simulation_sha256", "a" * 64),
+        ("statistics.expected_block_length_artifact_sha256", "deadbeef" * 8),
+    ),
+)
+def test_activation_rejects_field_aware_identity_placeholders(
+    path: str, replacement: str
+) -> None:
+    value = _activation_value()
+    _set_path(value, path, replacement)
+    with pytest.raises(ValueError, match=f"{path}.*placeholder"):
+        _parse_value(value)
+
+
+def test_model_input_policy_is_required_content_addressed_and_identity_bound() -> None:
+    policy = {
+        "openai_prompt_template_version": "phase1-openai-prompt-v1",
+        "openai_prompt_template_sha256": hashlib.sha256(
+            b"openai-prompt-v1"
+        ).hexdigest(),
+        "openai_schema_version": "phase1-openai-schema-v1",
+        "openai_schema_sha256": hashlib.sha256(b"openai-schema-v1").hexdigest(),
+        "evidence_delimiter_version": "phase1-evidence-delimiter-v1",
+        "evidence_delimiter_sha256": hashlib.sha256(
+            b"evidence-delimiter-v1"
+        ).hexdigest(),
+        "jev_state_template_version": "phase1-jev-state-v1",
+        "jev_state_template_sha256": hashlib.sha256(b"jev-state-v1").hexdigest(),
+        "jev_question_set_version": "phase1-jev-questions-v1",
+        "jev_question_set_sha256": hashlib.sha256(b"jev-questions-v1").hexdigest(),
+    }
+    value = _example()
+    assert value["model_input_policy"] == policy
+    original = _parse_value(value)
+
+    for field in policy:
+        missing = _example()
+        del missing["model_input_policy"][field]
+        with pytest.raises(ValueError, match=field):
+            _parse_value(missing)
+
+    changed = _example()
+    changed["model_input_policy"]["jev_question_set_sha256"] = hashlib.sha256(
+        b"changed"
+    ).hexdigest()
+    assert _parse_value(changed).manifest_id != original.manifest_id
+
+    active = _activation_value()
+    _parse_value(active).assert_activation_candidate()
+    active["model_input_policy"]["openai_prompt_template_version"] = "pending"
+    with pytest.raises(ValueError, match="openai_prompt_template_version.*placeholder"):
+        _parse_value(active)
+
 
 def test_required_review_contract_fields_and_exact_design_literals() -> None:
     expected: dict[str, object] = {
@@ -689,6 +825,48 @@ def test_categories_and_model_snapshots_reject_ambiguous_inputs() -> None:
             value["models"][provider]["expected_returned_model_id"] = bad_id
             with pytest.raises(ValueError):
                 _parse_value(value)
+
+
+def test_model_snapshots_reject_reserved_alias_components_and_invalid_dates() -> None:
+    for provider, bad_ids in (
+        (
+            "openai",
+            (
+                "gpt-latest-2026-10-02",
+                "gpt-5-current-preview-2026-10-02",
+                "gpt-5-DEFAULT-2026-10-02",
+                "gpt-5_latest_2026-10-02",
+                "gpt-5-2026-99-99",
+                "gpt-5-2026-02-30",
+            ),
+        ),
+        (
+            "jev",
+            (
+                "jev-latest-2026-10-02",
+                "jev-phase1-current-build-2026-10-02",
+                "jev-DEFAULT-2026-10-02",
+                "jev-phase1.default.2026-10-02",
+                "jev-phase1-2026-99-99",
+                "jev-phase1-2026-02-30",
+            ),
+        ),
+    ):
+        for bad_id in bad_ids:
+            value = _example()
+            value["models"][provider]["request_model_snapshot"] = bad_id
+            value["models"][provider]["expected_returned_model_id"] = bad_id
+            with pytest.raises(ValueError):
+                _parse_value(value)
+
+    for provider, valid_id in (
+        ("openai", "gpt-5-2025-08-07"),
+        ("jev", "jev-systemone-phase1-2026-10-02"),
+    ):
+        value = _example()
+        value["models"][provider]["request_model_snapshot"] = valid_id
+        value["models"][provider]["expected_returned_model_id"] = valid_id
+        _parse_value(value)
 
 
 def test_statistics_information_contract_is_exact() -> None:
