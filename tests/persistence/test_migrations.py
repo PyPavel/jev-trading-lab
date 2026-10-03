@@ -43,6 +43,9 @@ ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_SQL = (
     ROOT / "src/jev_trading_lab/persistence/schema/001_migration_metadata.sql"
 ).read_bytes()
+CORE_SCHEMA_SQL = (
+    ROOT / "src/jev_trading_lab/persistence/schema/002_core_entities.sql"
+).read_bytes()
 
 
 def _package(
@@ -241,23 +244,39 @@ def test_pragma_setup_failure_closes_connection(
         connection.execute("SELECT 1")
 
 
-def test_clean_database_applies_only_migration_metadata(tmp_path: Path) -> None:
+def test_clean_database_applies_full_packaged_prefix(tmp_path: Path) -> None:
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         apply_migrations(connection, clock=lambda: 1_700_000_000_000_000)
-        objects = connection.execute(
-            "SELECT type, name FROM sqlite_schema "
-            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
-        ).fetchall()
-        assert [tuple(row) for row in objects] == [("table", "schema_migrations")]
-        expected_hash = hashlib.sha256(SCHEMA_SQL).hexdigest()
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_schema WHERE type='table'"
+            )
+        }
+        assert tables == {
+            "schema_migrations",
+            "manifests",
+            "run_windows",
+            "runs",
+            "accounts",
+            "opportunities",
+            "observations",
+            "artifact_refs",
+        }
         assert _applied(connection) == [
             (
                 1,
                 "001_migration_metadata.sql",
-                expected_hash,
+                hashlib.sha256(SCHEMA_SQL).hexdigest(),
                 1_700_000_000_000_000,
-            )
+            ),
+            (
+                2,
+                "002_core_entities.sql",
+                hashlib.sha256(CORE_SCHEMA_SQL).hexdigest(),
+                1_700_000_000_000_000,
+            ),
         ]
     finally:
         connection.close()
@@ -268,8 +287,8 @@ def test_repeated_migration_application_is_idempotent(tmp_path: Path) -> None:
     try:
         apply_migrations(connection, clock=lambda: 1_000_000)
         apply_migrations(connection, clock=lambda: 2_000_000)
-        assert len(_applied(connection)) == 1
-        assert _applied(connection)[0][3] == 1_000_000
+        assert len(_applied(connection)) == 2
+        assert [row[3] for row in _applied(connection)] == [1_000_000, 1_000_000]
     finally:
         connection.close()
 
@@ -551,12 +570,16 @@ INSERT INTO policy_words VALUES (
 )
 def test_invalid_applied_migration_chain_rejected(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     versions: list[int],
     match: str,
 ) -> None:
+    package, _schema = _package(
+        tmp_path, monkeypatch, {"001_migration_metadata.sql": SCHEMA_SQL}
+    )
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
-        apply_migrations(connection, clock=lambda: 1_000_000)
+        apply_migrations(connection, package=package, clock=lambda: 1_000_000)
         for version in versions[1:]:
             connection.execute(
                 "INSERT INTO schema_migrations "
@@ -569,7 +592,7 @@ def test_invalid_applied_migration_chain_rejected(
                 ),
             )
         with pytest.raises(MigrationError, match=match):
-            apply_migrations(connection, clock=lambda: 2_000_000)
+            apply_migrations(connection, package=package, clock=lambda: 2_000_000)
     finally:
         connection.close()
 
@@ -610,7 +633,7 @@ def test_concurrent_migration_attempts_serialize(tmp_path: Path) -> None:
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(lambda _index: migrate(), range(2)))
 
-    assert len(results[0]) == 1
+    assert len(results[0]) == 2
     assert results[0] == results[1]
 
 
@@ -826,10 +849,13 @@ def test_temp_schema_migrations_cannot_shadow_main(tmp_path: Path) -> None:
             ).fetchone()[0]
             == 1
         )
-        row = connection.execute(
-            "SELECT version, name FROM main.schema_migrations"
-        ).fetchone()
-        assert tuple(row) == (1, "001_migration_metadata.sql")
+        rows = connection.execute(
+            "SELECT version, name FROM main.schema_migrations ORDER BY version"
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [
+            (1, "001_migration_metadata.sql"),
+            (2, "002_core_entities.sql"),
+        ]
     finally:
         connection.close()
 
@@ -840,7 +866,7 @@ def test_temp_schema_migrations_cannot_shadow_main(tmp_path: Path) -> None:
             reopened.execute("SELECT count(*) FROM main.schema_migrations").fetchone()[
                 0
             ]
-            == 1
+            == 2
         )
     finally:
         reopened.close()

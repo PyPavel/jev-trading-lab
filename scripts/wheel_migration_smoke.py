@@ -45,9 +45,15 @@ from jev_trading_lab.persistence.db import connect_database
 from jev_trading_lab.persistence.migrations import apply_migrations, load_migrations
 
 migrations = load_migrations()
-assert [item.version for item in migrations] == [1]
-assert migrations[0].name == "001_migration_metadata.sql"
-assert migrations[0].sha256 == hashlib.sha256(migrations[0].sql.encode()).hexdigest()
+assert [item.version for item in migrations] == [1, 2]
+assert [item.name for item in migrations] == [
+    "001_migration_metadata.sql",
+    "002_core_entities.sql",
+]
+assert all(
+    item.sha256 == hashlib.sha256(item.sql.encode()).hexdigest()
+    for item in migrations
+)
 with tempfile.TemporaryDirectory(prefix="jev-wheel-db-") as temporary:
     database = Path(temporary).resolve() / "private" / "lab.sqlite3"
     connection = connect_database(
@@ -57,10 +63,12 @@ with tempfile.TemporaryDirectory(prefix="jev-wheel-db-") as temporary:
     )
     try:
         apply_migrations(connection, clock=lambda: 1_700_000_000_000_000)
-        row = connection.execute(
-            "SELECT version, name, sha256 FROM main.schema_migrations"
-        ).fetchone()
-        assert tuple(row) == (1, migrations[0].name, migrations[0].sha256)
+        rows = connection.execute(
+            "SELECT version, name, sha256 FROM main.schema_migrations ORDER BY version"
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [
+            (item.version, item.name, item.sha256) for item in migrations
+        ]
     finally:
         connection.close()
 print("Installed-wheel migration smoke passed.")

@@ -589,7 +589,6 @@ def _migration_authorizer(
         sqlite3.SQLITE_ANALYZE,
         sqlite3.SQLITE_ATTACH,
         sqlite3.SQLITE_DETACH,
-        sqlite3.SQLITE_REINDEX,
     }:
         return sqlite3.SQLITE_DENY
     if action in _TEMP_ACTIONS:
