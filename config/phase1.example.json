@@ -14,9 +14,9 @@
     "maturation_trading_days": 10,
     "tm_rule": "tenth_nyse_session_strictly_after_e_plus_30_calendar_days",
     "tm_rule_version": "phase1-v1",
-    "package_sha256": "00b8672b567d52ff81ebfb0e9be8b3932f343de98496b65bbda4ee48540a2d36",
-    "content_sha256": "729be049d61d2d1e2f86d1b6805ff09a1becbf86c68228d68480d95ff9b5073c",
-    "tm_rule_sha256": "8f827b89de3ed73872c9935f4c3efb619b9fb922e47cc1009ef0820ce7597186"
+    "tm_rule_sha256": "8f827b89de3ed73872c9935f4c3efb619b9fb922e47cc1009ef0820ce7597186",
+    "lock_sha256": "4535dbd779b3c903f57235bb5f3a5c5ce12e3bf13f1b8e01da0576f97df212ac",
+    "artifact_sha256": "ade5009ba938836a5d17e298b0e704fc3635b8b1eef329ba4b43cba5c40fc978"
   },
   "accounts": {
     "currency": "USD",
@@ -194,12 +194,12 @@
     "nyse_calendar": {
       "source_name": "exchange-calendars",
       "endpoint": "python:exchange_calendars:XNYS",
-      "timestamp_semantics": "pinned_package_session_schedule",
+      "timestamp_semantics": "frozen_schedule_artifact",
       "precedence": 1,
       "validation": "phase1_xnys_calendar_v1",
       "fallback_enabled": false,
       "contract_version": "phase1-provider-contract-v1",
-      "contract_sha256": "b9a7e118387a8068087436e74ab485c7ffa15d190402dbd24b15bc3d738d6fa3"
+      "contract_sha256": "00f61dc45391e95fa63ef37ec1792f3c945f3c298608744a383ccfa280599281"
     },
     "stock_spread_model": {
       "source_name": "Frozen Phase-1 spread model",

@@ -71,7 +71,12 @@ def _activation_value() -> dict[str, Any]:
         if isinstance(item, dict):
             for key, child in item.items():
                 child_path = f"{path}.{key}" if path else key
-                if key.endswith("sha256"):
+                if key.endswith("sha256") and child_path not in {
+                    "calendar.lock_sha256",
+                    "calendar.artifact_sha256",
+                    "calendar.tm_rule_sha256",
+                    "providers.nyse_calendar.contract_sha256",
+                }:
                     item[key] = hashlib.sha256(child_path.encode()).hexdigest()
                 else:
                     replace_hashes(child, child_path)
@@ -876,11 +881,11 @@ def test_model_input_policy_is_required_content_addressed_and_identity_bound() -
 
 def test_required_review_contract_fields_and_exact_design_literals() -> None:
     expected: dict[str, object] = {
-        "calendar.package_sha256": (
-            "00b8672b567d52ff81ebfb0e9be8b3932f343de98496b65bbda4ee48540a2d36"
+        "calendar.lock_sha256": (
+            "4535dbd779b3c903f57235bb5f3a5c5ce12e3bf13f1b8e01da0576f97df212ac"
         ),
-        "calendar.content_sha256": (
-            "729be049d61d2d1e2f86d1b6805ff09a1becbf86c68228d68480d95ff9b5073c"
+        "calendar.artifact_sha256": (
+            "ade5009ba938836a5d17e298b0e704fc3635b8b1eef329ba4b43cba5c40fc978"
         ),
         "calendar.tm_rule_sha256": (
             "8f827b89de3ed73872c9935f4c3efb619b9fb922e47cc1009ef0820ce7597186"
@@ -993,6 +998,20 @@ def test_required_review_contract_fields_and_exact_design_literals() -> None:
             _parse_value(changed)
 
     assert value == _example()
+
+
+def test_nyse_provider_contract_version_is_exact_independent_of_hash() -> None:
+    value = _example()
+    value["providers"]["nyse_calendar"]["contract_version"] = (
+        "phase1-provider-contract-v2"
+    )
+    with pytest.raises(ValueError, match="provider contract version"):
+        _parse_value(value)
+
+    value = _example()
+    value["providers"]["nyse_calendar"]["contract_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="provider contract hash"):
+        _parse_value(value)
 
 
 def test_provider_contracts_are_exact_and_sec_evidence_is_complete() -> None:

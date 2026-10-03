@@ -59,6 +59,7 @@ include = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/jev_trading_lab"]
 include = [
+    "src/jev_trading_lab/artifacts/*.json",
     "src/jev_trading_lab/**/*.sql",
     "src/jev_trading_lab/templates/**/*",
 ]

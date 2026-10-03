@@ -19,6 +19,7 @@ EXPECTED_SOURCE_DIRS = frozenset(
     {
         "src",
         "src/jev_trading_lab",
+        "src/jev_trading_lab/artifacts",
         "src/jev_trading_lab/core",
         "src/jev_trading_lab/stocks",
     }
@@ -26,10 +27,13 @@ EXPECTED_SOURCE_DIRS = frozenset(
 EXPECTED_CONFIG_DIRS = frozenset({"config"})
 EXPECTED_CONFIG_HASHES = {
     "config/phase1.example.json": (
-        "a38c7ec9dcd6bcdea1044d5bdac282febbec3a29c6b1624456dac18e30b5178e"
+        "091c49428f15eb99fcea3a54b444b9fde929681e5ddfeaaadc4d4ebfa94438db"
     )
 }
 EXPECTED_SOURCE_HASHES = {
+    "src/jev_trading_lab/artifacts/xnys-schedule-2020-2036.json": (
+        "ade5009ba938836a5d17e298b0e704fc3635b8b1eef329ba4b43cba5c40fc978"
+    ),
     "src/jev_trading_lab/__init__.py": (
         "583ff05fc923ac30ef5cd0e9c44271e53746a65e312f53f112ec1b49e827647b"
     ),
@@ -40,10 +44,10 @@ EXPECTED_SOURCE_HASHES = {
         "0e73742a406e112f269e7b8d5fd205c448eb4fbf49541cab3c669bf7b4dc0dd4"
     ),
     "src/jev_trading_lab/core/manifest.py": (
-        "5ab6afa23825f47ea45cc6e7d63b8d6d878d4bf9a96e119ee564ff32c01004fd"
+        "43c98f3eb07039c7ad6581dd23a533e60e078e65c3e24d6963f686c8f6ff70ba"
     ),
     "src/jev_trading_lab/core/run_window.py": (
-        "b99e380c5a593acf7c9039796da92651a797328e095c74c748f39bf09d5de6ca"
+        "f90c328655cec51fafcb9850f8a9a8ccecf24f78398ff746814118614e277e51"
     ),
     "src/jev_trading_lab/core/observations.py": (
         "dbad9fa1099b527a640e68fc105641757ef2ef2fd68a504e208dda06958391ec"
@@ -58,7 +62,7 @@ EXPECTED_SOURCE_HASHES = {
         "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"
     ),
     "src/jev_trading_lab/stocks/calendar.py": (
-        "00d21c5bcb58293ab66710dbf06d4ae8668a005a8aa2201808950a23ed8e5d03"
+        "9536ea64aba216d7afcea434ba1e73634eca501095e72229797b45b8e2fed453"
     ),
 }
 EXPECTED_PROJECT = {
@@ -118,6 +122,7 @@ EXPECTED_TOOL = {
                 "wheel": {
                     "packages": ["src/jev_trading_lab"],
                     "include": [
+                        "src/jev_trading_lab/artifacts/*.json",
                         "src/jev_trading_lab/**/*.sql",
                         "src/jev_trading_lab/templates/**/*",
                     ],

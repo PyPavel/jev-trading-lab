@@ -185,8 +185,8 @@ class _RunContract(_StrictModel):
 class _CalendarContract(_StrictModel):
     exchange: Literal["NYSE"]
     exchange_calendars_version: _NonEmpty
-    package_sha256: _SHA256
-    content_sha256: _SHA256
+    lock_sha256: _SHA256
+    artifact_sha256: _SHA256
     timezone: Literal["America/New_York"]
     enrollment_weeks: Literal[12]
     maturation_calendar_days: Literal[30]
@@ -356,7 +356,7 @@ _TimestampSemantics = Literal[
     "observation_date_and_first_successful_retrieval_utc",
     "accepted_timestamp_and_first_successful_retrieval_utc",
     "original_publication_and_first_successful_retrieval_utc",
-    "pinned_package_session_schedule",
+    "frozen_schedule_artifact",
     "registration_time_artifact",
     "not_applicable",
 ]
@@ -540,7 +540,7 @@ class _ProviderContracts(_StrictModel):
                 self.nyse_calendar,
                 "exchange-calendars",
                 "python:exchange_calendars:XNYS",
-                "pinned_package_session_schedule",
+                "frozen_schedule_artifact",
                 1,
                 "phase1_xnys_calendar_v1",
                 False,
@@ -579,6 +579,15 @@ class _ProviderContracts(_StrictModel):
                     "provider source/endpoint/timestamp/precedence/validation/"
                     "fallback contract must be exact"
                 )
+        from jev_trading_lab.stocks.calendar import (
+            PROVIDER_CONTRACT_SHA256,
+            PROVIDER_CONTRACT_VERSION,
+        )
+
+        if self.nyse_calendar.contract_version != PROVIDER_CONTRACT_VERSION:
+            raise ValueError("NYSE provider contract version must be exact")
+        if self.nyse_calendar.contract_sha256 != PROVIDER_CONTRACT_SHA256:
+            raise ValueError("NYSE provider contract hash must be exact")
         if self.sec_evidence.endpoints != (
             "https://data.sec.gov/submissions/CIK##########.json",
             "https://www.sec.gov/Archives/edgar/data/{cik}/{accession_no_dashes}/{primary_document}",

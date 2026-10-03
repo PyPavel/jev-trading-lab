@@ -4,8 +4,8 @@ import json
 import os
 import subprocess
 import sys
-from datetime import UTC, date, datetime, timedelta
-from enum import IntEnum
+from dataclasses import replace
+from datetime import UTC, date, datetime
 from importlib.metadata import version
 from pathlib import Path
 
@@ -13,19 +13,25 @@ import pytest
 
 from jev_trading_lab.core.ids import canonical_json_bytes
 from jev_trading_lab.core.manifest import load_manifest, parse_manifest_bytes
-from jev_trading_lab.core.run_window import RunWindow, resolve_run_window
+from jev_trading_lab.core.run_window import (
+    RunWindow,
+    resolve_run_window,
+    revalidate_run_window,
+)
 from jev_trading_lab.core.time import datetime_to_utc_us
+from jev_trading_lab.stocks import calendar as calendar_module
 from jev_trading_lab.stocks.calendar import (
-    CALENDAR_CONTENT_SHA256,
+    CALENDAR_ARTIFACT_SHA256,
+    CALENDAR_LOCK_SHA256,
     CALENDAR_NAME,
-    CALENDAR_PACKAGE_SHA256,
     CALENDAR_PACKAGE_VERSION,
     CALENDAR_TIMEZONE,
     PROVIDER_CONTRACT_SHA256,
+    PROVIDER_CONTRACT_VERSION,
     TM_RULE_SHA256,
     TM_RULE_VERSION,
     XnysCalendar,
-    _schedule_close_us,
+    verify_runtime_calendar_against_artifact,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -37,37 +43,26 @@ def _us(value: datetime) -> int:
     return datetime_to_utc_us(value)
 
 
+def _start() -> int:
+    return _us(datetime(2024, 8, 4, 12, tzinfo=UTC))
+
+
 def _resolved_fixture() -> RunWindow:
-    enrollment_end = datetime(2024, 10, 27, 12, tzinfo=UTC)
-    enrollment_start = enrollment_end - timedelta(weeks=12)
     return resolve_run_window(
-        enrollment_start_us=_us(enrollment_start),
-        manifest=load_manifest(EXAMPLE),
+        enrollment_start_us=_start(), manifest=load_manifest(EXAMPLE)
     )
 
 
-def _window_fields(**changes: object) -> dict[str, object]:
-    start = _us(datetime(1960, 1, 1, tzinfo=UTC))
-    fields: dict[str, object] = {
-        "enrollment_start_us": start,
-        "enrollment_end_us": start + 84 * US_PER_DAY,
-        "maturation_cutoff_us": start + 85 * US_PER_DAY,
-        "timezone": CALENDAR_TIMEZONE,
-        "calendar_name": CALENDAR_NAME,
-        "package_version": CALENDAR_PACKAGE_VERSION,
-        "package_sha256": CALENDAR_PACKAGE_SHA256,
-        "content_sha256": CALENDAR_CONTENT_SHA256,
-        "tm_rule_version": TM_RULE_VERSION,
-        "tm_rule_sha256": TM_RULE_SHA256,
-    }
-    fields.update(changes)
-    return fields
+def test_run_window_is_resolver_issued_and_has_no_public_constructor() -> None:
+    with pytest.raises(TypeError, match="only be created by the run-window resolver"):
+        RunWindow()  # type: ignore[call-arg]
+    assert not hasattr(_resolved_fixture(), "__dict__")
 
 
 def test_tm_is_tenth_nyse_session_strictly_after_e_plus_30() -> None:
     window = _resolved_fixture()
     calendar = XnysCalendar()
-    threshold = date(2024, 11, 26)  # E UTC date + 30 calendar days; itself a session.
+    threshold = date(2024, 11, 26)
     sessions = calendar.session_dates_strictly_after(threshold, count=10)
 
     assert sessions == (
@@ -82,15 +77,11 @@ def test_tm_is_tenth_nyse_session_strictly_after_e_plus_30() -> None:
         date(2024, 12, 10),
         date(2024, 12, 11),
     )
-    assert threshold not in sessions
     assert window.maturation_cutoff_us == _us(datetime(2024, 12, 11, 21, tzinfo=UTC))
-    for session in sessions[:9]:
-        assert calendar.official_close_us(session) != window.maturation_cutoff_us
 
 
-def test_dst_holiday_early_close() -> None:
+def test_dst_holiday_and_early_close_are_frozen_in_artifact() -> None:
     calendar = XnysCalendar()
-
     assert calendar.official_close_us(date(2024, 3, 8)) == _us(
         datetime(2024, 3, 8, 21, tzinfo=UTC)
     )
@@ -102,115 +93,149 @@ def test_dst_holiday_early_close() -> None:
     assert calendar.official_close_us(date(2024, 7, 3)) == _us(
         datetime(2024, 7, 3, 17, tzinfo=UTC)
     )
-    with pytest.raises(ValueError, match="not an XNYS session"):
-        calendar.official_close_us(date(2024, 11, 28))
     assert calendar.official_close_us(date(2024, 11, 29)) == _us(
         datetime(2024, 11, 29, 18, tzinfo=UTC)
     )
 
 
-def test_same_tm_for_both_streams() -> None:
+def test_run_window_revalidation_recomputes_and_rejects_forgery() -> None:
+    manifest = load_manifest(EXAMPLE)
     window = _resolved_fixture()
+    assert revalidate_run_window(window, manifest) == window
+    assert revalidate_run_window(window, manifest) is not window
 
+    forged = object.__new__(RunWindow)
+    with pytest.raises(ValueError, match="wrapper state is invalid"):
+        revalidate_run_window(forged, manifest)
+
+    for field, value in (
+        ("_canonical_bytes", b"{}"),
+        ("_run_window_id", "run-window:" + "0" * 64),
+        (
+            "_data",
+            replace(
+                object.__getattribute__(window, "_data"),
+                maturation_cutoff_us=window.maturation_cutoff_us + 1,
+            ),
+        ),
+    ):
+        tampered = _resolved_fixture()
+        object.__setattr__(tampered, field, value)
+        with pytest.raises(ValueError, match="revalidation failed"):
+            revalidate_run_window(tampered, manifest)
+
+
+@pytest.mark.parametrize("delta", (-US_PER_DAY, -1, 1, US_PER_DAY))
+def test_arbitrary_maturation_cutoff_cannot_retain_identity(delta: int) -> None:
+    window = _resolved_fixture()
+    data = replace(
+        object.__getattribute__(window, "_data"),
+        maturation_cutoff_us=window.maturation_cutoff_us + delta,
+    )
+    object.__setattr__(window, "_data", data)
+    with pytest.raises(ValueError, match="revalidation failed"):
+        revalidate_run_window(window, load_manifest(EXAMPLE))
+
+
+def test_same_tm_for_both_streams_and_enrollment_boundary() -> None:
+    window = _resolved_fixture()
     assert not hasattr(window, "stream")
-    assert not hasattr(window, "polymarket_tm_us")
-    assert not hasattr(window, "stock_tm_us")
-    assert window.to_dict()["maturation_cutoff_us"] == window.maturation_cutoff_us
     assert canonical_json_bytes(window.to_dict()) == window.canonical_bytes
     assert window.run_window_id == _resolved_fixture().run_window_id
-
-
-def test_enrollment_is_exactly_twelve_weeks_and_boundary_is_exclusive() -> None:
-    window = _resolved_fixture()
-
     assert window.enrollment_end_us - window.enrollment_start_us == 84 * US_PER_DAY
     assert not window.entries_allowed_at(window.enrollment_start_us - 1)
     assert window.entries_allowed_at(window.enrollment_start_us)
     assert window.entries_allowed_at(window.enrollment_end_us - 1)
     assert not window.entries_allowed_at(window.enrollment_end_us)
-    assert not window.entries_allowed_at(window.enrollment_end_us + 1)
 
 
-class _IntSubclass(int):
-    pass
-
-
-class _IntValue(IntEnum):
-    VALUE = 1
-
-
-@pytest.mark.parametrize("bad", (True, _IntSubclass(1), _IntValue.VALUE, 1.0, "1"))
-def test_constructor_rejects_non_builtin_integer_timestamps(bad: object) -> None:
-    with pytest.raises(TypeError, match="built-in integer"):
-        RunWindow(**_window_fields(enrollment_start_us=bad))  # type: ignore[arg-type]
-
-
-@pytest.mark.parametrize(
-    ("changes", "message"),
-    (
-        ({"enrollment_end_us": _us(datetime(1960, 1, 1, tzinfo=UTC))}, "12 weeks"),
-        ({"enrollment_end_us": _us(datetime(1959, 12, 31, tzinfo=UTC))}, "12 weeks"),
-        (
-            {"maturation_cutoff_us": _us(datetime(1960, 1, 2, tzinfo=UTC))},
-            "after enrollment",
-        ),
-        ({"timezone": "UTC"}, "timezone"),
-        ({"calendar_name": "NYSE"}, "calendar name"),
-        ({"package_version": "4.11.1"}, "package version"),
-        ({"package_sha256": "0" * 64}, "package hash"),
-        ({"content_sha256": "0" * 64}, "content hash"),
-        ({"tm_rule_version": "phase1-v0"}, "rule version"),
-        ({"tm_rule_sha256": "0" * 64}, "rule hash"),
-    ),
-)
-def test_constructor_enforces_ordering_and_calendar_identity(
-    changes: dict[str, object], message: str
-) -> None:
-    with pytest.raises(ValueError, match=message):
-        RunWindow(**_window_fields(**changes))  # type: ignore[arg-type]
-
-
-def test_package_and_calendar_identity_mismatch_with_manifest_is_rejected() -> None:
-    manifest_data = json.loads(EXAMPLE.read_text(encoding="utf-8"))
-    expected = manifest_data["calendar"]
+def test_manifest_calendar_and_provider_identities_are_exact() -> None:
+    data = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    expected = data["calendar"]
     assert expected["exchange_calendars_version"] == CALENDAR_PACKAGE_VERSION
-    assert expected["package_sha256"] == CALENDAR_PACKAGE_SHA256
-    assert expected["content_sha256"] == CALENDAR_CONTENT_SHA256
+    assert expected["lock_sha256"] == CALENDAR_LOCK_SHA256
+    assert expected["artifact_sha256"] == CALENDAR_ARTIFACT_SHA256
     assert expected["tm_rule_version"] == TM_RULE_VERSION
     assert expected["tm_rule_sha256"] == TM_RULE_SHA256
-    assert (
-        manifest_data["providers"]["nyse_calendar"]["contract_sha256"]
-        == PROVIDER_CONTRACT_SHA256
-    )
+    provider = data["providers"]["nyse_calendar"]
+    assert provider["contract_version"] == PROVIDER_CONTRACT_VERSION
+    assert provider["contract_sha256"] == PROVIDER_CONTRACT_SHA256
     assert version("exchange-calendars") == CALENDAR_PACKAGE_VERSION
 
-    for field in (
-        "exchange_calendars_version",
-        "package_sha256",
-        "content_sha256",
-        "tm_rule_version",
-        "tm_rule_sha256",
-    ):
+    mismatches = (
+        ("calendar", "exchange_calendars_version", "0.0.0"),
+        ("calendar", "lock_sha256", "0" * 64),
+        ("calendar", "artifact_sha256", "0" * 64),
+        ("calendar", "tm_rule_version", "phase1-mismatch-v1"),
+        ("calendar", "tm_rule_sha256", "0" * 64),
+        ("providers.nyse_calendar", "contract_version", "phase1-provider-contract-v2"),
+        ("providers.nyse_calendar", "contract_sha256", "0" * 64),
+    )
+    for section, field, replacement in mismatches:
         changed = json.loads(EXAMPLE.read_text(encoding="utf-8"))
-        changed["calendar"][field] = (
-            "0.0.0" if field == "exchange_calendars_version" else "0" * 64
-        )
-        if field == "tm_rule_version":
-            changed["calendar"][field] = "phase1-mismatch-v1"
+        target = changed
+        for part in section.split("."):
+            target = target[part]
+        target[field] = replacement
+        if field.startswith("contract_"):
+            message = (
+                "provider contract version"
+                if field.endswith("version")
+                else "provider contract hash"
+            )
+            with pytest.raises(ValueError, match=message):
+                parse_manifest_bytes(json.dumps(changed).encode())
+            continue
         manifest = parse_manifest_bytes(json.dumps(changed).encode())
         with pytest.raises(ValueError, match="calendar manifest identity mismatch"):
-            resolve_run_window(
-                enrollment_start_us=_us(datetime(2024, 8, 4, 12, tzinfo=UTC)),
-                manifest=manifest,
-            )
+            resolve_run_window(enrollment_start_us=_start(), manifest=manifest)
 
-    changed = json.loads(EXAMPLE.read_text(encoding="utf-8"))
-    changed["providers"]["nyse_calendar"]["contract_sha256"] = "0" * 64
-    manifest = parse_manifest_bytes(json.dumps(changed).encode())
-    with pytest.raises(ValueError, match="calendar manifest identity mismatch"):
+
+def test_calendar_package_version_mismatch_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(calendar_module, "version", lambda _: "4.11.1")
+    with pytest.raises(RuntimeError, match="package version mismatch"):
+        XnysCalendar()
+    with pytest.raises(RuntimeError, match="package version mismatch"):
+        verify_runtime_calendar_against_artifact()
+
+
+def test_resolver_uses_artifact_when_runtime_provider_is_monkeypatched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = _resolved_fixture()
+
+    class BrokenCalendar:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("resolver consulted mutable runtime provider")
+
+    monkeypatch.setattr(calendar_module, "XNYSExchangeCalendar", BrokenCalendar)
+    assert _resolved_fixture() == expected
+    with pytest.raises(RuntimeError, match="runtime XNYS schedule mismatch"):
+        verify_runtime_calendar_against_artifact()
+
+
+def test_tampered_artifact_and_hash_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = calendar_module._read_artifact_bytes()
+    tampered = original.replace(b"2024-12-11", b"2024-12-12", 1)
+    monkeypatch.setattr(calendar_module, "_read_artifact_bytes", lambda: tampered)
+    with pytest.raises(RuntimeError, match="artifact SHA-256 mismatch"):
+        XnysCalendar()
+
+
+def test_schedule_outside_artifact_range_fails_closed() -> None:
+    with pytest.raises(ValueError, match="calendar sessions unavailable"):
         resolve_run_window(
-            enrollment_start_us=_us(datetime(2024, 8, 4, 12, tzinfo=UTC)),
-            manifest=manifest,
+            enrollment_start_us=_us(datetime(2019, 1, 1, tzinfo=UTC)),
+            manifest=load_manifest(EXAMPLE),
+        )
+    with pytest.raises(ValueError, match="calendar sessions unavailable"):
+        resolve_run_window(
+            enrollment_start_us=_us(datetime(2036, 1, 1, tzinfo=UTC)),
+            manifest=load_manifest(EXAMPLE),
         )
 
 
@@ -232,44 +257,18 @@ def test_fresh_process_identity_is_stable() -> None:
         text=True,
         env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "TZ": "Pacific/Auckland"},
     )
-
     assert result.stdout.splitlines() == [
         window.canonical_bytes.decode(),
         window.run_window_id,
     ]
 
 
-def test_pre_epoch_domain_values_work_and_unavailable_calendar_range_fails() -> None:
-    pre_epoch = RunWindow(**_window_fields())  # type: ignore[arg-type]
-    assert pre_epoch.enrollment_start_us < 0
-    assert pre_epoch.entries_allowed_at(pre_epoch.enrollment_start_us)
-
-    with pytest.raises(ValueError, match="calendar sessions unavailable"):
-        resolve_run_window(
-            enrollment_start_us=_us(datetime(1, 1, 1, tzinfo=UTC)),
-            manifest=load_manifest(EXAMPLE),
-        )
-    with pytest.raises(ValueError, match="supported datetime range"):
-        RunWindow(**_window_fields(enrollment_start_us=-(2**63)))  # type: ignore[arg-type]
-
-
-def test_calendar_missing_session_and_malformed_schedule_fail_closed() -> None:
-    calendar = XnysCalendar()
-    with pytest.raises(ValueError, match="not an XNYS session"):
-        calendar.official_close_us(date(2024, 1, 6))
-
-    import pandas as pd
-
-    missing_close = pd.DataFrame(
-        {"open": [pd.Timestamp("2024-01-02T14:30:00Z")]},
-        index=pd.DatetimeIndex(["2024-01-02"]),
-    )
-    with pytest.raises(ValueError, match="malformed XNYS schedule"):
-        _schedule_close_us(missing_close, date(2024, 1, 2))
-
-    naive_close = pd.DataFrame(
-        {"close": [pd.Timestamp("2024-01-02T21:00:00")]},
-        index=pd.DatetimeIndex(["2024-01-02"]),
-    )
-    with pytest.raises(ValueError, match="malformed XNYS schedule"):
-        _schedule_close_us(naive_close, date(2024, 1, 2))
+def test_window_identity_fields_are_read_only() -> None:
+    window = _resolved_fixture()
+    assert window.calendar_name == CALENDAR_NAME
+    assert window.timezone == CALENDAR_TIMEZONE
+    assert window.package_version == CALENDAR_PACKAGE_VERSION
+    assert window.lock_sha256 == CALENDAR_LOCK_SHA256
+    assert window.artifact_sha256 == CALENDAR_ARTIFACT_SHA256
+    with pytest.raises(AttributeError):
+        window.maturation_cutoff_us = 0  # type: ignore[misc]

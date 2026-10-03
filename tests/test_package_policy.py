@@ -28,6 +28,30 @@ def test_test_process_disables_bytecode_writes() -> None:
     assert sys.dont_write_bytecode
 
 
+def test_calendar_schedule_artifact_is_packaged_in_wheel_and_sdist() -> None:
+    artifact = "jev_trading_lab/artifacts/xnys-schedule-2020-2036.json"
+    wheels = tuple((ROOT / "dist").glob("*.whl"))
+    sdists = tuple((ROOT / "dist").glob("*.tar.gz"))
+    if not wheels or not sdists:
+        pytest.skip("build artifacts are inspected after the build gate")
+    newest_source = max(
+        (ROOT / relative).stat().st_mtime_ns
+        for relative in (
+            "pyproject.toml",
+            "src/jev_trading_lab/artifacts/xnys-schedule-2020-2036.json",
+        )
+    )
+    if (
+        min(wheels[-1].stat().st_mtime_ns, sdists[-1].stat().st_mtime_ns)
+        < newest_source
+    ):
+        pytest.skip("stale build artifacts are replaced by the build gate")
+    with zipfile.ZipFile(wheels[-1]) as archive:
+        assert artifact in archive.namelist()
+    with tarfile.open(sdists[-1]) as archive:
+        assert any(name.endswith("/src/" + artifact) for name in archive.getnames())
+
+
 def test_package_imports() -> None:
     sys.path.insert(0, str(SRC))
     try:
@@ -69,6 +93,7 @@ _APPROVED_SOURCE_DIRS = frozenset(
     {
         "src",
         "src/jev_trading_lab",
+        "src/jev_trading_lab/artifacts",
         "src/jev_trading_lab/core",
         "src/jev_trading_lab/stocks",
     }
@@ -76,10 +101,13 @@ _APPROVED_SOURCE_DIRS = frozenset(
 _APPROVED_CONFIG_DIRS = frozenset({"config"})
 _APPROVED_CONFIG_HASHES = {
     "config/phase1.example.json": (
-        "a38c7ec9dcd6bcdea1044d5bdac282febbec3a29c6b1624456dac18e30b5178e"
+        "091c49428f15eb99fcea3a54b444b9fde929681e5ddfeaaadc4d4ebfa94438db"
     )
 }
 _APPROVED_SOURCE_HASHES = {
+    "src/jev_trading_lab/artifacts/xnys-schedule-2020-2036.json": (
+        "ade5009ba938836a5d17e298b0e704fc3635b8b1eef329ba4b43cba5c40fc978"
+    ),
     "src/jev_trading_lab/__init__.py": (
         "583ff05fc923ac30ef5cd0e9c44271e53746a65e312f53f112ec1b49e827647b"
     ),
@@ -90,10 +118,10 @@ _APPROVED_SOURCE_HASHES = {
         "0e73742a406e112f269e7b8d5fd205c448eb4fbf49541cab3c669bf7b4dc0dd4"
     ),
     "src/jev_trading_lab/core/manifest.py": (
-        "5ab6afa23825f47ea45cc6e7d63b8d6d878d4bf9a96e119ee564ff32c01004fd"
+        "43c98f3eb07039c7ad6581dd23a533e60e078e65c3e24d6963f686c8f6ff70ba"
     ),
     "src/jev_trading_lab/core/run_window.py": (
-        "b99e380c5a593acf7c9039796da92651a797328e095c74c748f39bf09d5de6ca"
+        "f90c328655cec51fafcb9850f8a9a8ccecf24f78398ff746814118614e277e51"
     ),
     "src/jev_trading_lab/core/observations.py": (
         "dbad9fa1099b527a640e68fc105641757ef2ef2fd68a504e208dda06958391ec"
@@ -108,7 +136,7 @@ _APPROVED_SOURCE_HASHES = {
         "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"
     ),
     "src/jev_trading_lab/stocks/calendar.py": (
-        "00d21c5bcb58293ab66710dbf06d4ae8668a005a8aa2201808950a23ed8e5d03"
+        "9536ea64aba216d7afcea434ba1e73634eca501095e72229797b45b8e2fed453"
     ),
 }
 _ALLOWED_TOOL_CONFIG = {
@@ -138,6 +166,7 @@ _ALLOWED_TOOL_CONFIG = {
                 "wheel": {
                     "packages": ["src/jev_trading_lab"],
                     "include": [
+                        "src/jev_trading_lab/artifacts/*.json",
                         "src/jev_trading_lab/**/*.sql",
                         "src/jev_trading_lab/templates/**/*",
                     ],
@@ -160,10 +189,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "565a54e027c1bb349a09da765409fedf9b8abe0cfa31f4ac7fdcac0e49e17326"
+    "20b3507a20d261a53169020357b53844c6351bfa48cfe4717be174319633dfd3"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "edce2f7c5cf7d5fa405fb19e6f54a2e15cf34ae42f9466017ca4a27a75367922"
+    "ca9eacb7ae1ce20966da6073f68668f02883e8522b3346278e46a0d8e440e084"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = [
     "exchange-calendars==4.11.2",
@@ -1387,6 +1416,7 @@ def test_built_artifacts_exclude_repository_and_host_junk(tmp_path: Path) -> Non
     }
     assert package_files == {
         "jev_trading_lab/__init__.py",
+        "jev_trading_lab/artifacts/xnys-schedule-2020-2036.json",
         "jev_trading_lab/cli.py",
         "jev_trading_lab/core/ids.py",
         "jev_trading_lab/core/manifest.py",

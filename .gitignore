@@ -6,7 +6,7 @@
 *.sqlite
 *.sqlite-*
 data/
-artifacts/
+/artifacts/
 __pycache__/
 *.py[cod]
 .pytest_cache/
