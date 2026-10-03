@@ -5,6 +5,7 @@ import importlib
 import importlib.util
 import re
 import stat
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -38,7 +39,10 @@ def test_cli_root_describes_paper_research() -> None:
 def _project_data(root: Path = ROOT) -> dict[str, Any]:
     project_file = root / "pyproject.toml"
     assert project_file.is_file(), "pyproject.toml must define the package policy"
-    return tomllib.loads(project_file.read_text(encoding="utf-8"))
+    try:
+        return tomllib.loads(project_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        pytest.fail(f"pyproject.toml must be readable valid UTF-8 TOML: {error}")
 
 
 def _normalize_name(value: str) -> str:
@@ -85,6 +89,35 @@ _ALLOWED_TOOL_CONFIG = {
     "mypy": {"python_version": "3.12", "strict": True, "files": ["src"]},
 }
 _ALLOWED_ENTRY_POINTS = {"jev-lab": "jev_trading_lab.cli:app"}
+_ALLOWED_DEPENDENCY_GROUPS = {
+    "dev": frozenset(
+        {
+            "hatchling",
+            "hypothesis",
+            "mypy",
+            "pip-audit",
+            "pytest",
+            "pytest-asyncio",
+            "respx",
+            "ruff",
+        }
+    )
+}
+_PROTECTED_CALLABLE_BINDINGS = frozenset({"app", "main"})
+_BLOCKED_DYNAMIC_CALLS = frozenset(
+    {
+        "compile",
+        "delattr",
+        "eval",
+        "exec",
+        "getattr",
+        "globals",
+        "locals",
+        "setattr",
+        "vars",
+        "__import__",
+    }
+)
 
 
 def _import_paths(node: ast.Import | ast.ImportFrom) -> list[str]:
@@ -103,6 +136,76 @@ def _call_path(node: ast.AST) -> str | None:
     return None
 
 
+def _assigned_names(node: ast.AST) -> set[str]:
+    return {
+        child.id
+        for child in ast.walk(node)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+    }
+
+
+def _python_bindings(
+    tree: ast.Module, relative: str
+) -> tuple[dict[str, str], list[str]]:
+    bindings: dict[str, str] = {}
+    violations: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                binding = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                bindings[binding] = f"import:{alias.name}"
+                if binding in _PROTECTED_CALLABLE_BINDINGS:
+                    violations.append(
+                        f"{relative}: protected binding {binding} imported"
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                binding = alias.asname or alias.name
+                imported = f"{node.module}.{alias.name}" if node.module else alias.name
+                bindings[binding] = f"import:{imported}"
+                if binding in _PROTECTED_CALLABLE_BINDINGS:
+                    violations.append(
+                        f"{relative}: protected binding {binding} imported"
+                    )
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bindings[node.name] = "local"
+            if node.name in _PROTECTED_CALLABLE_BINDINGS and not (
+                relative == "src/jev_trading_lab/cli.py"
+                and isinstance(node, ast.FunctionDef)
+                and node.name == "main"
+            ):
+                violations.append(
+                    f"{relative}: protected binding {node.name} redeclared"
+                )
+        elif isinstance(
+            node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)
+        ):
+            assigned = _assigned_names(node)
+            allowed_app = (
+                relative == "src/jev_trading_lab/cli.py"
+                and assigned == {"app"}
+                and isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Call)
+                and _call_path(node.value.func) == "typer.Typer"
+            )
+            allowed_version = (
+                relative == "src/jev_trading_lab/__init__.py"
+                and assigned == {"__version__"}
+                and isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            )
+            if not (allowed_app or allowed_version):
+                violations.append(f"{relative}: assignment is not allowlisted")
+            for binding in assigned:
+                if binding in _PROTECTED_CALLABLE_BINDINGS and not allowed_app:
+                    violations.append(
+                        f"{relative}: protected binding {binding} reassigned"
+                    )
+                bindings[binding] = "typer-instance" if allowed_app else "value"
+    return bindings, violations
+
+
 def _python_policy_violations(path: Path, root: Path) -> list[str]:
     relative = path.relative_to(root).as_posix()
     if relative not in _ALLOWED_SOURCE_IMPORTS:
@@ -116,36 +219,176 @@ def _python_policy_violations(path: Path, root: Path) -> list[str]:
     except SyntaxError as error:
         return [f"{relative}: source is not valid Python: {error}"]
 
-    violations: list[str] = []
+    bindings, violations = _python_bindings(tree, relative)
     allowed_imports = _ALLOWED_SOURCE_IMPORTS[relative]
     allowed_calls = _ALLOWED_SOURCE_CALLS[relative]
+    allowed_app_assignment = next(
+        (
+            node.targets[0]
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "app"
+            and isinstance(node.value, ast.Call)
+            and _call_path(node.value.func) == "typer.Typer"
+        ),
+        None,
+    )
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            for imported in _import_paths(node):
+            for alias, imported in zip(node.names, _import_paths(node), strict=True):
+                binding = alias.asname or (
+                    alias.name
+                    if isinstance(node, ast.ImportFrom)
+                    else alias.name.split(".", maxsplit=1)[0]
+                )
+                if binding in _PROTECTED_CALLABLE_BINDINGS:
+                    violations.append(
+                        f"{relative}: protected binding {binding} imported"
+                    )
                 if imported not in allowed_imports:
                     violations.append(f"{relative}: unauthorized import {imported}")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name in _PROTECTED_CALLABLE_BINDINGS and not (
+                node in tree.body
+                and relative == "src/jev_trading_lab/cli.py"
+                and isinstance(node, ast.FunctionDef)
+                and node.name == "main"
+            ):
+                violations.append(f"{relative}: protected binding {node.name} declared")
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            if (
+                node.id in _PROTECTED_CALLABLE_BINDINGS
+                and node is not allowed_app_assignment
+            ):
+                violations.append(f"{relative}: protected binding {node.id} modified")
+        elif isinstance(node, ast.arg) and node.arg in _PROTECTED_CALLABLE_BINDINGS:
+            violations.append(f"{relative}: protected binding {node.arg} declared")
         elif isinstance(node, ast.Call):
             called = _call_path(node.func)
-            if called not in allowed_calls:
+            provenance_ok = False
+            if called == "typer.Typer":
+                provenance_ok = bindings.get("typer") == "import:typer"
+            elif called in {"app", "app.callback"}:
+                provenance_ok = bindings.get("app") == "typer-instance"
+            elif called == "main":
+                provenance_ok = bindings.get("main") == "local"
+            if called in _BLOCKED_DYNAMIC_CALLS or not provenance_ok:
                 violations.append(
                     f"{relative}: unauthorized call {called or '<dynamic>'}"
                 )
+            elif called not in allowed_calls:
+                violations.append(f"{relative}: call not allowlisted: {called}")
     return violations
+
+
+def _dependency_names(requirements: object) -> set[str]:
+    if not isinstance(requirements, list):
+        return set()
+    return {
+        _requirement_name(requirement)
+        if isinstance(requirement, str)
+        else _normalize_name(requirement["name"])
+        for requirement in requirements
+        if isinstance(requirement, str)
+        or (isinstance(requirement, dict) and isinstance(requirement.get("name"), str))
+    }
+
+
+def _dependency_group_violations(
+    groups: object, *, location: str, locked: bool = False
+) -> list[str]:
+    if not isinstance(groups, dict):
+        return [f"{location}: dependency groups must be a table"] if groups else []
+    violations: list[str] = []
+    for group, requirements in groups.items():
+        allowed = _ALLOWED_DEPENDENCY_GROUPS.get(group)
+        names = _dependency_names(requirements)
+        label = "locked dependency group" if locked else "dependency group"
+        if allowed is None:
+            violations.append(f"{location}: {label} not allowlisted: {group}")
+            continue
+        violations.extend(
+            f"{location}: {label} {group} dependency not allowlisted: {name}"
+            for name in sorted(names - allowed)
+        )
+    return violations
+
+
+def _optional_dependency_violations(
+    groups: object, *, location: str, locked: bool = False
+) -> list[str]:
+    if not groups:
+        return []
+    names = sorted(
+        {
+            name
+            for requirements in groups.values()
+            for name in _dependency_names(requirements)
+        }
+        if isinstance(groups, dict)
+        else set()
+    )
+    label = "locked optional dependencies" if locked else "optional dependencies"
+    return [f"{location}: {label} are not allowed: {', '.join(names) or groups}"]
+
+
+def _production_source_paths(root: Path) -> list[Path]:
+    try:
+        repository_root = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if Path(repository_root).resolve() == root.resolve():
+            listed = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "ls-files",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                    "src",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            return [root / relative for relative in listed]
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return [
+        path
+        for path in (root / "src").rglob("*")
+        if path.is_file() or path.name == "__pycache__"
+    ]
 
 
 def _runtime_policy_violations(root: Path) -> list[str]:
     project_data = _project_data(root)
+    project = project_data.get("project", {})
     allowed_runtime = {"typer"}
-    runtime_requirements = project_data.get("project", {}).get("dependencies", [])
-    runtime_names = {
-        _requirement_name(requirement) for requirement in runtime_requirements
-    }
+    runtime_names = _dependency_names(project.get("dependencies", []))
     violations = [
         f"pyproject.toml: runtime dependency not allowlisted: {name}"
         for name in sorted(runtime_names - allowed_runtime)
     ]
+    violations.extend(
+        _dependency_group_violations(
+            project_data.get("dependency-groups", {}), location="pyproject.toml"
+        )
+    )
+    violations.extend(
+        _optional_dependency_violations(
+            project.get("optional-dependencies", {}), location="pyproject.toml"
+        )
+    )
 
-    entry_points = project_data.get("project", {}).get("scripts", {})
+    entry_points = project.get("scripts", {})
     if entry_points != _ALLOWED_ENTRY_POINTS:
         violations.append(
             f"pyproject.toml: entry points not allowlisted: {entry_points}"
@@ -156,8 +399,12 @@ def _runtime_policy_violations(root: Path) -> list[str]:
 
     lock_file = root / "uv.lock"
     if lock_file.is_file():
-        lock_data = tomllib.loads(lock_file.read_text(encoding="utf-8"))
-        project_name = project_data.get("project", {}).get("name")
+        try:
+            lock_data = tomllib.loads(lock_file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+            violations.append(f"uv.lock: unreadable or invalid UTF-8 TOML: {error}")
+            lock_data = {}
+        project_name = project.get("name")
         project_package = next(
             (
                 package
@@ -169,24 +416,41 @@ def _runtime_policy_violations(root: Path) -> list[str]:
         if project_package is None:
             violations.append("uv.lock: project package missing")
         else:
-            locked_runtime = {
-                _normalize_name(dependency["name"])
-                for dependency in project_package.get("dependencies", [])
-            }
+            locked_runtime = _dependency_names(project_package.get("dependencies", []))
             for name in sorted(locked_runtime - allowed_runtime):
                 violations.append(
                     f"uv.lock: runtime dependency not allowlisted: {name}"
                 )
+            locked_group_sections = [
+                project_package.get("dependency-groups", {}),
+                project_package.get("dev-dependencies", {}),
+                project_package.get("metadata", {}).get("requires-dev", {}),
+            ]
+            for locked_groups in locked_group_sections:
+                violations.extend(
+                    _dependency_group_violations(
+                        locked_groups, location="uv.lock", locked=True
+                    )
+                )
+            violations.extend(
+                _optional_dependency_violations(
+                    project_package.get("optional-dependencies", {}),
+                    location="uv.lock",
+                    locked=True,
+                )
+            )
 
     source = root / "src"
     if source.is_dir():
-        for path in source.rglob("*"):
-            if not path.is_file() or "__pycache__" in path.parts:
-                continue
-            if path.suffix == ".py":
+        for path in _production_source_paths(root):
+            relative = path.relative_to(root).as_posix()
+            if "__pycache__" in path.parts:
+                violations.append(f"{relative}: production __pycache__ is not allowed")
+            elif not path.is_file():
+                violations.append(f"{relative}: unknown production source surface")
+            elif path.suffix == ".py":
                 violations.extend(_python_policy_violations(path, root))
             else:
-                relative = path.relative_to(root).as_posix()
                 violations.append(f"{relative}: source path is not allowlisted")
 
     for directory_name in ("scripts", "ops"):
@@ -398,6 +662,182 @@ def test_fail_closed_python_capability_allowlist(
     violations = _runtime_policy_violations(tmp_path)
 
     assert any(expected in violation for violation in violations), violations
+
+
+@pytest.mark.parametrize(
+    ("content", "binding"),
+    (
+        ("main = exec\nmain('pass')\n", "main"),
+        ("main = __import__\nmain('os')\n", "main"),
+        ("main = os.system\nmain('true')\n", "main"),
+        (
+            "main = urllib.request.urlopen\nmain('https://api.example.test/orders')\n",
+            "main",
+        ),
+        ("main = http.client.HTTPSConnection\nmain('api.example.test')\n", "main"),
+        ("main = subprocess.run\nmain(['true'])\n", "main"),
+        ("main = getattr\nmain(client, 'submit_order')\n", "main"),
+        ("app = exec\napp('pass')\n", "app"),
+        ("alias = exec\nmain = alias\nmain('pass')\n", "main"),
+        ("alias = getattr\napp = alias\napp(client, 'submit_order')\n", "app"),
+        ("import typer as main\nmain()\n", "main"),
+        ("from typer import Typer as app\napp()\n", "app"),
+        ("def outer():\n    def main():\n        pass\n    main()\n", "main"),
+    ),
+)
+def test_allowed_call_names_cannot_be_rebound(
+    content: str, binding: str, tmp_path: Path
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname="sample"\nversion="0.1.0"\ndependencies=["typer"]\n',
+        encoding="utf-8",
+    )
+    sample = tmp_path / "src/jev_trading_lab/cli.py"
+    sample.parent.mkdir(parents=True)
+    sample.write_text(content, encoding="utf-8")
+
+    violations = _runtime_policy_violations(tmp_path)
+
+    assert any(
+        binding in violation and "binding" in violation for violation in violations
+    ), violations
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        "typer.Typer = exec\napp = typer.Typer()\napp()\n",
+        "app.__call__ = exec\napp()\n",
+        "except_alias = exec\n",
+    ),
+)
+def test_frozen_source_contract_rejects_extra_assignments(
+    content: str, tmp_path: Path
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname="sample"\nversion="0.1.0"\ndependencies=["typer"]\n',
+        encoding="utf-8",
+    )
+    sample = tmp_path / "src/jev_trading_lab/cli.py"
+    sample.parent.mkdir(parents=True)
+    sample.write_text(content, encoding="utf-8")
+
+    violations = _runtime_policy_violations(tmp_path)
+
+    assert any("assignment" in violation for violation in violations), violations
+
+
+def test_dev_dependency_group_rejects_unapproved_direct_dependency(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname="sample"\nversion="0.1.0"\ndependencies=["typer"]\n'
+        '[dependency-groups]\ndev=["py-clob-client"]\n',
+        encoding="utf-8",
+    )
+
+    violations = _runtime_policy_violations(tmp_path)
+
+    assert any(
+        "dependency group dev" in violation and "py-clob-client" in violation
+        for violation in violations
+    ), violations
+
+
+def test_lock_dev_dependency_group_rejects_unapproved_direct_dependency(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname="sample"\nversion="0.1.0"\ndependencies=["typer"]\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "uv.lock").write_text(
+        'version=1\n[[package]]\nname="sample"\nversion="0.1.0"\n'
+        '[package.dev-dependencies]\ndev=[{name="py-clob-client"}]\n'
+        '[[package]]\nname="py-clob-client"\nversion="0.1.0"\n',
+        encoding="utf-8",
+    )
+
+    violations = _runtime_policy_violations(tmp_path)
+
+    assert any(
+        "locked dependency group dev" in violation and "py-clob-client" in violation
+        for violation in violations
+    ), violations
+
+
+def test_lock_metadata_dev_group_rejects_unapproved_direct_dependency(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname="sample"\nversion="0.1.0"\ndependencies=["typer"]\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "uv.lock").write_text(
+        'version=1\n[[package]]\nname="sample"\nversion="0.1.0"\n'
+        '[package.metadata.requires-dev]\ndev=[{name="py-clob-client"}]\n'
+        '[[package]]\nname="py-clob-client"\nversion="0.1.0"\n',
+        encoding="utf-8",
+    )
+
+    violations = _runtime_policy_violations(tmp_path)
+
+    assert any(
+        "locked dependency group dev" in violation and "py-clob-client" in violation
+        for violation in violations
+    ), violations
+
+
+def test_optional_dependencies_are_rejected(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname="sample"\nversion="0.1.0"\ndependencies=["typer"]\n'
+        '[project.optional-dependencies]\ntrade=["alpaca-py"]\n',
+        encoding="utf-8",
+    )
+
+    violations = _runtime_policy_violations(tmp_path)
+
+    assert any(
+        "optional dependencies" in violation and "alpaca-py" in violation
+        for violation in violations
+    ), violations
+
+
+def test_lock_optional_dependencies_are_rejected(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname="sample"\nversion="0.1.0"\ndependencies=["typer"]\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "uv.lock").write_text(
+        'version=1\n[[package]]\nname="sample"\nversion="0.1.0"\n'
+        '[package.optional-dependencies]\ntrade=[{name="alpaca-py"}]\n'
+        '[[package]]\nname="alpaca-py"\nversion="0.1.0"\n',
+        encoding="utf-8",
+    )
+
+    violations = _runtime_policy_violations(tmp_path)
+
+    assert any(
+        "locked optional dependencies" in violation and "alpaca-py" in violation
+        for violation in violations
+    ), violations
+
+
+def test_production_pycache_rejects_non_utf8_executable_source(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname="sample"\nversion="0.1.0"\ndependencies=["typer"]\n',
+        encoding="utf-8",
+    )
+    sample = tmp_path / "src/__pycache__/live.py"
+    sample.parent.mkdir(parents=True)
+    sample.write_bytes(b"#!/usr/bin/env python\n\xff\xfe\x00")
+    sample.chmod(sample.stat().st_mode | stat.S_IXUSR)
+
+    violations = _runtime_policy_violations(tmp_path)
+
+    assert any("src/__pycache__/live.py" in violation for violation in violations), (
+        violations
+    )
 
 
 def test_fail_closed_shell_surface_rejects_composed_curl_post(tmp_path: Path) -> None:
