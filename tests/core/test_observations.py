@@ -177,6 +177,42 @@ def test_source_uri_rejects_invalid_dns_hosts(source_uri: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "host",
+    (
+        "127.1",
+        "127.0.1",
+        "2130706433",
+        "0x7f000001",
+        "999",
+        "0177.0.0.1",
+        "127.000.000.001",
+        "1.2.3",
+        "1.2.3.4.5",
+        "0",
+        "00",
+        "0xffffffff",
+        "127.0x0.0.1",
+        "example.999",
+    ),
+)
+def test_source_uri_rejects_ambiguous_numeric_hosts(host: str) -> None:
+    with pytest.raises(ValueError, match="source URI"):
+        _metadata(source_uri=f"https://{host}/data")
+
+
+@pytest.mark.parametrize(
+    "source_uri",
+    (
+        "https://[fe80::1%eth0]/data",
+        "https://[fe80::1%25eth0]/data",
+    ),
+)
+def test_source_uri_rejects_scoped_ipv6_hosts(source_uri: str) -> None:
+    with pytest.raises(ValueError, match="source URI"):
+        _metadata(source_uri=source_uri)
+
+
+@pytest.mark.parametrize(
     "source_uri",
     (
         "https://[2001:db8::1/data",
@@ -265,6 +301,7 @@ def test_source_uri_rejects_controls_whitespace_and_non_ascii(character: str) ->
         "https://example.test/a%20b?value=%2F",
         "https://192.0.2.1/data",
         "https://[2001:db8::1]/data",
+        "https://example123.test/data",
         "https://example.test:443/data",
         "https://[2001:db8::1]:8443/data",
     ),

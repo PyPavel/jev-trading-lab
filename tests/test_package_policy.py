@@ -79,7 +79,7 @@ _APPROVED_SOURCE_HASHES = {
         "0e73742a406e112f269e7b8d5fd205c448eb4fbf49541cab3c669bf7b4dc0dd4"
     ),
     "src/jev_trading_lab/core/observations.py": (
-        "3682e73a79501314242253570fee20908b1368bae2f59b9df53d8ba9cb1435f0"
+        "dbad9fa1099b527a640e68fc105641757ef2ef2fd68a504e208dda06958391ec"
     ),
     "src/jev_trading_lab/core/time.py": (
         "edbc66ad7acf0bfb2da0a2d4038cbdc914474f33482a723161155ea81744312e"
@@ -137,10 +137,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "1c97c51b6bba5b91de2961cc4571e08e1ad03c4d5a932dbcc097432ba5d551cf"
+    "9d79b05b4cd1c7219f3eac14ea3e78b636ec088e93be998cc57e68f9916ca165"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "c5db5e324ca5144c0b6b36f829789726648621e093b8d46329b0f5f4464b4c80"
+    "39e9b034de67fb4dd4c2cbf3fbf4c1bdfcb68f2b4732525fd1802e5deced6bfd"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = ["typer>=0.19,<1"]
 _ALLOWED_DEPENDENCY_GROUPS = {

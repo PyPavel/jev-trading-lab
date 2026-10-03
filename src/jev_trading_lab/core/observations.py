@@ -38,23 +38,32 @@ def _validate_sha256(value: str, *, name: str) -> str:
 
 def _validate_hostname(hostname: str, *, bracketed: bool) -> None:
     if bracketed:
+        if "%" in hostname:
+            raise ValueError("source URI must not include an IPv6 scope identifier")
         try:
             ipaddress.IPv6Address(hostname)
         except ipaddress.AddressValueError as error:
             raise ValueError("source URI must include a valid IPv6 host") from error
         return
-    try:
-        ipaddress.IPv4Address(hostname)
-    except ipaddress.AddressValueError:
-        labels = hostname.split(".")
-        if (
-            len(hostname) > 253
-            or (len(labels) == 4 and all(label.isdigit() for label in labels))
-            or any(_DNS_LABEL_RE.fullmatch(label) is None for label in labels)
+    labels = hostname.split(".")
+    numeric_labels = all(label.isdecimal() for label in labels)
+    if len(labels) == 4 and numeric_labels:
+        if any(
+            not 0 <= int(label) <= 255 or (len(label) > 1 and label.startswith("0"))
+            for label in labels
         ):
-            raise ValueError(
-                "source URI must include a valid DNS hostname or IPv4 host"
-            )
+            raise ValueError("source URI must include a canonical IPv4 host")
+        if str(ipaddress.IPv4Address(hostname)) != hostname:
+            raise ValueError("source URI must include a canonical IPv4 host")
+        return
+    if (
+        len(hostname) > 253
+        or numeric_labels
+        or labels[-1].isdecimal()
+        or any(label.lower().startswith("0x") for label in labels)
+        or any(_DNS_LABEL_RE.fullmatch(label) is None for label in labels)
+    ):
+        raise ValueError("source URI must include a valid DNS hostname or IPv4 host")
 
 
 def _validate_source_uri(value: str) -> str:
