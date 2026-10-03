@@ -12,7 +12,11 @@ type CanonicalValue = (
 
 
 def _canonical_value(value: object) -> CanonicalValue:
-    if value is None or type(value) in {bool, int, str}:
+    if type(value) is int:
+        if not -(2**63) <= value <= 2**63 - 1:
+            raise ValueError("canonical JSON integers must fit signed 64-bit range")
+        return value
+    if value is None or type(value) in {bool, str}:
         return value  # type: ignore[return-value]
     if type(value) is list:
         return [_canonical_value(item) for item in value]

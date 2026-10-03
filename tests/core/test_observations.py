@@ -81,6 +81,91 @@ def test_invalid_corrections_are_rejected(case: str, message: str) -> None:
         observations.correct_observation(original, **fields)
 
 
+def test_direct_correction_constructor_requires_predecessor() -> None:
+    original = _metadata()
+
+    with pytest.raises(ValueError, match="predecessor"):
+        _metadata(
+            retrieved_at_us=300,
+            content_sha256=HASH_B,
+            supersedes_id=original.observation_id,
+        )
+
+
+def test_direct_correction_constructor_rejects_backdating() -> None:
+    original = _metadata()
+
+    with pytest.raises(ValueError, match="earlier than or equal"):
+        _metadata(
+            retrieved_at_us=original.retrieved_at_us,
+            content_sha256=HASH_B,
+            supersedes_id=original.observation_id,
+            predecessor=original,
+        )
+
+
+def test_direct_correction_constructor_rejects_same_content_hash() -> None:
+    original = _metadata()
+
+    with pytest.raises(ValueError, match="different content hash"):
+        _metadata(
+            retrieved_at_us=300,
+            content_sha256=original.content_sha256,
+            supersedes_id=original.observation_id,
+            predecessor=original,
+        )
+
+
+def test_direct_correction_constructor_rejects_unrelated_predecessor() -> None:
+    original = _metadata()
+    unrelated = _metadata(source_uri="https://example.test/other")
+
+    with pytest.raises(ValueError, match="identify the predecessor"):
+        _metadata(
+            retrieved_at_us=300,
+            content_sha256=HASH_B,
+            supersedes_id=original.observation_id,
+            predecessor=unrelated,
+        )
+
+
+def test_direct_non_correction_constructor_rejects_predecessor() -> None:
+    original = _metadata()
+
+    with pytest.raises(ValueError, match="without supersedes_id"):
+        _metadata(predecessor=original)
+
+
+@pytest.mark.parametrize(
+    "source_uri",
+    (
+        "https://example.test/%zz",
+        "https://example.test:invalid/data",
+        "https://:443/data",
+        "https://user@:443/data",
+        "https://example.test/data\x00tail",
+        "https://example.test/data\x7ftail",
+        "https://[2001:db8::1/data",
+        "custom:?query-only",
+    ),
+)
+def test_hostile_source_uris_are_rejected(source_uri: str) -> None:
+    with pytest.raises(ValueError, match="source URI"):
+        _metadata(source_uri=source_uri)
+
+
+@pytest.mark.parametrize(
+    "source_uri",
+    (
+        "https://[2001:db8::1]:443/a%20b?value=%2F#ok",
+        "urn:isbn:9780140328721",
+        "file:///tmp/provider%20payload",
+    ),
+)
+def test_valid_absolute_source_uris_are_accepted(source_uri: str) -> None:
+    assert _metadata(source_uri=source_uri) is not None
+
+
 def test_metadata_validates_required_fields() -> None:
     with pytest.raises(ValueError, match="source URI"):
         _metadata(source_uri="not-a-uri")

@@ -8,7 +8,7 @@ are separate observations linked to the observation they supersede.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from enum import Enum
 from urllib.parse import urlsplit
 
@@ -17,6 +17,7 @@ from jev_trading_lab.core.time import validate_utc_us
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*\Z")
+_INVALID_PERCENT_ESCAPE_RE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 
 
 class ObservationStatus(Enum):
@@ -36,11 +37,16 @@ def _validate_source_uri(value: str) -> str:
     if (
         type(value) is not str
         or not value
-        or any(character.isspace() for character in value)
+        or any(
+            character.isspace() or ord(character) < 32 or 127 <= ord(character) <= 159
+            for character in value
+        )
     ):
         raise ValueError(
-            "source URI must be a non-empty absolute URI without whitespace"
+            "source URI must be a non-empty absolute URI without control or whitespace"
         )
+    if _INVALID_PERCENT_ESCAPE_RE.search(value):
+        raise ValueError("source URI must contain only valid percent escapes")
     try:
         parsed = urlsplit(value)
     except ValueError as error:
@@ -49,14 +55,28 @@ def _validate_source_uri(value: str) -> str:
         parsed.netloc or parsed.path
     ):
         raise ValueError("source URI must include a valid scheme and location")
-    if parsed.scheme.casefold() in {"http", "https"} and not parsed.netloc:
-        raise ValueError("source URI HTTP(S) form must include a host")
+    if parsed.scheme.casefold() in {"http", "https"}:
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("source URI HTTP(S) form must not include userinfo")
+        try:
+            hostname = parsed.hostname
+            parsed.port
+        except ValueError as error:
+            raise ValueError(
+                "source URI HTTP(S) form has invalid host or port"
+            ) from error
+        if not hostname:
+            raise ValueError("source URI HTTP(S) form must include a host")
     return value
 
 
 @dataclass(frozen=True, slots=True)
 class ObservationMetadata:
-    """Validated immutable provenance for one exact provider payload."""
+    """Validated immutable provenance for one exact provider payload.
+
+    ``predecessor`` is constructor-only context: pass it exactly when
+    ``supersedes_id`` is present. It is validated but neither stored nor hashed.
+    """
 
     source_uri: str
     published_at_us: int | None
@@ -64,8 +84,9 @@ class ObservationMetadata:
     status: ObservationStatus
     content_sha256: str
     supersedes_id: str | None = None
+    predecessor: InitVar[ObservationMetadata | None] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, predecessor: ObservationMetadata | None) -> None:
         _validate_source_uri(self.source_uri)
         retrieved = validate_utc_us(self.retrieved_at_us)
         if self.published_at_us is not None:
@@ -75,8 +96,21 @@ class ObservationMetadata:
         if type(self.status) is not ObservationStatus:
             raise TypeError("status must be an ObservationStatus")
         _validate_sha256(self.content_sha256, name="content_sha256")
-        if self.supersedes_id is not None:
-            _validate_sha256(self.supersedes_id, name="supersedes_id")
+        if self.supersedes_id is None:
+            if predecessor is not None:
+                raise ValueError("predecessor cannot be provided without supersedes_id")
+            return
+        _validate_sha256(self.supersedes_id, name="supersedes_id")
+        if type(predecessor) is not ObservationMetadata:
+            raise ValueError("correction requires an ObservationMetadata predecessor")
+        if self.supersedes_id != predecessor.observation_id:
+            raise ValueError("correction supersedes_id must identify the predecessor")
+        if retrieved <= predecessor.retrieved_at_us:
+            raise ValueError(
+                "correction retrieval cannot be earlier than or equal to predecessor"
+            )
+        if self.content_sha256 == predecessor.content_sha256:
+            raise ValueError("correction must use a different content hash")
 
     @property
     def observation_id(self) -> str:
@@ -104,17 +138,6 @@ def correct_observation(
     """Append a corrected observation without mutating or backdating the original."""
     if type(original) is not ObservationMetadata:
         raise TypeError("original must be ObservationMetadata")
-    if supersedes_id != original.observation_id:
-        raise ValueError(
-            "correction supersedes_id must identify the original observation"
-        )
-    if content_sha256 == original.content_sha256:
-        raise ValueError("correction must use a different content hash")
-    validate_utc_us(retrieved_at_us)
-    if retrieved_at_us <= original.retrieved_at_us:
-        raise ValueError(
-            "correction retrieval cannot be earlier than or equal to original"
-        )
     return ObservationMetadata(
         source_uri=original.source_uri,
         published_at_us=original.published_at_us,
@@ -122,4 +145,5 @@ def correct_observation(
         status=original.status,
         content_sha256=content_sha256,
         supersedes_id=supersedes_id,
+        predecessor=original,
     )

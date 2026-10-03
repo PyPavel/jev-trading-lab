@@ -89,8 +89,37 @@ def test_canonical_hash_separates_namespaces_without_delimiter_collisions() -> N
     assert ids.canonical_hash("a", "b:c") != ids.canonical_hash("a:b", "c")
 
 
+@pytest.mark.parametrize("value", (-(2**63), 2**63 - 1))
+def test_canonical_json_accepts_signed_int64_boundaries(value: int) -> None:
+    ids = _module("jev_trading_lab.core.ids")
+
+    assert json.loads(ids.canonical_json_bytes(value)) == value
+
+
+@pytest.mark.parametrize("value", (-(2**63) - 1, 2**63))
+def test_canonical_json_rejects_integers_outside_signed_int64(value: int) -> None:
+    ids = _module("jev_trading_lab.core.ids")
+
+    with pytest.raises(ValueError, match="signed 64-bit"):
+        ids.canonical_json_bytes(value)
+
+
+def test_canonical_json_rejects_huge_integer_before_json_encoding() -> None:
+    ids = _module("jev_trading_lab.core.ids")
+
+    with pytest.raises(ValueError, match="signed 64-bit"):
+        ids.canonical_json_bytes(10**5000)
+
+
 class IntSubclass(int):
     pass
+
+
+def test_canonical_json_rejects_integer_subclasses() -> None:
+    ids = _module("jev_trading_lab.core.ids")
+
+    with pytest.raises(TypeError, match="built-in int"):
+        ids.canonical_json_bytes(IntSubclass(1))
 
 
 def test_naive_datetime_rejected() -> None:
