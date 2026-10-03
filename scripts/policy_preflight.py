@@ -34,7 +34,7 @@ EXPECTED_CONFIG_HASHES = {
 }
 EXPECTED_OPERATIONAL_HASHES = {
     "scripts/wheel_migration_smoke.py": (
-        "e86e1baedf82f85d16af36e95a6d303714fc2a7c2b7997d8fc6ce2ba9ed14dc1"
+        "4b066a3d6abcaaa2526b3b388eaeed579682d63d48f33fce154f32af6d5c1e9c"
     )
 }
 EXPECTED_SOURCE_HASHES = {
@@ -72,16 +72,13 @@ EXPECTED_SOURCE_HASHES = {
         "b4c2a856b006ee6bde860e8abff04c209915eb420e1c55425805e3e25042d133"
     ),
     "src/jev_trading_lab/persistence/journal.py": (
-        "eb24c43d268cc4d399aa567d8928103b146192aac1e9b63a40cd046739d18c3b"
-    ),
-    "src/jev_trading_lab/persistence/journal_sql.py": (
-        "f948ec7a0ecc413082b121f461187a828d1ebea4e9e725081af2316845ba1967"
+        "8a435bf395ec78dbecd8baa422cc1f44010d47567277201528dee91a93171334"
     ),
     "src/jev_trading_lab/persistence/db.py": (
-        "9adfb7e40f1d1be9016e2436f4d9f9c70d502daaf0bdd44fa5d2e6715192bb6f"
+        "c6c71737f943b75331d852582029b2ca00d7ba4b9da160891bb8ab5b36fae6a7"
     ),
     "src/jev_trading_lab/persistence/migrations.py": (
-        "fc574827a634bd4dd2cd7508015b066c7b39982ff56f599bfe0167d9013dd8fb"
+        "01feca8145f7d9dd49c0e4eb8854b02543883c2623934b416eacb6cee63d67f1"
     ),
     "src/jev_trading_lab/persistence/schema/__init__.py": (
         "5f19444569734cd60895d22219e7e2481fd00efb6054fb1d4cf9f7b38e26e4a5"
@@ -93,7 +90,7 @@ EXPECTED_SOURCE_HASHES = {
         "9026b984313d972dec6c3db8b442e4324f2a7f02ec71bd555c0c17f8ed362c54"
     ),
     "src/jev_trading_lab/persistence/schema/003_append_only_guards.sql": (
-        "929b3ee2eafef744d0f457d23b139ef4b1d081e3402c0d9f0fb3ba797dcb1d7f"
+        "d18492f31e6c0948fa87f11927f2bc4fb2a5a41ffb45c27c9e966339d5e35995"
     ),
     "src/jev_trading_lab/stocks/__init__.py": (
         "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"

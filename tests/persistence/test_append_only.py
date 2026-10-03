@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from jev_trading_lab.core.ids import canonical_hash, canonical_json_bytes
-from jev_trading_lab.persistence.db import connect_database
+from jev_trading_lab.core.ids import canonical_hash
+from jev_trading_lab.persistence.db import SecureConnection, connect_database
 from jev_trading_lab.persistence.journal import (
     AppendOnlyJournal,
     JournalConflictError,
@@ -21,9 +21,7 @@ from jev_trading_lab.persistence.journal import (
     JournalRepositoryError,
     make_journal_entity,
     make_journal_event,
-    register_journal_sql_functions,
 )
-from jev_trading_lab.persistence.journal_sql import jev_journal_entity_id
 from jev_trading_lab.persistence.migrations import apply_migrations, load_migrations
 
 HEX_A = "a" * 64
@@ -48,7 +46,19 @@ def _connection(path: str | None = None) -> sqlite3.Connection:
     connection.execute("PRAGMA synchronous = FULL")
     connection.execute("PRAGMA busy_timeout = 5000")
     connection.execute("PRAGMA trusted_schema = OFF")
-    register_journal_sql_functions(connection)
+    apply_migrations(connection, clock=lambda: 1_700_000_000_000_000)
+    return connection
+
+
+def _secure_connection(path: Path | None = None) -> SecureConnection:
+    if path is None:
+        path = Path(tempfile.mkdtemp()) / "journal.sqlite3"
+    connection = connect_database(
+        path.absolute(),
+        busy_timeout_ms=5000,
+        mount_resolver=lambda _path: "ext4",
+    )
+    assert isinstance(connection, SecureConnection)
     apply_migrations(connection, clock=lambda: 1_700_000_000_000_000)
     return connection
 
@@ -223,207 +233,110 @@ def _manual_event_values(
     )
 
 
-def test_registered_sql_functions_are_exact_and_fail_closed(tmp_path: Path) -> None:
-    database = (tmp_path / "private" / "journal.sqlite3").absolute()
-    for attempt in range(2):
-        connection = connect_database(
-            database,
-            busy_timeout_ms=5000,
-            mount_resolver=lambda _path: "ext4",
-        )
-        try:
-            payload = canonical_json_bytes({"attempt": attempt})
-            payload_sha256 = hashlib.sha256(payload).hexdigest()
-            entity_id = canonical_hash(
-                "journal-entity-v1",
-                {
-                    "run_id": HEX_A,
-                    "entity_type": "entity",
-                    "logical_identity": HEX_B,
-                    "created_at_us": 0,
-                    "payload_sha256": payload_sha256,
-                },
-            )
-            assert (
-                connection.execute("SELECT jev_sha256(?)", (payload,)).fetchone()[0]
-                == payload_sha256
-            )
-            assert (
-                connection.execute(
-                    "SELECT jev_is_canonical_json(?)", (payload,)
-                ).fetchone()[0]
-                == 1
-            )
-            assert (
-                connection.execute(
-                    "SELECT jev_journal_entity_id(?,?,?,?,?)",
-                    (HEX_A, "entity", HEX_B, 0, payload_sha256),
-                ).fetchone()[0]
-                == entity_id
-            )
-            assert connection.execute(
-                "SELECT jev_journal_event_id(?,?,?,?,?,?)",
-                (entity_id, "event", 0, 1, payload_sha256, None),
-            ).fetchone()[0] == canonical_hash(
-                "journal-event-v1",
-                {
-                    "entity_id": entity_id,
-                    "event_type": "event",
-                    "sequence": 0,
-                    "occurred_at_us": 1,
-                    "payload_sha256": payload_sha256,
-                    "supersedes_event_id": None,
-                },
-            )
-            assert (
-                connection.execute("SELECT jev_sha256(?)", ("not-bytes",)).fetchone()[0]
-                is None
-            )
-            assert (
-                connection.execute(
-                    "SELECT jev_is_canonical_json(?)", (b"not-json",)
-                ).fetchone()[0]
-                == 0
-            )
-            assert (
-                jev_journal_entity_id(HEX_A, "entity", HEX_B, True, payload_sha256)
-                is None
-            )
-            assert connection.execute("PRAGMA trusted_schema").fetchone()[0] == 0
-        finally:
-            connection.close()
-
-
-def test_reopened_raw_sqlite_connection_fails_closed_without_callbacks(
+def test_secure_connection_denies_direct_journal_inserts_and_allows_reads(
     tmp_path: Path,
 ) -> None:
-    database = tmp_path / "raw-reopen.sqlite3"
-    setup = _connection(str(database))
-    run_id = _insert_run(setup)
-    valid = _manual_entity_values(run_id, "raw-reopen")
-    setup.close()
-
-    raw = sqlite3.connect(database, isolation_level=None)
-    try:
-        raw.execute("PRAGMA foreign_keys = ON")
-        raw.execute("PRAGMA trusted_schema = OFF")
-        with pytest.raises(sqlite3.OperationalError, match="no such collation"):
-            raw.execute("INSERT INTO journal_entities VALUES (?,?,?,?,?,?,?)", valid)
-    finally:
-        raw.close()
-
-
-def test_direct_sql_authenticates_canonical_payload_hash_and_entity_id() -> None:
-    connection = _connection()
+    connection = _secure_connection(tmp_path / "private" / "journal.sqlite3")
     try:
         run_id = _insert_run(connection)
         valid = _manual_entity_values(run_id, "valid")
-        connection.execute("INSERT INTO journal_entities VALUES (?,?,?,?,?,?,?)", valid)
-
         malformed = list(_manual_entity_values(run_id, "malformed"))
         malformed[-1] = b"not-json"
-        malformed[-2] = hashlib.sha256(malformed[-1]).hexdigest()
-        malformed[0] = _hex("arbitrary-malformed-id")
-        with pytest.raises(sqlite3.IntegrityError, match="authentication:payload"):
+        for values in (valid, malformed):
+            with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+                connection.execute(
+                    "INSERT INTO journal_entities VALUES (?,?,?,?,?,?,?)", values
+                )
+        entity = _entity(run_id)
+        AppendOnlyJournal(connection).append_entity(entity)
+        columns = tuple(JournalEntity.__dataclass_fields__)
+        repeated_insert = (
+            f"INSERT INTO journal_entities ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})"
+        )
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
             connection.execute(
-                "INSERT INTO journal_entities VALUES (?,?,?,?,?,?,?)", malformed
+                repeated_insert,
+                tuple(getattr(entity, column) for column in columns),
             )
-
-        wrong_hash = list(_manual_entity_values(run_id, "wrong-hash"))
-        wrong_hash[-2] = HEX_A
-        with pytest.raises(sqlite3.IntegrityError, match="authentication:hash"):
-            connection.execute(
-                "INSERT INTO journal_entities VALUES (?,?,?,?,?,?,?)", wrong_hash
-            )
-
-        wrong_id = list(_manual_entity_values(run_id, "wrong-id"))
-        wrong_id[0] = HEX_B
-        with pytest.raises(sqlite3.IntegrityError, match="authentication:id"):
-            connection.execute(
-                "INSERT INTO journal_entities VALUES (?,?,?,?,?,?,?)", wrong_id
-            )
+        for statement in (
+            "UPDATE journal_entities SET entity_id = entity_id",
+            "DELETE FROM journal_entities",
+        ):
+            with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+                connection.execute(statement)
+        assert (
+            connection.execute("SELECT count(*) FROM journal_entities").fetchone()[0]
+            == 1
+        )
     finally:
         connection.close()
 
 
-def test_direct_sql_authenticates_events_and_changed_payload_bytes() -> None:
-    connection = _connection()
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "DROP TRIGGER journal_events_immutable_delete",
+        "ALTER TABLE journal_events RENAME TO replaced_events",
+        "DROP TABLE journal_entities",
+        "PRAGMA writable_schema = ON",
+        "ATTACH DATABASE ':memory:' AS auxiliary",
+    ),
+)
+def test_secure_connection_seals_authorizer_and_schema(
+    tmp_path: Path, statement: str
+) -> None:
+    connection = _secure_connection(tmp_path / "private" / "journal.sqlite3")
+    try:
+        assert connection.authorizer_sealed
+        for callback in (None, lambda *_args: sqlite3.SQLITE_OK):
+            with pytest.raises(RuntimeError, match="authorizer.*sealed"):
+                connection.set_authorizer(callback)
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            connection.execute(statement)
+    finally:
+        connection.close()
+
+
+def test_secure_journal_write_scope_restores_denial_after_error(tmp_path: Path) -> None:
+    connection = _secure_connection(tmp_path / "private" / "journal.sqlite3")
     try:
         run_id = _insert_run(connection)
-        entity = _manual_entity_values(run_id, "events")
-        connection.execute(
-            "INSERT INTO journal_entities VALUES (?,?,?,?,?,?,?)", entity
-        )
-        entity_id = str(entity[0])
-        first = _manual_event_values(entity_id, 0, payload=b'{"value":1}')
-        connection.execute("INSERT INTO journal_events VALUES (?,?,?,?,?,?,?,?)", first)
-
-        wrong_hash = list(
-            _manual_event_values(
-                entity_id,
-                1,
-                payload=b'{"value":2}',
-                supersedes_event_id=str(first[0]),
-            )
-        )
-        wrong_hash[-3] = HEX_A
-        wrong_hash[0] = HEX_B
-        with pytest.raises(sqlite3.IntegrityError, match="authentication:hash"):
-            connection.execute(
-                "INSERT INTO journal_events VALUES (?,?,?,?,?,?,?,?)", wrong_hash
-            )
-
-        wrong_id = list(
-            _manual_event_values(
-                entity_id,
-                1,
-                payload=b'{"value":2}',
-                supersedes_event_id=str(first[0]),
-            )
-        )
-        wrong_id[0] = HEX_C
-        with pytest.raises(sqlite3.IntegrityError, match="authentication:id"):
-            connection.execute(
-                "INSERT INTO journal_events VALUES (?,?,?,?,?,?,?,?)", wrong_id
-            )
-
-        identical_payload_fake_hash = list(
-            _manual_event_values(
-                entity_id,
-                1,
-                payload=bytes(first[-2]),
-                supersedes_event_id=str(first[0]),
-            )
-        )
-        identical_payload_fake_hash[-3] = HEX_C
-        identical_payload_fake_hash[0] = canonical_hash(
-            "journal-event-v1",
-            {
-                "entity_id": entity_id,
-                "event_type": "recorded",
-                "sequence": 1,
-                "occurred_at_us": 1_001,
-                "payload_sha256": HEX_C,
-                "supersedes_event_id": first[0],
-            },
-        )
-        with pytest.raises(
-            sqlite3.IntegrityError, match="(?:authentication:hash|supersession:payload)"
-        ):
-            connection.execute(
-                "INSERT INTO journal_events VALUES (?,?,?,?,?,?,?,?)",
-                identical_payload_fake_hash,
-            )
-
-        valid = _manual_event_values(
-            entity_id,
+        journal = AppendOnlyJournal(connection)
+        entity = _entity(run_id)
+        assert journal.append_entity(entity) == entity.entity_id
+        missing = _event(
+            entity.entity_id,
             1,
-            payload=b'{"value":2}',
-            supersedes_event_id=str(first[0]),
+            payload={"changed": True},
+            supersedes_event_id=HEX_B,
         )
-        connection.execute("INSERT INTO journal_events VALUES (?,?,?,?,?,?,?,?)", valid)
+        with pytest.raises(JournalConflictError, match="predecessor"):
+            journal.append_event(missing)
+        direct = _manual_event_values(entity.entity_id, 0, payload=b'{"direct":true}')
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            connection.execute(
+                "INSERT INTO journal_events VALUES (?,?,?,?,?,?,?,?)", direct
+            )
+        assert not connection.in_transaction
     finally:
         connection.close()
+
+
+def test_append_only_journal_rejects_plain_sqlite_connection() -> None:
+    connection = _connection()
+    try:
+        with pytest.raises(TypeError, match="SecureConnection"):
+            AppendOnlyJournal(connection, expected_busy_timeout_ms=5000)
+    finally:
+        connection.close()
+
+
+def test_migration_003_has_no_predicate_collation_or_json_dependency() -> None:
+    sql = load_migrations()[2].sql.casefold()
+    assert "collate jev_" not in sql
+    assert "json_array" not in sql
+    assert "authenticate" not in sql
 
 
 def test_update_delete_abort() -> None:
@@ -471,14 +384,6 @@ def test_two_node_back_edge_rejected_by_immutable_conflict() -> None:
         ).fetchone()[0]
         assert "WITH RECURSIVE" not in trigger_sql
 
-        journal = AppendOnlyJournal(connection, expected_busy_timeout_ms=5000)
-        forged = object.__new__(JournalEvent)
-        for field, value in zip(
-            JournalEvent.__dataclass_fields__, first_row, strict=True
-        ):
-            object.__setattr__(forged, field, value)
-        with pytest.raises((ValueError, JournalConflictError)):
-            journal.append_event(forged)
     finally:
         connection.close()
 
@@ -730,7 +635,7 @@ def test_factories_require_exact_builtin_types_and_canonical_payload_limit() -> 
 
 
 def test_tampered_and_forged_records_are_semantically_reconstructed() -> None:
-    connection = _connection()
+    connection = _secure_connection()
     try:
         run_id = _insert_run(connection)
         journal = AppendOnlyJournal(connection, expected_busy_timeout_ms=5000)
@@ -753,7 +658,7 @@ def test_tampered_and_forged_records_are_semantically_reconstructed() -> None:
 
 
 def test_append_idempotency_and_conflicts() -> None:
-    connection = _connection()
+    connection = _secure_connection()
     try:
         run_id = _insert_run(connection)
         journal = AppendOnlyJournal(connection, expected_busy_timeout_ms=5000)
@@ -775,7 +680,7 @@ def test_append_idempotency_and_conflicts() -> None:
 
 
 def test_repository_uses_authoritative_database_predecessor() -> None:
-    connection = _connection()
+    connection = _secure_connection()
     try:
         run_id = _insert_run(connection)
         journal = AppendOnlyJournal(connection, expected_busy_timeout_ms=5000)
@@ -796,28 +701,19 @@ def test_repository_uses_authoritative_database_predecessor() -> None:
 
 
 def test_repository_transaction_ownership_and_rollback() -> None:
-    connection = _connection()
+    connection = _secure_connection()
     try:
         run_id = _insert_run(connection)
         journal = AppendOnlyJournal(connection, expected_busy_timeout_ms=5000)
         entity = _entity(run_id)
         connection.execute("BEGIN")
-        connection.execute("CREATE TEMP TABLE caller_state(value TEXT)")
-        connection.execute("INSERT INTO caller_state VALUES ('keep')")
         with pytest.raises(JournalRepositoryError, match="active caller transaction"):
             journal.append_entity(entity)
         assert connection.in_transaction
-        assert (
-            connection.execute("SELECT value FROM caller_state").fetchone()[0] == "keep"
-        )
         connection.execute("ROLLBACK")
 
-        connection.execute(
-            "CREATE TRIGGER reject_entity BEFORE INSERT ON journal_entities "
-            "BEGIN SELECT RAISE(ABORT, 'forced'); END"
-        )
-        with pytest.raises(sqlite3.IntegrityError, match="forced"):
-            journal.append_entity(entity)
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+            journal.append_entity(_entity(HEX_B))
         assert not connection.in_transaction
         assert (
             connection.execute("SELECT count(*) FROM journal_entities").fetchone()[0]
@@ -839,7 +735,7 @@ def test_repository_transaction_ownership_and_rollback() -> None:
     ),
 )
 def test_repository_rejects_pragma_drift(pragma: str, drift: str) -> None:
-    connection = _connection()
+    connection = _secure_connection()
     try:
         run_id = _insert_run(connection)
         journal = AppendOnlyJournal(connection, expected_busy_timeout_ms=5000)
@@ -875,14 +771,14 @@ def test_secure_connection_timeout_is_authoritative(tmp_path: Path) -> None:
 
 def test_concurrent_identical_appends_converge(tmp_path: Path) -> None:
     database = tmp_path / "identical.sqlite3"
-    setup = _connection(str(database))
+    setup = _secure_connection(database)
     run_id = _insert_run(setup)
     entity = _entity(run_id)
     setup.close()
     barrier = threading.Barrier(2)
 
     def append() -> str:
-        connection = _connection(str(database))
+        connection = _secure_connection(database)
         try:
             barrier.wait(timeout=5)
             return AppendOnlyJournal(
@@ -907,7 +803,7 @@ def test_concurrent_identical_appends_converge(tmp_path: Path) -> None:
 
 def test_concurrent_conflicting_sequence_has_one_winner(tmp_path: Path) -> None:
     database = tmp_path / "conflict.sqlite3"
-    setup = _connection(str(database))
+    setup = _secure_connection(database)
     run_id = _insert_run(setup)
     journal = AppendOnlyJournal(setup, expected_busy_timeout_ms=5000)
     entity = _entity(run_id)
@@ -920,7 +816,7 @@ def test_concurrent_conflicting_sequence_has_one_winner(tmp_path: Path) -> None:
     barrier = threading.Barrier(2)
 
     def append(event: JournalEvent) -> tuple[str, str]:
-        connection = _connection(str(database))
+        connection = _secure_connection(database)
         try:
             barrier.wait(timeout=5)
             try:

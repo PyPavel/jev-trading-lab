@@ -8,10 +8,29 @@ import sqlite3
 import stat
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Protocol
+
+_Authorizer = Callable[[int, str | None, str | None, str | None, str | None], int]
+_JOURNAL_TABLES = frozenset({"journal_entities", "journal_events"})
+_SCHEMA_ACTIONS = frozenset(
+    {
+        sqlite3.SQLITE_ALTER_TABLE,
+        sqlite3.SQLITE_CREATE_INDEX,
+        sqlite3.SQLITE_CREATE_TABLE,
+        sqlite3.SQLITE_CREATE_TRIGGER,
+        sqlite3.SQLITE_CREATE_VIEW,
+        sqlite3.SQLITE_CREATE_VTABLE,
+        sqlite3.SQLITE_DROP_INDEX,
+        sqlite3.SQLITE_DROP_TABLE,
+        sqlite3.SQLITE_DROP_TRIGGER,
+        sqlite3.SQLITE_DROP_VIEW,
+        sqlite3.SQLITE_DROP_VTABLE,
+    }
+)
+_DANGEROUS_PRAGMAS = frozenset({"writable_schema", "wal_checkpoint"})
 
 MIN_SQLITE_VERSION = (3, 37, 0)
 _MAX_BUSY_TIMEOUT_MS = 2_147_483_647
@@ -65,23 +84,36 @@ class MountResolver(Protocol):
 
 
 class SecureConnection(sqlite3.Connection):
-    """SQLite connection that owns its validated parent directory descriptor."""
+    """SQLite connection with owned storage and a sealable runtime authorizer."""
 
-    __slots__ = ("_parent_descriptor", "_busy_timeout_ms")
+    __slots__ = ("_parent_descriptor", "_busy_timeout_ms", "_authorizer_sealed")
 
     _parent_descriptor: int | None
     _busy_timeout_ms: int
+    _authorizer_sealed: bool
     _close_descriptor = staticmethod(os.close)
     _close_sqlite = sqlite3.Connection.close
+    _set_sqlite_authorizer = sqlite3.Connection.set_authorizer
+
+    @property
+    def authorizer_sealed(self) -> bool:
+        """Return whether the persistent runtime write boundary is installed."""
+        return getattr(self, "_authorizer_sealed", False)
+
+    def set_authorizer(self, authorizer_callback: _Authorizer | None) -> None:
+        """Set an authorizer only before the runtime boundary has been sealed."""
+        if self.authorizer_sealed:
+            raise RuntimeError("runtime authorizer is sealed")
+        self._set_sqlite_authorizer(authorizer_callback)
 
     def __setattr__(self, name: str, value: object) -> None:
-        if name == "_busy_timeout_ms":
-            raise AttributeError("busy timeout is immutable")
+        if name in {"_busy_timeout_ms", "_authorizer_sealed"}:
+            raise AttributeError(f"{name.removeprefix('_')} is immutable")
         super().__setattr__(name, value)
 
     def __delattr__(self, name: str) -> None:
-        if name == "_busy_timeout_ms":
-            raise AttributeError("busy timeout is immutable")
+        if name in {"_busy_timeout_ms", "_authorizer_sealed"}:
+            raise AttributeError(f"{name.removeprefix('_')} is immutable")
         super().__delattr__(name)
 
     @property
@@ -115,6 +147,84 @@ class SecureConnection(sqlite3.Connection):
             self._close_sqlite()
         except BaseException:
             pass
+
+
+def _runtime_authorizer(
+    action: int,
+    argument1: str | None,
+    _argument2: str | None,
+    database: str | None,
+    _trigger: str | None,
+) -> int:
+    if action in {sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH}:
+        return sqlite3.SQLITE_DENY
+    if (
+        action == sqlite3.SQLITE_PRAGMA
+        and (argument1 or "").casefold() in _DANGEROUS_PRAGMAS
+    ):
+        return sqlite3.SQLITE_DENY
+    if action in _SCHEMA_ACTIONS:
+        return sqlite3.SQLITE_DENY
+    if (
+        action in {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE}
+        and database == "main"
+        and argument1 in _JOURNAL_TABLES
+    ):
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
+def _journal_authorizer(table: str) -> _Authorizer:
+    if table not in _JOURNAL_TABLES:
+        raise ValueError("journal write scope requires an exact journal table")
+
+    def authorize(
+        action: int,
+        argument1: str | None,
+        argument2: str | None,
+        database: str | None,
+        trigger: str | None,
+    ) -> int:
+        if (
+            action == sqlite3.SQLITE_INSERT
+            and database == "main"
+            and argument1 == table
+        ):
+            return sqlite3.SQLITE_OK
+        return _runtime_authorizer(action, argument1, argument2, database, trigger)
+
+    return authorize
+
+
+def _set_internal_authorizer(
+    connection: SecureConnection, authorizer: _Authorizer | None
+) -> None:
+    connection._set_sqlite_authorizer(authorizer)
+
+
+def _seal_runtime_authorizer(connection: SecureConnection) -> None:
+    _set_internal_authorizer(connection, _runtime_authorizer)
+    object.__setattr__(connection, "_authorizer_sealed", True)
+
+
+@contextmanager
+def _journal_write_scope(connection: SecureConnection, table: str) -> Iterator[None]:
+    if not connection.authorizer_sealed:
+        raise DatabaseConfigurationError("runtime authorizer is not sealed")
+    _set_internal_authorizer(connection, _journal_authorizer(table))
+    try:
+        yield
+    finally:
+        _set_internal_authorizer(connection, _runtime_authorizer)
+
+
+def _seal_if_migrated(connection: SecureConnection) -> None:
+    row = connection.execute(
+        "SELECT 1 FROM main.sqlite_schema WHERE type = 'table' "
+        "AND name = 'journal_events'"
+    ).fetchone()
+    if row is not None:
+        _seal_runtime_authorizer(connection)
 
 
 def _decode_mountinfo_path(value: str) -> str:
@@ -558,17 +668,12 @@ def connect_database(
                     "SQLite did not create a secure connection"
                 )
             connection._parent_descriptor = parent_descriptor
+            object.__setattr__(connection, "_authorizer_sealed", False)
             transferred_parent = True
             _verify_sqlite_descriptors(
                 before_fds, file_identity, path, parent_descriptor
             )
             _verify_main_database_path(connection, path)
-            # Lazy import keeps the pure callback module outside db.py's storage layer.
-            from jev_trading_lab.persistence.journal_sql import (
-                register_journal_sql_functions,
-            )
-
-            register_journal_sql_functions(connection)
             _check_directory_entries(path, parent_descriptor)
             _recheck_storage(path, parent_descriptor, parent_identity, file_identity)
             connection.row_factory = sqlite3.Row
@@ -597,6 +702,7 @@ def connect_database(
             connection.execute("PRAGMA trusted_schema = OFF")
             _verify_pragma(connection, "trusted_schema", 0, label="trusted_schema")
             _recheck_storage(path, parent_descriptor, parent_identity, file_identity)
+            _seal_if_migrated(connection)
             return connection
         except BaseException:
             if connection is not None:

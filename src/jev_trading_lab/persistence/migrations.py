@@ -28,6 +28,11 @@ from jev_trading_lab.core.time import (
     datetime_to_utc_us,
     validate_utc_us,
 )
+from jev_trading_lab.persistence.db import (
+    SecureConnection,
+    _seal_runtime_authorizer,
+    _set_internal_authorizer,
+)
 
 MAX_MIGRATION_BYTES = 1_048_576
 _DEFAULT_PACKAGE = "jev_trading_lab.persistence.schema"
@@ -633,7 +638,10 @@ def apply_migrations(
                 connection.execute("COMMIT")
                 owned_transaction = False
                 continue
-            connection.set_authorizer(_migration_authorizer)
+            if isinstance(connection, SecureConnection):
+                _set_internal_authorizer(connection, _migration_authorizer)
+            else:
+                connection.set_authorizer(_migration_authorizer)
             authorizer_active = True
             try:
                 for statement in statements:
@@ -663,4 +671,9 @@ def apply_migrations(
             raise
         finally:
             if authorizer_active:
-                connection.set_authorizer(None)
+                if isinstance(connection, SecureConnection):
+                    _seal_runtime_authorizer(connection)
+                else:
+                    connection.set_authorizer(None)
+    if isinstance(connection, SecureConnection):
+        _seal_runtime_authorizer(connection)

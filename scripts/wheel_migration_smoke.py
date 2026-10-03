@@ -41,8 +41,8 @@ import hashlib
 import sqlite3
 import tempfile
 from pathlib import Path
-from jev_trading_lab.core.ids import canonical_hash, canonical_json_bytes
 from jev_trading_lab.persistence.db import connect_database
+from jev_trading_lab.persistence.journal import AppendOnlyJournal, make_journal_entity
 from jev_trading_lab.persistence.migrations import apply_migrations, load_migrations
 
 migrations = load_migrations()
@@ -86,33 +86,38 @@ with tempfile.TemporaryDirectory(prefix="jev-wheel-db-") as temporary:
             "INSERT INTO runs VALUES (?,?,?,?,?,?,?)",
             (run_id, manifest_id, window_id, "phase1", "paper", "1" * 64, 1),
         )
-        payload = canonical_json_bytes({"wheel": True})
-        payload_sha256 = hashlib.sha256(payload).hexdigest()
-        entity_id = canonical_hash(
-            "journal-entity-v1",
-            {"run_id": run_id, "entity_type": "entity", "logical_identity": "2" * 64,
-             "created_at_us": 1, "payload_sha256": payload_sha256},
+        entity = make_journal_entity(
+            run_id=run_id,
+            entity_type="entity",
+            logical_identity="2" * 64,
+            created_at_us=1,
+            payload={"wheel": True},
         )
-        connection.execute(
-            "INSERT INTO journal_entities VALUES (?,?,?,?,?,?,?)",
-            (entity_id, run_id, "entity", "2" * 64, 1, payload_sha256, payload),
-        )
-        assert (
-            connection.execute("SELECT jev_sha256(?)", (payload,)).fetchone()[0]
-            == payload_sha256
-        )
-        try:
-            connection.execute(
+        assert AppendOnlyJournal(connection).append_entity(entity) == entity.entity_id
+        for statement, parameters in (
+            (
                 "INSERT INTO journal_entities VALUES (?,?,?,?,?,?,?)",
                 ("3" * 64, run_id, "entity", "4" * 64, 1, "5" * 64, b"not-json"),
-            )
-        except sqlite3.IntegrityError:
-            pass
-        else:
-            raise AssertionError("installed wheel accepted unauthenticated journal row")
+            ),
+            ("UPDATE journal_entities SET entity_id = entity_id", ()),
+            ("DELETE FROM journal_entities", ()),
+            ("DROP TABLE journal_entities", ()),
+        ):
+            try:
+                connection.execute(statement, parameters)
+            except sqlite3.DatabaseError as error:
+                assert "not authorized" in str(error)
+            else:
+                raise AssertionError(
+                    f"installed wheel permitted controlled write: {statement}"
+                )
+        assert (
+            connection.execute("SELECT count(*) FROM journal_entities").fetchone()[0]
+            == 1
+        )
     finally:
         connection.close()
-print("Installed-wheel migration and journal authentication smoke passed.")
+print("Installed-wheel migration and controlled journal write smoke passed.")
 """
         subprocess.run([str(python), "-I", "-c", code], cwd=outside, check=True)
     return 0

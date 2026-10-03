@@ -12,8 +12,7 @@ from dataclasses import dataclass
 
 from jev_trading_lab.core.ids import canonical_hash, canonical_json_bytes
 from jev_trading_lab.core.time import MAX_DATETIME_US, MIN_DATETIME_US
-from jev_trading_lab.persistence.db import SecureConnection
-from jev_trading_lab.persistence.journal_sql import register_journal_sql_functions
+from jev_trading_lab.persistence.db import SecureConnection, _journal_write_scope
 
 _HEX = frozenset("0123456789abcdef")
 _SLUG = re.compile(r"[a-z](?:[a-z0-9]|_(?=[a-z0-9])){0,63}")
@@ -274,7 +273,11 @@ def _reconstruct_event(record: JournalEvent) -> JournalEvent:
 
 
 class AppendOnlyJournal:
-    """Append immutable records with owned transactions and database authority.
+    """Validate and append immutable records through a sealed ``SecureConnection``.
+
+    Consistency and controlled-writer change control apply only to writes through
+    this supported API. This is not keyed provenance or authentication against
+    malicious same-process code, raw SQLite connections, or filesystem writers.
 
     Supersession is acyclic without graph traversal: each new event may reference
     only an already persisted predecessor, event primary keys are immutable, and
@@ -289,26 +292,23 @@ class AppendOnlyJournal:
         *,
         expected_busy_timeout_ms: int | None = None,
     ) -> None:
-        if not isinstance(connection, sqlite3.Connection):
-            raise TypeError("connection must be sqlite3.Connection")
+        if not isinstance(connection, SecureConnection):
+            raise TypeError("journal connection must be SecureConnection")
         if connection.isolation_level is not None:
             raise ValueError(
                 "journal connection must use autocommit isolation_level=None"
             )
-        if isinstance(connection, SecureConnection):
-            configured = connection.busy_timeout_ms
-            if (
-                expected_busy_timeout_ms is not None
-                and expected_busy_timeout_ms != configured
-            ):
-                raise ValueError(
-                    "expected_busy_timeout_ms cannot override SecureConnection"
-                )
-            expected_busy_timeout_ms = configured
-        elif expected_busy_timeout_ms is None:
+        if not connection.authorizer_sealed:
+            raise ValueError("journal connection runtime authorizer must be sealed")
+        configured = connection.busy_timeout_ms
+        if (
+            expected_busy_timeout_ms is not None
+            and expected_busy_timeout_ms != configured
+        ):
             raise ValueError(
-                "expected_busy_timeout_ms is required for plain sqlite connections"
+                "expected_busy_timeout_ms cannot override SecureConnection"
             )
+        expected_busy_timeout_ms = configured
         if type(expected_busy_timeout_ms) is not int:
             raise TypeError("expected_busy_timeout_ms must be a built-in integer")
         if not 0 < expected_busy_timeout_ms <= _MAX_BUSY_TIMEOUT_MS:
@@ -342,19 +342,20 @@ class AppendOnlyJournal:
                 )
 
     @contextmanager
-    def _write(self) -> Iterator[None]:
+    def _write(self, table: str) -> Iterator[None]:
         self._verify_write_boundary()
         owned = False
-        try:
-            self._connection.execute("BEGIN IMMEDIATE")
-            owned = True
-            yield
-            self._connection.execute("COMMIT")
-            owned = False
-        except BaseException:
-            if owned and self._connection.in_transaction:
-                self._connection.execute("ROLLBACK")
-            raise
+        with _journal_write_scope(self._connection, table):
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                owned = True
+                yield
+                self._connection.execute("COMMIT")
+                owned = False
+            except BaseException:
+                if owned and self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                raise
 
     def _append_exact(
         self,
@@ -397,7 +398,7 @@ class AppendOnlyJournal:
         trusted = _reconstruct_entity(record)
         columns = tuple(JournalEntity.__dataclass_fields__)
         values = tuple(getattr(trusted, column) for column in columns)
-        with self._write():
+        with self._write("journal_entities"):
             return self._append_exact(
                 table="journal_entities",
                 key_column="entity_id",
@@ -416,7 +417,7 @@ class AppendOnlyJournal:
         trusted = _reconstruct_event(record)
         columns = tuple(JournalEvent.__dataclass_fields__)
         values = tuple(getattr(trusted, column) for column in columns)
-        with self._write():
+        with self._write("journal_events"):
             if trusted.supersedes_event_id is not None:
                 predecessor = self._connection.execute(
                     "SELECT entity_id, sequence, occurred_at_us, payload_sha256 "
@@ -466,5 +467,4 @@ __all__ = [
     "JournalRepositoryError",
     "make_journal_entity",
     "make_journal_event",
-    "register_journal_sql_functions",
 ]

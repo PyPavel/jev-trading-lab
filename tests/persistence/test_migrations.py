@@ -492,6 +492,30 @@ def test_failed_second_statement_rolls_back_entire_migration(
         connection.close()
 
 
+def test_failed_migration_restores_sealed_runtime_authorizer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package, _schema = _package(
+        tmp_path / "package",
+        monkeypatch,
+        {
+            "001_migration_metadata.sql": SCHEMA_SQL,
+            "002_core_entities.sql": CORE_SCHEMA_SQL,
+            "003_append_only_guards.sql": JOURNAL_SCHEMA_SQL,
+            "004_failure.sql": b"SELECT * FROM table_that_does_not_exist;\n",
+        },
+    )
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
+    try:
+        apply_migrations(connection, clock=lambda: 1_000_000)
+        with pytest.raises(sqlite3.OperationalError, match="no such table"):
+            apply_migrations(connection, package=package, clock=lambda: 2_000_000)
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            connection.execute("CREATE TABLE escaped (id INTEGER) STRICT")
+    finally:
+        connection.close()
+
+
 def test_trigger_aware_statement_parsing_and_execution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
