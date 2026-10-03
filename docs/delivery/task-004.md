@@ -2,9 +2,9 @@
 
 ## Status
 
-**PENDING INDEPENDENT RE-REVIEW**
+**FINAL APPROVED / COMPLETE**
 
-Task 5 remains blocked until reviewers accept this correction.
+This document records implementation, remediation, verification, and final independent approval evidence.
 
 ## Commits
 
@@ -214,4 +214,35 @@ exit 0
 
 No design, plan, provider-research, or review file changed. No dependency changed. The checked-in example remains `example_only=true` and structurally valid with explicit placeholder values; its Jev SDK version was normalized to strict semantic form. Task 14 registration must revalidate canonical bytes and call `assert_activation_candidate()` before persistence or activation.
 
-Independent spec/adversarial and quality/security re-reviews have not yet been recorded. Status remains **PENDING INDEPENDENT RE-REVIEW**.
+## Final independent review verdicts
+
+### Spec and adversarial review: PASS
+
+The independent spec/adversarial reviewer reported **PASS**, with zero BLOCKER and zero MAJOR findings. The reviewer completed 4,134 identity/trust checks and verified the complete 431-test suite.
+
+### Quality and model-risk review: APPROVED
+
+The independent quality/model-risk reviewer reported **APPROVED**, with zero BLOCKER and zero MAJOR findings. The reviewer verified 299 Task 4 tests and 193 supplemental adversarial checks.
+
+## Final reviewed commit chain
+
+```text
+3a2ede39d5cc4572f9a36ee4f3173fe4953c97e1 feat(core): define immutable run manifest
+62ca131b3899cbd0c3a66785964613fe23852d4c docs(delivery): record task 004 evidence
+0476dd3ad9f1bfef9978bce6f9c6c4b30ff41ead fix(core): close manifest trust and policy gaps
+611549406a5500ef388214b93d3e3a77d0432314 docs(delivery): update task 004 review evidence
+be86be2cf9a764b7b9120c5008ac46fc6451707c fix(core): freeze model input and activation identities
+d1b76688ab3c94491ecb67a8a040b4bf08becc9d docs(delivery): update task 004 identity review
+b85d8fc00942730c2819c9583c48574da1b5ff46 fix(core): close activation and schema identity gaps
+a3cd848bede7837b3aae01adee88d5ab6c3778e7 docs(delivery): update task 004 activation review
+bdfda7566dfd94e6409e92d7c54e36287c089600 fix(core): make activation identity checks field-aware
+2f7773ffd1fe254087afb046b33bd02c562292ad docs(delivery): update task 004 identity classifier review
+f8c901811ff7634f8ffb1e650ce9d0f1ab7ec2ee fix(core): make activation identities precise
+34baba296bf283ebb98f021d3f86a25c9968af7a docs(delivery): update task 004 precise identity review
+```
+
+The approval evidence commit containing this section follows `34baba2` and changes only `docs/delivery/task-004.md`.
+
+## Final status
+
+**FINAL APPROVED / COMPLETE.** Both required independent reviews report zero BLOCKER and zero MAJOR findings. Task 4 is complete; Task 5 may proceed under its own reviewed change-control cycle.
