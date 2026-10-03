@@ -41,38 +41,6 @@ def _project_data(root: Path = ROOT) -> dict[str, Any]:
     return tomllib.loads(project_file.read_text(encoding="utf-8"))
 
 
-def _policy_terms() -> tuple[str, ...]:
-    return (
-        "bro" + "ker",
-        "wal" + "let",
-        "private" + "_key",
-        "sign" + "ing",
-        "sign" + "_order",
-        "submit" + "_order",
-        "create" + "_order",
-        "live" + "_order",
-        "web" + "3",
-        "cc" + "xt",
-        "eth" + "_account",
-        "py_" + "clob_client",
-    )
-
-
-def _python_surface(path: Path) -> set[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            names.update(alias.name.casefold() for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            names.add(node.module.casefold())
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(node.name.casefold())
-        elif isinstance(node, ast.Attribute):
-            names.add(node.attr.casefold())
-    return names
-
-
 def _normalize_name(value: str) -> str:
     return re.sub(r"[-_.]+", "-", value).casefold()
 
@@ -83,92 +51,86 @@ def _requirement_name(requirement: str) -> str:
     return _normalize_name(match.group())
 
 
-def _dangerous_spelling(value: str) -> str | None:
-    normalized = re.sub(r"[-_.\s]+", "-", value).casefold()
-    compact = normalized.replace("-", "")
-    blocked = {
-        "bro" + "ker",
-        "wal" + "let",
-        "sign" + "ing",
-        "private" + "key",
-        "sign" + "order",
-        "submit" + "order",
-        "create" + "order",
-        "live" + "order",
-        "py" + "clobclient",
-        "eth" + "account",
-        "alpaca" + "py",
-        "ib" + "insync",
-        "web" + "3",
-        "cc" + "xt",
-    }
-    return value if any(term in compact for term in blocked) else None
+_ALLOWED_SOURCE_IMPORTS = {
+    "src/jev_trading_lab/__init__.py": frozenset(),
+    "src/jev_trading_lab/cli.py": frozenset({"typer"}),
+}
+_ALLOWED_SOURCE_CALLS = {
+    "src/jev_trading_lab/__init__.py": frozenset(),
+    "src/jev_trading_lab/cli.py": frozenset(
+        {"typer.Typer", "app.callback", "app", "main"}
+    ),
+}
+_ALLOWED_TOOL_CONFIG = {
+    "hatch": {
+        "build": {
+            "targets": {
+                "wheel": {
+                    "packages": ["src/jev_trading_lab"],
+                    "include": [
+                        "src/jev_trading_lab/**/*.sql",
+                        "src/jev_trading_lab/templates/**/*",
+                    ],
+                }
+            }
+        }
+    },
+    "pytest": {"ini_options": {"testpaths": ["tests"]}},
+    "ruff": {
+        "target-version": "py312",
+        "line-length": 88,
+        "extend-exclude": ["docs"],
+        "lint": {"select": ["E", "F", "I", "UP"]},
+    },
+    "mypy": {"python_version": "3.12", "strict": True, "files": ["src"]},
+}
+_ALLOWED_ENTRY_POINTS = {"jev-lab": "jev_trading_lab.cli:app"}
 
 
-def _literal_string(node: ast.AST) -> str | None:
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left = _literal_string(node.left)
-        right = _literal_string(node.right)
-        if left is not None and right is not None:
-            return left + right
+def _import_paths(node: ast.Import | ast.ImportFrom) -> list[str]:
+    if isinstance(node, ast.Import):
+        return [alias.name for alias in node.names]
+    prefix = "." * node.level + (node.module or "")
+    return [f"{prefix}.{alias.name}".strip(".") for alias in node.names]
+
+
+def _call_path(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        owner = _call_path(node.value)
+        return f"{owner}.{node.attr}" if owner else node.attr
     return None
 
 
 def _python_policy_violations(path: Path, root: Path) -> list[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    allowed_imports = set(sys.stdlib_module_names) | {"jev_trading_lab", "typer"}
+    relative = path.relative_to(root).as_posix()
+    if relative not in _ALLOWED_SOURCE_IMPORTS:
+        return [f"{relative}: source path is not allowlisted"]
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        return [f"{relative}: source is unreadable UTF-8: {error}"]
+    try:
+        tree = ast.parse(source, filename=str(path))
+    except SyntaxError as error:
+        return [f"{relative}: source is not valid Python: {error}"]
+
     violations: list[str] = []
+    allowed_imports = _ALLOWED_SOURCE_IMPORTS[relative]
+    allowed_calls = _ALLOWED_SOURCE_CALLS[relative]
     for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imports = [alias.name for alias in node.names]
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imports = [node.module]
-        else:
-            imports = []
-        for imported in imports:
-            top_level = imported.split(".", maxsplit=1)[0]
-            if top_level not in allowed_imports:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for imported in _import_paths(node):
+                if imported not in allowed_imports:
+                    violations.append(f"{relative}: unauthorized import {imported}")
+        elif isinstance(node, ast.Call):
+            called = _call_path(node.func)
+            if called not in allowed_calls:
                 violations.append(
-                    f"{path.relative_to(root)}: unauthorized import {imported}"
+                    f"{relative}: unauthorized call {called or '<dynamic>'}"
                 )
-
-        candidates: list[str] = []
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            candidates.append(node.value)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            candidates.append(node.name)
-        elif isinstance(node, ast.Attribute):
-            candidates.append(node.attr)
-        for candidate in candidates:
-            if dangerous := _dangerous_spelling(candidate):
-                violations.append(
-                    f"{path.relative_to(root)}: prohibited surface {dangerous}"
-                )
-
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if node.func.attr.casefold() == "post":
-                for argument in node.args:
-                    literal = _literal_string(argument)
-                    if literal and re.search(
-                        r"/(?:v\d+/)?orders?(?:[/?#]|$)", literal, re.I
-                    ):
-                        violations.append(
-                            f"{path.relative_to(root)}: direct POST to orders endpoint "
-                            f"{literal}"
-                        )
     return violations
-
-
-def _nested_strings(value: object) -> list[str]:
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, dict):
-        return [text for item in value.values() for text in _nested_strings(item)]
-    if isinstance(value, list):
-        return [text for item in value for text in _nested_strings(item)]
-    return []
 
 
 def _runtime_policy_violations(root: Path) -> list[str]:
@@ -182,22 +144,19 @@ def _runtime_policy_violations(root: Path) -> list[str]:
         f"pyproject.toml: runtime dependency not allowlisted: {name}"
         for name in sorted(runtime_names - allowed_runtime)
     ]
-    for entry_point in project_data.get("project", {}).get("scripts", {}):
-        if dangerous := _dangerous_spelling(entry_point):
-            violations.append(f"pyproject.toml: prohibited entry point {dangerous}")
-    for config_value in _nested_strings(project_data):
-        if dangerous := _dangerous_spelling(config_value):
-            violations.append(f"pyproject.toml: prohibited config surface {dangerous}")
-        if re.search(r"\bpost\b.*?/(?:v\d+/)?orders?(?:[/?#]|$)", config_value, re.I):
-            violations.append("pyproject.toml: direct POST to orders endpoint")
+
+    entry_points = project_data.get("project", {}).get("scripts", {})
+    if entry_points != _ALLOWED_ENTRY_POINTS:
+        violations.append(
+            f"pyproject.toml: entry points not allowlisted: {entry_points}"
+        )
+    tool_config = project_data.get("tool", {})
+    if tool_config != _ALLOWED_TOOL_CONFIG:
+        violations.append(f"pyproject.toml: tool config not allowlisted: {tool_config}")
 
     lock_file = root / "uv.lock"
     if lock_file.is_file():
         lock_data = tomllib.loads(lock_file.read_text(encoding="utf-8"))
-        for package in lock_data.get("package", []):
-            name = _normalize_name(package["name"])
-            if dangerous := _dangerous_spelling(name):
-                violations.append(f"uv.lock: prohibited package {dangerous}")
         project_name = project_data.get("project", {}).get("name")
         project_package = next(
             (
@@ -219,43 +178,30 @@ def _runtime_policy_violations(root: Path) -> list[str]:
                     f"uv.lock: runtime dependency not allowlisted: {name}"
                 )
 
-    for directory_name in ("src", "scripts", "ops"):
-        directory = root / directory_name
-        if not directory.is_dir():
-            continue
-        for path in directory.rglob("*"):
+    source = root / "src"
+    if source.is_dir():
+        for path in source.rglob("*"):
             if not path.is_file() or "__pycache__" in path.parts:
                 continue
             if path.suffix == ".py":
                 violations.extend(_python_policy_violations(path, root))
-                continue
-            try:
-                text = path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                continue
-            for line_number, line in enumerate(text.splitlines(), start=1):
-                if dangerous := _dangerous_spelling(line):
-                    violations.append(
-                        f"{path.relative_to(root)}:{line_number}: prohibited surface "
-                        f"{dangerous.strip()}"
-                    )
-                if re.search(r"\bpost\b.*?/(?:v\d+/)?orders?(?:[/?#]|$)", line, re.I):
-                    relative = path.relative_to(root)
-                    violations.append(
-                        f"{relative}:{line_number}: direct POST to orders endpoint"
-                    )
+            else:
+                relative = path.relative_to(root).as_posix()
+                violations.append(f"{relative}: source path is not allowlisted")
+
+    for directory_name in ("scripts", "ops"):
+        directory = root / directory_name
+        if not directory.is_dir():
+            continue
+        for path in directory.rglob("*"):
+            if path.is_file():
+                relative = path.relative_to(root).as_posix()
+                violations.append(f"{relative}: operational path is not allowlisted")
     return violations
 
 
 def test_no_live_execution_surface() -> None:
     assert not _runtime_policy_violations(ROOT)
-
-
-@pytest.mark.parametrize("term", _policy_terms())
-def test_surface_scanner_rejects_prohibited_terms(term: str, tmp_path: Path) -> None:
-    sample = tmp_path / "unsafe.py"
-    sample.write_text(f"def {term}():\n    pass\n", encoding="utf-8")
-    assert term in _python_surface(sample)
 
 
 @pytest.mark.parametrize(
@@ -296,49 +242,49 @@ def test_surface_scanner_rejects_prohibited_terms(term: str, tmp_path: Path) -> 
             "pyproject.toml",
             '[project]\nname="sample"\nversion="0.1.0"\ndependencies=["typer"]\n'
             '[tool.runner]\ncommand="curl -X POST https://api.example.test/orders"\n',
-            "orders",
+            "not allowlisted",
         ),
         (
             "uv.lock",
             'version=1\n[[package]]\nname="sample"\nversion="0.1.0"\n'
-            'dependencies=[{name="typer"}]\n[[package]]\nname="py-clob-client"\n'
-            'version="0.1.0"\n',
+            'dependencies=[{name="py-clob-client"}]\n'
+            '[[package]]\nname="py-clob-client"\nversion="0.1.0"\n',
             "py-clob-client",
         ),
         (
             "src/sample.py",
             'import requests\nrequests.post("https://api.example.test/v2/orders")\n',
-            "orders",
+            "src/sample.py",
         ),
         (
             "src/sample.py",
             'import requests\nrequests.post("https://api.example.test" + "/orders")\n',
-            "orders",
+            "src/sample.py",
         ),
         (
             "src/sample.py",
             'method = "submit-order"\ngetattr(client, method)()\n',
-            "submit-order",
+            "src/sample.py",
         ),
         (
             "src/sample.py",
             'handlers["sign-order"]()\n',
-            "sign-order",
+            "src/sample.py",
         ),
         (
             "ops/live.service",
             "ExecStart=/usr/bin/curl -X POST https://api.example.test/orders\n",
-            "orders",
+            "ops/live.service",
         ),
         (
             "scripts/adapter.sh",
             "#!/bin/sh\npython -m alpaca-py submit-order\n",
-            "alpaca-py",
+            "scripts/adapter.sh",
         ),
         (
             "src/sample.py",
             "import mystery_trading_sdk\n",
-            "mystery_trading_sdk",
+            "src/sample.py",
         ),
     ),
 )
@@ -359,6 +305,145 @@ def test_policy_positive_controls_reject_bypasses(
     violations = _runtime_policy_violations(tmp_path)
 
     assert any(expected in violation for violation in violations), violations
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    (
+        (
+            "from urllib.request import Request, urlopen\n"
+            'request = Request("https://api.example.test/orders", method="POST")\n'
+            "urlopen(request)\n",
+            "urllib.request",
+        ),
+        (
+            "from http.client import HTTPSConnection\n"
+            'connection = HTTPSConnection("api.example.test")\n'
+            'connection.request("POST", "/orders")\n',
+            "http.client",
+        ),
+        (
+            "import subprocess\n"
+            'verb = "PO" + "ST"\n'
+            'endpoint = "https://api.example.test" + "/orders"\n'
+            'argv = ["curl", "-X", verb, endpoint]\n'
+            "subprocess.run(argv, check=True)\n",
+            "subprocess",
+        ),
+        (
+            'module_name = "urllib" + ".request"\n'
+            "transport = __import__(module_name)\n",
+            "__import__",
+        ),
+        (
+            "import importlib\n"
+            'module_name = "http" + ".client"\n'
+            "transport = importlib.import_module(module_name)\n",
+            "importlib",
+        ),
+        (
+            "import jev_trading_lab.broker as transport\n",
+            "jev_trading_lab.broker",
+        ),
+        (
+            "from jev_trading_lab import broker\n",
+            "jev_trading_lab.broker",
+        ),
+        (
+            "from jev_trading_lab import wallet\n",
+            "jev_trading_lab.wallet",
+        ),
+        (
+            "from jev_trading_lab import signing\n",
+            "jev_trading_lab.signing",
+        ),
+        (
+            "from jev_trading_lab import order\n",
+            "jev_trading_lab.order",
+        ),
+        (
+            "from jev_trading_lab import execution\n",
+            "jev_trading_lab.execution",
+        ),
+        (
+            "from jev_trading_lab import live\n",
+            "jev_trading_lab.live",
+        ),
+        (
+            'method = "submit" + "_order"\ngetattr(client, method)()\n',
+            "getattr",
+        ),
+        (
+            'request = {"method": "POST", "url": "https://api.example.test/orders"}\n'
+            "client.request(**request)\n",
+            "client.request",
+        ),
+        (
+            'client.request(method="POST", url="https://api.example.test/orders")\n',
+            "client.request",
+        ),
+    ),
+)
+def test_fail_closed_python_capability_allowlist(
+    content: str, expected: str, tmp_path: Path
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname="sample"\nversion="0.1.0"\ndependencies=["typer"]\n',
+        encoding="utf-8",
+    )
+    sample = tmp_path / "src/jev_trading_lab/cli.py"
+    sample.parent.mkdir(parents=True)
+    sample.write_text(content, encoding="utf-8")
+
+    violations = _runtime_policy_violations(tmp_path)
+
+    assert any(expected in violation for violation in violations), violations
+
+
+def test_fail_closed_shell_surface_rejects_composed_curl_post(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname="sample"\nversion="0.1.0"\ndependencies=["typer"]\n',
+        encoding="utf-8",
+    )
+    sample = tmp_path / "scripts/adapter.sh"
+    sample.parent.mkdir()
+    sample.write_text(
+        "#!/bin/sh\n"
+        'verb="P"\n'
+        'verb="${verb}OST"\n'
+        'base="https://api.example.test"\n'
+        'path="/orders"\n'
+        'curl -X "$verb" "${base}${path}"\n',
+        encoding="utf-8",
+    )
+    sample.chmod(sample.stat().st_mode | stat.S_IXUSR)
+
+    violations = _runtime_policy_violations(tmp_path)
+
+    assert any("scripts/adapter.sh" in violation for violation in violations), (
+        violations
+    )
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    ("src/opaque.cfg", "scripts/opaque.sh", "ops/opaque.service"),
+)
+def test_fail_closed_surfaces_reject_non_utf8(
+    relative_path: str, tmp_path: Path
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname="sample"\nversion="0.1.0"\ndependencies=["typer"]\n',
+        encoding="utf-8",
+    )
+    sample = tmp_path / relative_path
+    sample.parent.mkdir(parents=True, exist_ok=True)
+    sample.write_bytes(b"#!/bin/sh\n\xff\xfe\x00")
+    sample.chmod(sample.stat().st_mode | stat.S_IXUSR)
+
+    violations = _runtime_policy_violations(tmp_path)
+
+    assert any(relative_path in violation for violation in violations), violations
 
 
 def test_required_dev_toolchain_is_declared_and_locked() -> None:
@@ -425,3 +510,5 @@ def test_ci_uses_immutable_actions_and_locked_audit() -> None:
         "uv run pip-audit --strict --requirement audit-requirements.txt "
         "--no-deps --disable-pip"
     ) in workflow
+    assert "run: uv build --no-build-isolation" in workflow
+    assert "run: uv build\n" not in workflow
