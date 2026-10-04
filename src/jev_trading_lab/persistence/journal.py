@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from jev_trading_lab.core.ids import canonical_hash, canonical_json_bytes
 from jev_trading_lab.core.time import MAX_DATETIME_US, MIN_DATETIME_US
 from jev_trading_lab.persistence.db import (
     SecureConnection,
+    _is_migration_ready,
     _journal_write_scope,
     _reject_user_temp_schema,
 )
@@ -330,8 +332,11 @@ class AppendOnlyJournal:
         *,
         expected_busy_timeout_ms: int | None = None,
     ) -> None:
-        if not isinstance(connection, SecureConnection):
-            raise TypeError("journal connection must be SecureConnection")
+        if not _is_migration_ready(connection):
+            raise TypeError(
+                "journal connection must be an exact factory-created SecureConnection"
+            )
+        assert type(connection) is SecureConnection
         if connection.isolation_level is not None:
             raise ValueError(
                 "journal connection must use autocommit isolation_level=None"
@@ -358,6 +363,15 @@ class AppendOnlyJournal:
         self._expected_busy_timeout_ms = expected_busy_timeout_ms
 
     def _verify_write_boundary(self) -> None:
+        if not _is_migration_ready(self._connection):
+            raise JournalRepositoryError(
+                "journal connection factory provenance is no longer valid"
+            )
+        if sys.gettrace() is not None or sys.getprofile() is not None:
+            raise JournalRepositoryError(
+                "journal writes are unavailable while interpreter tracing "
+                "or profiling is active"
+            )
         if self._connection.isolation_level is not None:
             raise JournalRepositoryError(
                 "journal connection isolation_level drift: expected autocommit"
@@ -366,9 +380,7 @@ class AppendOnlyJournal:
             raise JournalRepositoryError(
                 "cannot write inside an active caller transaction"
             )
-        timeout = self._expected_busy_timeout_ms
-        if isinstance(self._connection, SecureConnection):
-            timeout = self._connection.busy_timeout_ms
+        timeout = self._connection.busy_timeout_ms
         for pragma, expected in (*_STATIC_PRAGMA_CONTRACT, ("busy_timeout", timeout)):
             row = self._connection.execute(f"PRAGMA {pragma}").fetchone()
             actual = None if row is None else row[0]

@@ -17,6 +17,7 @@ import os
 import re
 import sqlite3
 import stat
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -31,9 +32,9 @@ from jev_trading_lab.core.time import (
 from jev_trading_lab.persistence.db import (
     SecureConnection,
     _is_migration_ready,
+    _privileged_authorizer_scope,
     _reject_user_temp_schema,
     _restore_runtime_authorizer,
-    _set_internal_authorizer,
 )
 
 MAX_MIGRATION_BYTES = 1_048_576
@@ -625,7 +626,11 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
         raise MigrationError(
             "migration connection must be created and sealed by connect_database"
         )
-    assert isinstance(connection, SecureConnection)
+    assert type(connection) is SecureConnection
+    if sys.gettrace() is not None or sys.getprofile() is not None:
+        raise MigrationError(
+            "migration is unavailable while interpreter tracing or profiling is active"
+        )
     if connection.isolation_level is not None:
         raise MigrationError(
             "migration connection must use autocommit isolation_level=None"
@@ -643,7 +648,6 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
         migrations, migration_statements, timestamps, strict=True
     ):
         owned_transaction = False
-        authorizer_active = False
         try:
             connection.execute("BEGIN IMMEDIATE")
             owned_transaction = True
@@ -653,25 +657,25 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
                 connection.execute("COMMIT")
                 owned_transaction = False
                 continue
-            _set_internal_authorizer(connection, _migration_authorizer)
-            authorizer_active = True
-            try:
-                for statement in statements:
-                    connection.execute(statement)
-                connection.execute(_migration_metadata_insert(migration, applied_at_us))
-                connection.execute("COMMIT")
-                owned_transaction = False
-            except sqlite3.DatabaseError as error:
-                if "authorized" in str(error).casefold():
-                    raise MigrationError(
-                        f"migration {migration.name!r} contains unauthorized SQL"
-                    ) from error
-                raise
+            with _privileged_authorizer_scope(connection, _migration_authorizer):
+                try:
+                    for statement in statements:
+                        connection.execute(statement)
+                    connection.execute(
+                        _migration_metadata_insert(migration, applied_at_us)
+                    )
+                    connection.execute("COMMIT")
+                    owned_transaction = False
+                except sqlite3.DatabaseError as error:
+                    if "authorized" in str(error).casefold():
+                        raise MigrationError(
+                            f"migration {migration.name!r} contains unauthorized SQL"
+                        ) from error
+                    raise
         except BaseException:
             if owned_transaction and connection.in_transaction:
                 connection.execute("ROLLBACK")
             raise
         finally:
-            if authorizer_active:
-                _restore_runtime_authorizer(connection)
+            _restore_runtime_authorizer(connection)
     _restore_runtime_authorizer(connection)

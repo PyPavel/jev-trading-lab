@@ -333,10 +333,12 @@ def test_apply_rejects_raw_connection_before_trace_callback_or_sql() -> None:
 
         assert callback_calls == 0
         connection.set_trace_callback(None)
-        assert connection.execute(
-            "SELECT 1 FROM main.sqlite_schema "
-            "WHERE type = 'trigger' AND name = 'guarded_immutable'"
-        ).fetchone() == (1,)
+        assert tuple(
+            connection.execute(
+                "SELECT 1 FROM main.sqlite_schema "
+                "WHERE type = 'trigger' AND name = 'guarded_immutable'"
+            ).fetchone()
+        ) == (1,)
         assert (
             connection.execute(
                 "SELECT 1 FROM main.sqlite_schema WHERE name = 'schema_migrations'"
@@ -478,6 +480,143 @@ def test_rejected_connection_preserves_transaction_and_authorizer_state() -> Non
         connection.execute("ROLLBACK")
         assert connection.execute("SELECT count(*) FROM caller_data").fetchone() == (0,)
     finally:
+        connection.close()
+
+
+class _TraceAbort(BaseException):
+    pass
+
+
+def test_apply_rejects_active_trace_before_privileged_transition(
+    tmp_path: Path,
+) -> None:
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
+    sqlite3.Connection.set_authorizer(connection, None)
+    connection.execute("CREATE TABLE main.guarded(value INTEGER) STRICT")
+    connection.execute(
+        "CREATE TRIGGER main.guarded_immutable BEFORE DELETE ON guarded "
+        "BEGIN SELECT RAISE(ABORT, 'immutable'); END"
+    )
+    sqlite3.Connection.set_authorizer(connection, db_module._runtime_authorizer)
+    injected = False
+
+    def inject_after_install(frame: object, event: str, _arg: object) -> object:
+        nonlocal injected
+        if (
+            not injected
+            and event == "return"
+            and getattr(frame, "f_code", None)
+            is db_module._set_internal_authorizer.__code__
+        ):
+            connection.execute("DROP TRIGGER main.guarded_immutable")
+            connection.execute("CREATE TABLE main.trace_forged(value INTEGER) STRICT")
+            injected = True
+        return inject_after_install
+
+    sys.settrace(inject_after_install)
+    try:
+        with pytest.raises(MigrationError, match="tracing|profiling"):
+            apply_migrations(connection)
+    finally:
+        sys.settrace(None)
+    try:
+        assert not injected
+        assert tuple(
+            connection.execute(
+                "SELECT 1 FROM main.sqlite_schema "
+                "WHERE type = 'trigger' AND name = 'guarded_immutable'"
+            ).fetchone()
+        ) == (1,)
+        assert (
+            connection.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE name = 'trace_forged'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+
+
+def test_migration_transition_restores_after_trace_baseexception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
+    raised_after_install = False
+
+    def abort_after_install(frame: object, event: str, _arg: object) -> object:
+        nonlocal raised_after_install
+        if (
+            event == "return"
+            and getattr(frame, "f_code", None)
+            is db_module._set_internal_authorizer.__code__
+        ):
+            raised_after_install = True
+            raise _TraceAbort("after migration authorizer install")
+        return abort_after_install
+
+    monkeypatch.setattr(sys, "gettrace", lambda: None)
+    sys.settrace(abort_after_install)
+    try:
+        with pytest.raises(_TraceAbort, match="after migration authorizer install"):
+            apply_migrations(connection)
+    finally:
+        sys.settrace(None)
+    try:
+        assert raised_after_install
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            connection.execute("CREATE TABLE main.stranded_privilege(value INTEGER)")
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("hook", ("trace", "profile"))
+def test_apply_rejects_active_interpreter_hook_before_sql(
+    tmp_path: Path, hook: str
+) -> None:
+    connection = _connect(tmp_path / hook / "db.sqlite3")
+    callback_calls = 0
+
+    def callback(_frame: object, _event: str, _arg: object) -> object:
+        nonlocal callback_calls
+        callback_calls += 1
+        return callback
+
+    setter = sys.settrace if hook == "trace" else sys.setprofile
+    setter(callback)
+    try:
+        with pytest.raises(MigrationError, match="tracing|profiling"):
+            apply_migrations(connection)
+    finally:
+        setter(None)
+    try:
+        assert callback_calls > 0
+        assert (
+            connection.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE name = 'schema_migrations'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+
+
+def test_apply_rejects_threading_trace_active_on_current_thread(
+    tmp_path: Path,
+) -> None:
+    if not hasattr(threading, "settrace_all_threads"):
+        pytest.skip("threading.settrace_all_threads is unavailable")
+    connection = _connect(tmp_path / "threading-trace" / "db.sqlite3")
+
+    def callback(_frame: object, _event: str, _arg: object) -> object:
+        return callback
+
+    threading.settrace_all_threads(callback)
+    try:
+        assert sys.gettrace() is callback
+        with pytest.raises(MigrationError, match="tracing|profiling"):
+            apply_migrations(connection)
+    finally:
+        threading.settrace_all_threads(None)
         connection.close()
 
 

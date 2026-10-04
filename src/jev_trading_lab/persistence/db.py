@@ -337,7 +337,7 @@ def _mark_migration_ready(connection: SecureConnection) -> None:
 
 
 def _is_migration_ready(connection: object) -> bool:
-    if not isinstance(connection, SecureConnection):
+    if type(connection) is not SecureConnection:
         return False
     try:
         sealed = _secure_slot(connection, "_authorizer_sealed")
@@ -370,12 +370,26 @@ def _restore_runtime_authorizer(connection: SecureConnection) -> None:
 
 
 @contextmanager
-def _journal_write_scope(connection: SecureConnection, table: str) -> Iterator[None]:
-    if not connection.authorizer_sealed:
-        raise DatabaseConfigurationError("runtime authorizer is not sealed")
-    _set_internal_authorizer(connection, _journal_authorizer(table))
+def _privileged_authorizer_scope(
+    connection: SecureConnection, authorizer: _Authorizer
+) -> Iterator[None]:
+    """Install privilege only inside an already-established restoration guard."""
     try:
+        _set_internal_authorizer(connection, authorizer)
         yield
+    finally:
+        _set_internal_authorizer(connection, _runtime_authorizer)
+
+
+@contextmanager
+def _journal_write_scope(connection: SecureConnection, table: str) -> Iterator[None]:
+    if not _is_migration_ready(connection):
+        raise DatabaseConfigurationError(
+            "journal connection must be created and sealed by connect_database"
+        )
+    try:
+        with _privileged_authorizer_scope(connection, _journal_authorizer(table)):
+            yield
     finally:
         _set_internal_authorizer(connection, _runtime_authorizer)
 

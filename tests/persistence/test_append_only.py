@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import linecache
 import sqlite3
+import sys
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -11,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from jev_trading_lab.core.ids import canonical_hash
+from jev_trading_lab.persistence import db as db_module
 from jev_trading_lab.persistence import journal as journal_module
 from jev_trading_lab.persistence.db import (
     DatabaseConfigurationError,
@@ -35,6 +38,10 @@ HEX_A = "a" * 64
 HEX_B = "b" * 64
 HEX_C = "c" * 64
 TABLES = ("journal_entities", "journal_events")
+
+
+class _TraceAbort(BaseException):
+    pass
 
 
 def _hex(label: str) -> str:
@@ -417,6 +424,131 @@ def test_privileged_journal_literals_preserve_sqlite_boundaries(
             "SELECT typeof(value), value FROM journal_entities"
         ).fetchone()
         assert actual == (expected_type, expected_value)
+    finally:
+        connection.close()
+
+
+def test_interpreter_trace_cannot_forge_journal_row(tmp_path: Path) -> None:
+    connection = _secure_connection(tmp_path / "private" / "journal.sqlite3")
+    try:
+        run_id = _insert_run(connection)
+        journal = AppendOnlyJournal(connection)
+        forged = _entity(run_id, logical_identity=HEX_B, payload={"forged": True})
+        forged_sql = journal_module._trusted_insert_sql(
+            "journal_entities",
+            tuple(
+                getattr(forged, field) for field in JournalEntity.__dataclass_fields__
+            ),
+        )
+        injected = False
+
+        def inject_after_install(frame: object, event: str, _arg: object) -> object:
+            nonlocal injected
+            if (
+                not injected
+                and event == "return"
+                and getattr(frame, "f_code", None)
+                is db_module._set_internal_authorizer.__code__
+            ):
+                connection.execute(forged_sql)
+                injected = True
+            return inject_after_install
+
+        sys.settrace(inject_after_install)
+        try:
+            with pytest.raises(JournalRepositoryError, match="tracing|profiling"):
+                journal.append_entity(_entity(run_id))
+        finally:
+            sys.settrace(None)
+        assert not injected
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM main.journal_entities WHERE entity_id = ?",
+                (forged.entity_id,),
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("abort_point", ("transition", "yield"))
+def test_journal_scope_restores_after_trace_baseexception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, abort_point: str
+) -> None:
+    connection = _secure_connection(
+        tmp_path / abort_point / "private" / "journal.sqlite3"
+    )
+    try:
+        run_id = _insert_run(connection)
+        journal = AppendOnlyJournal(connection)
+        raised_under_privilege = False
+        write_code = AppendOnlyJournal._write.__wrapped__.__code__
+
+        def abort_under_privilege(frame: object, event: str, _arg: object) -> object:
+            nonlocal raised_under_privilege
+            code = getattr(frame, "f_code", None)
+            at_transition = (
+                abort_point == "transition"
+                and event == "return"
+                and code is db_module._set_internal_authorizer.__code__
+            )
+            at_yield = (
+                abort_point == "yield"
+                and event == "line"
+                and code is write_code
+                and linecache.getline(
+                    code.co_filename, getattr(frame, "f_lineno", 0)
+                ).strip()
+                == "yield"
+            )
+            if at_transition or at_yield:
+                raised_under_privilege = True
+                raise _TraceAbort(f"journal {abort_point}")
+            return abort_under_privilege
+
+        monkeypatch.setattr(sys, "gettrace", lambda: None)
+        sys.settrace(abort_under_privilege)
+        try:
+            with pytest.raises(_TraceAbort, match=f"journal {abort_point}"):
+                journal.append_entity(_entity(run_id))
+        finally:
+            sys.settrace(None)
+        assert raised_under_privilege
+        direct = _manual_entity_values(run_id, f"direct-{abort_point}")
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            connection.execute(
+                "INSERT INTO main.journal_entities VALUES (?,?,?,?,?,?,?)", direct
+            )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("hook", ("trace", "profile"))
+def test_journal_rejects_active_interpreter_hook_before_write(
+    tmp_path: Path, hook: str
+) -> None:
+    connection = _secure_connection(tmp_path / hook / "journal.sqlite3")
+    try:
+        run_id = _insert_run(connection)
+        journal = AppendOnlyJournal(connection)
+
+        def callback(_frame: object, _event: str, _arg: object) -> object:
+            return callback
+
+        setter = sys.settrace if hook == "trace" else sys.setprofile
+        setter(callback)
+        try:
+            with pytest.raises(JournalRepositoryError, match="tracing|profiling"):
+                journal.append_entity(_entity(run_id))
+        finally:
+            setter(None)
+        assert (
+            connection.execute("SELECT count(*) FROM main.journal_entities").fetchone()[
+                0
+            ]
+            == 0
+        )
     finally:
         connection.close()
 
@@ -875,6 +1007,70 @@ def test_append_only_journal_documents_supported_python_boundary() -> None:
     assert "object internals" in boundary
     assert "process memory" in boundary
     assert "out of scope" in boundary
+
+
+def test_append_only_journal_rejects_spoofed_secure_subclass_before_use(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "private" / "journal.sqlite3"
+    setup = _secure_connection(database)
+    run_id = _insert_run(setup)
+    setup.close()
+    property_reads = 0
+    sql_calls = 0
+
+    class SpoofedSecureConnection(SecureConnection):
+        @property
+        def authorizer_sealed(self) -> bool:
+            nonlocal property_reads
+            property_reads += 1
+            return True
+
+        @property
+        def busy_timeout_ms(self) -> int:
+            nonlocal property_reads
+            property_reads += 1
+            return 5000
+
+        def execute(self, sql: str, parameters: object = (), /) -> sqlite3.Cursor:
+            nonlocal sql_calls
+            sql_calls += 1
+            return super().execute(sql, parameters)  # type: ignore[arg-type]
+
+    connection = sqlite3.connect(
+        database,
+        isolation_level=None,
+        factory=SpoofedSecureConnection,
+    )
+    sqlite3.Connection.__setattr__(connection, "row_factory", sqlite3.Row)
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA recursive_triggers = ON")
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA synchronous = FULL")
+    connection.execute("PRAGMA busy_timeout = 5000")
+    connection.execute("PRAGMA trusted_schema = OFF")
+    property_reads = 0
+    sql_calls = 0
+    accepted = False
+    try:
+        try:
+            journal = AppendOnlyJournal(connection)
+        except TypeError:
+            pass
+        else:
+            accepted = True
+            journal.append_entity(_entity(run_id, logical_identity=HEX_B))
+        assert not accepted
+        assert property_reads == 0
+        assert sql_calls == 0
+    finally:
+        connection.close()
+
+    check = sqlite3.connect(database)
+    try:
+        assert check.execute("SELECT count(*) FROM journal_entities").fetchone()[0] == 0
+    finally:
+        check.close()
 
 
 def test_append_only_journal_rejects_plain_sqlite_connection() -> None:
