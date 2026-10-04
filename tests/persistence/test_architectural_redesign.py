@@ -1,0 +1,436 @@
+from __future__ import annotations
+
+import hashlib
+import inspect
+import os
+import signal
+import sqlite3
+import subprocess
+import sys
+import threading
+import zipfile
+from pathlib import Path
+
+import pytest
+
+from jev_trading_lab.persistence import db as db_module
+from jev_trading_lab.persistence import journal as journal_module
+from jev_trading_lab.persistence import migrations as migration_module
+from jev_trading_lab.persistence.db import SecureConnection, connect_database
+from jev_trading_lab.persistence.journal import AppendOnlyJournal, make_journal_entity
+from jev_trading_lab.persistence.migrations import apply_migrations
+
+
+def _connect(path: Path, timeout: int = 5_000) -> SecureConnection:
+    connection = connect_database(
+        path.absolute(),
+        busy_timeout_ms=timeout,
+        mount_resolver=lambda _path: "ext4",
+    )
+    assert type(connection) is SecureConnection
+    return connection
+
+
+def _hex(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _insert_run(connection: sqlite3.Connection) -> str:
+    manifest_id = _hex("manifest")
+    window_id = _hex("window")
+    run_id = _hex("run")
+    connection.execute(
+        "INSERT INTO manifests VALUES (?,?,?,?)", (manifest_id, b"{}", 1, 1)
+    )
+    connection.execute(
+        "INSERT INTO run_windows VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            window_id,
+            b"{}",
+            0,
+            7_257_600_000_000,
+            7_257_600_000_001,
+            "XNYS",
+            "America/New_York",
+            "test",
+            _hex("lock"),
+            _hex("artifact"),
+            "test",
+            _hex("rule"),
+        ),
+    )
+    connection.execute(
+        "INSERT INTO runs VALUES (?,?,?,?,?,?,?)",
+        (run_id, manifest_id, window_id, "phase1", "paper", _hex("config"), 1),
+    )
+    return run_id
+
+
+def _assert_public_denied(connection: sqlite3.Connection, statement: str) -> None:
+    with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+        connection.execute(statement)
+
+
+@pytest.mark.parametrize("hook", ("trace", "profile"))
+def test_active_interpreter_hooks_cannot_borrow_journal_writer(
+    tmp_path: Path, hook: str
+) -> None:
+    connection = _connect(tmp_path / hook / "db.sqlite3")
+    try:
+        apply_migrations(connection)
+        run_id = _insert_run(connection)
+        journal = AppendOnlyJournal(connection)
+        record = make_journal_entity(
+            run_id=run_id,
+            entity_type="order_intent",
+            logical_identity=_hex("logical"),
+            created_at_us=100,
+            payload={"value": 1},
+        )
+        attacks: list[str] = []
+        armed = True
+
+        def attack() -> None:
+            nonlocal armed
+            if not armed:
+                return
+            armed = False
+            for sql in (
+                "INSERT INTO main.journal_entities SELECT * FROM main.journal_entities",
+                "DELETE FROM main.schema_migrations",
+            ):
+                try:
+                    connection.execute(sql)
+                except sqlite3.DatabaseError as error:
+                    attacks.append(str(error))
+
+        def trace_callback(_frame: object, _event: str, _arg: object) -> object:
+            attack()
+            return trace_callback
+
+        def profile_callback(_frame: object, _event: str, _arg: object) -> None:
+            attack()
+
+        setter = sys.settrace if hook == "trace" else sys.setprofile
+        setter(trace_callback if hook == "trace" else profile_callback)
+        try:
+            assert journal.append_entity(record) == record.entity_id
+        finally:
+            setter(None)
+        assert len(attacks) == 2
+        assert all("authorized" in error for error in attacks)
+        _assert_public_denied(
+            connection,
+            "INSERT INTO main.journal_entities SELECT * FROM main.journal_entities",
+        )
+    finally:
+        connection.close()
+
+
+def test_signal_handler_cannot_borrow_journal_writer(tmp_path: Path) -> None:
+    if not hasattr(signal, "SIGUSR1"):
+        pytest.skip("SIGUSR1 is unavailable")
+    connection = _connect(tmp_path / "signal" / "db.sqlite3")
+    try:
+        apply_migrations(connection)
+        run_id = _insert_run(connection)
+        journal = AppendOnlyJournal(connection)
+        record = make_journal_entity(
+            run_id=run_id,
+            entity_type="order_intent",
+            logical_identity=_hex("signal-logical"),
+            created_at_us=100,
+            payload={"value": 1},
+        )
+        attacks: list[str] = []
+
+        def handler(_signum: int, _frame: object) -> None:
+            try:
+                connection.execute(
+                    "INSERT INTO main.journal_entities "
+                    "SELECT * FROM main.journal_entities"
+                )
+            except sqlite3.DatabaseError as error:
+                attacks.append(str(error))
+
+        previous = signal.signal(signal.SIGUSR1, handler)
+        fired = False
+
+        def trigger(_frame: object, _event: str, _arg: object) -> object:
+            nonlocal fired
+            if not fired:
+                fired = True
+                signal.raise_signal(signal.SIGUSR1)
+            return trigger
+
+        sys.settrace(trigger)
+        try:
+            assert journal.append_entity(record) == record.entity_id
+        finally:
+            sys.settrace(None)
+            signal.signal(signal.SIGUSR1, previous)
+        assert attacks and "not authorized" in attacks[0]
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("hook", ("trace", "profile"))
+def test_active_parent_hooks_cannot_borrow_migration_role(
+    tmp_path: Path, hook: str
+) -> None:
+    connection = _connect(tmp_path / hook / "db.sqlite3")
+    attacks: list[str] = []
+    armed = True
+
+    def attack() -> None:
+        nonlocal armed
+        if not armed:
+            return
+        armed = False
+        for sql in (
+            "CREATE TABLE main.forged(value INTEGER)",
+            "INSERT INTO main.schema_migrations VALUES (99,'x','x',1)",
+        ):
+            try:
+                connection.execute(sql)
+            except sqlite3.DatabaseError as error:
+                attacks.append(str(error))
+
+    def trace_callback(_frame: object, _event: str, _arg: object) -> object:
+        attack()
+        return trace_callback
+
+    def profile_callback(_frame: object, _event: str, _arg: object) -> None:
+        attack()
+
+    setter = sys.settrace if hook == "trace" else sys.setprofile
+    setter(trace_callback if hook == "trace" else profile_callback)
+    try:
+        apply_migrations(connection)
+    finally:
+        setter(None)
+    try:
+        assert len(attacks) == 2
+        assert all(
+            "authorized" in error or "no such table" in error for error in attacks
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM main.schema_migrations"
+            ).fetchone()[0]
+            == 3
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE name='forged'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+
+
+def test_all_thread_trace_does_not_change_public_policy_during_migration(
+    tmp_path: Path,
+) -> None:
+    if not hasattr(threading, "settrace_all_threads"):
+        pytest.skip("threading.settrace_all_threads is unavailable")
+    connection = _connect(tmp_path / "all-thread" / "db.sqlite3")
+    attacked = False
+
+    def callback(_frame: object, _event: str, _arg: object) -> object:
+        nonlocal attacked
+        if not attacked:
+            attacked = True
+            _assert_public_denied(connection, "CREATE TABLE main.forged(value INTEGER)")
+        return callback
+
+    threading.settrace_all_threads(callback)
+    try:
+        apply_migrations(connection)
+    finally:
+        threading.settrace_all_threads(None)
+    try:
+        assert attacked
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM main.schema_migrations"
+            ).fetchone()[0]
+            == 3
+        )
+    finally:
+        connection.close()
+
+
+def test_production_has_no_authorizer_transitions_or_hook_preflights() -> None:
+    db_source = inspect.getsource(db_module)
+    journal_source = inspect.getsource(journal_module)
+    migration_source = inspect.getsource(migration_module)
+    forbidden = (
+        "_privileged_authorizer_scope",
+        "_journal_write_scope",
+        "_restore_runtime_authorizer",
+        "sys.gettrace",
+        "sys.getprofile",
+    )
+    for token in forbidden:
+        assert token not in db_source + journal_source + migration_source
+    assert db_source.count("_set_sqlite_authorizer(") == 2
+
+
+def test_fixed_journal_role_authorizer_truth_table() -> None:
+    authorize = db_module._journal_authorizer("journal_entities")
+    assert (
+        authorize(sqlite3.SQLITE_INSERT, "journal_entities", None, "main", None)
+        == sqlite3.SQLITE_OK
+    )
+    denied = (
+        (sqlite3.SQLITE_INSERT, "journal_events", "main", None),
+        (sqlite3.SQLITE_INSERT, "manifests", "main", None),
+        (sqlite3.SQLITE_INSERT, "journal_entities", "temp", None),
+        (sqlite3.SQLITE_INSERT, "journal_entities", "main", "trigger"),
+        (sqlite3.SQLITE_UPDATE, "journal_entities", "main", None),
+        (sqlite3.SQLITE_DELETE, "journal_entities", "main", None),
+        (sqlite3.SQLITE_CREATE_TABLE, "anything", "main", None),
+        (sqlite3.SQLITE_ATTACH, None, None, None),
+    )
+    for action, table, database, source in denied:
+        assert authorize(action, table, None, database, source) == sqlite3.SQLITE_DENY
+
+
+def test_append_rejects_schema_prefix_checksum_drift(tmp_path: Path) -> None:
+    database = tmp_path / "schema-prefix" / "db.sqlite3"
+    connection = _connect(database)
+    apply_migrations(connection)
+    run_id = _insert_run(connection)
+    journal = AppendOnlyJournal(connection)
+    sqlite3.Connection.set_authorizer(connection, None)
+    connection.execute(
+        "UPDATE schema_migrations SET sha256 = ? WHERE version = 3", ("0" * 64,)
+    )
+    sqlite3.Connection.set_authorizer(connection, db_module._runtime_authorizer)
+    record = make_journal_entity(
+        run_id=run_id,
+        entity_type="order_intent",
+        logical_identity=_hex("drift"),
+        created_at_us=100,
+        payload={"value": 1},
+    )
+    try:
+        with pytest.raises(Exception, match="checksum|migration"):
+            journal.append_entity(record)
+    finally:
+        connection.close()
+
+
+def test_directory_handle_close_is_idempotent_and_marks_before_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed: list[int] = []
+    observed_closed = False
+    handle = db_module._DirectoryHandle(123)
+
+    def close_fd(fd: int) -> None:
+        nonlocal observed_closed
+        observed_closed = handle.closed
+        closed.append(fd)
+        raise RuntimeError("close failed after ownership ended")
+
+    monkeypatch.setattr(db_module.os, "close", close_fd)
+    with pytest.raises(RuntimeError, match="close failed"):
+        handle.close()
+    handle.close()
+    assert observed_closed
+    assert closed == [123]
+
+
+def test_migration_helper_protocol_is_fixed() -> None:
+    helper = __import__(
+        "jev_trading_lab.persistence.migration_helper", fromlist=["PROTOCOL_VERSION"]
+    )
+    assert helper.PROTOCOL_VERSION == 1
+    assert tuple(inspect.signature(helper.main).parameters) == ("argv",)
+
+
+def test_migration_helper_protocol_rejects_invalid_inputs() -> None:
+    helper = __import__(
+        "jev_trading_lab.persistence.migration_helper", fromlist=["main"]
+    )
+    assert helper.main(("helper",)) == 1
+    assert helper.main(("helper", "2", "/tmp/db.sqlite3", "1000")) == 1
+    assert helper.main(("helper", "1", "relative.sqlite3", "1000")) == 1
+    assert helper.main(("helper", "1", "/tmp/db.sqlite3", "0")) == 1
+
+
+@pytest.mark.parametrize(
+    "completed,match",
+    (
+        (subprocess.CompletedProcess([], 1, b"{}", b"failed"), "failed"),
+        (subprocess.CompletedProcess([], 0, b"not json", b""), "malformed"),
+        (
+            subprocess.CompletedProcess([], 0, b"x" * 16_385, b""),
+            "exceeded",
+        ),
+    ),
+)
+def test_migration_helper_reply_is_bounded_and_strict(
+    completed: subprocess.CompletedProcess[bytes], match: str
+) -> None:
+    with pytest.raises(Exception, match=match):
+        migration_module._validate_helper_reply(completed)
+
+
+def test_post_commit_reply_loss_uses_database_readback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    connection = _connect(tmp_path / "reply-loss" / "db.sqlite3")
+    real_run = migration_module._run_migration_helper
+
+    def lose_reply(path: Path, timeout_ms: int) -> subprocess.CompletedProcess[bytes]:
+        completed = real_run(path, timeout_ms)
+        assert completed.returncode == 0
+        return subprocess.CompletedProcess(completed.args, 17, b"", b"lost reply")
+
+    monkeypatch.setattr(migration_module, "_run_migration_helper", lose_reply)
+    try:
+        apply_migrations(connection)
+        assert (
+            connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0]
+            == 3
+        )
+    finally:
+        connection.close()
+
+
+def test_parent_database_descriptors_are_not_inheritable(tmp_path: Path) -> None:
+    connection = _connect(tmp_path / "fds" / "db.sqlite3")
+    path = tmp_path / "fds" / "db.sqlite3"
+    targets: list[tuple[int, str]] = []
+    for entry in Path("/proc/self/fd").iterdir():
+        try:
+            target = entry.readlink().as_posix()
+            fd = int(entry.name)
+        except (OSError, ValueError):
+            continue
+        if target.startswith(str(path)):
+            targets.append((fd, target))
+    try:
+        assert targets
+        assert all(not os.get_inheritable(fd) for fd, _target in targets)
+    finally:
+        connection.close()
+
+
+def test_built_wheel_contains_helper_and_migrations() -> None:
+    wheels = tuple((Path(__file__).resolve().parents[2] / "dist").glob("*.whl"))
+    if not wheels:
+        pytest.skip("built wheel is checked in required-artifact mode")
+    with zipfile.ZipFile(wheels[0]) as archive:
+        names = set(archive.namelist())
+    assert "jev_trading_lab/persistence/migration_helper.py" in names
+    for version in ("001", "002", "003"):
+        assert any(
+            name.startswith(f"jev_trading_lab/persistence/schema/{version}_")
+            and name.endswith(".sql")
+            for name in names
+        )

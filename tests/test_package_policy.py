@@ -180,13 +180,16 @@ _APPROVED_SOURCE_HASHES = {
         "b4c2a856b006ee6bde860e8abff04c209915eb420e1c55425805e3e25042d133"
     ),
     "src/jev_trading_lab/persistence/journal.py": (
-        "ad0e05b6981559a8f2feb362fa0651eed4b1c95765f5248c39b514b129ed6447"
+        "e30877e84273e4e49a152663763d375bf717005785f3cecf7a8c2aaacb0207c7"
     ),
     "src/jev_trading_lab/persistence/db.py": (
-        "f11fb9e2a81f5696ca30235098cc276da317f788977243b0c9312c7b8968c300"
+        "9b4242fbd263fbbdd44c6cc8fd88dfb660b0dc228a9884e25573be60fe4e4431"
     ),
     "src/jev_trading_lab/persistence/migrations.py": (
-        "f5dfe8f961b9bac375aeb20eb9a6b2085ded74a349efe27a27339ae41b9e6fc8"
+        "bf5fa242b30193b3b73b4bccf7fe059195012e2d00f88d632aee2c7e1a60217b"
+    ),
+    "src/jev_trading_lab/persistence/migration_helper.py": (
+        "88ea33f38390efed8e8901bc471d8efcdc7659c844c8fcb8c13f19b85c1faf8a"
     ),
     "src/jev_trading_lab/persistence/schema/__init__.py": (
         "5f19444569734cd60895d22219e7e2481fd00efb6054fb1d4cf9f7b38e26e4a5"
@@ -257,10 +260,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "dc05bf474b56042cd25e6e66e4678136f7507468febe6de811d768ef74d8930f"
+    "09cbf88e3ac465ff9b70c293a40720f8f42945298adc0db52d252d373e079666"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "b161e4590f7959308cee43f338f153bebf668cf50d5bc7f781930464979415ec"
+    "e2426e00bea619465f67c2da1425f334ef39ee378d588c4b9ac82a6565a419c6"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = [
     "exchange-calendars==4.11.2",
@@ -1562,6 +1565,7 @@ def test_built_artifacts_exclude_repository_and_host_junk(tmp_path: Path) -> Non
         "jev_trading_lab/persistence/db.py",
         "jev_trading_lab/persistence/journal.py",
         "jev_trading_lab/persistence/migrations.py",
+        "jev_trading_lab/persistence/migration_helper.py",
         "jev_trading_lab/persistence/schema/__init__.py",
         "jev_trading_lab/persistence/schema/001_migration_metadata.sql",
         "jev_trading_lab/persistence/schema/002_core_entities.sql",

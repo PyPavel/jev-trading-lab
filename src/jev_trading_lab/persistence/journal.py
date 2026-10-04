@@ -6,7 +6,6 @@ import hashlib
 import json
 import re
 import sqlite3
-import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -15,10 +14,11 @@ from jev_trading_lab.core.ids import canonical_hash, canonical_json_bytes
 from jev_trading_lab.core.time import MAX_DATETIME_US, MIN_DATETIME_US
 from jev_trading_lab.persistence.db import (
     SecureConnection,
-    _is_migration_ready,
-    _journal_write_scope,
+    _is_factory_connection,
+    _open_journal_writer,
     _reject_user_temp_schema,
 )
+from jev_trading_lab.persistence.migrations import verify_migration_prefix
 
 _HEX = frozenset("0123456789abcdef")
 _SLUG = re.compile(r"[a-z](?:[a-z0-9]|_(?=[a-z0-9])){0,63}")
@@ -310,14 +310,17 @@ def _reconstruct_event(record: JournalEvent) -> JournalEvent:
 class AppendOnlyJournal:
     """Validate and append immutable records through a sealed ``SecureConnection``.
 
-    Consistency and controlled-writer change control assume callers use
-    ``SecureConnection`` public instance methods. After sealing, those methods
-    reject callback/function/collation registration, extension loading,
-    deserialization, and blob access while ordinary SQL reads and approved writes
-    remain available. Code that deliberately invokes base-class descriptors,
-    mutates object internals or process memory, opens raw SQLite connections, or
-    writes files directly is out of scope. This is not a sandbox, keyed provenance,
-    or writer authentication against hostile same-process code.
+    The exact factory-created public ``SecureConnection`` is retained only for
+    provenance, location, configuration, and liveness. Every append uses a fresh
+    private fixed-role writer whose authorizer is installed once during opening and
+    permits direct INSERT only into the selected journal table. The public
+    connection remains permanently restricted before, during, and after append.
+
+    Code that deliberately invokes base-class descriptors, inspects frames or
+    object internals to steal the private writer, imports private helpers, modifies
+    process memory, opens raw SQLite connections, or writes files directly is
+    out of scope. This is not a sandbox or writer authentication against hostile
+    same-process code.
 
     Supersession is acyclic without graph traversal: each new event may reference
     only an already persisted predecessor, event primary keys are immutable, and
@@ -332,7 +335,7 @@ class AppendOnlyJournal:
         *,
         expected_busy_timeout_ms: int | None = None,
     ) -> None:
-        if not _is_migration_ready(connection):
+        if not _is_factory_connection(connection):
             raise TypeError(
                 "journal connection must be an exact factory-created SecureConnection"
             )
@@ -363,14 +366,9 @@ class AppendOnlyJournal:
         self._expected_busy_timeout_ms = expected_busy_timeout_ms
 
     def _verify_write_boundary(self) -> None:
-        if not _is_migration_ready(self._connection):
+        if not _is_factory_connection(self._connection):
             raise JournalRepositoryError(
                 "journal connection factory provenance is no longer valid"
-            )
-        if sys.gettrace() is not None or sys.getprofile() is not None:
-            raise JournalRepositoryError(
-                "journal writes are unavailable while interpreter tracing "
-                "or profiling is active"
             )
         if self._connection.isolation_level is not None:
             raise JournalRepositoryError(
@@ -393,23 +391,27 @@ class AppendOnlyJournal:
                 )
 
     @contextmanager
-    def _write(self, table: str) -> Iterator[None]:
+    def _write(self, table: str) -> Iterator[sqlite3.Connection]:
         self._verify_write_boundary()
+        writer = _open_journal_writer(self._connection, table)
         owned = False
-        with _journal_write_scope(self._connection, table):
-            try:
-                self._connection.execute("BEGIN IMMEDIATE")
-                owned = True
-                yield
-                self._connection.execute("COMMIT")
-                owned = False
-            except BaseException:
-                if owned and self._connection.in_transaction:
-                    self._connection.execute("ROLLBACK")
-                raise
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            owned = True
+            verify_migration_prefix(writer)
+            yield writer
+            writer.execute("COMMIT")
+            owned = False
+        except BaseException:
+            if owned and writer.in_transaction:
+                writer.execute("ROLLBACK")
+            raise
+        finally:
+            writer.close()
 
     def _append_exact(
         self,
+        writer: sqlite3.Connection,
         *,
         table: str,
         key_column: str,
@@ -418,7 +420,7 @@ class AppendOnlyJournal:
         values: tuple[object, ...],
         conflicts: tuple[tuple[str, tuple[object, ...]], ...],
     ) -> str:
-        existing = self._connection.execute(
+        existing = writer.execute(
             f"SELECT {', '.join(columns)} FROM main.{table} WHERE "
             f"{key_column} = {_trusted_literal(key)}"
         ).fetchone()
@@ -427,13 +429,13 @@ class AppendOnlyJournal:
                 raise JournalConflictError(f"existing {table} record conflicts")
             return key
         for where, parameters in conflicts:
-            if self._connection.execute(
+            if writer.execute(
                 f"SELECT 1 FROM main.{table} WHERE "
                 f"{_trusted_predicate(where, parameters)}"
             ).fetchone():
                 raise JournalConflictError(f"existing {table} identity conflicts")
         try:
-            self._connection.execute(_trusted_insert_sql(table, values))
+            writer.execute(_trusted_insert_sql(table, values))
         except sqlite3.IntegrityError as error:
             if "immutable-conflict" in str(error) or "UNIQUE constraint failed" in str(
                 error
@@ -446,8 +448,9 @@ class AppendOnlyJournal:
         trusted = _reconstruct_entity(record)
         columns = tuple(JournalEntity.__dataclass_fields__)
         values = tuple(getattr(trusted, column) for column in columns)
-        with self._write("journal_entities"):
+        with self._write("journal_entities") as writer:
             return self._append_exact(
+                writer,
                 table="journal_entities",
                 key_column="entity_id",
                 key=trusted.entity_id,
@@ -465,9 +468,9 @@ class AppendOnlyJournal:
         trusted = _reconstruct_event(record)
         columns = tuple(JournalEvent.__dataclass_fields__)
         values = tuple(getattr(trusted, column) for column in columns)
-        with self._write("journal_events"):
+        with self._write("journal_events") as writer:
             if trusted.supersedes_event_id is not None:
-                predecessor = self._connection.execute(
+                predecessor = writer.execute(
                     "SELECT entity_id, sequence, occurred_at_us, payload_sha256 "
                     "FROM main.journal_events WHERE event_id = "
                     f"{_trusted_literal(trusted.supersedes_event_id)}"
@@ -498,6 +501,7 @@ class AppendOnlyJournal:
                     ),
                 )
             return self._append_exact(
+                writer,
                 table="journal_events",
                 key_column="event_id",
                 key=trusted.event_id,

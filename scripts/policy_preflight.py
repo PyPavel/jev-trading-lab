@@ -72,13 +72,16 @@ EXPECTED_SOURCE_HASHES = {
         "b4c2a856b006ee6bde860e8abff04c209915eb420e1c55425805e3e25042d133"
     ),
     "src/jev_trading_lab/persistence/journal.py": (
-        "ad0e05b6981559a8f2feb362fa0651eed4b1c95765f5248c39b514b129ed6447"
+        "e30877e84273e4e49a152663763d375bf717005785f3cecf7a8c2aaacb0207c7"
     ),
     "src/jev_trading_lab/persistence/db.py": (
-        "f11fb9e2a81f5696ca30235098cc276da317f788977243b0c9312c7b8968c300"
+        "9b4242fbd263fbbdd44c6cc8fd88dfb660b0dc228a9884e25573be60fe4e4431"
     ),
     "src/jev_trading_lab/persistence/migrations.py": (
-        "f5dfe8f961b9bac375aeb20eb9a6b2085ded74a349efe27a27339ae41b9e6fc8"
+        "bf5fa242b30193b3b73b4bccf7fe059195012e2d00f88d632aee2c7e1a60217b"
+    ),
+    "src/jev_trading_lab/persistence/migration_helper.py": (
+        "88ea33f38390efed8e8901bc471d8efcdc7659c844c8fcb8c13f19b85c1faf8a"
     ),
     "src/jev_trading_lab/persistence/schema/__init__.py": (
         "5f19444569734cd60895d22219e7e2481fd00efb6054fb1d4cf9f7b38e26e4a5"

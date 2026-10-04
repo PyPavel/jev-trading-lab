@@ -80,7 +80,43 @@ _MOUNTINFO_ESCAPES = {
 }
 _UMASK_LOCK = threading.Lock()
 _CONNECT_LOCK = threading.Lock()
-_MIGRATION_READY = object()
+_PUBLIC_CONNECTION = object()
+_INTERNAL_CONNECTION = object()
+
+
+class _DirectoryHandle:
+    """Own one directory descriptor with idempotent, reentrancy-safe cleanup."""
+
+    __slots__ = ("_descriptor", "_lock")
+
+    def __init__(self, descriptor: int) -> None:
+        self._descriptor: int | None = descriptor
+        self._lock = threading.Lock()
+
+    @property
+    def closed(self) -> bool:
+        return self._descriptor is None
+
+    @property
+    def descriptor(self) -> int:
+        descriptor = self._descriptor
+        if descriptor is None:
+            raise DatabaseConfigurationError("database directory handle is closed")
+        return descriptor
+
+    def close(self) -> None:
+        with self._lock:
+            descriptor = self._descriptor
+            if descriptor is None:
+                return
+            self._descriptor = None
+        os.close(descriptor)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            pass
 
 
 @contextmanager
@@ -120,17 +156,18 @@ class SecureConnection(sqlite3.Connection):
     """
 
     __slots__ = (
-        "_parent_descriptor",
+        "_directory_handle",
+        "_database_path",
         "_busy_timeout_ms",
         "_authorizer_sealed",
-        "_migration_ready_token",
+        "_factory_token",
     )
 
-    _parent_descriptor: int | None
+    _directory_handle: _DirectoryHandle
+    _database_path: Path
     _busy_timeout_ms: int
     _authorizer_sealed: bool
-    _migration_ready_token: object
-    _close_descriptor = staticmethod(os.close)
+    _factory_token: object
     _close_sqlite = sqlite3.Connection.close
     _set_sqlite_authorizer = sqlite3.Connection.set_authorizer
 
@@ -197,15 +234,17 @@ class SecureConnection(sqlite3.Connection):
         return super().blobopen(*args, **kwargs)
 
     def __getattribute__(self, name: str) -> object:
-        if name == "_migration_ready_token":
-            raise AttributeError("migration readiness is internal")
+        if name in {"_factory_token", "_directory_handle", "_database_path"}:
+            raise AttributeError("connection provenance is internal")
         return super().__getattribute__(name)
 
     def __setattr__(self, name: str, value: object) -> None:
         if name in {
             "_busy_timeout_ms",
             "_authorizer_sealed",
-            "_migration_ready_token",
+            "_factory_token",
+            "_directory_handle",
+            "_database_path",
         }:
             raise AttributeError(f"{name.removeprefix('_')} is immutable")
         if name in {"row_factory", "text_factory"} and self.authorizer_sealed:
@@ -216,7 +255,9 @@ class SecureConnection(sqlite3.Connection):
         if name in {
             "_busy_timeout_ms",
             "_authorizer_sealed",
-            "_migration_ready_token",
+            "_factory_token",
+            "_directory_handle",
+            "_database_path",
         }:
             raise AttributeError(f"{name.removeprefix('_')} is immutable")
         if name in {"row_factory", "text_factory"} and self.authorizer_sealed:
@@ -237,17 +278,22 @@ class SecureConnection(sqlite3.Connection):
         try:
             self._close_sqlite()
         finally:
-            descriptor = getattr(self, "_parent_descriptor", None)
-            self._parent_descriptor = None
-            if descriptor is not None:
-                self._close_descriptor(descriptor)
+            try:
+                handle = _secure_slot(self, "_directory_handle")
+            except AttributeError:
+                return
+            assert isinstance(handle, _DirectoryHandle)
+            handle.close()
 
     def __del__(self) -> None:
-        descriptor = getattr(self, "_parent_descriptor", None)
-        self._parent_descriptor = None
-        if descriptor is not None:
+        try:
+            handle = _secure_slot(self, "_directory_handle")
+        except (AttributeError, TypeError):
+            pass
+        else:
+            assert isinstance(handle, _DirectoryHandle)
             try:
-                self._close_descriptor(descriptor)
+                handle.close()
             except BaseException:
                 pass
         try:
@@ -287,11 +333,9 @@ def _runtime_authorizer(
         }
     ):
         return sqlite3.SQLITE_DENY
-    if (
-        action in {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE}
-        and argument1 in _JOURNAL_TABLES
-    ):
-        return sqlite3.SQLITE_DENY
+    if action in {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE}:
+        if argument1 in _JOURNAL_TABLES or argument1 == "schema_migrations":
+            return sqlite3.SQLITE_DENY
     return sqlite3.SQLITE_OK
 
 
@@ -299,10 +343,20 @@ def _journal_authorizer(table: str) -> _Authorizer:
     if table not in _JOURNAL_TABLES:
         raise ValueError("journal write scope requires an exact journal table")
 
+    allowed = frozenset(
+        {
+            sqlite3.SQLITE_FUNCTION,
+            sqlite3.SQLITE_PRAGMA,
+            sqlite3.SQLITE_READ,
+            sqlite3.SQLITE_SELECT,
+            sqlite3.SQLITE_TRANSACTION,
+        }
+    )
+
     def authorize(
         action: int,
         argument1: str | None,
-        argument2: str | None,
+        _argument2: str | None,
         database: str | None,
         trigger: str | None,
     ) -> int:
@@ -313,15 +367,11 @@ def _journal_authorizer(table: str) -> _Authorizer:
             and trigger is None
         ):
             return sqlite3.SQLITE_OK
-        return _runtime_authorizer(action, argument1, argument2, database, trigger)
+        if action in allowed and database != "temp":
+            return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
 
     return authorize
-
-
-def _set_internal_authorizer(
-    connection: SecureConnection, authorizer: _Authorizer | None
-) -> None:
-    connection._set_sqlite_authorizer(authorizer)
 
 
 def _secure_slot(connection: SecureConnection, name: str) -> object:
@@ -329,22 +379,33 @@ def _secure_slot(connection: SecureConnection, name: str) -> object:
     return descriptor.__get__(connection, SecureConnection)
 
 
-def _mark_migration_ready(connection: SecureConnection) -> None:
-    if _secure_slot(connection, "_authorizer_sealed") is not True:
-        raise DatabaseConfigurationError("runtime authorizer is not sealed")
-    descriptor = SecureConnection.__dict__["_migration_ready_token"]
-    descriptor.__set__(connection, _MIGRATION_READY)
-
-
-def _is_migration_ready(connection: object) -> bool:
+def _is_factory_connection(connection: object) -> bool:
     if type(connection) is not SecureConnection:
         return False
     try:
         sealed = _secure_slot(connection, "_authorizer_sealed")
-        token = _secure_slot(connection, "_migration_ready_token")
+        token = _secure_slot(connection, "_factory_token")
+        path = _secure_slot(connection, "_database_path")
+        handle = _secure_slot(connection, "_directory_handle")
     except AttributeError:
         return False
-    return sealed is True and token is _MIGRATION_READY
+    return (
+        sealed is True
+        and token is _PUBLIC_CONNECTION
+        and isinstance(path, Path)
+        and isinstance(handle, _DirectoryHandle)
+        and not handle.closed
+    )
+
+
+def _connection_locator(connection: SecureConnection) -> tuple[Path, int]:
+    if not _is_factory_connection(connection):
+        raise DatabaseConfigurationError(
+            "connection must be created and sealed by connect_database"
+        )
+    path = _secure_slot(connection, "_database_path")
+    assert isinstance(path, Path)
+    return path, connection.busy_timeout_ms
 
 
 def _reject_user_temp_schema(connection: SecureConnection) -> None:
@@ -359,39 +420,59 @@ def _reject_user_temp_schema(connection: SecureConnection) -> None:
 
 def _seal_runtime_authorizer(connection: SecureConnection) -> None:
     _reject_user_temp_schema(connection)
-    _set_internal_authorizer(connection, _runtime_authorizer)
+    connection._set_sqlite_authorizer(_runtime_authorizer)
     object.__setattr__(connection, "_authorizer_sealed", True)
 
 
-def _restore_runtime_authorizer(connection: SecureConnection) -> None:
-    if not connection.authorizer_sealed:
-        raise DatabaseConfigurationError("runtime authorizer is not sealed")
-    _set_internal_authorizer(connection, _runtime_authorizer)
-
-
-@contextmanager
-def _privileged_authorizer_scope(
-    connection: SecureConnection, authorizer: _Authorizer
-) -> Iterator[None]:
-    """Install privilege only inside an already-established restoration guard."""
+def _internal_connection(
+    path: Path,
+    *,
+    timeout_ms: int,
+    authorizer: _Authorizer,
+) -> sqlite3.Connection:
+    """Open a fixed-role internal connection whose authorizer never changes."""
+    if not path.is_absolute() or type(timeout_ms) is not int:
+        raise DatabaseConfigurationError("invalid internal database locator")
+    parent = _open_private_parent(path.parent)
+    handle = _DirectoryHandle(parent)
+    connection: sqlite3.Connection | None = None
     try:
-        _set_internal_authorizer(connection, authorizer)
-        yield
-    finally:
-        _set_internal_authorizer(connection, _runtime_authorizer)
-
-
-@contextmanager
-def _journal_write_scope(connection: SecureConnection, table: str) -> Iterator[None]:
-    if not _is_migration_ready(connection):
-        raise DatabaseConfigurationError(
-            "journal connection must be created and sealed by connect_database"
+        _validate_database_metadata(
+            os.stat(path.name, dir_fd=handle.descriptor, follow_symlinks=False), path
         )
-    try:
-        with _privileged_authorizer_scope(connection, _journal_authorizer(table)):
-            yield
+        _check_sidecars(path, handle.descriptor)
+        connection = sqlite3.connect(
+            f"/proc/self/fd/{handle.descriptor}/{path.name}",
+            timeout=timeout_ms / 1_000,
+            isolation_level=None,
+            check_same_thread=True,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA recursive_triggers = ON")
+        connection.execute(f"PRAGMA busy_timeout = {timeout_ms}")
+        connection.execute("PRAGMA synchronous = FULL")
+        connection.execute("PRAGMA trusted_schema = OFF")
+        connection.set_authorizer(authorizer)
+        _verify_main_database_path(connection, path)
+        _check_directory_entries(path, handle.descriptor)
+        _check_sidecars(path, handle.descriptor)
+        return connection
+    except BaseException:
+        if connection is not None:
+            connection.close()
+        raise
     finally:
-        _set_internal_authorizer(connection, _runtime_authorizer)
+        handle.close()
+
+
+def _open_journal_writer(
+    connection: SecureConnection, table: str
+) -> sqlite3.Connection:
+    path, timeout = _connection_locator(connection)
+    return _internal_connection(
+        path, timeout_ms=timeout, authorizer=_journal_authorizer(table)
+    )
 
 
 def _seal_if_migrated(connection: SecureConnection) -> None:
@@ -399,7 +480,7 @@ def _seal_if_migrated(connection: SecureConnection) -> None:
         "SELECT 1 FROM main.sqlite_schema WHERE type = 'table' "
         "AND name = 'journal_events'"
     ).fetchone()
-    if row is not None:
+    if row is not None and not connection.authorizer_sealed:
         _seal_runtime_authorizer(connection)
 
 
@@ -818,11 +899,11 @@ def connect_database(
         if mount_resolver is None:
             filesystem = _resolve_filesystem(path.parent, _linux_mount_resolver)
             _validate_filesystem(path.parent, filesystem)
-        parent_descriptor = _open_private_parent(path.parent)
+        parent_handle = _DirectoryHandle(_open_private_parent(path.parent))
+        parent_descriptor = parent_handle.descriptor
         parent_metadata = os.fstat(parent_descriptor)
         parent_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
         connection: SecureConnection | None = None
-        transferred_parent = False
         try:
             if mount_resolver is None:
                 _validate_filesystem(path.parent, filesystem)
@@ -843,9 +924,10 @@ def connect_database(
                 raise DatabaseConfigurationError(
                     "SQLite did not create a secure connection"
                 )
-            connection._parent_descriptor = parent_descriptor
+            object.__setattr__(connection, "_directory_handle", parent_handle)
+            object.__setattr__(connection, "_database_path", path)
+            object.__setattr__(connection, "_factory_token", _PUBLIC_CONNECTION)
             object.__setattr__(connection, "_authorizer_sealed", False)
-            transferred_parent = True
             _verify_sqlite_descriptors(
                 before_fds, file_identity, path, parent_descriptor
             )
@@ -888,12 +970,11 @@ def connect_database(
                             )
             _recheck_storage(path, parent_descriptor, parent_identity, file_identity)
             _seal_runtime_authorizer(connection)
-            _mark_migration_ready(connection)
             return connection
         except BaseException:
-            if connection is not None:
-                connection.close()
+            try:
+                if connection is not None:
+                    connection.close()
+            finally:
+                parent_handle.close()
             raise
-        finally:
-            if not transferred_parent:
-                os.close(parent_descriptor)

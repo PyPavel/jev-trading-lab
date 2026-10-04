@@ -13,10 +13,12 @@ from __future__ import annotations
 import errno
 import hashlib
 import importlib.resources
+import json
 import os
 import re
 import sqlite3
 import stat
+import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -31,10 +33,9 @@ from jev_trading_lab.core.time import (
 )
 from jev_trading_lab.persistence.db import (
     SecureConnection,
-    _is_migration_ready,
-    _privileged_authorizer_scope,
+    _connection_locator,
+    _is_factory_connection,
     _reject_user_temp_schema,
-    _restore_runtime_authorizer,
 )
 
 MAX_MIGRATION_BYTES = 1_048_576
@@ -618,19 +619,80 @@ def _migration_metadata_insert(migration: Migration, applied_at_us: int) -> str:
     )
 
 
+_HELPER_PROTOCOL_VERSION = 1
+_HELPER_TIMEOUT_SECONDS = 30.0
+_HELPER_OUTPUT_LIMIT = 16_384
+
+
+def verify_migration_prefix(connection: sqlite3.Connection) -> None:
+    """Read-verify the exact packaged migration prefix and checksums."""
+    migrations = load_migrations()
+    _validate_applied(_applied_rows(connection), migrations)
+    if len(_applied_rows(connection)) != len(migrations):
+        raise MigrationError(
+            "database does not contain the full packaged migration prefix"
+        )
+
+
+def _helper_command(path: Path, timeout_ms: int) -> tuple[str, ...]:
+    return (
+        sys.executable,
+        "-I",
+        "-B",
+        "-m",
+        "jev_trading_lab.persistence.migration_helper",
+        str(_HELPER_PROTOCOL_VERSION),
+        str(path),
+        str(timeout_ms),
+    )
+
+
+def _run_migration_helper(
+    path: Path, timeout_ms: int
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            _helper_command(path, timeout_ms),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=_HELPER_TIMEOUT_SECONDS,
+            check=False,
+            close_fds=True,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise MigrationError("isolated migration helper timed out") from error
+    except OSError as error:
+        raise MigrationError("cannot launch isolated migration helper") from error
+
+
+def _validate_helper_reply(completed: subprocess.CompletedProcess[bytes]) -> None:
+    if (
+        len(completed.stdout) > _HELPER_OUTPUT_LIMIT
+        or len(completed.stderr) > _HELPER_OUTPUT_LIMIT
+    ):
+        raise MigrationError("isolated migration helper output exceeded limit")
+    try:
+        reply = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise MigrationError(
+            "isolated migration helper returned malformed output"
+        ) from error
+    if completed.returncode != 0 or reply != {
+        "protocol": _HELPER_PROTOCOL_VERSION,
+        "status": "ok",
+    }:
+        raise MigrationError("isolated migration helper failed")
+
+
 def apply_migrations(connection: sqlite3.Connection) -> None:
-    """Apply only the reviewed, packaged production migration chain."""
+    """Apply packaged migrations in a fresh isolated fixed-role interpreter."""
     if not isinstance(connection, sqlite3.Connection):
         raise TypeError("connection must be sqlite3.Connection")
-    if not _is_migration_ready(connection):
+    if not _is_factory_connection(connection):
         raise MigrationError(
             "migration connection must be created and sealed by connect_database"
         )
     assert type(connection) is SecureConnection
-    if sys.gettrace() is not None or sys.getprofile() is not None:
-        raise MigrationError(
-            "migration is unavailable while interpreter tracing or profiling is active"
-        )
     if connection.isolation_level is not None:
         raise MigrationError(
             "migration connection must use autocommit isolation_level=None"
@@ -639,11 +701,28 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
         raise MigrationError("cannot migrate inside an active caller transaction")
     _require_main_only(connection)
     _reject_user_temp_schema(connection)
+    path, timeout_ms = _connection_locator(connection)
+    migrations = load_migrations()
+    _validate_applied(_applied_rows(connection), migrations)
+
+    completed = _run_migration_helper(path, timeout_ms)
+    try:
+        verify_migration_prefix(connection)
+    except MigrationError:
+        _validate_helper_reply(completed)
+        raise
+    if completed.returncode == 0:
+        _validate_helper_reply(completed)
+    # A lost or malformed post-commit reply is resolved by authoritative DB readback.
+    verify_migration_prefix(connection)
+
+
+def _apply_packaged_migrations(connection: sqlite3.Connection) -> None:
+    """Child-only migration loop for a fixed migration-role connection."""
     migrations = load_migrations()
     migration_statements = tuple(_validated_statements(item) for item in migrations)
     timestamps = tuple(_timestamp(_utc_now_us) for _item in migrations)
     _validate_applied(_applied_rows(connection), migrations)
-
     for migration, statements, applied_at_us in zip(
         migrations, migration_statements, timestamps, strict=True
     ):
@@ -653,29 +732,22 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
             owned_transaction = True
             applied = _applied_rows(connection)
             _validate_applied(applied, migrations)
-            if migration.version <= len(applied):
-                connection.execute("COMMIT")
-                owned_transaction = False
-                continue
-            with _privileged_authorizer_scope(connection, _migration_authorizer):
-                try:
-                    for statement in statements:
-                        connection.execute(statement)
-                    connection.execute(
-                        _migration_metadata_insert(migration, applied_at_us)
-                    )
-                    connection.execute("COMMIT")
-                    owned_transaction = False
-                except sqlite3.DatabaseError as error:
-                    if "authorized" in str(error).casefold():
-                        raise MigrationError(
-                            f"migration {migration.name!r} contains unauthorized SQL"
-                        ) from error
-                    raise
+            if migration.version > len(applied):
+                for statement in statements:
+                    connection.execute(statement)
+                connection.execute(_migration_metadata_insert(migration, applied_at_us))
+            connection.execute("COMMIT")
+            owned_transaction = False
+        except sqlite3.DatabaseError as error:
+            if owned_transaction and connection.in_transaction:
+                connection.execute("ROLLBACK")
+            if "authorized" in str(error).casefold():
+                raise MigrationError(
+                    f"migration {migration.name!r} contains unauthorized SQL"
+                ) from error
+            raise
         except BaseException:
             if owned_transaction and connection.in_transaction:
                 connection.execute("ROLLBACK")
             raise
-        finally:
-            _restore_runtime_authorizer(connection)
-    _restore_runtime_authorizer(connection)
+    verify_migration_prefix(connection)
