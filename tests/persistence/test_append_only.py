@@ -365,6 +365,113 @@ def test_trace_callback_cannot_forge_row_during_journal_begin(tmp_path: Path) ->
         connection.close()
 
 
+@pytest.mark.parametrize("construct_before_assignment", (False, True))
+@pytest.mark.parametrize(
+    "operation",
+    ("entity_idempotent", "entity_conflict", "event_idempotent", "event_conflict"),
+)
+def test_row_factory_cannot_reenter_journal_read_paths(
+    tmp_path: Path, construct_before_assignment: bool, operation: str
+) -> None:
+    database = tmp_path / operation / "journal.sqlite3"
+    setup = _secure_connection(database)
+    run_id = _insert_run(setup)
+    setup_journal = AppendOnlyJournal(setup)
+    entity = _entity(run_id)
+    setup_journal.append_entity(entity)
+    existing_event = _event(entity.entity_id, 0)
+    setup_journal.append_event(existing_event)
+    setup.close()
+
+    connection = _secure_connection(database)
+    try:
+        journal = AppendOnlyJournal(connection) if construct_before_assignment else None
+        forged_entity = _entity(
+            run_id,
+            logical_identity=_hex(f"forged-{operation}-{construct_before_assignment}"),
+            payload={"forged": operation},
+        )
+        forged_event = _event(
+            entity.entity_id,
+            99,
+            payload={"forged": operation},
+        )
+        forged = forged_entity if operation.startswith("entity") else forged_event
+        columns = tuple(type(forged).__dataclass_fields__)
+        values = tuple(getattr(forged, column) for column in columns)
+        table = (
+            "journal_entities" if operation.startswith("entity") else "journal_events"
+        )
+        injected = False
+
+        def inject(cursor: sqlite3.Cursor, row: tuple[object, ...]) -> sqlite3.Row:
+            nonlocal injected
+            if not injected:
+                try:
+                    connection.execute(
+                        f"INSERT INTO main.{table} ({', '.join(columns)}) "
+                        f"VALUES ({', '.join('?' for _ in columns)})",
+                        values,
+                    )
+                except sqlite3.DatabaseError as error:
+                    if "not authorized" not in str(error):
+                        raise
+                else:
+                    injected = True
+            return sqlite3.Row(cursor, row)
+
+        assignment_rejected = False
+        try:
+            connection.row_factory = inject
+        except AttributeError:
+            assignment_rejected = True
+        if journal is None:
+            journal = AppendOnlyJournal(connection)
+
+        if operation == "entity_idempotent":
+            assert journal.append_entity(entity) == entity.entity_id
+        elif operation == "entity_conflict":
+            with pytest.raises(JournalConflictError, match="conflict"):
+                journal.append_entity(_entity(run_id, payload={"different": True}))
+        elif operation == "event_idempotent":
+            assert journal.append_event(existing_event) == existing_event.event_id
+        else:
+            with pytest.raises(JournalConflictError, match="conflict"):
+                journal.append_event(
+                    _event(entity.entity_id, 0, payload={"different": True})
+                )
+
+        assert assignment_rejected
+        assert connection.row_factory is sqlite3.Row
+        assert (
+            connection.execute(
+                f"SELECT count(*) FROM main.{table} WHERE {columns[0]} = ?",
+                (values[0],),
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("construct_before_assignment", (False, True))
+def test_text_factory_is_sealed_and_rows_remain_sqlite_rows(
+    tmp_path: Path, construct_before_assignment: bool
+) -> None:
+    connection = _secure_connection(tmp_path / "private" / "journal.sqlite3")
+    try:
+        journal = AppendOnlyJournal(connection) if construct_before_assignment else None
+        with pytest.raises(AttributeError, match="text_factory"):
+            connection.text_factory = lambda value: value.decode("utf-8")
+        if journal is None:
+            AppendOnlyJournal(connection)
+        assert connection.text_factory is str
+        assert connection.row_factory is sqlite3.Row
+        assert isinstance(connection.execute("SELECT 'value'").fetchone(), sqlite3.Row)
+    finally:
+        connection.close()
+
+
 def test_public_like_override_cannot_hide_temp_objects(tmp_path: Path) -> None:
     connection = _secure_connection(tmp_path / "private" / "journal.sqlite3")
     try:
@@ -1131,12 +1238,14 @@ def test_concurrent_identical_appends_converge(tmp_path: Path) -> None:
     run_id = _insert_run(setup)
     entity = _entity(run_id)
     setup.close()
-    barrier = threading.Barrier(2)
+    ready = threading.Semaphore(0)
+    release = threading.Event()
 
     def append() -> str:
         connection = _secure_connection(database)
         try:
-            barrier.wait(timeout=5)
+            ready.release()
+            assert release.wait(timeout=30)
             return AppendOnlyJournal(
                 connection, expected_busy_timeout_ms=5000
             ).append_entity(entity)
@@ -1144,10 +1253,11 @@ def test_concurrent_identical_appends_converge(tmp_path: Path) -> None:
             connection.close()
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        results = [
-            future.result(timeout=10)
-            for future in (pool.submit(append), pool.submit(append))
-        ]
+        futures = (pool.submit(append), pool.submit(append))
+        assert ready.acquire(timeout=30)
+        assert ready.acquire(timeout=30)
+        release.set()
+        results = [future.result(timeout=30) for future in futures]
     assert results == [entity.entity_id, entity.entity_id]
     check = sqlite3.connect(database)
     try:
@@ -1169,12 +1279,14 @@ def test_concurrent_conflicting_sequence_has_one_winner(tmp_path: Path) -> None:
         _event(entity.entity_id, 0, payload={"candidate": "a"}),
         _event(entity.entity_id, 0, payload={"candidate": "b"}),
     )
-    barrier = threading.Barrier(2)
+    ready = threading.Semaphore(0)
+    release = threading.Event()
 
     def append(event: JournalEvent) -> tuple[str, str]:
         connection = _secure_connection(database)
         try:
-            barrier.wait(timeout=5)
+            ready.release()
+            assert release.wait(timeout=30)
             try:
                 result = AppendOnlyJournal(
                     connection, expected_busy_timeout_ms=5000
@@ -1186,13 +1298,14 @@ def test_concurrent_conflicting_sequence_has_one_winner(tmp_path: Path) -> None:
             connection.close()
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        outcomes = [
-            future.result(timeout=10)
-            for future in (
-                pool.submit(append, events[0]),
-                pool.submit(append, events[1]),
-            )
-        ]
+        futures = (
+            pool.submit(append, events[0]),
+            pool.submit(append, events[1]),
+        )
+        assert ready.acquire(timeout=30)
+        assert ready.acquire(timeout=30)
+        release.set()
+        outcomes = [future.result(timeout=30) for future in futures]
     assert sorted(item[0] for item in outcomes) == ["conflict", "ok"]
 
 

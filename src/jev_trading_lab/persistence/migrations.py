@@ -605,13 +605,13 @@ def _migration_authorizer(
     return sqlite3.SQLITE_OK
 
 
-def apply_migrations(
+def _apply_migrations(
     connection: sqlite3.Connection,
     *,
     package: str = _DEFAULT_PACKAGE,
     clock: Callable[[], int] = _utc_now_us,
 ) -> None:
-    """Apply migrations using an idle autocommit connection and owned transactions."""
+    """Apply a caller-selected migration package for internal tests only."""
     if not isinstance(connection, sqlite3.Connection):
         raise TypeError("connection must be sqlite3.Connection")
     if connection.isolation_level is not None:
@@ -680,3 +680,17 @@ def apply_migrations(
                     connection.set_authorizer(None)
     if isinstance(connection, SecureConnection):
         _seal_runtime_authorizer(connection)
+
+
+def apply_migrations(
+    connection: sqlite3.Connection,
+    *,
+    package: str = _DEFAULT_PACKAGE,
+    clock: Callable[[], int] = _utc_now_us,
+) -> None:
+    """Apply only the reviewed, packaged production migration chain."""
+    if package != _DEFAULT_PACKAGE:
+        raise MigrationError(
+            "public migration API requires the approved migration package"
+        )
+    _apply_migrations(connection, clock=clock)

@@ -179,11 +179,15 @@ class SecureConnection(sqlite3.Connection):
     def __setattr__(self, name: str, value: object) -> None:
         if name in {"_busy_timeout_ms", "_authorizer_sealed"}:
             raise AttributeError(f"{name.removeprefix('_')} is immutable")
+        if name in {"row_factory", "text_factory"} and self.authorizer_sealed:
+            raise AttributeError(f"{name} is immutable after sealing")
         super().__setattr__(name, value)
 
     def __delattr__(self, name: str) -> None:
         if name in {"_busy_timeout_ms", "_authorizer_sealed"}:
             raise AttributeError(f"{name.removeprefix('_')} is immutable")
+        if name in {"row_factory", "text_factory"} and self.authorizer_sealed:
+            raise AttributeError(f"{name} is immutable after sealing")
         super().__delattr__(name)
 
     @property
