@@ -80,6 +80,7 @@ _MOUNTINFO_ESCAPES = {
 }
 _UMASK_LOCK = threading.Lock()
 _CONNECT_LOCK = threading.Lock()
+_MIGRATION_READY = object()
 
 
 @contextmanager
@@ -118,11 +119,17 @@ class SecureConnection(sqlite3.Connection):
     outside this same-process change-control boundary; this is not a sandbox.
     """
 
-    __slots__ = ("_parent_descriptor", "_busy_timeout_ms", "_authorizer_sealed")
+    __slots__ = (
+        "_parent_descriptor",
+        "_busy_timeout_ms",
+        "_authorizer_sealed",
+        "_migration_ready_token",
+    )
 
     _parent_descriptor: int | None
     _busy_timeout_ms: int
     _authorizer_sealed: bool
+    _migration_ready_token: object
     _close_descriptor = staticmethod(os.close)
     _close_sqlite = sqlite3.Connection.close
     _set_sqlite_authorizer = sqlite3.Connection.set_authorizer
@@ -189,15 +196,28 @@ class SecureConnection(sqlite3.Connection):
         self._reject_if_sealed()
         return super().blobopen(*args, **kwargs)
 
+    def __getattribute__(self, name: str) -> object:
+        if name == "_migration_ready_token":
+            raise AttributeError("migration readiness is internal")
+        return super().__getattribute__(name)
+
     def __setattr__(self, name: str, value: object) -> None:
-        if name in {"_busy_timeout_ms", "_authorizer_sealed"}:
+        if name in {
+            "_busy_timeout_ms",
+            "_authorizer_sealed",
+            "_migration_ready_token",
+        }:
             raise AttributeError(f"{name.removeprefix('_')} is immutable")
         if name in {"row_factory", "text_factory"} and self.authorizer_sealed:
             raise AttributeError(f"{name} is immutable after sealing")
         super().__setattr__(name, value)
 
     def __delattr__(self, name: str) -> None:
-        if name in {"_busy_timeout_ms", "_authorizer_sealed"}:
+        if name in {
+            "_busy_timeout_ms",
+            "_authorizer_sealed",
+            "_migration_ready_token",
+        }:
             raise AttributeError(f"{name.removeprefix('_')} is immutable")
         if name in {"row_factory", "text_factory"} and self.authorizer_sealed:
             raise AttributeError(f"{name} is immutable after sealing")
@@ -304,6 +324,29 @@ def _set_internal_authorizer(
     connection._set_sqlite_authorizer(authorizer)
 
 
+def _secure_slot(connection: SecureConnection, name: str) -> object:
+    descriptor = SecureConnection.__dict__[name]
+    return descriptor.__get__(connection, SecureConnection)
+
+
+def _mark_migration_ready(connection: SecureConnection) -> None:
+    if _secure_slot(connection, "_authorizer_sealed") is not True:
+        raise DatabaseConfigurationError("runtime authorizer is not sealed")
+    descriptor = SecureConnection.__dict__["_migration_ready_token"]
+    descriptor.__set__(connection, _MIGRATION_READY)
+
+
+def _is_migration_ready(connection: object) -> bool:
+    if not isinstance(connection, SecureConnection):
+        return False
+    try:
+        sealed = _secure_slot(connection, "_authorizer_sealed")
+        token = _secure_slot(connection, "_migration_ready_token")
+    except AttributeError:
+        return False
+    return sealed is True and token is _MIGRATION_READY
+
+
 def _reject_user_temp_schema(connection: SecureConnection) -> None:
     for row in connection.execute("SELECT type, name FROM temp.sqlite_schema"):
         object_type, name = row
@@ -318,6 +361,12 @@ def _seal_runtime_authorizer(connection: SecureConnection) -> None:
     _reject_user_temp_schema(connection)
     _set_internal_authorizer(connection, _runtime_authorizer)
     object.__setattr__(connection, "_authorizer_sealed", True)
+
+
+def _restore_runtime_authorizer(connection: SecureConnection) -> None:
+    if not connection.authorizer_sealed:
+        raise DatabaseConfigurationError("runtime authorizer is not sealed")
+    _set_internal_authorizer(connection, _runtime_authorizer)
 
 
 @contextmanager
@@ -825,6 +874,7 @@ def connect_database(
                             )
             _recheck_storage(path, parent_descriptor, parent_identity, file_identity)
             _seal_runtime_authorizer(connection)
+            _mark_migration_ready(connection)
             return connection
         except BaseException:
             if connection is not None:

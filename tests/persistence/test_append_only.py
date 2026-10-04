@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sqlite3
 import tempfile
 import threading
@@ -43,10 +42,17 @@ def _hex(label: str) -> str:
 
 
 def _connection(path: str | None = None) -> sqlite3.Connection:
-    if path is None:
-        descriptor, path = tempfile.mkstemp(suffix=".sqlite3")
-        os.close(descriptor)
-    connection = sqlite3.connect(path, isolation_level=None, timeout=5)
+    if path is None or path == ":memory:":
+        path = str(Path(tempfile.mkdtemp()) / "database.sqlite3")
+    database = Path(path).absolute()
+    setup = connect_database(
+        database,
+        busy_timeout_ms=5000,
+        mount_resolver=lambda _path: "ext4",
+    )
+    apply_migrations(setup)
+    setup.close()
+    connection = sqlite3.connect(database, isolation_level=None, timeout=5)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA recursive_triggers = ON")
@@ -54,7 +60,6 @@ def _connection(path: str | None = None) -> sqlite3.Connection:
     connection.execute("PRAGMA synchronous = FULL")
     connection.execute("PRAGMA busy_timeout = 5000")
     connection.execute("PRAGMA trusted_schema = OFF")
-    apply_migrations(connection)
     return connection
 
 

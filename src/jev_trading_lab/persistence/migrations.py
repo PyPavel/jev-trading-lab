@@ -30,8 +30,9 @@ from jev_trading_lab.core.time import (
 )
 from jev_trading_lab.persistence.db import (
     SecureConnection,
+    _is_migration_ready,
     _reject_user_temp_schema,
-    _seal_runtime_authorizer,
+    _restore_runtime_authorizer,
     _set_internal_authorizer,
 )
 
@@ -620,6 +621,11 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
     """Apply only the reviewed, packaged production migration chain."""
     if not isinstance(connection, sqlite3.Connection):
         raise TypeError("connection must be sqlite3.Connection")
+    if not _is_migration_ready(connection):
+        raise MigrationError(
+            "migration connection must be created and sealed by connect_database"
+        )
+    assert isinstance(connection, SecureConnection)
     if connection.isolation_level is not None:
         raise MigrationError(
             "migration connection must use autocommit isolation_level=None"
@@ -627,8 +633,7 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
     if connection.in_transaction:
         raise MigrationError("cannot migrate inside an active caller transaction")
     _require_main_only(connection)
-    if isinstance(connection, SecureConnection):
-        _reject_user_temp_schema(connection)
+    _reject_user_temp_schema(connection)
     migrations = load_migrations()
     migration_statements = tuple(_validated_statements(item) for item in migrations)
     timestamps = tuple(_timestamp(_utc_now_us) for _item in migrations)
@@ -648,10 +653,7 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
                 connection.execute("COMMIT")
                 owned_transaction = False
                 continue
-            if isinstance(connection, SecureConnection):
-                _set_internal_authorizer(connection, _migration_authorizer)
-            else:
-                connection.set_authorizer(_migration_authorizer)
+            _set_internal_authorizer(connection, _migration_authorizer)
             authorizer_active = True
             try:
                 for statement in statements:
@@ -671,9 +673,5 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
             raise
         finally:
             if authorizer_active:
-                if isinstance(connection, SecureConnection):
-                    _seal_runtime_authorizer(connection)
-                else:
-                    connection.set_authorizer(None)
-    if isinstance(connection, SecureConnection):
-        _seal_runtime_authorizer(connection)
+                _restore_runtime_authorizer(connection)
+    _restore_runtime_authorizer(connection)

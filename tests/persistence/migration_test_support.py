@@ -8,7 +8,7 @@ from collections.abc import Callable
 from jev_trading_lab.persistence.db import (
     SecureConnection,
     _reject_user_temp_schema,
-    _seal_runtime_authorizer,
+    _restore_runtime_authorizer,
     _set_internal_authorizer,
 )
 from jev_trading_lab.persistence.migrations import (
@@ -87,8 +87,8 @@ def apply_fixture_migrations(
         finally:
             if authorizer_active:
                 if isinstance(connection, SecureConnection):
-                    _seal_runtime_authorizer(connection)
+                    _restore_runtime_authorizer(connection)
                 else:
                     connection.set_authorizer(None)
     if isinstance(connection, SecureConnection):
-        _seal_runtime_authorizer(connection)
+        _restore_runtime_authorizer(connection)

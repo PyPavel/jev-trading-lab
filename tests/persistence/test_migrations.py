@@ -26,6 +26,7 @@ from jev_trading_lab.persistence.db import (
     MIN_SQLITE_VERSION,
     DatabaseConfigurationError,
     DatabaseSafetyError,
+    SecureConnection,
     connect_database,
 )
 from jev_trading_lab.persistence.journal import (
@@ -309,6 +310,186 @@ def test_pragma_setup_failure_closes_connection(
     assert connection is not None
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
         connection.execute("SELECT 1")
+
+
+def test_apply_rejects_raw_connection_before_trace_callback_or_sql() -> None:
+    connection = sqlite3.connect(":memory:", isolation_level=None)
+    callback_calls = 0
+    try:
+        connection.execute("CREATE TABLE guarded (id INTEGER PRIMARY KEY) STRICT")
+        connection.execute(
+            "CREATE TRIGGER guarded_immutable BEFORE DELETE ON guarded "
+            "BEGIN SELECT RAISE(ABORT, 'immutable'); END"
+        )
+
+        def hostile_trace(_statement: str) -> None:
+            nonlocal callback_calls
+            callback_calls += 1
+            connection.execute("DROP TRIGGER main.guarded_immutable")
+
+        connection.set_trace_callback(hostile_trace)
+        with pytest.raises(MigrationError, match="connect_database"):
+            apply_migrations(connection)
+
+        assert callback_calls == 0
+        connection.set_trace_callback(None)
+        assert connection.execute(
+            "SELECT 1 FROM main.sqlite_schema "
+            "WHERE type = 'trigger' AND name = 'guarded_immutable'"
+        ).fetchone() == (1,)
+        assert (
+            connection.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE name = 'schema_migrations'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+
+
+def test_apply_rejects_direct_secure_connection_before_callbacks_or_sql() -> None:
+    connection = sqlite3.connect(
+        ":memory:", isolation_level=None, factory=SecureConnection
+    )
+    calls = {
+        "trace": 0,
+        "progress": 0,
+        "function": 0,
+        "collation": 0,
+        "aggregate": 0,
+        "window": 0,
+    }
+
+    def called(name: str) -> None:
+        calls[name] += 1
+
+    class HostileAggregate:
+        def step(self, _value: object) -> None:
+            called("aggregate")
+
+        def finalize(self) -> int:
+            called("aggregate")
+            return 0
+
+    class HostileWindow(HostileAggregate):
+        def value(self) -> int:
+            called("window")
+            return 0
+
+        def inverse(self, _value: object) -> None:
+            called("window")
+
+    try:
+        connection.create_function("length", 1, lambda _value: called("function") or 64)
+        connection.create_collation(
+            "hostile", lambda _left, _right: called("collation") or 0
+        )
+        connection.create_aggregate("hostile_aggregate", 1, HostileAggregate)
+        if hasattr(connection, "create_window_function"):
+            connection.create_window_function("hostile_window", 1, HostileWindow)
+        connection.set_progress_handler(lambda: called("progress") or 0, 1)
+        connection.set_trace_callback(lambda _statement: called("trace"))
+
+        with pytest.raises(MigrationError, match="connect_database"):
+            apply_migrations(connection)
+
+        assert calls == {
+            "trace": 0,
+            "progress": 0,
+            "function": 0,
+            "collation": 0,
+            "aggregate": 0,
+            "window": 0,
+        }
+        connection.set_trace_callback(None)
+        connection.set_progress_handler(None, 0)
+        assert (
+            connection.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE name = 'schema_migrations'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+
+
+def test_public_secure_connection_setup_cannot_grant_migration_trust() -> None:
+    connection = sqlite3.connect(
+        ":memory:", isolation_level=None, factory=SecureConnection
+    )
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA recursive_triggers = ON")
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA busy_timeout = 1000")
+        connection.execute("PRAGMA synchronous = FULL")
+        connection.execute("PRAGMA trusted_schema = OFF")
+        connection.set_authorizer(db_module._runtime_authorizer)
+        with pytest.raises(AttributeError, match="migration_ready_token"):
+            connection._migration_ready_token = object()  # type: ignore[attr-defined]
+        with pytest.raises(MigrationError, match="connect_database"):
+            apply_migrations(connection)
+
+        assert not connection.authorizer_sealed
+        assert (
+            connection.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE name = 'schema_migrations'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+
+
+def test_rejected_connection_preserves_transaction_and_authorizer_state() -> None:
+    connection = sqlite3.connect(
+        ":memory:", isolation_level=None, factory=SecureConnection
+    )
+    authorizer_calls = 0
+
+    def authorizer(
+        _action: int,
+        _argument1: str | None,
+        _argument2: str | None,
+        _database: str | None,
+        _source: str | None,
+    ) -> int:
+        nonlocal authorizer_calls
+        authorizer_calls += 1
+        return sqlite3.SQLITE_OK
+
+    try:
+        connection.execute("CREATE TABLE caller_data (value TEXT NOT NULL) STRICT")
+        connection.set_authorizer(authorizer)
+        connection.execute("BEGIN")
+        connection.execute("INSERT INTO caller_data VALUES ('keep me')")
+        before_apply = authorizer_calls
+
+        with pytest.raises(MigrationError, match="connect_database"):
+            apply_migrations(connection)
+
+        assert authorizer_calls == before_apply
+        assert connection.in_transaction
+        assert connection.execute("SELECT value FROM caller_data").fetchone() == (
+            "keep me",
+        )
+        assert authorizer_calls > before_apply
+        connection.execute("ROLLBACK")
+        assert connection.execute("SELECT count(*) FROM caller_data").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+def test_factory_created_sealed_connection_is_migration_ready(tmp_path: Path) -> None:
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
+    try:
+        assert connection.authorizer_sealed
+        apply_migrations(connection)
+        assert [row[0] for row in _applied(connection)] == [1, 2, 3]
+        assert connection.authorizer_sealed
+    finally:
+        connection.close()
 
 
 def test_public_migration_api_accepts_no_callback_or_package_capability() -> None:
@@ -1074,10 +1255,10 @@ def test_apply_rejects_caller_transaction_without_rollback(tmp_path: Path) -> No
         connection.close()
 
 
-def test_apply_requires_autocommit_connection_contract() -> None:
+def test_apply_rejects_untrusted_connection_before_autocommit_inspection() -> None:
     connection = sqlite3.connect(":memory:")
     try:
-        with pytest.raises(MigrationError, match="autocommit"):
+        with pytest.raises(MigrationError, match="connect_database"):
             apply_migrations(connection)
     finally:
         connection.close()
