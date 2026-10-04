@@ -4,11 +4,12 @@
 
 **PENDING INDEPENDENT RE-REVIEW**
 
-Remaining privileged callback/configuration findings are resolved in production commit `8bfb961`. This records local TDD and gate evidence only. No push or independent approval occurred.
+The final migration-entry callback boundary blocker is resolved in production commit `c08a7f6`. This records local TDD and gate evidence only. No push or independent approval occurred.
 
 ## Commits
 
 ```text
+c08a7f6 fix(persistence): require trusted migration connections
 8bfb961 fix(persistence): eliminate privileged callback execution
 bafb2ae fix(persistence): close journal trust-boundary gaps
 4af1cb5 fix(persistence): seal SQLite callback surfaces
@@ -22,6 +23,11 @@ Evidence is committed separately from production.
 
 ## Findings resolved
 
+- Public `apply_migrations` now rejects every connection except a factory-created, already-sealed `SecureConnection` that completed `connect_database` setup. Rejection occurs before connection property reads, transaction checks, authorizer changes, callbacks, or SQL.
+- Direct `SecureConnection` construction and ordinary public setup cannot forge migration readiness. The internal slot token is inaccessible and immutable through the supported public surface; migration validation reads exact class slot descriptors, not overrideable instance properties.
+- Migration authorizer transitions no longer reseal the connection. Migration temporarily installs the internal authorizer and restores the runtime authorizer while the public sealed state remains true.
+- Raw trace callbacks and direct-connection trace/progress/scalar/collation/aggregate/window callbacks stay dormant on rejection. Existing caller transactions and authorizers remain untouched, and no schema metadata leaks.
+- Existing raw-connection schema behavior tests now create schema through the supported factory migration boundary, close it, then reopen raw only to exercise downstream compatibility behavior.
 - Public `apply_migrations(connection)` accepts no package or clock. Production no longer exports `_apply_migrations` or another callable accepting arbitrary package plus privileged connection.
 - Production migration resources, statements, and timestamps are resolved and validated before installing the migration authorizer. Synthetic package execution moved to `tests/persistence/migration_test_support.py`; its caller clock is fully evaluated before privilege.
 - Migration metadata insertion binds no Python object while privileged.
@@ -32,6 +38,22 @@ Evidence is committed separately from production.
 - Prior hostile package, row/text factory, TEMP trigger/schema, authorizer restoration, and concurrent append regressions remain green.
 
 ## TDD RED evidence
+
+### Migration entry callback boundary
+
+```text
+FAILED test_apply_rejects_raw_connection_before_trace_callback_or_sql
+E Failed: DID NOT RAISE MigrationError
+FAILED test_apply_rejects_direct_secure_connection_before_callbacks_or_sql
+E sqlite3.IntegrityError: CHECK constraint failed ...
+FAILED test_public_secure_connection_setup_cannot_grant_migration_trust
+E Failed: DID NOT RAISE MigrationError
+FAILED test_rejected_connection_preserves_transaction_and_authorizer_state
+E Actual message: 'cannot migrate inside an active caller transaction'
+4 failed, 1 passed, 152 deselected in 0.56s
+```
+
+The old entry boundary executed callback-visible SQL and inspected caller transaction state before rejecting unsupported connections.
 
 ### Migration callback and production helper
 
@@ -72,6 +94,18 @@ The runtime exposed `setconfig`, and sealed callers could mutate DB configuratio
 ## Focused GREEN evidence
 
 ```text
+PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/persistence/test_migrations.py -q \
+  -k 'apply_rejects_raw_connection_before_trace_callback_or_sql or apply_rejects_direct_secure_connection_before_callbacks_or_sql or public_secure_connection_setup_cannot_grant_migration_trust or rejected_connection_preserves_transaction_and_authorizer_state or factory_created_sealed_connection_is_migration_ready'
+5 passed, 152 deselected in 0.50s
+
+PYTHONDONTWRITEBYTECODE=1 uv run pytest \
+  tests/persistence/test_migrations.py \
+  tests/persistence/test_append_only.py \
+  tests/persistence/test_core_schema.py -q
+322 passed in 6.65s
+```
+
+```text
 PYTHONDONTWRITEBYTECODE=1 uv run pytest \
   tests/persistence/test_migrations.py::test_public_migration_api_accepts_no_callback_or_package_capability \
   tests/persistence/test_migrations.py::test_public_migration_clock_cannot_run_sql_under_privilege \
@@ -107,7 +141,7 @@ uv sync --frozen --all-groups
 Checked 63 packages in 0.84ms
 
 PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
-778 passed in 13.37s
+783 passed in 13.14s
 
 uv run ruff check .
 All checks passed!
@@ -146,21 +180,21 @@ exit 0
 ## Exact reviewed hashes
 
 ```text
-src/jev_trading_lab/persistence/db.py f89c0301ed79b5efdacebc683ca6bf202f2bfd14417acbddd90eec2a9991c302
+src/jev_trading_lab/persistence/db.py 23e863411e21a2f2b73dfab95b9b21cf082ef42d5db4249e6a0ca6be603b5229
 src/jev_trading_lab/persistence/journal.py d74367ddae2402031bde8caafe1f669edfe8ec73b89ec22b7df7d0debace8176
-src/jev_trading_lab/persistence/migrations.py fd0f0dec6d291c31ee7e06fa90983b2b0eaa29d1eb5d0b9fff4707397079e46a
+src/jev_trading_lab/persistence/migrations.py 3c759241ae0737e23de20a03977d703a24c7339ac50c35aad12d19ff4962f1d0
 src/jev_trading_lab/persistence/schema/002_core_entities.sql 9026b984313d972dec6c3db8b442e4324f2a7f02ec71bd555c0c17f8ed362c54
 src/jev_trading_lab/persistence/schema/003_append_only_guards.sql d18492f31e6c0948fa87f11927f2bc4fb2a5a41ffb45c27c9e966339d5e35995
-scripts/policy_preflight.py dafc65f1e5ce773410c21543d812e41c27cb84f0a28afce70316d9935c597823
+scripts/policy_preflight.py 7662c9586ce21bbb0f44acb15e5e86f5ddf4396e7e6df74664927ab401a2f05b
 scripts/wheel_migration_smoke.py a9792c0e8dc9d7a9ed8a1ea57e1caf6f0b5eea03ecf8930bdef0ba394190568c
-.github/workflows/ci.yml 004f1985c5fd9c2448d6293d78b4c40570f78dcf034f2022a9c3730d3de7a7ea
+.github/workflows/ci.yml b6a044e6dbd465798fa70319e7d2b39bfe5918bad4513a89bc8ffc7bc1aa7dde
 ```
 
 Migration SQL, dependencies, `pyproject.toml`, and `uv.lock` were unchanged.
 
 ## Trust boundary
 
-Supported guarantee: controlled-writer consistency through `SecureConnection` public instance methods and `AppendOnlyJournal`. No caller-controlled Python callback or mutable SQLite DB configuration can execute while a migration or journal authorizer grants privileged writes through this API.
+Supported guarantee: controlled-writer consistency through factory-created, already-sealed `SecureConnection` instances and `AppendOnlyJournal`. Unsupported migration connections are rejected before callback-visible SQL or state inspection. No caller-controlled Python callback or mutable SQLite DB configuration can execute while a migration or journal authorizer grants privileged writes through this API.
 
 Base-class descriptor dispatch, `object.__setattr__`, process-memory modification, raw separately opened SQLite connections, direct filesystem writes, and FD ABA attacks remain outside this same-process boundary. This is not a sandbox, keyed provenance, or cryptographic writer authentication.
 
