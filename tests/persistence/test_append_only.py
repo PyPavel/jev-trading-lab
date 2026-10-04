@@ -330,6 +330,128 @@ def test_secure_journal_write_scope_restores_denial_after_error(tmp_path: Path) 
         connection.close()
 
 
+def test_trace_callback_cannot_forge_row_during_journal_begin(tmp_path: Path) -> None:
+    connection = _secure_connection(tmp_path / "private" / "journal.sqlite3")
+    try:
+        run_id = _insert_run(connection)
+        forged = _entity(run_id, logical_identity=HEX_B, payload={"forged": True})
+        values = tuple(
+            getattr(forged, field) for field in JournalEntity.__dataclass_fields__
+        )
+        registration_rejected = False
+
+        def inject_on_begin(statement: str) -> None:
+            if statement.startswith("BEGIN"):
+                connection.execute(
+                    "INSERT INTO main.journal_entities VALUES (?,?,?,?,?,?,?)", values
+                )
+
+        try:
+            connection.set_trace_callback(inject_on_begin)
+        except RuntimeError:
+            registration_rejected = True
+
+        AppendOnlyJournal(connection).append_entity(_entity(run_id))
+
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM main.journal_entities WHERE entity_id = ?",
+                (forged.entity_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert registration_rejected
+    finally:
+        connection.close()
+
+
+def test_public_like_override_cannot_hide_temp_objects(tmp_path: Path) -> None:
+    connection = _secure_connection(tmp_path / "private" / "journal.sqlite3")
+    try:
+        registration_rejected = False
+        try:
+            connection.create_function("like", 2, lambda _pattern, _value: 1)
+        except RuntimeError:
+            registration_rejected = True
+
+        sqlite3.Connection.set_authorizer(connection, None)
+        connection.execute("CREATE TEMP TABLE hidden_by_like(value INTEGER)")
+        sqlite3.Connection.set_authorizer(connection, _runtime_authorizer)
+
+        with pytest.raises(DatabaseConfigurationError, match="TEMP schema"):
+            AppendOnlyJournal(connection)
+        assert registration_rejected
+    finally:
+        connection.close()
+
+
+def test_base_like_override_cannot_hide_temp_objects(tmp_path: Path) -> None:
+    connection = _secure_connection(tmp_path / "private" / "journal.sqlite3")
+    try:
+        sqlite3.Connection.create_function(
+            connection, "like", 2, lambda _pattern, _value: 1
+        )
+        sqlite3.Connection.set_authorizer(connection, None)
+        connection.execute("CREATE TEMP TABLE hidden_by_base_like(value INTEGER)")
+        sqlite3.Connection.set_authorizer(connection, _runtime_authorizer)
+
+        with pytest.raises(DatabaseConfigurationError, match="TEMP schema"):
+            AppendOnlyJournal(connection)
+    finally:
+        connection.close()
+
+
+class _Aggregate:
+    def step(self) -> None:
+        pass
+
+    def finalize(self) -> int:
+        return 0
+
+
+class _WindowAggregate(_Aggregate):
+    def value(self) -> int:
+        return 0
+
+    def inverse(self) -> None:
+        pass
+
+
+@pytest.mark.parametrize(
+    "method, arguments, keyword_arguments",
+    (
+        ("set_trace_callback", (lambda _statement: None,), {}),
+        ("create_function", ("blocked_function", 0, lambda: 1), {}),
+        ("create_aggregate", ("blocked_aggregate", 0, _Aggregate), {}),
+        ("create_window_function", ("blocked_window", 0, _WindowAggregate), {}),
+        ("create_collation", ("blocked_collation", lambda _left, _right: 0), {}),
+        ("set_progress_handler", (lambda: 0, 1), {}),
+        ("set_authorizer", (None,), {}),
+        ("enable_load_extension", (True,), {}),
+        ("load_extension", ("missing_extension",), {}),
+        ("deserialize", (b"not a database",), {}),
+        ("blobopen", ("journal_entities", "payload", 1), {"readonly": False}),
+    ),
+)
+def test_sealed_connection_rejects_mutable_callback_and_database_surfaces(
+    tmp_path: Path,
+    method: str,
+    arguments: tuple[object, ...],
+    keyword_arguments: dict[str, object],
+) -> None:
+    if not hasattr(sqlite3.Connection, method):
+        pytest.skip(f"sqlite3.Connection.{method} is unavailable")
+    connection = _secure_connection(tmp_path / method / "private" / "journal.sqlite3")
+    try:
+        before = connection.total_changes
+        with pytest.raises(RuntimeError, match="sealed"):
+            getattr(connection, method)(*arguments, **keyword_arguments)
+        assert connection.total_changes == before
+        assert connection.execute("SELECT 1").fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
 def test_append_ignores_matching_temp_journal_shadows(tmp_path: Path) -> None:
     connection = _secure_connection(tmp_path / "private" / "journal.sqlite3")
     try:
@@ -450,6 +572,33 @@ def test_sealed_connection_denies_temp_schema_creation(
         connection.close()
 
 
+def test_fresh_connection_denies_temp_schema_creation(tmp_path: Path) -> None:
+    connection = connect_database(
+        (tmp_path / "private" / "journal.sqlite3").absolute(),
+        busy_timeout_ms=5000,
+        mount_resolver=lambda _path: "ext4",
+    )
+    try:
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            connection.execute(
+                "CREATE TEMP TABLE blocked_before_migration(value INTEGER)"
+            )
+    finally:
+        connection.close()
+
+
+def test_sealed_connection_denies_temp_index_creation(tmp_path: Path) -> None:
+    connection = _secure_connection(tmp_path / "private" / "journal.sqlite3")
+    try:
+        sqlite3.Connection.set_authorizer(connection, None)
+        connection.execute("CREATE TEMP TABLE index_target(value INTEGER)")
+        sqlite3.Connection.set_authorizer(connection, _runtime_authorizer)
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            connection.execute("CREATE INDEX temp.blocked_index ON index_target(value)")
+    finally:
+        connection.close()
+
+
 @pytest.mark.parametrize(
     "setup_sql",
     (
@@ -473,7 +622,9 @@ def test_sealing_rejects_preexisting_user_temp_objects(
         mount_resolver=lambda _path: "ext4",
     )
     try:
+        sqlite3.Connection.set_authorizer(connection, None)
         connection.executescript(setup_sql)
+        sqlite3.Connection.set_authorizer(connection, _runtime_authorizer)
         with pytest.raises(DatabaseConfigurationError, match="TEMP schema"):
             apply_migrations(connection, clock=lambda: 1)
     finally:

@@ -28,9 +28,11 @@ from jev_trading_lab.persistence.db import (
     DatabaseSafetyError,
     connect_database,
 )
+from jev_trading_lab.persistence.journal import JournalEntity, make_journal_entity
 from jev_trading_lab.persistence.migrations import (
     MAX_MIGRATION_BYTES,
     MigrationError,
+    _migration_authorizer,
     apply_migrations,
     load_migrations,
     split_sql_statements,
@@ -845,7 +847,9 @@ def test_database_sidecars_remain_private(tmp_path: Path) -> None:
     database = tmp_path / "private" / "db.sqlite3"
     connection = _connect(database)
     try:
+        sqlite3.Connection.set_authorizer(connection, None)
         connection.execute("CREATE TABLE sample (id INTEGER PRIMARY KEY) STRICT")
+        sqlite3.Connection.set_authorizer(connection, db_module._runtime_authorizer)
         connection.execute("INSERT INTO sample VALUES (1)")
         for suffix in ("-wal", "-shm"):
             sidecar = Path(f"{database}{suffix}")
@@ -858,7 +862,9 @@ def test_database_sidecars_remain_private(tmp_path: Path) -> None:
 def test_apply_rejects_caller_transaction_without_rollback(tmp_path: Path) -> None:
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
+        sqlite3.Connection.set_authorizer(connection, None)
         connection.execute("CREATE TABLE caller_data (value TEXT NOT NULL) STRICT")
+        sqlite3.Connection.set_authorizer(connection, db_module._runtime_authorizer)
         connection.execute("BEGIN")
         connection.execute("INSERT INTO caller_data VALUES ('keep me')")
 
@@ -888,6 +894,7 @@ def test_apply_requires_autocommit_connection_contract() -> None:
 def test_temp_schema_migrations_cannot_shadow_main(tmp_path: Path) -> None:
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
+        sqlite3.Connection.set_authorizer(connection, None)
         connection.execute(
             "CREATE TEMP TABLE schema_migrations "
             "(version INTEGER, name TEXT, sha256 TEXT, applied_at_us INTEGER)"
@@ -895,6 +902,7 @@ def test_temp_schema_migrations_cannot_shadow_main(tmp_path: Path) -> None:
         connection.execute(
             "INSERT INTO temp.schema_migrations VALUES (99, 'shadow', 'bad', 1)"
         )
+        sqlite3.Connection.set_authorizer(connection, db_module._runtime_authorizer)
 
         with pytest.raises(DatabaseConfigurationError, match="TEMP schema"):
             apply_migrations(connection, clock=lambda: 1_000_000)
@@ -1326,7 +1334,9 @@ def test_migration_rejects_pre_attached_auxiliary_database(
     auxiliary = tmp_path / "aux.sqlite3"
     connection = _connect(database)
     try:
+        sqlite3.Connection.set_authorizer(connection, None)
         connection.execute("ATTACH DATABASE ? AS aux", (str(auxiliary),))
+        sqlite3.Connection.set_authorizer(connection, db_module._runtime_authorizer)
         with pytest.raises(MigrationError, match="auxiliary database"):
             apply_migrations(connection, package=package, clock=lambda: 1_000_000)
         assert not connection.in_transaction
@@ -2102,8 +2112,10 @@ def test_quoted_temp_reindex_is_denied_without_metadata(
     )
     connection = _connect(tmp_path / "database" / "db.sqlite3")
     try:
+        sqlite3.Connection.set_authorizer(connection, None)
         connection.execute("CREATE TEMP TABLE sink (value TEXT)")
         connection.execute("CREATE INDEX temp.idx ON sink(value)")
+        sqlite3.Connection.set_authorizer(connection, db_module._runtime_authorizer)
         with pytest.raises(DatabaseConfigurationError, match="TEMP schema"):
             apply_migrations(connection, package=package, clock=lambda: 1_000_000)
         assert (
@@ -2112,6 +2124,147 @@ def test_quoted_temp_reindex_is_denied_without_metadata(
             ).fetchone()
             is None
         )
+    finally:
+        connection.close()
+
+
+def test_migration_authorizer_denies_trigger_originated_writes() -> None:
+    actions = {
+        sqlite3.SQLITE_INSERT,
+        sqlite3.SQLITE_UPDATE,
+        sqlite3.SQLITE_DELETE,
+        sqlite3.SQLITE_ALTER_TABLE,
+        sqlite3.SQLITE_CREATE_INDEX,
+        sqlite3.SQLITE_CREATE_TABLE,
+        sqlite3.SQLITE_CREATE_TRIGGER,
+        sqlite3.SQLITE_CREATE_VIEW,
+        sqlite3.SQLITE_DROP_INDEX,
+        sqlite3.SQLITE_DROP_TABLE,
+        sqlite3.SQLITE_DROP_TRIGGER,
+        sqlite3.SQLITE_DROP_VIEW,
+    }
+    for action in actions:
+        assert (
+            _migration_authorizer(action, "target", None, "main", "hostile_trigger")
+            == sqlite3.SQLITE_DENY
+        )
+
+
+def test_upgrade_rejects_persistent_trigger_side_effect_on_metadata_insert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package_v1, _schema_v1 = _package(
+        tmp_path / "v1",
+        monkeypatch,
+        {"001_migration_metadata.sql": SCHEMA_SQL},
+    )
+    database = tmp_path / "database" / "db.sqlite3"
+    connection = _connect(database)
+    try:
+        apply_migrations(connection, package=package_v1, clock=lambda: 1_000_000)
+        sqlite3.Connection.set_authorizer(connection, None)
+        connection.execute("CREATE TABLE main.trigger_sink (version INTEGER)")
+        connection.execute(
+            "CREATE TRIGGER main.capture_metadata "
+            "AFTER INSERT ON schema_migrations "
+            "BEGIN INSERT INTO trigger_sink VALUES (NEW.version); END"
+        )
+        sqlite3.Connection.set_authorizer(connection, db_module._runtime_authorizer)
+
+        package_v2, _schema_v2 = _package(
+            tmp_path / "v2",
+            monkeypatch,
+            {
+                "001_migration_metadata.sql": SCHEMA_SQL,
+                "002_core_entities.sql": CORE_SCHEMA_SQL,
+            },
+        )
+        with pytest.raises(MigrationError, match="unauthorized SQL"):
+            apply_migrations(connection, package=package_v2, clock=lambda: 1_000_001)
+
+        assert [row[0] for row in _applied(connection)] == [1]
+        assert (
+            connection.execute("SELECT count(*) FROM main.trigger_sink").fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE name = 'manifests'"
+            ).fetchone()
+            is None
+        )
+        assert connection.authorizer_sealed
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            connection.execute("DROP TABLE main.trigger_sink")
+    finally:
+        connection.close()
+
+
+def test_upgrade_rejects_temp_trigger_forging_journal_on_metadata_insert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package_v2, _schema_v2 = _package(
+        tmp_path / "v2",
+        monkeypatch,
+        {
+            "001_migration_metadata.sql": SCHEMA_SQL,
+            "002_core_entities.sql": CORE_SCHEMA_SQL,
+        },
+    )
+    database = tmp_path / "database" / "db.sqlite3"
+    connection = _connect(database)
+    try:
+        apply_migrations(connection, package=package_v2, clock=lambda: 1_000_000)
+        run_id = hashlib.sha256(b"run").hexdigest()
+        forged = make_journal_entity(
+            run_id=run_id,
+            entity_type="order_intent",
+            logical_identity=hashlib.sha256(b"logical").hexdigest(),
+            created_at_us=1,
+            payload={"forged": True},
+        )
+        values = tuple(
+            getattr(forged, field) for field in JournalEntity.__dataclass_fields__
+        )
+        quoted = ", ".join(
+            "X'" + value.hex() + "'"
+            if isinstance(value, bytes)
+            else str(value)
+            if isinstance(value, int)
+            else "'" + value.replace("'", "''") + "'"
+            for value in values
+        )
+        sqlite3.Connection.set_authorizer(connection, None)
+        connection.execute(
+            "CREATE TEMP TRIGGER forge_journal_after_migration "
+            "AFTER INSERT ON main.schema_migrations WHEN NEW.version = 3 "
+            "BEGIN INSERT INTO journal_entities VALUES "
+            f"({quoted}); END"
+        )
+        sqlite3.Connection.set_authorizer(connection, db_module._runtime_authorizer)
+
+        package_v3, _schema_v3 = _package(
+            tmp_path / "v3",
+            monkeypatch,
+            {
+                "001_migration_metadata.sql": SCHEMA_SQL,
+                "002_core_entities.sql": CORE_SCHEMA_SQL,
+                "003_append_only_guards.sql": JOURNAL_SCHEMA_SQL,
+            },
+        )
+        with pytest.raises(DatabaseConfigurationError, match="TEMP schema"):
+            apply_migrations(connection, package=package_v3, clock=lambda: 1_000_001)
+
+        assert [row[0] for row in _applied(connection)] == [1, 2]
+        assert (
+            connection.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE name = 'journal_entities'"
+            ).fetchone()
+            is None
+        )
+        assert connection.authorizer_sealed
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            connection.execute("CREATE TEMP TABLE still_blocked(value INTEGER)")
     finally:
         connection.close()
 
@@ -2127,6 +2280,7 @@ def test_temp_trigger_cannot_write_during_metadata_insert(
     database = tmp_path / "database" / "db.sqlite3"
     connection = _connect(database)
     try:
+        sqlite3.Connection.set_authorizer(connection, None)
         connection.executescript(SCHEMA_SQL.decode("utf-8"))
         connection.execute("CREATE TEMP TABLE sink (version INTEGER)")
         connection.execute(
@@ -2134,6 +2288,7 @@ def test_temp_trigger_cannot_write_during_metadata_insert(
             "AFTER INSERT ON main.schema_migrations "
             "BEGIN INSERT INTO sink VALUES (NEW.version); END"
         )
+        sqlite3.Connection.set_authorizer(connection, db_module._runtime_authorizer)
 
         with pytest.raises(DatabaseConfigurationError, match="TEMP schema"):
             apply_migrations(connection, package=package, clock=lambda: 1_000_000)

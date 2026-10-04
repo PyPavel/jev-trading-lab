@@ -280,10 +280,13 @@ class AppendOnlyJournal:
     """Validate and append immutable records through a sealed ``SecureConnection``.
 
     Consistency and controlled-writer change control assume callers use
-    ``SecureConnection`` public instance methods. Code that deliberately invokes
-    base-class descriptors, mutates object internals or process memory, opens raw
-    SQLite connections, or writes files directly is out of scope. This is not
-    keyed provenance or writer authentication against hostile same-process code.
+    ``SecureConnection`` public instance methods. After sealing, those methods
+    reject callback/function/collation registration, extension loading,
+    deserialization, and blob access while ordinary SQL reads and approved writes
+    remain available. Code that deliberately invokes base-class descriptors,
+    mutates object internals or process memory, opens raw SQLite connections, or
+    writes files directly is out of scope. This is not a sandbox, keyed provenance,
+    or writer authentication against hostile same-process code.
 
     Supersession is acyclic without graph traversal: each new event may reference
     only an already persisted predecessor, event primary keys are immutable, and

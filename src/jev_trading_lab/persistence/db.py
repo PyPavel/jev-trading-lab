@@ -11,7 +11,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 _Authorizer = Callable[[int, str | None, str | None, str | None, str | None], int]
 _JOURNAL_TABLES = frozenset({"journal_entities", "journal_events"})
@@ -102,7 +102,14 @@ class MountResolver(Protocol):
 
 
 class SecureConnection(sqlite3.Connection):
-    """SQLite connection with owned storage and a sealable runtime authorizer."""
+    """SQLite connection with sealed code callbacks and database mutation APIs.
+
+    Supported callers may execute ordinary SQL but cannot replace trusted behavior
+    through public instance callback, extension, deserialization, or blob methods
+    after ``connect_database`` returns. Deliberate base-class descriptor dispatch,
+    object-internal mutation, process-memory modification, and raw file writes are
+    outside this same-process change-control boundary; this is not a sandbox.
+    """
 
     __slots__ = ("_parent_descriptor", "_busy_timeout_ms", "_authorizer_sealed")
 
@@ -115,14 +122,59 @@ class SecureConnection(sqlite3.Connection):
 
     @property
     def authorizer_sealed(self) -> bool:
-        """Return whether the persistent runtime write boundary is installed."""
+        """Return whether public mutation surfaces and runtime writes are sealed."""
         return getattr(self, "_authorizer_sealed", False)
 
-    def set_authorizer(self, authorizer_callback: _Authorizer | None) -> None:
-        """Set an authorizer only before the runtime boundary has been sealed."""
+    def _reject_if_sealed(self) -> None:
         if self.authorizer_sealed:
-            raise RuntimeError("runtime authorizer is sealed")
+            raise RuntimeError(
+                "secure connection authorizer, callback, and mutation APIs are sealed"
+            )
+
+    def set_authorizer(self, authorizer_callback: _Authorizer | None) -> None:
+        """Set an authorizer only before the connection has been sealed."""
+        self._reject_if_sealed()
         self._set_sqlite_authorizer(authorizer_callback)
+
+    def set_trace_callback(self, trace_callback: Any) -> None:
+        self._reject_if_sealed()
+        super().set_trace_callback(trace_callback)
+
+    def create_function(self, *args: Any, **kwargs: Any) -> None:
+        self._reject_if_sealed()
+        super().create_function(*args, **kwargs)
+
+    def create_aggregate(self, *args: Any, **kwargs: Any) -> None:
+        self._reject_if_sealed()
+        super().create_aggregate(*args, **kwargs)
+
+    def create_window_function(self, *args: Any, **kwargs: Any) -> None:
+        self._reject_if_sealed()
+        super().create_window_function(*args, **kwargs)
+
+    def create_collation(self, *args: Any, **kwargs: Any) -> None:
+        self._reject_if_sealed()
+        super().create_collation(*args, **kwargs)
+
+    def set_progress_handler(self, *args: Any, **kwargs: Any) -> None:
+        self._reject_if_sealed()
+        super().set_progress_handler(*args, **kwargs)
+
+    def enable_load_extension(self, *args: Any, **kwargs: Any) -> None:
+        self._reject_if_sealed()
+        super().enable_load_extension(*args, **kwargs)
+
+    def load_extension(self, *args: Any, **kwargs: Any) -> None:
+        self._reject_if_sealed()
+        super().load_extension(*args, **kwargs)
+
+    def deserialize(self, *args: Any, **kwargs: Any) -> None:
+        self._reject_if_sealed()
+        super().deserialize(*args, **kwargs)
+
+    def blobopen(self, *args: Any, **kwargs: Any) -> sqlite3.Blob:
+        self._reject_if_sealed()
+        return super().blobopen(*args, **kwargs)
 
     def __setattr__(self, name: str, value: object) -> None:
         if name in {"_busy_timeout_ms", "_authorizer_sealed"}:
@@ -236,13 +288,12 @@ def _set_internal_authorizer(
 
 
 def _reject_user_temp_schema(connection: SecureConnection) -> None:
-    row = connection.execute(
-        "SELECT type, name FROM temp.sqlite_schema "
-        "WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\' LIMIT 1"
-    ).fetchone()
-    if row is not None:
+    for row in connection.execute("SELECT type, name FROM temp.sqlite_schema"):
+        object_type, name = row
+        if type(name) is str and name.startswith("sqlite_"):
+            continue
         raise DatabaseConfigurationError(
-            f"TEMP schema contains unsupported user object {row[0]} {row[1]!r}"
+            f"TEMP schema contains unsupported user object {object_type} {name!r}"
         )
 
 
@@ -747,7 +798,7 @@ def connect_database(
             connection.execute("PRAGMA trusted_schema = OFF")
             _verify_pragma(connection, "trusted_schema", 0, label="trusted_schema")
             _recheck_storage(path, parent_descriptor, parent_identity, file_identity)
-            _seal_if_migrated(connection)
+            _seal_runtime_authorizer(connection)
             return connection
         except BaseException:
             if connection is not None:

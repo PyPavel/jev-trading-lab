@@ -590,7 +590,7 @@ def _migration_authorizer(
     _argument1: str | None,
     _argument2: str | None,
     database: str | None,
-    _trigger: str | None,
+    source: str | None,
 ) -> int:
     if action in {
         sqlite3.SQLITE_ANALYZE,
@@ -600,7 +600,7 @@ def _migration_authorizer(
         return sqlite3.SQLITE_DENY
     if action in _TEMP_ACTIONS:
         return sqlite3.SQLITE_DENY
-    if action in _WRITE_ACTIONS and database != "main":
+    if action in _WRITE_ACTIONS and (database != "main" or source is not None):
         return sqlite3.SQLITE_DENY
     return sqlite3.SQLITE_OK
 
