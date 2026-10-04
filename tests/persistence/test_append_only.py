@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from jev_trading_lab.core.ids import canonical_hash
+from jev_trading_lab.persistence import journal as journal_module
 from jev_trading_lab.persistence.db import (
     DatabaseConfigurationError,
     SecureConnection,
@@ -53,7 +54,7 @@ def _connection(path: str | None = None) -> sqlite3.Connection:
     connection.execute("PRAGMA synchronous = FULL")
     connection.execute("PRAGMA busy_timeout = 5000")
     connection.execute("PRAGMA trusted_schema = OFF")
-    apply_migrations(connection, clock=lambda: 1_700_000_000_000_000)
+    apply_migrations(connection)
     return connection
 
 
@@ -66,7 +67,7 @@ def _secure_connection(path: Path | None = None) -> SecureConnection:
         mount_resolver=lambda _path: "ext4",
     )
     assert isinstance(connection, SecureConnection)
-    apply_migrations(connection, clock=lambda: 1_700_000_000_000_000)
+    apply_migrations(connection)
     return connection
 
 
@@ -326,6 +327,91 @@ def test_secure_journal_write_scope_restores_denial_after_error(tmp_path: Path) 
                 "INSERT INTO journal_events VALUES (?,?,?,?,?,?,?,?)", direct
             )
         assert not connection.in_transaction
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("adapted_type", (str, int, bytes, type(None)))
+def test_global_adapters_cannot_run_during_privileged_journal_insert(
+    tmp_path: Path, adapted_type: type[object]
+) -> None:
+    connection = _secure_connection(
+        tmp_path / adapted_type.__name__ / "journal.sqlite3"
+    )
+    original_adapter = sqlite3.adapters.get((adapted_type, sqlite3.PrepareProtocol))
+    try:
+        run_id = _insert_run(connection)
+        journal = AppendOnlyJournal(connection)
+        legitimate_entity = _entity(run_id)
+        if adapted_type is type(None):
+            journal.append_entity(legitimate_entity)
+            legitimate: JournalEntity | JournalEvent = _event(
+                legitimate_entity.entity_id, 0
+            )
+        else:
+            legitimate = legitimate_entity
+        forged = _entity(
+            run_id,
+            logical_identity=_hex(f"forged-adapter-{adapted_type.__name__}"),
+            payload={"forged": adapted_type.__name__},
+        )
+        forged_sql = journal_module._trusted_insert_sql(
+            "journal_entities",
+            tuple(
+                getattr(forged, field) for field in JournalEntity.__dataclass_fields__
+            ),
+        )
+        callback_ran = False
+
+        def hostile_adapter(value: object) -> object:
+            nonlocal callback_ran
+            callback_ran = True
+            connection.execute(forged_sql)
+            return value
+
+        sqlite3.register_adapter(adapted_type, hostile_adapter)
+        if isinstance(legitimate, JournalEvent):
+            assert journal.append_event(legitimate) == legitimate.event_id
+        else:
+            assert journal.append_entity(legitimate) == legitimate.entity_id
+        assert not callback_ran
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM main.journal_entities WHERE entity_id = "
+                f"CAST(X'{forged.entity_id.encode().hex()}' AS TEXT)"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        key = (adapted_type, sqlite3.PrepareProtocol)
+        if original_adapter is None:
+            sqlite3.adapters.pop(key, None)
+        else:
+            sqlite3.adapters[key] = original_adapter
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "value,expected_type,expected_value",
+    (
+        ("quote'\x00snowman ☃", "text", "quote'\x00snowman ☃"),
+        (b"\x00'\xff", "blob", b"\x00'\xff"),
+        (-(2**63) + 1, "integer", -(2**63) + 1),
+        (None, "null", None),
+    ),
+)
+def test_privileged_journal_literals_preserve_sqlite_boundaries(
+    value: object, expected_type: str, expected_value: object
+) -> None:
+    statement = journal_module._trusted_insert_sql("journal_entities", (value,))
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.execute("CREATE TABLE journal_entities(value)")
+        connection.execute(statement)
+        actual = connection.execute(
+            "SELECT typeof(value), value FROM journal_entities"
+        ).fetchone()
+        assert actual == (expected_type, expected_value)
     finally:
         connection.close()
 
@@ -733,7 +819,7 @@ def test_sealing_rejects_preexisting_user_temp_objects(
         connection.executescript(setup_sql)
         sqlite3.Connection.set_authorizer(connection, _runtime_authorizer)
         with pytest.raises(DatabaseConfigurationError, match="TEMP schema"):
-            apply_migrations(connection, clock=lambda: 1)
+            apply_migrations(connection)
     finally:
         connection.close()
 
@@ -1220,7 +1306,7 @@ def test_secure_connection_timeout_is_authoritative(tmp_path: Path) -> None:
         mount_resolver=lambda _path: "ext4",
     )
     try:
-        apply_migrations(connection, clock=lambda: 1)
+        apply_migrations(connection)
         run_id = _insert_run(connection)
         with pytest.raises(ValueError, match="expected_busy_timeout_ms"):
             AppendOnlyJournal(connection, expected_busy_timeout_ms=1234)

@@ -37,12 +37,12 @@ from jev_trading_lab.persistence.journal import (
 from jev_trading_lab.persistence.migrations import (
     MAX_MIGRATION_BYTES,
     MigrationError,
-    _apply_migrations,
     _migration_authorizer,
     apply_migrations,
     load_migrations,
     split_sql_statements,
 )
+from tests.persistence.migration_test_support import apply_fixture_migrations
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -92,6 +92,15 @@ def _applied(connection: sqlite3.Connection) -> list[tuple[object, ...]]:
     return [tuple(row) for row in rows]
 
 
+def _apply_reviewed_migrations(connection: sqlite3.Connection, timestamp: int) -> None:
+    real_clock = migration_module._utc_now_us
+    migration_module._utc_now_us = lambda: timestamp
+    try:
+        apply_migrations(connection)
+    finally:
+        migration_module._utc_now_us = real_clock
+
+
 def test_connection_pragmas(tmp_path: Path) -> None:
     parent = tmp_path / "private"
     database = parent / "lab.sqlite3"
@@ -112,6 +121,37 @@ def test_connection_pragmas(tmp_path: Path) -> None:
 
     assert stat.S_IMODE(parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(database.stat().st_mode) == 0o600
+
+
+def test_secure_connection_seals_sqlite_dbconfig_after_safe_setup(
+    tmp_path: Path,
+) -> None:
+    if not hasattr(sqlite3.Connection, "setconfig"):
+        pytest.skip("sqlite3.Connection.setconfig is unavailable")
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
+    try:
+        expected = {
+            "SQLITE_DBCONFIG_WRITABLE_SCHEMA": False,
+            "SQLITE_DBCONFIG_ENABLE_TRIGGER": True,
+            "SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION": False,
+            "SQLITE_DBCONFIG_DEFENSIVE": True,
+            "SQLITE_DBCONFIG_TRUSTED_SCHEMA": False,
+        }
+        supported = {
+            getattr(sqlite3, name): value
+            for name, value in expected.items()
+            if hasattr(sqlite3, name)
+        }
+        assert supported
+        for operation, value in supported.items():
+            assert connection.getconfig(operation) is value  # type: ignore[attr-defined]
+            with pytest.raises(RuntimeError, match="sealed"):
+                connection.setconfig(operation, not value)  # type: ignore[attr-defined]
+            assert connection.getconfig(operation) is value  # type: ignore[attr-defined]
+        with pytest.raises(AttributeError):
+            connection.setconfig = lambda *_args: False  # type: ignore[attr-defined,method-assign]
+    finally:
+        connection.close()
 
 
 def test_secure_connection_retains_immutable_busy_timeout(tmp_path: Path) -> None:
@@ -271,10 +311,47 @@ def test_pragma_setup_failure_closes_connection(
         connection.execute("SELECT 1")
 
 
+def test_public_migration_api_accepts_no_callback_or_package_capability() -> None:
+    import inspect
+
+    assert tuple(inspect.signature(apply_migrations).parameters) == ("connection",)
+    assert not hasattr(migration_module, "_apply_migrations")
+
+
+def test_public_migration_clock_cannot_run_sql_under_privilege(tmp_path: Path) -> None:
+    connection = _connect(tmp_path / "private" / "db.sqlite3")
+    callback_ran = False
+
+    def hostile_clock() -> int:
+        nonlocal callback_ran
+        callback_ran = True
+        trigger = connection.execute(
+            "SELECT 1 FROM main.sqlite_schema "
+            "WHERE type = 'trigger' AND name = 'journal_events_immutable_delete'"
+        ).fetchone()
+        if trigger is not None:
+            connection.execute("DROP TRIGGER main.journal_events_immutable_delete")
+        return 1_700_000_000_000_000
+
+    try:
+        with pytest.raises(TypeError, match="clock"):
+            apply_migrations(connection, clock=hostile_clock)  # type: ignore[call-arg]
+        assert not callback_ran
+        assert (
+            connection.execute(
+                "SELECT 1 FROM main.sqlite_schema "
+                "WHERE type = 'trigger' AND name = 'journal_events_immutable_delete'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+
+
 def test_clean_database_applies_full_packaged_prefix(tmp_path: Path) -> None:
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
-        apply_migrations(connection, clock=lambda: 1_700_000_000_000_000)
+        _apply_reviewed_migrations(connection, 1_700_000_000_000_000)
         tables = {
             row[0]
             for row in connection.execute(
@@ -320,8 +397,8 @@ def test_clean_database_applies_full_packaged_prefix(tmp_path: Path) -> None:
 def test_repeated_migration_application_is_idempotent(tmp_path: Path) -> None:
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
-        apply_migrations(connection, clock=lambda: 1_000_000)
-        apply_migrations(connection, clock=lambda: 2_000_000)
+        _apply_reviewed_migrations(connection, 1_000_000)
+        _apply_reviewed_migrations(connection, 2_000_000)
         assert len(_applied(connection)) == 3
         assert [row[3] for row in _applied(connection)] == [
             1_000_000,
@@ -341,7 +418,7 @@ def test_migration_checksum_change_rejected(
     )
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
-        _apply_migrations(connection, package=package, clock=lambda: 1_000_000)
+        apply_fixture_migrations(connection, package=package, clock=lambda: 1_000_000)
         if change == "bytes":
             (schema / "001_migration_metadata.sql").write_bytes(SCHEMA_SQL + b"\n")
         else:
@@ -351,7 +428,9 @@ def test_migration_checksum_change_rejected(
         before = _applied(connection)
 
         with pytest.raises(MigrationError, match="applied migration"):
-            _apply_migrations(connection, package=package, clock=lambda: 2_000_000)
+            apply_fixture_migrations(
+                connection, package=package, clock=lambda: 2_000_000
+            )
 
         assert _applied(connection) == before
     finally:
@@ -375,7 +454,7 @@ def test_installed_wheel_loads_sql(
 
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
-        _apply_migrations(
+        apply_fixture_migrations(
             connection, package=f"{package}.schema", clock=lambda: 1_234_567
         )
         assert _applied(connection) == [
@@ -487,7 +566,9 @@ def test_failed_second_statement_rolls_back_entire_migration(
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         with pytest.raises(sqlite3.OperationalError, match="no such table"):
-            _apply_migrations(connection, package=package, clock=lambda: 1_000_000)
+            apply_fixture_migrations(
+                connection, package=package, clock=lambda: 1_000_000
+            )
         assert (
             connection.execute(
                 "SELECT 1 FROM sqlite_schema WHERE name = 'must_rollback'"
@@ -515,9 +596,11 @@ def test_failed_migration_restores_sealed_runtime_authorizer(
     )
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
-        apply_migrations(connection, clock=lambda: 1_000_000)
+        _apply_reviewed_migrations(connection, 1_000_000)
         with pytest.raises(sqlite3.OperationalError, match="no such table"):
-            _apply_migrations(connection, package=package, clock=lambda: 2_000_000)
+            apply_fixture_migrations(
+                connection, package=package, clock=lambda: 2_000_000
+            )
         with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
             connection.execute("CREATE TABLE escaped (id INTEGER) STRICT")
     finally:
@@ -529,7 +612,7 @@ def test_public_apply_rejects_hostile_later_migration_package(
 ) -> None:
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
-        apply_migrations(connection, clock=lambda: 1_000_000)
+        _apply_reviewed_migrations(connection, 1_000_000)
 
         def digest(value: str) -> str:
             return hashlib.sha256(value.encode()).hexdigest()
@@ -597,8 +680,8 @@ BEGIN SELECT RAISE(ABORT, 'immutable:journal_events'); END;
             },
         )
 
-        with pytest.raises(MigrationError, match="approved migration package"):
-            apply_migrations(connection, package=package, clock=lambda: 2_000_000)
+        with pytest.raises(TypeError, match="package"):
+            apply_migrations(connection, package=package)  # type: ignore[call-arg]
 
         assert (
             connection.execute(
@@ -649,7 +732,7 @@ INSERT INTO guarded (id, value) VALUES (1, 'original');
     )
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
-        _apply_migrations(connection, package=package, clock=lambda: 1_000_000)
+        apply_fixture_migrations(connection, package=package, clock=lambda: 1_000_000)
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
             connection.execute("UPDATE guarded SET value = 'changed' WHERE id = 1")
     finally:
@@ -686,7 +769,9 @@ def test_transaction_control_and_attach_sql_rejected(
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         with pytest.raises(MigrationError, match="forbidden SQL"):
-            _apply_migrations(connection, package=package, clock=lambda: 1_000_000)
+            apply_fixture_migrations(
+                connection, package=package, clock=lambda: 1_000_000
+            )
         assert (
             connection.execute(
                 "SELECT 1 FROM sqlite_schema WHERE name = 'schema_migrations'"
@@ -715,7 +800,7 @@ INSERT INTO policy_words VALUES (
     )
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
-        _apply_migrations(connection, package=package, clock=lambda: 1_000_000)
+        apply_fixture_migrations(connection, package=package, clock=lambda: 1_000_000)
         row = connection.execute("SELECT count(*) FROM policy_words").fetchone()
         assert row[0] == 1
     finally:
@@ -741,7 +826,7 @@ def test_invalid_applied_migration_chain_rejected(
     )
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
-        _apply_migrations(connection, package=package, clock=lambda: 1_000_000)
+        apply_fixture_migrations(connection, package=package, clock=lambda: 1_000_000)
         for version in versions[1:]:
             connection.execute(
                 "INSERT INTO schema_migrations "
@@ -754,7 +839,9 @@ def test_invalid_applied_migration_chain_rejected(
                 ),
             )
         with pytest.raises(MigrationError, match=match):
-            _apply_migrations(connection, package=package, clock=lambda: 2_000_000)
+            apply_fixture_migrations(
+                connection, package=package, clock=lambda: 2_000_000
+            )
     finally:
         connection.close()
 
@@ -768,7 +855,7 @@ def test_clock_must_return_builtin_integer_and_rolls_back(
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         with pytest.raises(TypeError, match="clock"):
-            _apply_migrations(connection, package=package, clock=lambda: True)
+            apply_fixture_migrations(connection, package=package, clock=lambda: True)
         assert (
             connection.execute(
                 "SELECT 1 FROM sqlite_schema WHERE name = 'schema_migrations'"
@@ -787,7 +874,7 @@ def test_concurrent_migration_attempts_serialize(tmp_path: Path) -> None:
         connection = _connect(database, timeout=5_000)
         try:
             barrier.wait(timeout=5)
-            apply_migrations(connection, clock=lambda: 1_000_000)
+            _apply_reviewed_migrations(connection, 1_000_000)
             return _applied(connection)
         finally:
             connection.close()
@@ -974,7 +1061,7 @@ def test_apply_rejects_caller_transaction_without_rollback(tmp_path: Path) -> No
         connection.execute("INSERT INTO caller_data VALUES ('keep me')")
 
         with pytest.raises(MigrationError, match="active caller transaction"):
-            apply_migrations(connection, clock=lambda: 1_000_000)
+            _apply_reviewed_migrations(connection, 1_000_000)
 
         assert connection.in_transaction
         assert (
@@ -1010,7 +1097,7 @@ def test_temp_schema_migrations_cannot_shadow_main(tmp_path: Path) -> None:
         sqlite3.Connection.set_authorizer(connection, db_module._runtime_authorizer)
 
         with pytest.raises(DatabaseConfigurationError, match="TEMP schema"):
-            apply_migrations(connection, clock=lambda: 1_000_000)
+            _apply_reviewed_migrations(connection, 1_000_000)
 
         assert (
             connection.execute(
@@ -1029,7 +1116,7 @@ def test_temp_schema_migrations_cannot_shadow_main(tmp_path: Path) -> None:
 
     reopened = _connect(tmp_path / "private" / "db.sqlite3")
     try:
-        apply_migrations(reopened, clock=lambda: 2_000_000)
+        _apply_reviewed_migrations(reopened, 2_000_000)
         assert (
             reopened.execute("SELECT count(*) FROM main.schema_migrations").fetchone()[
                 0
@@ -1047,7 +1134,7 @@ def test_empty_migration_package_fails_before_database_mutation(
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         with pytest.raises(MigrationError, match="at least migration 001"):
-            _apply_migrations(connection, package=package)
+            apply_fixture_migrations(connection, package=package)
         assert (
             connection.execute(
                 "SELECT 1 FROM main.sqlite_schema WHERE name = 'schema_migrations'"
@@ -1076,7 +1163,7 @@ def test_schema_rejects_hostile_or_mismatched_migration_names(
 ) -> None:
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
-        apply_migrations(connection, clock=lambda: 1_000_000)
+        _apply_reviewed_migrations(connection, 1_000_000)
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 "INSERT INTO main.schema_migrations "
@@ -1443,7 +1530,9 @@ def test_migration_rejects_pre_attached_auxiliary_database(
         connection.execute("ATTACH DATABASE ? AS aux", (str(auxiliary),))
         sqlite3.Connection.set_authorizer(connection, db_module._runtime_authorizer)
         with pytest.raises(MigrationError, match="auxiliary database"):
-            _apply_migrations(connection, package=package, clock=lambda: 1_000_000)
+            apply_fixture_migrations(
+                connection, package=package, clock=lambda: 1_000_000
+            )
         assert not connection.in_transaction
         assert (
             connection.execute(
@@ -1487,7 +1576,9 @@ def test_create_temp_migration_is_denied_and_rolled_back(
     connection = _connect(database)
     try:
         with pytest.raises(MigrationError, match="TEMP|authorized"):
-            _apply_migrations(connection, package=package, clock=lambda: 1_000_000)
+            apply_fixture_migrations(
+                connection, package=package, clock=lambda: 1_000_000
+            )
         assert not connection.in_transaction
         assert (
             connection.execute(
@@ -1526,7 +1617,7 @@ def test_create_temp_migration_is_denied_and_rolled_back(
 def test_schema_rejects_invalid_applied_timestamp(tmp_path: Path, invalid: int) -> None:
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
-        apply_migrations(connection, clock=lambda: 0)
+        _apply_reviewed_migrations(connection, 0)
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 "INSERT INTO main.schema_migrations "
@@ -1545,7 +1636,7 @@ def test_reconnect_detects_corrupt_applied_timestamp(
     database = tmp_path / "private" / "db.sqlite3"
     connection = _connect(database)
     try:
-        apply_migrations(connection, clock=lambda: 0)
+        _apply_reviewed_migrations(connection, 0)
         connection.execute("PRAGMA ignore_check_constraints = ON")
         connection.execute(
             "UPDATE main.schema_migrations SET applied_at_us = ? WHERE version = 1",
@@ -1558,7 +1649,7 @@ def test_reconnect_detects_corrupt_applied_timestamp(
     reopened = _connect(database)
     try:
         with pytest.raises(MigrationError, match="applied migration metadata"):
-            apply_migrations(reopened, clock=lambda: MAX_DATETIME_US)
+            _apply_reviewed_migrations(reopened, MAX_DATETIME_US)
     finally:
         reopened.close()
 
@@ -2126,7 +2217,9 @@ def test_schema_directory_swap_restore_is_rejected_before_sql_executes(
     connection = _connect(tmp_path / "database" / "db.sqlite3")
     try:
         with pytest.raises(MigrationError, match="directory.*changed"):
-            _apply_migrations(connection, package=package, clock=lambda: 1_000_000)
+            apply_fixture_migrations(
+                connection, package=package, clock=lambda: 1_000_000
+            )
         assert replaced
         assert (
             connection.execute(
@@ -2158,7 +2251,9 @@ def test_explicit_non_main_schema_is_rejected_before_execution(
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
         with pytest.raises(MigrationError, match="non-main schema"):
-            _apply_migrations(connection, package=package, clock=lambda: 1_000_000)
+            apply_fixture_migrations(
+                connection, package=package, clock=lambda: 1_000_000
+            )
         assert not connection.in_transaction
         assert (
             connection.execute(
@@ -2193,7 +2288,9 @@ def test_reindex_is_forbidden_before_authorizer_without_metadata(
     connection = _connect(tmp_path / "reindex" / "db.sqlite3")
     try:
         with pytest.raises(MigrationError, match="forbidden SQL REINDEX"):
-            _apply_migrations(connection, package=package, clock=lambda: 1_000_000)
+            apply_fixture_migrations(
+                connection, package=package, clock=lambda: 1_000_000
+            )
         assert (
             connection.execute(
                 "SELECT 1 FROM sqlite_schema WHERE name = 'schema_migrations'"
@@ -2222,7 +2319,9 @@ def test_quoted_temp_reindex_is_denied_without_metadata(
         connection.execute("CREATE INDEX temp.idx ON sink(value)")
         sqlite3.Connection.set_authorizer(connection, db_module._runtime_authorizer)
         with pytest.raises(DatabaseConfigurationError, match="TEMP schema"):
-            _apply_migrations(connection, package=package, clock=lambda: 1_000_000)
+            apply_fixture_migrations(
+                connection, package=package, clock=lambda: 1_000_000
+            )
         assert (
             connection.execute(
                 "SELECT 1 FROM main.sqlite_schema WHERE name = 'schema_migrations'"
@@ -2266,7 +2365,9 @@ def test_upgrade_rejects_persistent_trigger_side_effect_on_metadata_insert(
     database = tmp_path / "database" / "db.sqlite3"
     connection = _connect(database)
     try:
-        _apply_migrations(connection, package=package_v1, clock=lambda: 1_000_000)
+        apply_fixture_migrations(
+            connection, package=package_v1, clock=lambda: 1_000_000
+        )
         sqlite3.Connection.set_authorizer(connection, None)
         connection.execute("CREATE TABLE main.trigger_sink (version INTEGER)")
         connection.execute(
@@ -2285,7 +2386,9 @@ def test_upgrade_rejects_persistent_trigger_side_effect_on_metadata_insert(
             },
         )
         with pytest.raises(MigrationError, match="unauthorized SQL"):
-            _apply_migrations(connection, package=package_v2, clock=lambda: 1_000_001)
+            apply_fixture_migrations(
+                connection, package=package_v2, clock=lambda: 1_000_001
+            )
 
         assert [row[0] for row in _applied(connection)] == [1]
         assert (
@@ -2319,7 +2422,9 @@ def test_upgrade_rejects_temp_trigger_forging_journal_on_metadata_insert(
     database = tmp_path / "database" / "db.sqlite3"
     connection = _connect(database)
     try:
-        _apply_migrations(connection, package=package_v2, clock=lambda: 1_000_000)
+        apply_fixture_migrations(
+            connection, package=package_v2, clock=lambda: 1_000_000
+        )
         run_id = hashlib.sha256(b"run").hexdigest()
         forged = make_journal_entity(
             run_id=run_id,
@@ -2358,7 +2463,9 @@ def test_upgrade_rejects_temp_trigger_forging_journal_on_metadata_insert(
             },
         )
         with pytest.raises(DatabaseConfigurationError, match="TEMP schema"):
-            _apply_migrations(connection, package=package_v3, clock=lambda: 1_000_001)
+            apply_fixture_migrations(
+                connection, package=package_v3, clock=lambda: 1_000_001
+            )
 
         assert [row[0] for row in _applied(connection)] == [1, 2]
         assert (
@@ -2396,7 +2503,9 @@ def test_temp_trigger_cannot_write_during_metadata_insert(
         sqlite3.Connection.set_authorizer(connection, db_module._runtime_authorizer)
 
         with pytest.raises(DatabaseConfigurationError, match="TEMP schema"):
-            _apply_migrations(connection, package=package, clock=lambda: 1_000_000)
+            apply_fixture_migrations(
+                connection, package=package, clock=lambda: 1_000_000
+            )
 
         assert connection.execute("SELECT count(*) FROM temp.sink").fetchone()[0] == 0
         assert (

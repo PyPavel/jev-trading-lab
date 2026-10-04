@@ -605,13 +605,19 @@ def _migration_authorizer(
     return sqlite3.SQLITE_OK
 
 
-def _apply_migrations(
-    connection: sqlite3.Connection,
-    *,
-    package: str = _DEFAULT_PACKAGE,
-    clock: Callable[[], int] = _utc_now_us,
-) -> None:
-    """Apply a caller-selected migration package for internal tests only."""
+def _migration_metadata_insert(migration: Migration, applied_at_us: int) -> str:
+    name = migration.name.encode("utf-8").hex()
+    sha256 = migration.sha256.encode("utf-8").hex()
+    return (
+        "INSERT INTO main.schema_migrations "
+        "(version, name, sha256, applied_at_us) VALUES "
+        f"({migration.version}, CAST(X'{name}' AS TEXT), "
+        f"CAST(X'{sha256}' AS TEXT), {applied_at_us})"
+    )
+
+
+def apply_migrations(connection: sqlite3.Connection) -> None:
+    """Apply only the reviewed, packaged production migration chain."""
     if not isinstance(connection, sqlite3.Connection):
         raise TypeError("connection must be sqlite3.Connection")
     if connection.isolation_level is not None:
@@ -620,16 +626,17 @@ def _apply_migrations(
         )
     if connection.in_transaction:
         raise MigrationError("cannot migrate inside an active caller transaction")
-    if not callable(clock):
-        raise TypeError("migration clock must be callable")
     _require_main_only(connection)
     if isinstance(connection, SecureConnection):
         _reject_user_temp_schema(connection)
-    migrations = load_migrations(package)
+    migrations = load_migrations()
     migration_statements = tuple(_validated_statements(item) for item in migrations)
+    timestamps = tuple(_timestamp(_utc_now_us) for _item in migrations)
     _validate_applied(_applied_rows(connection), migrations)
 
-    for migration, statements in zip(migrations, migration_statements, strict=True):
+    for migration, statements, applied_at_us in zip(
+        migrations, migration_statements, timestamps, strict=True
+    ):
         owned_transaction = False
         authorizer_active = False
         try:
@@ -649,17 +656,7 @@ def _apply_migrations(
             try:
                 for statement in statements:
                     connection.execute(statement)
-                applied_at_us = _timestamp(clock)
-                connection.execute(
-                    "INSERT INTO main.schema_migrations "
-                    "(version, name, sha256, applied_at_us) VALUES (?, ?, ?, ?)",
-                    (
-                        migration.version,
-                        migration.name,
-                        migration.sha256,
-                        applied_at_us,
-                    ),
-                )
+                connection.execute(_migration_metadata_insert(migration, applied_at_us))
                 connection.execute("COMMIT")
                 owned_transaction = False
             except sqlite3.DatabaseError as error:
@@ -680,17 +677,3 @@ def _apply_migrations(
                     connection.set_authorizer(None)
     if isinstance(connection, SecureConnection):
         _seal_runtime_authorizer(connection)
-
-
-def apply_migrations(
-    connection: sqlite3.Connection,
-    *,
-    package: str = _DEFAULT_PACKAGE,
-    clock: Callable[[], int] = _utc_now_us,
-) -> None:
-    """Apply only the reviewed, packaged production migration chain."""
-    if package != _DEFAULT_PACKAGE:
-        raise MigrationError(
-            "public migration API requires the approved migration package"
-        )
-    _apply_migrations(connection, clock=clock)

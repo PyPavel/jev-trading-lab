@@ -58,7 +58,7 @@ def _connection(path: str | None = None) -> sqlite3.Connection:
     connection.execute("PRAGMA synchronous = FULL")
     connection.execute("PRAGMA busy_timeout = 5000")
     connection.execute("PRAGMA trusted_schema = OFF")
-    apply_migrations(connection, clock=lambda: 1_700_000_000_000_000)
+    apply_migrations(connection)
     return connection
 
 

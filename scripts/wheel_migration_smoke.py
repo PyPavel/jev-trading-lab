@@ -38,13 +38,17 @@ def main() -> int:
         )
         code = """
 import hashlib
+import inspect
 import sqlite3
 import tempfile
 from pathlib import Path
 from jev_trading_lab.persistence.db import connect_database
 from jev_trading_lab.persistence.journal import AppendOnlyJournal, make_journal_entity
+from jev_trading_lab.persistence import migrations as migration_module
 from jev_trading_lab.persistence.migrations import apply_migrations, load_migrations
 
+assert tuple(inspect.signature(apply_migrations).parameters) == ("connection",)
+assert not hasattr(migration_module, "_apply_migrations")
 migrations = load_migrations()
 assert [item.version for item in migrations] == [1, 2, 3]
 assert [item.name for item in migrations] == [
@@ -64,7 +68,7 @@ with tempfile.TemporaryDirectory(prefix="jev-wheel-db-") as temporary:
         mount_resolver=lambda _path: "ext4",
     )
     try:
-        apply_migrations(connection, clock=lambda: 1_700_000_000_000_000)
+        apply_migrations(connection)
         rows = connection.execute(
             "SELECT version, name, sha256 FROM main.schema_migrations ORDER BY version"
         ).fetchall()

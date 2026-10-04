@@ -49,6 +49,13 @@ _SCHEMA_ACTIONS = (
     | _TEMP_SCHEMA_ACTIONS
 )
 _DANGEROUS_PRAGMAS = frozenset({"writable_schema", "wal_checkpoint"})
+_SAFE_DBCONFIG = (
+    ("SQLITE_DBCONFIG_WRITABLE_SCHEMA", False),
+    ("SQLITE_DBCONFIG_ENABLE_TRIGGER", True),
+    ("SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION", False),
+    ("SQLITE_DBCONFIG_DEFENSIVE", True),
+    ("SQLITE_DBCONFIG_TRUSTED_SCHEMA", False),
+)
 
 MIN_SQLITE_VERSION = (3, 37, 0)
 _MAX_BUSY_TIMEOUT_MS = 2_147_483_647
@@ -163,6 +170,12 @@ class SecureConnection(sqlite3.Connection):
     def enable_load_extension(self, *args: Any, **kwargs: Any) -> None:
         self._reject_if_sealed()
         super().enable_load_extension(*args, **kwargs)
+
+    if hasattr(sqlite3.Connection, "setconfig"):
+
+        def setconfig(self, *args: Any, **kwargs: Any) -> bool:
+            self._reject_if_sealed()
+            return super().setconfig(*args, **kwargs)
 
     def load_extension(self, *args: Any, **kwargs: Any) -> None:
         self._reject_if_sealed()
@@ -801,6 +814,15 @@ def connect_database(
             _verify_pragma(connection, "synchronous", 2, label="synchronous")
             connection.execute("PRAGMA trusted_schema = OFF")
             _verify_pragma(connection, "trusted_schema", 0, label="trusted_schema")
+            if hasattr(connection, "setconfig"):
+                for name, value in _SAFE_DBCONFIG:
+                    operation = getattr(sqlite3, name, None)
+                    if operation is not None:
+                        connection.setconfig(operation, value)
+                        if connection.getconfig(operation) is not value:
+                            raise DatabaseConfigurationError(
+                                f"SQLite {name} setup failed"
+                            )
             _recheck_storage(path, parent_descriptor, parent_identity, file_identity)
             _seal_runtime_authorizer(connection)
             return connection

@@ -90,6 +90,35 @@ def _payload(value: object) -> tuple[bytes, str]:
     return canonical, hashlib.sha256(canonical).hexdigest()
 
 
+def _trusted_literal(value: object) -> str:
+    if type(value) is str:
+        return f"CAST(X'{value.encode('utf-8').hex()}' AS TEXT)"
+    if type(value) is bytes:
+        return f"X'{value.hex()}'"
+    if type(value) is int:
+        return str(value)
+    if value is None:
+        return "NULL"
+    raise TypeError("trusted journal SQL supports only exact SQLite primitive types")
+
+
+def _trusted_insert_sql(table: str, values: tuple[object, ...]) -> str:
+    if table not in {"journal_entities", "journal_events"}:
+        raise ValueError("trusted journal insert requires an exact journal table")
+    literals = ", ".join(_trusted_literal(value) for value in values)
+    return f"INSERT INTO main.{table} VALUES ({literals})"
+
+
+def _trusted_predicate(where: str, values: tuple[object, ...]) -> str:
+    if where.count("?") != len(values):
+        raise ValueError("trusted journal predicate placeholder mismatch")
+    parts = where.split("?")
+    statement = parts[0]
+    for value, suffix in zip(values, parts[1:], strict=True):
+        statement += _trusted_literal(value) + suffix
+    return statement
+
+
 def _canonical_payload(value: object) -> bytes:
     if type(value) is not bytes or not 1 <= len(value) <= _MAX_PAYLOAD_BYTES:
         raise ValueError("canonical_payload must be bounded bytes")
@@ -378,8 +407,8 @@ class AppendOnlyJournal:
         conflicts: tuple[tuple[str, tuple[object, ...]], ...],
     ) -> str:
         existing = self._connection.execute(
-            f"SELECT {', '.join(columns)} FROM main.{table} WHERE {key_column} = ?",
-            (key,),
+            f"SELECT {', '.join(columns)} FROM main.{table} WHERE "
+            f"{key_column} = {_trusted_literal(key)}"
         ).fetchone()
         if existing is not None:
             if tuple(existing) != values:
@@ -387,16 +416,12 @@ class AppendOnlyJournal:
             return key
         for where, parameters in conflicts:
             if self._connection.execute(
-                f"SELECT 1 FROM main.{table} WHERE {where}", parameters
+                f"SELECT 1 FROM main.{table} WHERE "
+                f"{_trusted_predicate(where, parameters)}"
             ).fetchone():
                 raise JournalConflictError(f"existing {table} identity conflicts")
-        placeholders = ", ".join("?" for _ in columns)
         try:
-            self._connection.execute(
-                f"INSERT INTO main.{table} ({', '.join(columns)}) "
-                f"VALUES ({placeholders})",
-                values,
-            )
+            self._connection.execute(_trusted_insert_sql(table, values))
         except sqlite3.IntegrityError as error:
             if "immutable-conflict" in str(error) or "UNIQUE constraint failed" in str(
                 error
@@ -432,8 +457,8 @@ class AppendOnlyJournal:
             if trusted.supersedes_event_id is not None:
                 predecessor = self._connection.execute(
                     "SELECT entity_id, sequence, occurred_at_us, payload_sha256 "
-                    "FROM main.journal_events WHERE event_id = ?",
-                    (trusted.supersedes_event_id,),
+                    "FROM main.journal_events WHERE event_id = "
+                    f"{_trusted_literal(trusted.supersedes_event_id)}"
                 ).fetchone()
                 if predecessor is None:
                     raise JournalConflictError(
