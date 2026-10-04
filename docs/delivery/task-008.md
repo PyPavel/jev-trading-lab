@@ -4,11 +4,12 @@
 
 **PENDING INDEPENDENT RE-REVIEW**
 
-The final migration-entry callback boundary blocker is resolved in production commit `c08a7f6`. This records local TDD and gate evidence only. No push or independent approval occurred.
+The interpreter-hook transition and journal provenance blockers are resolved in production commit `135d63f`. This records local TDD and gate evidence only. No push or independent approval occurred.
 
 ## Commits
 
 ```text
+135d63f fix(persistence): harden privileged transitions
 c08a7f6 fix(persistence): require trusted migration connections
 8bfb961 fix(persistence): eliminate privileged callback execution
 bafb2ae fix(persistence): close journal trust-boundary gaps
@@ -23,6 +24,9 @@ Evidence is committed separately from production.
 
 ## Findings resolved
 
+- `apply_migrations` and journal writes reject active `sys.settrace`, `threading.settrace_all_threads` hooks on the current thread, and `sys.setprofile` before supported-boundary state or SQL.
+- Privileged authorizer installation now occurs inside an established context-manager restoration guard. Outermost `finally` restoration remains in migration and journal callers, so a trace-raised `BaseException` during transition or yield cannot strand privilege.
+- `AppendOnlyJournal` requires exact `SecureConnection` factory provenance at construction and immediately before every write, using non-overrideable slot-token validation before property reads, callbacks, or SQL. Direct subclasses and spoofed properties are rejected.
 - Public `apply_migrations` now rejects every connection except a factory-created, already-sealed `SecureConnection` that completed `connect_database` setup. Rejection occurs before connection property reads, transaction checks, authorizer changes, callbacks, or SQL.
 - Direct `SecureConnection` construction and ordinary public setup cannot forge migration readiness. The internal slot token is inaccessible and immutable through the supported public surface; migration validation reads exact class slot descriptors, not overrideable instance properties.
 - Migration authorizer transitions no longer reseal the connection. Migration temporarily installs the internal authorizer and restores the runtime authorizer while the public sealed state remains true.
@@ -91,6 +95,19 @@ E Failed: DID NOT RAISE RuntimeError
 
 The runtime exposed `setconfig`, and sealed callers could mutate DB configuration.
 
+
+### Interpreter hooks, asynchronous restoration, and journal provenance
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run pytest \
+  tests/persistence/test_migrations.py \
+  tests/persistence/test_append_only.py -q \
+  -k 'active_trace or transition_restores or active_interpreter_hook or interpreter_trace or journal_scope_restores or spoofed_secure_subclass'
+9 failed, 1 passed, 241 deselected in 0.80s
+```
+
+Failures reproduced migration trace injection, migration privilege stranding after a trace-raised `BaseException`, journal trace injection, journal privilege stranding at transition, active trace/profile acceptance, and acceptance of a spoofed `SecureConnection` subclass. The yield-point restoration reproduction already passed because the pre-existing inner `finally` covered that later boundary; transition failures proved the uncovered interval before that guard.
+
 ## Focused GREEN evidence
 
 ```text
@@ -126,6 +143,21 @@ PYTHONDONTWRITEBYTECODE=1 uv run pytest \
 
 Focused set includes prior row_factory/text_factory, hostile package, migration trigger/TEMP, and concurrency regressions.
 
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run pytest \
+  tests/persistence/test_migrations.py \
+  tests/persistence/test_append_only.py -q \
+  -k 'active_trace or transition_restores or active_interpreter_hook or interpreter_trace or journal_scope_restores or spoofed_secure_subclass or factory_created_sealed_connection_is_migration_ready or threading_trace'
+12 passed, 240 deselected in 0.59s
+
+PYTHONDONTWRITEBYTECODE=1 uv run pytest \
+  tests/persistence/test_migrations.py \
+  tests/persistence/test_append_only.py \
+  tests/persistence/test_core_schema.py -q
+333 passed in 7.24s
+```
+
 ## Final gates
 
 All commands exited 0. Mandatory built-artifact gate had no skips.
@@ -141,7 +173,7 @@ uv sync --frozen --all-groups
 Checked 63 packages in 0.84ms
 
 PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
-783 passed in 13.14s
+794 passed in 12.96s
 
 uv run ruff check .
 All checks passed!
@@ -201,3 +233,20 @@ Base-class descriptor dispatch, `object.__setattr__`, process-memory modificatio
 ## Review state
 
 **PENDING INDEPENDENT RE-REVIEW.**
+
+
+## Interpreter-transition production snapshot
+
+```text
+135d63f39c62e63c25644d11cf45b649601be8dd  production commit
+f11fb9e2a81f5696ca30235098cc276da317f788977243b0c9312c7b8968c300  src/jev_trading_lab/persistence/db.py
+f5dfe8f961b9bac375aeb20eb9a6b2085ded74a349efe27a27339ae41b9e6fc8  src/jev_trading_lab/persistence/migrations.py
+ad0e05b6981559a8f2feb362fa0651eed4b1c95765f5248c39b514b129ed6447  src/jev_trading_lab/persistence/journal.py
+f0ebbb9b1206565a059facba248096d4222de1f34c95886aae3c183e744ea296  tests/persistence/test_migrations.py
+2156b54469a7c4dce07824569d99ff1971c4632c99ababf75d0e640d84ab4a07  tests/persistence/test_append_only.py
+b161e4590f7959308cee43f338f153bebf668cf50d5bc7f781930464979415ec  scripts/policy_preflight.py
+9a6f52386bfc94d0455bffb339fc581e50173fde9e960f834ae051838323db6d  tests/test_package_policy.py
+dc05bf474b56042cd25e6e66e4678136f7507468febe6de811d768ef74d8930f  .github/workflows/ci.yml
+```
+
+Status remains pending independent re-review; this agent did not independently approve the change.
