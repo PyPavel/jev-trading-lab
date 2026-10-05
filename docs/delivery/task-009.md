@@ -735,3 +735,88 @@ Migration hashes remain
 The preserved `.hermes-tmp.W3Xrv5` sentinel hash remains
 `3bd946d16a26c126e038bf7d735e29352ee22a42652fc43d0e2261f4d653ccd9`.
 No push or independent approval occurred.
+
+
+## Unlimited version-suffix remediation at `01f81fb`
+
+Status remains **PENDING INDEPENDENT RE-REVIEW**. Production commit `01f81fb`
+removes the eight-component credential-version cap without changing migrations,
+dependencies, or the lockfile.
+
+### Root cause and RED evidence
+
+`_strip_credential_versions()` repeatedly sliced the compact field name but stopped
+after eight suffixes. Nine or more terminal numeric/`v`-numeric components therefore
+left residual version text after a credential phrase and leaked values on query,
+header, JSON, and decoded escaped-JSON-key surfaces.
+
+Before production edits, the new focused selection reported 23 expected failures and
+34 passes. Failures directly exposed stored credential bytes for 9, 10, and 32 suffix
+chains, maximum bounded surface names, and malformed terminal chains.
+
+### Delivered behavior
+
+- One bounded reverse scan now consumes terminal digits and optional `v` markers until
+  stable. The cursor only moves left, so work is O(n) under the existing 16 KiB
+  credential-name bound; no repeated slicing or suffix-count cap remains.
+- A trailing malformed `v` component is consumed fail-closed. Plausible credential
+  phrases cannot become nonsecret solely because suffix processing reached a count cap
+  or malformed terminal marker.
+- Regression coverage includes 9, 10, 32, and maximum-length names; separated `_v1`,
+  `.v2`, `-3`; attached `v1` and numeric forms; query, header, JSON, and escaped JSON
+  keys. Stored envelope bytes, decoded JSON body bytes, and on-disk blob bytes exclude
+  the secret.
+- Versioned semantic near-misses remain exact for all suffix styles. Explicit context
+  management prevents the large matrix from retaining descriptors until GC.
+
+### Stable verification
+
+```text
+focused credential matrix: 289 passed, 139 deselected
+focused blob suite: 428 passed in 86.25s
+FD leak regression: 6 passed
+
+exact full suite, clean caches, sequential run 1:
+PYTHONDONTWRITEBYTECODE=1 uv run pytest -q -rs
+1253 passed in 110.56s; zero skips
+
+exact full suite, sequential run 2:
+PYTHONDONTWRITEBYTECODE=1 uv run pytest -q -rs
+1253 passed in 109.23s; zero skips
+
+mandatory built-artifact full suite:
+JEV_REQUIRE_BUILT_ARTIFACTS=1 PYTHONDONTWRITEBYTECODE=1 uv run pytest -q -rs
+1253 passed in 108.28s; zero skips
+
+mandatory built-artifact policy suite: 62 passed in 2.47s
+policy preflight: Policy preflight passed.
+uv lock --check: Resolved 64 packages
+uv sync --frozen --all-groups: Checked 63 packages
+ruff check: All checks passed!
+ruff format --check: 37 files already formatted
+mypy: Success: no issues found in 18 source files
+build: wheel and sdist built successfully
+pip-audit: No known vulnerabilities found
+wheel smoke: Installed-wheel migration and controlled journal write smoke passed.
+git diff --check: exit 0
+source/test bytecode after each full run: none
+```
+
+Stable production hashes:
+
+```text
+2b4e8b2cbf2cb689e667c4b31f2d8019c4e1bf8b7187838679bb6a6e7f97c90e  src/jev_trading_lab/persistence/blobs.py
+f97cc3e77c50642b488d0584847a15aa1feca9d104c46b5a2a885f6ee8add93c  tests/persistence/test_blobs.py
+321f5d526290739fbc74ff6a83a8473d00e4d589674e051d6af1398412280df1  scripts/policy_preflight.py
+5570d549e45f21e9047f8528a31065befa7271397112651b1743d80ae0dd7c35  tests/test_package_policy.py
+4067eaea51e4670a9ce0e68645abc07b2a22eb78dcf8017766532c76300ecc3b  .github/workflows/ci.yml
+```
+
+Migration hashes remain
+`1be6dbbcb20a6ab8efe016172d786280470fc7a450f403825e2a61e199a1cb48`,
+`9026b984313d972dec6c3db8b442e4324f2a7f02ec71bd555c0c17f8ed362c54`, and
+`d18492f31e6c0948fa87f11927f2bc4fb2a5a41ffb45c27c9e966339d5e35995`.
+`pyproject.toml` and `uv.lock` remain unchanged. The preserved
+`.hermes-tmp.W3Xrv5` sentinel remains untracked at hash
+`3bd946d16a26c126e038bf7d735e29352ee22a42652fc43d0e2261f4d653ccd9`.
+No push or independent approval occurred.
