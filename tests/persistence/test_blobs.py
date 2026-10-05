@@ -23,6 +23,14 @@ def _api() -> Any:
     return blobs
 
 
+@pytest.fixture(autouse=True)
+def _local_test_filesystem(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = _api()
+    defaults = dict(api.BlobStore.__init__.__kwdefaults__ or {})
+    defaults["filesystem_resolver"] = lambda _path: "ext4"
+    monkeypatch.setattr(api.BlobStore.__init__, "__kwdefaults__", defaults)
+
+
 def _store(tmp_path: Path, **kwargs: Any) -> Any:
     return _api().BlobStore(tmp_path / "blobs", **kwargs)
 
@@ -33,6 +41,11 @@ def _final_path(store: Any, ref: Any) -> Path:
 
 def test_filesystem_boundary_source_policy_is_explicit_and_non_atomic() -> None:
     source = " ".join(Path(_api().__file__).read_text(encoding="utf-8").split())
+    delivery = " ".join(
+        (Path(__file__).parents[2] / "docs/delivery/task-009.md")
+        .read_text(encoding="utf-8")
+        .split()
+    )
     required = (
         "Concurrent same-user raw filesystem mutation is unsupported "
         "for the entire operation",
@@ -40,17 +53,93 @@ def test_filesystem_boundary_source_policy_is_explicit_and_non_atomic() -> None:
         "documented filesystem semantics",
         "descriptor-relative no-follow validation",
         "fails closed on preexisting or checkpoint-observed state drift",
-        "callback runs only after fsync and final canonical-state verification",
+        "callback runs only after fsync and final canonical-state verification "
+        "as observed at that checkpoint",
         "malicious process-wide or private hooks",
     )
     forbidden = (
         "canonical path cannot change after final verification",
         "cannot leave a callback-created dangling reference",
+        "cannot leave callback-created dangling reference",
+        "prevents bad references",
         "atomic against concurrent same-user filesystem mutation",
     )
 
-    assert all(claim in source for claim in required)
-    assert all(overclaim not in source for overclaim in forbidden)
+    for contract in (source, delivery):
+        assert all(claim in contract for claim in required)
+        assert all(overclaim not in contract for overclaim in forbidden)
+
+
+def test_root_owned_sticky_world_writable_ancestor_is_accepted() -> None:
+    api = _api()
+    system_tmp = Path("/tmp")
+    descriptor = os.open(system_tmp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        metadata = api._validate_ancestor_directory(descriptor)
+    finally:
+        os.close(descriptor)
+
+    assert metadata.st_uid == 0
+    assert stat.S_IMODE(metadata.st_mode) == 0o1777
+
+
+def test_current_owned_sticky_world_writable_ancestor_is_traversal_only(
+    tmp_path: Path,
+) -> None:
+    api = _api()
+    sticky = tmp_path / "sticky"
+    sticky.mkdir(mode=0o700)
+    sticky.chmod(0o1777)
+
+    store = api.BlobStore(
+        sticky / "private" / "root", filesystem_resolver=lambda _path: "ext4"
+    )
+    ref = store.publish(b"private hierarchy")
+
+    assert sticky.stat().st_uid == os.geteuid()
+    assert stat.S_IMODE(sticky.stat().st_mode) == 0o1777
+    for directory in (
+        sticky / "private",
+        store.root,
+        store.root / ref.sha256[:2],
+        _final_path(store, ref).parent,
+    ):
+        assert directory.stat().st_uid == os.geteuid()
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+
+
+def test_nonsticky_world_writable_ancestor_and_sticky_blob_root_are_rejected(
+    tmp_path: Path,
+) -> None:
+    api = _api()
+    public = tmp_path / "public"
+    public.mkdir(mode=0o700)
+    public.chmod(0o777)
+
+    with pytest.raises(api.BlobSecurityError, match="ancestor"):
+        api.BlobStore(public / "root", filesystem_resolver=lambda _path: "ext4")
+
+    sticky_root = tmp_path / "sticky-root"
+    sticky_root.mkdir(mode=0o700)
+    sticky_root.chmod(0o1777)
+    with pytest.raises(api.BlobSecurityError, match="blob root is not private"):
+        api.BlobStore(sticky_root, filesystem_resolver=lambda _path: "ext4")
+
+
+def test_sticky_ancestor_symlink_is_rejected(tmp_path: Path) -> None:
+    api = _api()
+    sticky = tmp_path / "sticky"
+    sticky.mkdir(mode=0o700)
+    sticky.chmod(0o1777)
+    real = sticky / "real"
+    real.mkdir(mode=0o700)
+    linked = sticky / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(api.BlobSecurityError, match="ancestor"):
+        api.BlobStore(linked / "root", filesystem_resolver=lambda _path: "ext4")
+
+    assert not (real / "root").exists()
 
 
 def test_publication_order(tmp_path: Path) -> None:
@@ -487,7 +576,8 @@ def test_multiprocess_same_bytes_deduplicate_to_one_verified_blob(
 
         def publish():
             try:
-                queue.put(BlobStore(root).publish(payload).relative_path)
+                store = BlobStore(root, filesystem_resolver=lambda _path: 'ext4')
+                queue.put(store.publish(payload).relative_path)
             except BaseException as error:
                 queue.put(type(error).__name__ + ':' + str(error))
 
@@ -499,7 +589,7 @@ def test_multiprocess_same_bytes_deduplicate_to_one_verified_blob(
         assert all(process.exitcode == 0 for process in processes)
         references = [queue.get(timeout=1) for _ in processes]
         assert len(set(references)) == 1, references
-        store = BlobStore(root)
+        store = BlobStore(root, filesystem_resolver=lambda _path: 'ext4')
         assert store.read_verified(store.publish(payload)) == payload
         assert len([path for path in root.rglob('*') if path.is_file()]) == 1
         """
@@ -899,7 +989,7 @@ def test_fifo_target_never_blocks(tmp_path: Path) -> None:
         from pathlib import Path
         from jev_trading_lab.persistence.blobs import BlobStore, BlobCorruptError
         root = Path({str(tmp_path / "root")!r})
-        store = BlobStore(root)
+        store = BlobStore(root, filesystem_resolver=lambda _path: 'ext4')
         ref = store.publish(b'fifo')
         target = root / ref.relative_path
         target.unlink()
@@ -959,7 +1049,11 @@ def test_real_process_crash_boundaries_reopen_safely(
         from jev_trading_lab.persistence.blobs import BlobStore
         def stop(name):
             if name == {boundary!r}: os._exit(91)
-        BlobStore({str(root)!r}, failpoint=stop).publish(b'crash-data')
+        BlobStore(
+            {str(root)!r},
+            failpoint=stop,
+            filesystem_resolver=lambda _path: 'ext4',
+        ).publish(b'crash-data')
         """
     )
     result = subprocess.run([sys.executable, "-B", "-c", code], check=False)
@@ -1279,6 +1373,8 @@ def test_harmless_structured_names_remain_exact(tmp_path: Path, name: str) -> No
         "monkey",
         "keyframe",
         "donkey",
+        "apikeynote",
+        "accessibilityToken",
     ),
 )
 def test_semantically_harmless_names_remain_exact_on_every_surface(
@@ -1398,6 +1494,102 @@ def test_declared_json_credential_errors_never_include_values(
     rendered = str(caught.value) + repr(caught.value)
     assert secret not in rendered
     assert secret not in repr(envelope)
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "providerAPIKey",
+        "ProviderAPIKey",
+        "openaiAPIKey",
+        "vendorAPIKey",
+        "vendorSESSIONToken",
+        "vendorACCESSToken",
+        "vendorREFRESHToken",
+        "vendorIDToken",
+        "vendorOAUTHToken",
+        "vendorCLIENTSecret",
+        "vendorOAUTHTokenSecret",
+        "vendorPassword",
+        "vendorPassphrase",
+        "vendorPrivateKey",
+        "vendorSecretKey",
+        "vendorSecurityToken",
+        "vendorBearerToken",
+        "vendorCookie",
+        "vendorAuthToken",
+        "vendor_api_key_2",
+        "vendor.api-key",
+        "ｖｅｎｄｏｒＡＰＩＫｅｙ",
+    ),
+)
+@pytest.mark.parametrize("surface", ("query", "header", "json"))
+def test_acronym_credentials_are_redacted_on_every_structured_surface(
+    tmp_path: Path, name: str, surface: str
+) -> None:
+    api = _api()
+    secret = f"{surface}-ACRONYM-CREDENTIAL-LEAK"
+    kwargs: dict[str, Any] = {"body": b"opaque"}
+    if surface == "query":
+        kwargs["url"] = f"https://e.test/?{name}={secret}&safe=keep"
+    elif surface == "header":
+        kwargs["headers"] = {name: secret, "Safe": "keep"}
+    else:
+        kwargs["body"] = json.dumps({name: secret, "safe": "keep"}).encode()
+        kwargs["headers"] = {"Content-Type": "application/json"}
+    envelope = api.ArtifactEnvelope(**kwargs)
+
+    stored = _store(tmp_path).read_verified(_store(tmp_path).publish(envelope))
+
+    assert secret.encode() not in stored
+    assert secret not in repr(envelope)
+
+
+def test_escaped_json_acronym_credential_key_is_redacted(tmp_path: Path) -> None:
+    api = _api()
+    secret = "ESCAPED-ACRONYM-CREDENTIAL-LEAK"
+    envelope = api.ArtifactEnvelope(
+        body=b'{"vendor\\u0041PIKey":"' + secret.encode() + b'","safe":"keep"}',
+        headers={"Content-Type": "application/json"},
+    )
+
+    stored = _store(tmp_path).read_verified(_store(tmp_path).publish(envelope))
+
+    assert secret.encode() not in stored
+    assert secret not in repr(envelope)
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "providerAPIKey",
+        "vendorSESSIONToken",
+        "vendorACCESSToken",
+        "vendorREFRESHToken",
+        "vendorIDToken",
+        "vendorOAUTHToken",
+        "vendorCLIENTSecret",
+        "vendor_api_key_2",
+        "vendor.api-key",
+        "ｖｅｎｄｏｒＡＰＩＫｅｙ",
+        "vendor\\u0041PIKey",
+    ),
+)
+def test_acronym_credential_json_errors_never_include_values(
+    tmp_path: Path, name: str
+) -> None:
+    api = _api()
+    secret = "ERROR-ACRONYM-CREDENTIAL-LEAK"
+    envelope = api.ArtifactEnvelope(
+        body=f'{{"{name}":"{secret}"'.encode(),
+        headers={"Content-Type": "application/json"},
+    )
+
+    with pytest.raises(ValueError, match="declared JSON body is unsafe") as caught:
+        _store(tmp_path).publish(envelope)
+
+    rendered = str(caught.value) + repr(caught.value) + repr(envelope)
+    assert secret not in rendered
 
 
 def test_oauth_body_redaction_and_stored_bytes(tmp_path: Path) -> None:

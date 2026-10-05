@@ -176,8 +176,12 @@ def _valid_ref(ref: object) -> bool:
 
 def _normalized_secret_name(name: str) -> str:
     normalized = unicodedata.normalize("NFKC", name)
+    normalized = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", normalized)
     normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", normalized)
-    return re.sub(r"[-_\s]+", "_", normalized.casefold()).strip("_")
+    normalized = "".join(
+        character if character.isalnum() else "_" for character in normalized
+    )
+    return re.sub(r"_+", "_", normalized.casefold()).strip("_")
 
 
 def _compact_secret_name(name: str) -> str:
@@ -247,20 +251,38 @@ _SIGNED_QUERY_COMPACT = frozenset(
 )
 _CREDENTIAL_TERMINAL_PHRASES = (
     ("api", "key"),
+    ("session", "token"),
     ("access", "token"),
     ("refresh", "token"),
     ("id", "token"),
-    ("session", "token"),
-    ("client", "secret"),
     ("oauth", "token"),
     ("oauth", "token", "secret"),
+    ("client", "secret"),
     ("password",),
+    ("passphrase",),
+    ("private", "key"),
+    ("secret", "key"),
+    ("security", "token"),
+    ("bearer", "token"),
     ("cookie",),
+    ("auth", "token"),
 )
 
 
 def _secret_name_words(name: str) -> tuple[str, ...]:
-    return tuple(filter(None, _normalized_secret_name(name).split("_")))
+    raw_words = tuple(filter(None, _normalized_secret_name(name).split("_")))
+    words: tuple[str, ...] = ()
+    index = 0
+    while index < len(raw_words):
+        if raw_words[index : index + 2] == ("o", "auth"):
+            words += ("oauth",)
+            index += 2
+        else:
+            words += (raw_words[index],)
+            index += 1
+    while words and words[-1].isdecimal():
+        words = words[:-1]
+    return words
 
 
 def _is_structured_credential_name(name: str, exact: frozenset[str]) -> bool:
@@ -545,10 +567,12 @@ def _validate_directory(
 
 def _validate_ancestor_directory(descriptor: int) -> os.stat_result:
     metadata = os.fstat(descriptor)
+    mode = stat.S_IMODE(metadata.st_mode)
+    sticky_world_writable = mode & stat.S_ISVTX and mode & stat.S_IWOTH
     if (
         not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid not in {0, os.geteuid()}
-        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or (mode & 0o022 and not sticky_world_writable)
     ):
         raise BlobSecurityError("blob root ancestor is not safe")
     return metadata
