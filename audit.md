@@ -97,3 +97,16 @@
 - Independent adversarial boundary review: APPROVED, zero BLOCKER/MAJOR.
 - Fresh gates: 822 tests passed, zero skips; focused 339; artifact policy 59; lint/format/types/policy/dependency/build/wheel gates passed.
 - Task 8 closed. Task 9 may begin.
+
+## Task 9 first independent review
+
+- Result: NOT APPROVED.
+- BLOCKER: new root/shard directory entries were not durably fsynced before the reference callback.
+- BLOCKER: pathname-based stale-temp traversal could follow a raced shard symlink and delete outside the store.
+- BLOCKER: credential/signed-URL redaction missed common Google/Azure/CloudFront and camelCase/full-width structured names; envelope repr leaked originals.
+- MAJOR: link/unlink no-replace fallback was not crash-recoverable.
+- MAJOR: redacting JSON rewrote unrelated body bytes, violating exact artifact preservation.
+- MAJOR: volatile/wrong root filesystem and root mode/path drift were not revalidated.
+- MAJOR: FIFO target open could block.
+- MAJOR: metadata parsing had no early aggregate bounds.
+- Decision: fix every finding test-first with real subprocess/filesystem tests before re-review.

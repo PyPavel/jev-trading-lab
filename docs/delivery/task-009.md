@@ -4,12 +4,115 @@
 
 **PENDING INDEPENDENT RE-REVIEW**
 
-Production commit `101dfd8` implements crash-durable, content-addressed artifact publication. This document records local TDD and gate evidence only. No independent approval or push occurred.
+Production commits `101dfd8` and `3c8cbdb` implement and harden crash-durable,
+content-addressed artifact publication. This document records local TDD and gate
+evidence only. No independent approval or push occurred.
+
+## Review remediation
+
+All Task 9 review findings received exact regression coverage before production
+was edited. The regression suite used real directories, descriptors, fsyncs,
+subprocess crashes, FIFO targets, filesystem identity changes, and scavenger
+replacement races. Migrations `001`-`003` were unchanged.
+
+### RED evidence
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/persistence/test_blobs.py -q
+exit=1
+50 failed, 44 passed in 4.33s
+```
+
+Expected failures covered missing ancestor directory fsync ordering, unsafe
+path-based scavenging, incomplete normalized redaction and signed-query coverage,
+JSON reserialization, unsafe invalid-JSON preservation, absent
+`BlobConfigurationError`, tmpfs acceptance, root identity/mode drift, blocking
+FIFO opens, late aggregate bounds, and ENOSPC/EIO cleanup. The FIFO subprocess
+hit its three-second timeout, directly reproducing the blocking defect.
+
+A second exact RED was added for escaped JSON secret markers:
+
+```text
+FAILED test_invalid_declared_json_with_escaped_secret_marker_fails_closed
+E Failed: DID NOT RAISE ValueError
+1 failed in 0.53s
+```
+
+### GREEN evidence
+
+```text
+TMPDIR=/home/pavel/.pytest-local PYTHONDONTWRITEBYTECODE=1 \
+  uv run pytest tests/persistence/test_blobs.py -q
+95 passed in 2.66s
+
+TMPDIR=/mnt/storage/.jev-task9-pytest PYTHONDONTWRITEBYTECODE=1 \
+  uv run pytest -q -rs
+918 passed in 175.56s (0:02:55)
+```
+
+The complete zero-skip run used btrfs because tmpfs is intentionally rejected and
+the available ext filesystem can immediately reuse an inode in a pre-existing
+migration replacement regression. No migration production code or tests changed.
+
+### Final gates
+
+```text
+uv build --no-build-isolation
+Successfully built dist/jev_trading_lab-0.1.0.tar.gz
+Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
+
+uv run ruff check .
+All checks passed!
+
+uv run ruff format --check .
+37 files already formatted
+
+uv run mypy src
+Success: no issues found in 18 source files
+
+PYTHONDONTWRITEBYTECODE=1 python3 -I scripts/policy_preflight.py
+Policy preflight passed.
+
+uv lock --check
+Resolved 64 packages
+
+uv sync --frozen --all-groups
+Checked 63 packages
+
+uv run pip-audit --strict --requirement /home/pavel/audit-requirements-task9.txt \
+  --no-deps --disable-pip
+No known vulnerabilities found
+
+JEV_REQUIRE_BUILT_ARTIFACTS=1 PYTHONDONTWRITEBYTECODE=1 \
+  uv run pytest tests/test_package_policy.py -q
+60 passed in 2.41s
+
+PYTHONDONTWRITEBYTECODE=1 uv run python scripts/wheel_migration_smoke.py
+Installed-wheel migration and controlled journal write smoke passed.
+
+git diff --check
+exit 0
+```
+
+Package inventory, approved source hashes, preflight self-hash, and exact workflow
+hash were refreshed. No dependency or migration SQL changed.
+
+### Supported boundary and exclusions
+
+Observable root path replacement, symlink substitution, mode drift, filesystem
+type, owner/type/mode violations, shard races, corrupt/special final targets,
+and durability failures fail closed. Same-user raw mutation through an already
+held private capability is outside the trust boundary. Deliberate same-user
+sabotage of private descriptors/capabilities is likewise excluded. A malicious
+test failpoint that deletes an already published final is not a supported crash
+model; failpoints model process interruption and I/O failures, not an attacker
+executing arbitrary mutation callbacks. No claim is made beyond those bounds.
 
 ## Commit
 
 ```text
 101dfd8 feat(persistence): add crash-durable artifact store
+3c8cbdb fix(persistence): harden crash-durable blob storage
 ```
 
 Delivery evidence is committed separately from production.
