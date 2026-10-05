@@ -206,7 +206,7 @@ _APPROVED_SOURCE_HASHES = {
         "74c92b09eeb9c10e713c99354df7d40e43c2d90e7de0088968e95197f1a0dce2"
     ),
     "src/jev_trading_lab/persistence/db.py": (
-        "ac6765cb29cc6e21ea2d0c2aed1495295d038d466717165f3ce7f3f803080da9"
+        "6eddc63cafb5ca7fdb965009c2c8b31bf7e8baa8cc4a90d158a44257aa6d7560"
     ),
     "src/jev_trading_lab/persistence/migrations.py": (
         "6848e5a2c83d91867649079acc32fbe0df6f6059e3d0e03c274f3d86c7d82255"
