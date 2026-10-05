@@ -413,3 +413,89 @@ git diff --check: exit 0
 Migration files `001`-`003` remain byte-for-byte unchanged. No dependency or lockfile
 change occurred. Evidence is committed separately from production; no push or
 independent approval occurred.
+
+
+## Final shard/ancestry/durability/OAuth remediation at `8d250a7`
+
+Status remains **PENDING INDEPENDENT RE-REVIEW**. Production commit `8d250a7`
+closes the final four review findings without changing migrations `001`-`003`.
+
+### Exact RED evidence
+
+Before production edits, focused regressions failed exactly on the reported gaps:
+
+```text
+raced second-shard replacement/mode drift: 2 failed
+nested existing and higher lexical ancestor symlinks: 2 failed
+EEXIST parent fsync-before-descent: 2 failed
+OAuth/OIDC structured query/header variants: 12 failed, 7 passed
+```
+
+The callback ran after a visible second-shard replacement or mode drift; root creation
+opened a resolved multi-component prefix; existing shard creation skipped the parent
+fsync; and `oauth_token`, `oauth_token_secret`, `Id-Token`, `OAuth-Token`, and
+`X-Client-Secret` variants reached stored bytes.
+
+### Delivered remediation
+
+- Publication retains the exact first- and second-shard descriptor identities. Just
+  before callback invocation, it reopens the canonical root/`aa`/`bb` chain with
+  descriptor-relative `O_DIRECTORY|O_NOFOLLOW`, validates owner/type/mode, compares
+  both shard identities, verifies the final blob through the canonical `bb`
+  descriptor, and revalidates both shard modes. Replacement, disappearance, and mode
+  drift fail closed before the callback.
+- Every absolute lexical root component is traversed from a pinned `/` descriptor.
+  Existing components are opened one at a time without following symlinks and checked
+  for safe owner/type/mode; missing components are created one at a time. Filesystem
+  root and `..` root paths are rejected.
+- `_ensure_child_directory` fsyncs the parent after every successful child open and
+  validation, including the `EEXIST` observer path, before returning for descent.
+  Root ancestors and both shard levels use the same rule.
+- Structured credential names use NFKC/camelCase/separator normalization plus bounded
+  OAuth/OIDC credential suffix recognition. Full-width, prefixed, camelCase,
+  hyphenated, and underscored query/header variants redact before hashing. Exact safe
+  names such as `token_count`, `secretary`, `password_policy`, and `code_version`
+  remain unchanged. Stored-byte and exception/repr assertions remain in coverage.
+- A real 12-process dedup regression proves one verified blob survives concurrent
+  same-content publication.
+- Policy source/preflight/workflow hashes were refreshed after stabilization. No
+  dependency or lockfile change occurred.
+
+### Fresh verification
+
+```text
+focused blob suite: 154 passed in 95.94s
+Task 8 local/storage plus blobs: 513 passed in 115.93s
+
+exact CI command after mandatory artifacts, run 1:
+PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
+978 passed in 120.55s (0:02:00); zero skips; source bytecode = []
+
+exact CI command after mandatory artifacts, run 2:
+PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
+978 passed in 121.20s (0:02:01); zero skips; source bytecode = []
+
+mandatory built-artifact full suite:
+JEV_REQUIRE_BUILT_ARTIFACTS=1 PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
+978 passed in 121.12s (0:02:01); zero skips
+
+policy preflight: Policy preflight passed.
+uv lock --check: Resolved 64 packages
+uv sync --frozen --all-groups: Checked 63 packages
+ruff check: All checks passed!
+ruff format --check: 37 files already formatted
+mypy: Success: no issues found in 18 source files
+build: wheel and sdist built successfully
+required built-artifact policy: 61 passed
+pip-audit: No known vulnerabilities found
+wheel smoke: Installed-wheel migration and controlled journal write smoke passed.
+git diff --check: exit 0
+source/package bytecode outside generated test state: none
+```
+
+The zero-skip post-build full-suite result is recorded from the mandatory artifact
+mode. Migrations `001`-`003` remain byte-for-byte unchanged at hashes
+`1be6dbbcb20a6ab8efe016172d786280470fc7a450f403825e2a61e199a1cb48`,
+`9026b984313d972dec6c3db8b442e4324f2a7f02ec71bd555c0c17f8ed362c54`, and
+`d18492f31e6c0948fa87f11927f2bc4fb2a5a41ffb45c27c9e966339d5e35995`.
+No push or independent approval occurred.
