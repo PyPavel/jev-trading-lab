@@ -113,6 +113,13 @@ class _DirectoryHandle:
             self._descriptor = None
             os.close(descriptor)
 
+    def release(self) -> int:
+        """Relinquish ownership and return the still-open descriptor."""
+        with self._lock:
+            descriptor = self.descriptor
+            self._descriptor = None
+            return descriptor
+
     def __del__(self) -> None:
         try:
             self.close()
@@ -297,29 +304,17 @@ class SecureConnection(sqlite3.Connection):
             ) from error
 
     def close(self) -> None:
+        self._close_sqlite()
         try:
-            self._close_sqlite()
-        finally:
-            try:
-                handle = _secure_slot(self, "_directory_handle")
-            except AttributeError:
-                return
-            assert isinstance(handle, _DirectoryHandle)
-            _close_directory_handle(handle)
+            handle = _secure_slot(self, "_directory_handle")
+        except AttributeError:
+            return
+        assert isinstance(handle, _DirectoryHandle)
+        _close_directory_handle(handle)
 
     def __del__(self) -> None:
         try:
-            handle = _secure_slot(self, "_directory_handle")
-        except (AttributeError, TypeError):
-            pass
-        else:
-            assert isinstance(handle, _DirectoryHandle)
-            try:
-                handle.close()
-            except BaseException:
-                pass
-        try:
-            self._close_sqlite()
+            self.close()
         except BaseException:
             pass
 
@@ -335,14 +330,12 @@ class _InternalConnection(sqlite3.Connection):
     _close_sqlite = sqlite3.Connection.close
 
     def close(self) -> None:
+        self._close_sqlite()
         try:
-            self._close_sqlite()
-        finally:
-            try:
-                handle = self._directory_handle
-            except AttributeError:
-                return
-            _close_directory_handle(handle)
+            handle = self._directory_handle
+        except AttributeError:
+            return
+        _close_directory_handle(handle)
 
     def __del__(self) -> None:
         try:
@@ -657,17 +650,17 @@ def _directory_flags() -> int:
 def _open_private_parent(parent: Path) -> int:
     """Traverse without symlinks and return an open descriptor for the 0700 parent."""
     flags = _directory_flags()
-    current = os.open("/", flags)
+    current = _DirectoryHandle(os.open("/", flags))
     try:
         for component in parent.parts[1:]:
             try:
-                child = os.open(component, flags, dir_fd=current)
+                child_descriptor = os.open(component, flags, dir_fd=current.descriptor)
             except FileNotFoundError:
                 try:
-                    os.mkdir(component, 0o700, dir_fd=current)
+                    os.mkdir(component, 0o700, dir_fd=current.descriptor)
                 except FileExistsError:
                     pass
-                child = os.open(component, flags, dir_fd=current)
+                child_descriptor = os.open(component, flags, dir_fd=current.descriptor)
             except OSError as error:
                 if error.errno in {errno.ELOOP, errno.ENOTDIR}:
                     raise DatabaseConfigurationError(
@@ -677,10 +670,11 @@ def _open_private_parent(parent: Path) -> int:
                 raise DatabaseConfigurationError(
                     f"cannot securely traverse database parent {parent}: {error}"
                 ) from error
-            os.close(current)
+            child = _DirectoryHandle(child_descriptor)
+            current.close()
             current = child
 
-        metadata = os.fstat(current)
+        metadata = os.fstat(current.descriptor)
         if not stat.S_ISDIR(metadata.st_mode):
             raise DatabaseConfigurationError(
                 f"database parent is not a directory: {parent}"
@@ -693,9 +687,9 @@ def _open_private_parent(parent: Path) -> int:
             raise DatabaseConfigurationError(
                 f"database parent must have mode 0700: {parent}"
             )
-        return current
+        return current.release()
     except BaseException:
-        os.close(current)
+        _close_directory_handle(current)
         raise
 
 
@@ -718,10 +712,12 @@ def _prepare_database_file(path: Path, parent_descriptor: int) -> tuple[int, int
     flags = os.O_RDWR | os.O_CREAT
     flags |= getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
-    descriptor: int | None = None
+    handle: _DirectoryHandle | None = None
     try:
-        descriptor = os.open(path.name, flags, 0o600, dir_fd=parent_descriptor)
-        metadata = os.fstat(descriptor)
+        handle = _DirectoryHandle(
+            os.open(path.name, flags, 0o600, dir_fd=parent_descriptor)
+        )
+        metadata = os.fstat(handle.descriptor)
         _validate_database_metadata(metadata, path)
         return metadata.st_dev, metadata.st_ino
     except OSError as error:
@@ -733,8 +729,8 @@ def _prepare_database_file(path: Path, parent_descriptor: int) -> tuple[int, int
             f"cannot securely open database file: {error}"
         ) from error
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
+        if handle is not None:
+            _close_directory_handle(handle)
 
 
 def _open_fd_identities() -> dict[int, tuple[int, int]]:

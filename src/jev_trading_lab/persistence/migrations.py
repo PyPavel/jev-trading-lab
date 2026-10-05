@@ -36,7 +36,9 @@ from jev_trading_lab.core.time import (
 )
 from jev_trading_lab.persistence.db import (
     SecureConnection,
+    _close_directory_handle,
     _connection_locator,
+    _DirectoryHandle,
     _is_factory_connection,
     _reject_user_temp_schema,
     _verify_internal_connection_storage,
@@ -154,52 +156,54 @@ def _validate_resource_directory(metadata: os.stat_result, path: Path) -> None:
 
 def _open_resource_directories(
     root: Path, package: str
-) -> list[tuple[int, tuple[int, ...], Path]]:
+) -> list[tuple[_DirectoryHandle, tuple[int, ...], Path]]:
     package_parts = tuple(package.split("."))
     if tuple(root.parts[-len(package_parts) :]) != package_parts:
         raise MigrationError("migration package path does not match package name")
     base = root.parents[len(package_parts) - 1]
     try:
-        current = os.open(base, _directory_flags())
+        current = _DirectoryHandle(os.open(base, _directory_flags()))
     except OSError as error:
         raise MigrationError(
             f"migration package directory {base} is unreadable"
         ) from error
-    opened: list[tuple[int, tuple[int, ...], Path]] = []
-    base_descriptor = current
+    opened: list[tuple[_DirectoryHandle, tuple[int, ...], Path]] = []
+    base_handle = current
     try:
         current_path = base
         for component in package_parts:
             current_path /= component
-            child = os.open(component, _directory_flags(), dir_fd=current)
+            child = _DirectoryHandle(
+                os.open(component, _directory_flags(), dir_fd=current.descriptor)
+            )
             try:
-                metadata = os.fstat(child)
+                metadata = os.fstat(child.descriptor)
                 _validate_resource_directory(metadata, current_path)
             except BaseException:
-                os.close(child)
+                _close_directory_handle(child)
                 raise
             opened.append((child, _directory_snapshot(metadata), current_path))
             current = child
         return opened
     except OSError as error:
-        for descriptor, _snapshot, _path in opened:
-            os.close(descriptor)
+        for handle, _snapshot, _path in opened:
+            _close_directory_handle(handle)
         raise MigrationError(
             f"migration package directory {root} is a symlink or unreadable"
         ) from error
     except BaseException:
-        for descriptor, _snapshot, _path in opened:
-            os.close(descriptor)
+        for handle, _snapshot, _path in opened:
+            _close_directory_handle(handle)
         raise
     finally:
-        os.close(base_descriptor)
+        _close_directory_handle(base_handle)
 
 
 def _revalidate_resource_directories(
-    opened: list[tuple[int, tuple[int, ...], Path]],
+    opened: list[tuple[_DirectoryHandle, tuple[int, ...], Path]],
 ) -> None:
-    for descriptor, snapshot, path in opened:
-        metadata = os.fstat(descriptor)
+    for handle, snapshot, path in opened:
+        metadata = os.fstat(handle.descriptor)
         _validate_resource_directory(metadata, path)
         if _directory_snapshot(metadata) != snapshot:
             raise MigrationError(
@@ -229,14 +233,16 @@ def _read_filesystem_resource(
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_NONBLOCK", 0)
     )
-    descriptor: int | None = None
+    handle: _DirectoryHandle | None = None
     try:
-        descriptor = os.open(
-            resource.name if parent_descriptor is not None else resource,
-            flags,
-            dir_fd=parent_descriptor,
+        handle = _DirectoryHandle(
+            os.open(
+                resource.name if parent_descriptor is not None else resource,
+                flags,
+                dir_fd=parent_descriptor,
+            )
         )
-        before = os.fstat(descriptor)
+        before = os.fstat(handle.descriptor)
         if not stat.S_ISREG(before.st_mode):
             raise MigrationError(
                 f"migration resource {resource.name!r} is not a regular file"
@@ -258,13 +264,13 @@ def _read_filesystem_resource(
         chunks: list[bytes] = []
         remaining = MAX_MIGRATION_BYTES + 1
         while remaining:
-            chunk = os.read(descriptor, min(65_536, remaining))
+            chunk = os.read(handle.descriptor, min(65_536, remaining))
             if not chunk:
                 break
             chunks.append(chunk)
             remaining -= len(chunk)
         content = b"".join(chunks)
-        after = os.fstat(descriptor)
+        after = os.fstat(handle.descriptor)
         if _resource_snapshot(before) != _resource_snapshot(after):
             raise MigrationError(
                 f"migration resource {resource.name!r} changed while reading"
@@ -278,8 +284,8 @@ def _read_filesystem_resource(
             f"migration resource {resource.name!r} is unreadable"
         ) from error
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
+        if handle is not None:
+            _close_directory_handle(handle)
     if len(content) > MAX_MIGRATION_BYTES:
         raise MigrationError(
             f"migration resource {resource.name!r} exceeds maximum size "
@@ -316,7 +322,7 @@ def load_migrations(package: str = _DEFAULT_PACKAGE) -> tuple[Migration, ...]:
     except (ImportError, ModuleNotFoundError, OSError) as error:
         raise MigrationError(f"cannot load migration package {package!r}") from error
 
-    directories: list[tuple[int, tuple[int, ...], Path]] = []
+    directories: list[tuple[_DirectoryHandle, tuple[int, ...], Path]] = []
     filesystem_root: Path | None = root if isinstance(root, Path) else None
     filesystem_names: tuple[str, ...] | None = None
     archive_resources: tuple[Traversable, ...] = ()
@@ -324,17 +330,17 @@ def load_migrations(package: str = _DEFAULT_PACKAGE) -> tuple[Migration, ...]:
         if filesystem_root is not None:
             directories = _open_resource_directories(filesystem_root, package)
             _revalidate_resource_directories(directories)
-            filesystem_names = tuple(os.listdir(directories[-1][0]))
+            filesystem_names = tuple(os.listdir(directories[-1][0].descriptor))
             _revalidate_resource_directories(directories)
         else:
             archive_resources = tuple(root.iterdir())
     except (ImportError, ModuleNotFoundError, OSError) as error:
-        for descriptor, _snapshot, _path in directories:
-            os.close(descriptor)
+        for handle, _snapshot, _path in directories:
+            _close_directory_handle(handle)
         raise MigrationError(f"cannot load migration package {package!r}") from error
     except BaseException:
-        for descriptor, _snapshot, _path in directories:
-            os.close(descriptor)
+        for handle, _snapshot, _path in directories:
+            _close_directory_handle(handle)
         raise
 
     migrations: list[Migration] = []
@@ -353,7 +359,7 @@ def load_migrations(package: str = _DEFAULT_PACKAGE) -> tuple[Migration, ...]:
                 else:
                     metadata = os.stat(
                         name,
-                        dir_fd=directories[-1][0],
+                        dir_fd=directories[-1][0].descriptor,
                         follow_symlinks=False,
                     )
                     if stat.S_ISDIR(metadata.st_mode):
@@ -363,7 +369,7 @@ def load_migrations(package: str = _DEFAULT_PACKAGE) -> tuple[Migration, ...]:
                     _revalidate_resource_directories(directories)
                     assert filesystem_root is not None
                     _read_filesystem_resource(
-                        filesystem_root / name, directories[-1][0]
+                        filesystem_root / name, directories[-1][0].descriptor
                     )
                     _revalidate_resource_directories(directories)
                 else:
@@ -384,7 +390,7 @@ def load_migrations(package: str = _DEFAULT_PACKAGE) -> tuple[Migration, ...]:
                 _revalidate_resource_directories(directories)
                 assert filesystem_root is not None
                 content = _read_filesystem_resource(
-                    filesystem_root / name, directories[-1][0]
+                    filesystem_root / name, directories[-1][0].descriptor
                 )
                 _revalidate_resource_directories(directories)
             else:
@@ -407,8 +413,8 @@ def load_migrations(package: str = _DEFAULT_PACKAGE) -> tuple[Migration, ...]:
     except OSError as error:
         raise MigrationError(f"cannot load migration package {package!r}") from error
     finally:
-        for descriptor, _snapshot, _path in directories:
-            os.close(descriptor)
+        for handle, _snapshot, _path in directories:
+            _close_directory_handle(handle)
 
     migrations.sort(key=lambda migration: migration.version)
     if not migrations:
@@ -673,6 +679,7 @@ def _run_migration_helper(
     stdout = bytearray()
     stderr = bytearray()
     failure: MigrationError | None = None
+    returncode = -1
     try:
         assert process.stdout is not None and process.stderr is not None
         output = {process.stdout.fileno(): stdout, process.stderr.fileno(): stderr}
@@ -703,9 +710,21 @@ def _run_migration_helper(
                     break
             if failure is not None:
                 break
+        if failure is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure = MigrationError("isolated migration helper timed out")
+            else:
+                try:
+                    returncode = process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    failure = MigrationError("isolated migration helper timed out")
         if failure is not None:
-            os.killpg(process.pid, signal.SIGKILL)
-        returncode = process.wait()
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            returncode = process.wait()
     except BaseException:
         try:
             try:

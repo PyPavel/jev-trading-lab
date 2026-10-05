@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import gc
 import hashlib
 import inspect
@@ -325,6 +326,39 @@ def test_append_rejects_schema_prefix_checksum_drift(tmp_path: Path) -> None:
         connection.close()
 
 
+def test_foreign_thread_close_preserves_live_connection_and_provenance(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "private" / "db.sqlite3"
+    connection = _connect(database)
+    handle = db_module._secure_slot(connection, "_directory_handle")
+    assert isinstance(handle, db_module._DirectoryHandle)
+    parent_descriptor = handle.descriptor
+    failures: list[BaseException] = []
+
+    def close_in_foreign_thread() -> None:
+        try:
+            connection.close()
+        except BaseException as error:
+            failures.append(error)
+
+    worker = threading.Thread(target=close_in_foreign_thread)
+    worker.start()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(failures) == 1
+    assert isinstance(failures[0], sqlite3.ProgrammingError)
+    assert connection.execute("SELECT 1").fetchone()[0] == 1
+    assert db_module._is_factory_connection(connection)
+    os.fstat(parent_descriptor)
+
+    connection.close()
+    assert handle.closed
+    with pytest.raises(OSError):
+        os.fstat(parent_descriptor)
+
+
 def test_directory_handle_ambiguous_close_never_closes_reused_fd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -356,6 +390,219 @@ def test_directory_handle_ambiguous_close_never_closes_reused_fd(
     gc.collect()
     assert os.fstat(owned).st_ino == sentinel.stat().st_ino
     real_close(owned)
+
+
+def test_private_parent_transition_interrupt_cannot_close_reused_fd(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "private" / "nested"
+    parent.mkdir(parents=True, mode=0o700)
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_text("safe", encoding="utf-8")
+    replacement: int | None = None
+
+    def interrupt_after_close(frame: object, event: str, _arg: object) -> object:
+        nonlocal replacement
+        caller = getattr(frame, "f_back", None)
+        if (
+            event == "return"
+            and getattr(frame, "f_code", None)
+            is db_module._DirectoryHandle.close.__code__
+            and getattr(caller, "f_code", None)
+            is db_module._open_private_parent.__code__
+        ):
+            descriptor = frame.f_locals["descriptor"]  # type: ignore[attr-defined]
+            try:
+                os.fstat(descriptor)
+            except OSError:
+                opened = os.open(sentinel, os.O_RDONLY)
+                if opened != descriptor:
+                    os.dup2(opened, descriptor)
+                    os.close(opened)
+                replacement = descriptor
+                raise KeyboardInterrupt("interrupt after real close")
+        return interrupt_after_close
+
+    sys.settrace(interrupt_after_close)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="interrupt after real close"):
+            db_module._open_private_parent(parent)
+    finally:
+        sys.settrace(None)
+
+    assert replacement is not None
+    assert os.fstat(replacement).st_ino == sentinel.stat().st_ino
+    os.close(replacement)
+
+
+def test_owned_production_fds_never_use_raw_os_close() -> None:
+    for module in (db_module, migration_module):
+        source = inspect.getsource(module)
+        tree = ast.parse(source)
+        raw_closes = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "os"
+            and node.func.attr == "close"
+        ]
+        assert raw_closes == ([] if module is migration_module else [114])
+
+
+def test_private_parent_success_transfers_live_descriptor(tmp_path: Path) -> None:
+    parent = tmp_path / "private" / "nested"
+    parent.mkdir(parents=True, mode=0o700)
+
+    descriptor = db_module._open_private_parent(parent)
+    try:
+        assert os.path.samefile(f"/proc/self/fd/{descriptor}", parent)
+    finally:
+        os.close(descriptor)
+
+
+def test_private_parent_failure_cleanup_closes_final_descriptor(tmp_path: Path) -> None:
+    parent = tmp_path / "public"
+    parent.mkdir(mode=0o755)
+    before = {entry.name for entry in os.scandir("/proc/self/fd")}
+
+    with pytest.raises(Exception, match="mode 0700"):
+        db_module._open_private_parent(parent)
+
+    after = {entry.name for entry in os.scandir("/proc/self/fd")}
+    assert after == before
+
+
+def test_private_parent_failure_cleanup_cannot_close_reused_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "public"
+    parent.mkdir(mode=0o755)
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_text("safe", encoding="utf-8")
+    real_close = os.close
+    reused: int | None = None
+
+    def close_then_interrupt(descriptor: int) -> None:
+        nonlocal reused
+        real_close(descriptor)
+        replacement = os.open(sentinel, os.O_RDONLY)
+        if replacement != descriptor:
+            os.dup2(replacement, descriptor)
+            real_close(replacement)
+        reused = descriptor
+        raise KeyboardInterrupt("cleanup interrupted after close")
+
+    with monkeypatch.context() as context:
+        context.setattr(db_module.os, "close", close_then_interrupt)
+        with pytest.raises(KeyboardInterrupt, match="cleanup interrupted after close"):
+            db_module._open_private_parent(parent)
+
+    assert reused is not None
+    assert os.fstat(reused).st_ino == sentinel.stat().st_ino
+    real_close(reused)
+
+
+def test_database_file_cleanup_cannot_close_reused_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_text("safe", encoding="utf-8")
+    parent_descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    real_close = os.close
+    reused: int | None = None
+
+    def close_then_interrupt(descriptor: int) -> None:
+        nonlocal reused
+        real_close(descriptor)
+        replacement = os.open(sentinel, os.O_RDONLY)
+        if replacement != descriptor:
+            os.dup2(replacement, descriptor)
+            real_close(replacement)
+        reused = descriptor
+        raise KeyboardInterrupt("file cleanup interrupted after close")
+
+    try:
+        with monkeypatch.context() as context:
+            context.setattr(db_module.os, "close", close_then_interrupt)
+            with pytest.raises(KeyboardInterrupt, match="file cleanup interrupted"):
+                db_module._prepare_database_file(
+                    parent / "database.sqlite3", parent_descriptor
+                )
+        assert reused is not None
+        assert os.fstat(reused).st_ino == sentinel.stat().st_ino
+        real_close(reused)
+    finally:
+        real_close(parent_descriptor)
+
+
+def test_migration_directory_cleanup_cannot_close_reused_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package_root = tmp_path / "test_package"
+    schema = package_root / "schema"
+    schema.mkdir(parents=True)
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_text("safe", encoding="utf-8")
+    real_close = os.close
+    reused: int | None = None
+    interrupted = False
+
+    def close_then_interrupt(descriptor: int) -> None:
+        nonlocal interrupted, reused
+        if interrupted:
+            real_close(descriptor)
+            return
+        interrupted = True
+        real_close(descriptor)
+        replacement = os.open(sentinel, os.O_RDONLY)
+        if replacement != descriptor:
+            os.dup2(replacement, descriptor)
+            real_close(replacement)
+        reused = descriptor
+        raise KeyboardInterrupt("directory cleanup interrupted after close")
+
+    with monkeypatch.context() as context:
+        context.setattr(migration_module.os, "close", close_then_interrupt)
+        with pytest.raises(KeyboardInterrupt, match="directory cleanup interrupted"):
+            migration_module._open_resource_directories(schema, "test_package.schema")
+
+    assert reused is not None
+    assert os.fstat(reused).st_ino == sentinel.stat().st_ino
+    real_close(reused)
+
+
+def test_migration_resource_cleanup_cannot_close_reused_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resource = tmp_path / "001_test.sql"
+    resource.write_text("SELECT 1;\n", encoding="utf-8")
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_text("safe", encoding="utf-8")
+    real_close = os.close
+    reused: int | None = None
+
+    def close_then_interrupt(descriptor: int) -> None:
+        nonlocal reused
+        real_close(descriptor)
+        replacement = os.open(sentinel, os.O_RDONLY)
+        if replacement != descriptor:
+            os.dup2(replacement, descriptor)
+            real_close(replacement)
+        reused = descriptor
+        raise KeyboardInterrupt("resource cleanup interrupted after close")
+
+    with monkeypatch.context() as context:
+        context.setattr(migration_module.os, "close", close_then_interrupt)
+        with pytest.raises(KeyboardInterrupt, match="resource cleanup interrupted"):
+            migration_module._read_filesystem_resource(resource)
+
+    assert reused is not None
+    assert os.fstat(reused).st_ino == sentinel.stat().st_ino
+    real_close(reused)
 
 
 def test_directory_handle_ordinary_close_has_no_leak(tmp_path: Path) -> None:
@@ -459,6 +706,34 @@ def test_migration_helper_timeout_kills_process_group(
     while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     assert not Path(f"/proc/{child_pid}").exists()
+
+
+def test_migration_helper_eof_still_enforces_lifetime_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_file = tmp_path / "descendant.pid"
+    code = (
+        "import os,pathlib,subprocess,sys,time; "
+        "p=subprocess.Popen([sys.executable,'-c',"
+        "'import os,time; os.close(1); os.close(2); time.sleep(30)']); "
+        "pathlib.Path(sys.argv[1]).write_text(str(p.pid)); "
+        "os.close(1); os.close(2); time.sleep(1)"
+    )
+    command = (sys.executable, "-c", code, str(pid_file))
+    monkeypatch.setattr(migration_module, "_helper_command", lambda *_args: command)
+    monkeypatch.setattr(migration_module, "_HELPER_TIMEOUT_SECONDS", 0.1)
+
+    started = time.monotonic()
+    with pytest.raises(Exception, match="timed out"):
+        migration_module._run_migration_helper(Path("/tmp/db"), 1000, (1, 2))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    descendant_pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 2
+    while Path(f"/proc/{descendant_pid}").exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not Path(f"/proc/{descendant_pid}").exists()
 
 
 def test_migration_helper_baseexception_kills_and_reaps_process_group(
