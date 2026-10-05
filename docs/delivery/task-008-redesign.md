@@ -4,7 +4,7 @@
 
 **PENDING INDEPENDENT RE-REVIEW**
 
-Production commit: `049ae1b refactor(persistence): isolate privileged writers`
+Production commit: `c36a1d8 fix(persistence): close final isolated writer gaps`
 
 No push or independent approval occurred. This document records implementation and local evidence only.
 
@@ -13,22 +13,32 @@ No push or independent approval occurred. This document records implementation a
 - Factory-created public `SecureConnection` installs the restrictive runtime authorizer once during initialization. Production contains no temporary journal/migration authorizer scope, restoration helper, or trace/profile preflight.
 - Runtime policy denies journal DML, `schema_migrations` DML, schema/TEMP DDL, ATTACH/DETACH, and hardened dangerous configuration surfaces.
 - `AppendOnlyJournal` retains the exact public factory connection only as provenance, path/configuration, and liveness. Each append opens a fresh fixed-role internal writer for exactly one selected journal table.
-- Journal writer policy permits reads and direct main INSERT only into the selected table. It denies other inserts, UPDATE/DELETE, trigger-originated writes, schema/TEMP operations, and ATTACH/DETACH. Schema prefix/checksums, idempotency, conflicts, predecessors, exact literal insertion, and commit execute in one `BEGIN IMMEDIATE` transaction on that writer.
-- `apply_migrations(connection)` validates the parent connection and invokes a packaged helper through `sys.executable -I -B -m jev_trading_lab.persistence.migration_helper`, with `close_fds=True`, disabled stdin, fixed argv protocol, bounded timeout, and bounded output.
-- The helper independently loads packaged migrations, opens a fresh fixed-role migration connection, serializes each migration with `BEGIN IMMEDIATE`, and closes. Parent independently verifies the exact packaged prefix/checksums. Authoritative DB readback resolves lost/malformed post-commit replies.
-- `_DirectoryHandle` atomically marks descriptor ownership closed before `os.close`; explicit close, constructor cleanup, and finalizer cleanup are idempotent and cannot double-close a reused FD.
+- Journal writer policy permits reads and direct main INSERT only into the selected table. It denies other inserts, UPDATE/DELETE, trigger-originated writes, schema/TEMP operations, and ATTACH/DETACH. Each private writer binds the SQLite-opened main FD to the expected `(st_dev, st_ino)`, classifies every SQLite main/sidecar FD, revalidates the restored path, and repeats storage validation around `BEGIN IMMEDIATE` before schema-prefix/checksum, idempotency, conflict, predecessor, and exact-literal checks.
+- `apply_migrations(connection)` validates the parent connection and invokes a packaged helper through `sys.executable -I -B -m jev_trading_lab.persistence.migration_helper`, with `close_fds=True`, disabled stdin, fixed argv protocol, bounded timeout, and one combined bounded stdout/stderr budget. Every `BaseException` after `Popen` kills the helper process group, reaps the child, closes selector/pipes, and preserves the original exception.
+- The helper independently loads packaged migrations, opens a fresh fixed-role migration connection, validates its opened descriptors/path around every `BEGIN IMMEDIATE`, serializes each migration, and closes. Parent independently verifies the exact packaged prefix/checksums. Complete authoritative DB readback is success regardless of a missing, malformed, or nonzero post-commit helper reply; incomplete/corrupt readback remains an error.
+- `_DirectoryHandle` relinquishes numeric descriptor ownership before `os.close`; explicit close, constructor cleanup, and finalizer cleanup never retry an ambiguously closed FD and therefore cannot close a reused unrelated descriptor. If `os.close` raises before the kernel closes the FD, the handle may leak rather than risk unrelated-FD closure.
 - Migration SQL files 001-003 remained byte-for-byte unchanged.
 
 ## TDD RED evidence
 
-Before production edits:
+Each final defect reproduced before its production edit:
 
 ```text
-PYTHONDONTWRITEBYTECODE=1 uv run pytest -q tests/persistence/test_architectural_redesign.py
-12 failed in 0.55s
-```
+writer swap-restore FD binding:
+1 failed in 0.53s — append returned success instead of rejecting the decoy
 
-Failures showed the current architecture rejected active hooks instead of safely operating, exposed temporary authorizer helpers and `sys.gettrace/getprofile` guards, allowed non-selected table INSERT in the journal authorizer, lacked schema-prefix verification, lacked `_DirectoryHandle`, lacked the packaged helper, and lacked the helper in the built wheel.
+successful malformed/missing helper reply after real commit:
+3 failed in 0.64s — malformed output raised despite three authoritative rows
+
+ambiguous DirectoryHandle close with forced FD reuse:
+1 failed, 2 passed in 0.44s — ownership remained and risked reused-FD close
+
+selector KeyboardInterrupt after Popen:
+failed — helper PID remained until test cleanup
+
+combined stdout/stderr budget:
+4 failed, 2 passed in 2.50s — combined, interleaved, and trailing overflow passed
+```
 
 ## Focused GREEN evidence
 
@@ -38,39 +48,7 @@ PYTHONDONTWRITEBYTECODE=1 uv run pytest -q \
   tests/persistence/test_append_only.py \
   tests/persistence/test_migrations.py \
   tests/test_package_policy.py
-303 passed, 26 skipped in 9.65s
-
-uv run ruff check .
-All checks passed!
-
-uv run ruff format --check .
-35 files already formatted
-
-uv run mypy src
-Success: no issues found in 17 source files
-
-python3 -I scripts/policy_preflight.py
-Policy preflight passed.
-
-git diff --check
-exit 0
-```
-
-The 26 skips are legacy transition/trace-rejection and direct public `schema_migrations` corruption tests whose premises were removed by the redesign. Replacement tests exercise permanent public denial while trace/profile/signal/all-thread hooks run, fixed-role truth tables, isolated helper protocol/output/readback, descriptor ownership, packaging, and existing append/migration behavior.
-
-## Full final gates
-
-All commands exited 0. Mandatory built-artifact mode had no skips.
-
-```text
-uv lock --check
-Resolved 64 packages in 1ms
-
-uv sync --frozen --all-groups
-Checked 63 packages in 0.58ms
-
-PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
-786 passed, 26 skipped in 21.08s
+322 passed in 10.48s
 
 uv run ruff check .
 All checks passed!
@@ -84,6 +62,42 @@ Success: no issues found in 17 source files
 PYTHONDONTWRITEBYTECODE=1 python3 -I scripts/policy_preflight.py
 Policy preflight passed.
 
+git diff --check
+exit 0
+```
+
+Replacement coverage assertions remain executable. The default and focused suites report zero skips.
+
+## Full final gates
+
+All commands exited 0. Default and mandatory built-artifact modes had zero skips.
+
+```text
+uv lock --check
+Resolved 64 packages in 1ms
+
+uv sync --frozen --all-groups
+Checked 63 packages in 0.56ms
+
+PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
+805 passed in 21.89s
+
+uv run ruff check .
+All checks passed!
+
+uv run ruff format --check .
+35 files already formatted
+
+uv run mypy src
+Success: no issues found in 17 source files
+
+PYTHONDONTWRITEBYTECODE=1 python3 -I scripts/policy_preflight.py
+Policy preflight passed.
+
+uv export --frozen --all-groups --no-emit-project \
+  --format requirements-txt --output-file audit-requirements.txt
+exit 0
+
 uv run pip-audit --strict --requirement audit-requirements.txt \
   --no-deps --disable-pip
 No known vulnerabilities found
@@ -94,14 +108,22 @@ Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
 
 JEV_REQUIRE_BUILT_ARTIFACTS=1 PYTHONDONTWRITEBYTECODE=1 \
   uv run pytest tests/test_package_policy.py -q
-59 passed in 2.72s
+59 passed in 2.45s
 
 PYTHONDONTWRITEBYTECODE=1 uv run python scripts/wheel_migration_smoke.py
 Installed-wheel migration and controlled journal write smoke passed.
 
 git diff --check
 exit 0
+
+git diff --exit-code c36a1d8 -- \
+  src/jev_trading_lab/persistence/schema/001_migration_metadata.sql \
+  src/jev_trading_lab/persistence/schema/002_core_entities.sql \
+  src/jev_trading_lab/persistence/schema/003_append_only_guards.sql
+exit 0
 ```
+
+The focused gate executed 322 tests, and the fresh mandatory artifact-policy gate executed all 59 package-policy cases; neither reported skips. Migrations 001-003 remain byte-for-byte unchanged from production commit `c36a1d8` and its parent.
 
 `pip-audit` emitted only its standard `--no-deps` advisories. The transient audit requirements file was removed. Build artifacts remain ignored.
 
