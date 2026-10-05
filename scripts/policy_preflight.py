@@ -72,7 +72,7 @@ EXPECTED_SOURCE_HASHES = {
         "b4c2a856b006ee6bde860e8abff04c209915eb420e1c55425805e3e25042d133"
     ),
     "src/jev_trading_lab/persistence/blobs.py": (
-        "95850e5f98f278e003b349aa1f0c4ab2e85892fc4d6fef7175c55fa9008e1282"
+        "bb59d61e1c15b463057b4e6118c0f1f1528c1e52ff53456f08d06a1bf0cec279"
     ),
     "src/jev_trading_lab/persistence/journal.py": (
         "74c92b09eeb9c10e713c99354df7d40e43c2d90e7de0088968e95197f1a0dce2"
@@ -170,9 +170,7 @@ EXPECTED_TOOL = {
             },
         }
     },
-    "pytest": {
-        "ini_options": {"testpaths": ["tests"], "addopts": "--basetemp=.pytest-tmp"}
-    },
+    "pytest": {"ini_options": {"testpaths": ["tests"]}},
     "ruff": {
         "target-version": "py312",
         "line-length": 88,

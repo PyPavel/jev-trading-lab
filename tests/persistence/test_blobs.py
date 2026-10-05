@@ -31,6 +31,28 @@ def _final_path(store: Any, ref: Any) -> Path:
     return store.root.joinpath(*ref.relative_path.split("/"))
 
 
+def test_filesystem_boundary_source_policy_is_explicit_and_non_atomic() -> None:
+    source = " ".join(Path(_api().__file__).read_text(encoding="utf-8").split())
+    required = (
+        "Concurrent same-user raw filesystem mutation is unsupported "
+        "for the entire operation",
+        "crash and power-loss durability",
+        "documented filesystem semantics",
+        "descriptor-relative no-follow validation",
+        "fails closed on preexisting or checkpoint-observed state drift",
+        "callback runs only after fsync and final canonical-state verification",
+        "malicious process-wide or private hooks",
+    )
+    forbidden = (
+        "canonical path cannot change after final verification",
+        "cannot leave a callback-created dangling reference",
+        "atomic against concurrent same-user filesystem mutation",
+    )
+
+    assert all(claim in source for claim in required)
+    assert all(overclaim not in source for overclaim in forbidden)
+
+
 def test_publication_order(tmp_path: Path) -> None:
     events: list[str] = []
     store = _store(tmp_path, failpoint=events.append)
@@ -1047,7 +1069,7 @@ def test_query_count_rejects_before_parse_expansion(
 
 @pytest.mark.parametrize(
     "name",
-    ["X-Amz-Custom-Future-Field", "secret", "password", "session", "cookie"],
+    ["X-Amz-Custom-Future-Field", "secret", "password", "cookie"],
 )
 def test_wildcard_aws_and_common_secret_query_fields_are_redacted(
     tmp_path: Path, name: str
@@ -1230,16 +1252,152 @@ def test_oauth_oidc_header_credential_variants_never_reach_stored_bytes(
 def test_harmless_structured_names_remain_exact(tmp_path: Path, name: str) -> None:
     api = _api()
     marker_value = f"safe-{name}"
+    body = json.dumps({name: marker_value}, separators=(",", ":")).encode()
     envelope = api.ArtifactEnvelope(
-        body=b"opaque",
+        body=body,
         url=f"https://e.test/?{name}={marker_value}",
-        headers={name: marker_value},
+        headers={name: marker_value, "Content-Type": "application/json"},
     )
     store = _store(tmp_path)
     document = json.loads(store.read_verified(store.publish(envelope)))
+    stored_body = json.loads(__import__("base64").b64decode(document["body_base64"]))
 
     assert marker_value in document["url"]
     assert document["headers"][name] == marker_value
+    assert stored_body[name] == marker_value
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "possession",
+        "session",
+        "tokenization",
+        "secretariat",
+        "passwordPolicy",
+        "cookiePreferences",
+        "monkey",
+        "keyframe",
+        "donkey",
+    ),
+)
+def test_semantically_harmless_names_remain_exact_on_every_surface(
+    tmp_path: Path, name: str
+) -> None:
+    api = _api()
+    marker_value = "SAFE-STRUCTURED-VALUE"
+    body = json.dumps({name: marker_value}, separators=(",", ":")).encode()
+    envelope = api.ArtifactEnvelope(
+        body=body,
+        url=f"https://e.test/?{name}={marker_value}",
+        headers={name: marker_value, "Content-Type": "application/json"},
+    )
+    stored = _store(tmp_path).read_verified(_store(tmp_path).publish(envelope))
+    document = json.loads(stored)
+    stored_body = json.loads(__import__("base64").b64decode(document["body_base64"]))
+
+    assert marker_value in document["url"]
+    assert document["headers"][name] == marker_value
+    assert stored_body[name] == marker_value
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "provider_api_key",
+        "provider-api-key",
+        "providerApiKey",
+        "ｐｒｏｖｉｄｅｒ＿ａｐｉ＿ｋｅｙ",
+        "OPENAI_API_KEY",
+        "openaiApiKey",
+        "TYPESAFE_API_KEY",
+        "typesafe-api-key",
+    ),
+)
+@pytest.mark.parametrize("surface", ("query", "header", "json"))
+def test_provider_prefixed_api_key_is_redacted_on_every_structured_surface(
+    tmp_path: Path, name: str, surface: str
+) -> None:
+    api = _api()
+    secret = f"{surface}-PROVIDER-API-KEY-LEAK"
+    kwargs: dict[str, Any] = {"body": b"opaque"}
+    if surface == "query":
+        kwargs["url"] = f"https://e.test/?{name}={secret}&safe=keep"
+    elif surface == "header":
+        kwargs["headers"] = {name: secret, "Safe": "keep"}
+    else:
+        kwargs["body"] = json.dumps({name: secret, "safe": "keep"}).encode()
+        kwargs["headers"] = {"Content-Type": "application/json"}
+    envelope = api.ArtifactEnvelope(**kwargs)
+
+    stored = _store(tmp_path).read_verified(_store(tmp_path).publish(envelope))
+
+    assert secret.encode() not in stored
+    assert secret not in repr(envelope)
+
+
+@pytest.mark.parametrize(
+    "surface,name",
+    (
+        ("query", "session_token"),
+        ("header", "X-Session-Token"),
+        ("header", "Session-Token"),
+        ("json", "sessionToken"),
+        ("json", "session_token"),
+    ),
+)
+def test_session_token_is_redacted_on_declared_structured_surfaces(
+    tmp_path: Path, surface: str, name: str
+) -> None:
+    api = _api()
+    secret = f"{surface}-SESSION-TOKEN-LEAK"
+    kwargs: dict[str, Any] = {"body": b"opaque"}
+    if surface == "query":
+        kwargs["url"] = f"https://e.test/?{name}={secret}"
+    elif surface == "header":
+        kwargs["headers"] = {name: secret}
+    else:
+        kwargs["body"] = json.dumps({name: secret}).encode()
+        kwargs["headers"] = {"Content-Type": "application/json"}
+    envelope = api.ArtifactEnvelope(**kwargs)
+
+    stored = _store(tmp_path).read_verified(_store(tmp_path).publish(envelope))
+
+    assert secret.encode() not in stored
+    assert secret not in repr(envelope)
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "sessionToken",
+        "session_token",
+        "provider_api_key",
+        "provider-api-key",
+        "providerApiKey",
+        "ｐｒｏｖｉｄｅｒ＿ａｐｉ＿ｋｅｙ",
+        "OPENAI_API_KEY",
+        "openaiApiKey",
+        "TYPESAFE_API_KEY",
+        "typesafe-api-key",
+    ),
+)
+def test_declared_json_credential_errors_never_include_values(
+    tmp_path: Path, name: str
+) -> None:
+    api = _api()
+    secret = "DECLARED-JSON-CREDENTIAL-LEAK"
+    envelope = api.ArtifactEnvelope(
+        body=("{" + json.dumps(name) + ":" + json.dumps(secret)).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+
+    with pytest.raises(ValueError, match="declared JSON body is unsafe") as caught:
+        _store(tmp_path).publish(envelope)
+
+    rendered = str(caught.value) + repr(caught.value)
+    assert secret not in rendered
+    assert secret not in repr(envelope)
 
 
 def test_oauth_body_redaction_and_stored_bytes(tmp_path: Path) -> None:

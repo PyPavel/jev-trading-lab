@@ -1,4 +1,14 @@
-"""Crash-durable, content-addressed storage for redacted provider artifacts."""
+"""Crash-durable, content-addressed storage for redacted provider artifacts.
+
+Supported guarantees are crash and power-loss durability under documented filesystem
+semantics and descriptor-relative no-follow validation. The store fails closed on
+preexisting or checkpoint-observed state drift. The reference callback runs only after
+fsync and final canonical-state verification as observed at that checkpoint.
+
+Concurrent same-user raw filesystem mutation is unsupported for the entire operation,
+as are malicious process-wide or private hooks. Pure filesystem verification and a
+later Python callback are not an atomic transaction or a sandbox against those actors.
+"""
 
 from __future__ import annotations
 
@@ -227,7 +237,6 @@ _SIGNED_QUERY_COMPACT = frozenset(
         "apikey",
         "secret",
         "password",
-        "session",
         "cookie",
         "clientsecret",
         "accesstoken",
@@ -236,28 +245,35 @@ _SIGNED_QUERY_COMPACT = frozenset(
         "code",
     }
 )
-_CREDENTIAL_SUFFIXES = (
-    "accesstoken",
-    "clientsecret",
-    "idtoken",
-    "oauthtoken",
-    "oauthtokensecret",
-    "oidcidtoken",
-    "oidctoken",
-    "refreshtoken",
+_CREDENTIAL_TERMINAL_PHRASES = (
+    ("api", "key"),
+    ("access", "token"),
+    ("refresh", "token"),
+    ("id", "token"),
+    ("session", "token"),
+    ("client", "secret"),
+    ("oauth", "token"),
+    ("oauth", "token", "secret"),
+    ("password",),
+    ("cookie",),
 )
+
+
+def _secret_name_words(name: str) -> tuple[str, ...]:
+    return tuple(filter(None, _normalized_secret_name(name).split("_")))
 
 
 def _is_structured_credential_name(name: str, exact: frozenset[str]) -> bool:
     compact = _compact_secret_name(name)
-    return compact in exact or compact.endswith(_CREDENTIAL_SUFFIXES)
+    words = _secret_name_words(name)
+    return compact in exact or any(
+        len(words) >= len(phrase) and words[-len(phrase) :] == phrase
+        for phrase in _CREDENTIAL_TERMINAL_PHRASES
+    )
 
 
 def _is_secret_field(name: str) -> bool:
-    compact = _compact_secret_name(name)
-    return compact in _SECRET_FIELD_COMPACT or compact.endswith(
-        ("token", "secret", "password", "session", "cookie")
-    )
+    return _is_structured_credential_name(name, _SECRET_FIELD_COMPACT)
 
 
 def _json_string_end(data: bytes, start: int) -> int:

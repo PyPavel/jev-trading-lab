@@ -200,7 +200,7 @@ _APPROVED_SOURCE_HASHES = {
         "b4c2a856b006ee6bde860e8abff04c209915eb420e1c55425805e3e25042d133"
     ),
     "src/jev_trading_lab/persistence/blobs.py": (
-        "95850e5f98f278e003b349aa1f0c4ab2e85892fc4d6fef7175c55fa9008e1282"
+        "bb59d61e1c15b463057b4e6118c0f1f1528c1e52ff53456f08d06a1bf0cec279"
     ),
     "src/jev_trading_lab/persistence/journal.py": (
         "74c92b09eeb9c10e713c99354df7d40e43c2d90e7de0088968e95197f1a0dce2"
@@ -268,9 +268,7 @@ _ALLOWED_TOOL_CONFIG = {
             },
         }
     },
-    "pytest": {
-        "ini_options": {"testpaths": ["tests"], "addopts": "--basetemp=.pytest-tmp"}
-    },
+    "pytest": {"ini_options": {"testpaths": ["tests"]}},
     "ruff": {
         "target-version": "py312",
         "line-length": 88,
@@ -285,10 +283,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "7a7069d3a918a9ea3bec531e13848f29a4ef162a0cba63c41e678d23449d52c1"
+    "308d26a8a4bf8bfc218b733c1b75d470212e206234b0e19c69acbae1bd4095bd"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "b10ed95a227ffd4bdb45b405103702cd2475100fcca712d8c24c26dea8968ed8"
+    "36814a1362deb5b642e69a85e8230eac09c35de4a8bc93de97e5bdba1716b42d"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = [
     "exchange-calendars==4.11.2",
@@ -1379,6 +1377,12 @@ def test_locked_build_configuration() -> None:
     assert project_data["project"]["name"] in locked
     assert locked["hatchling"] == "1.27.0"
     assert locked["exchange-calendars"] == "4.11.2"
+
+
+def test_pytest_uses_process_isolated_default_basetemp() -> None:
+    pytest_options = _project_data()["tool"]["pytest"]["ini_options"]
+
+    assert "addopts" not in pytest_options
 
 
 def test_ci_uses_immutable_actions_and_locked_audit() -> None:
