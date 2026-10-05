@@ -138,6 +138,106 @@ Passive CPython audit hooks remain supported. A malicious hook installed with
 Python installs its fixed authorizer; that capability-theft attack is explicitly
 outside the controlled-API boundary and is not claimed to be sandboxed.
 
+## Remaining descriptor/lifetime hardening
+
+Production commit: `c668b60 fix(persistence): close remaining descriptor lifetime gaps`
+
+The final review findings after `c36a1d8` were reproduced before production edits:
+
+```text
+helper EOF/lifetime reproduction:
+FAILED — helper returned after 1.47s without timeout instead of the 0.1s deadline
+
+private-parent traversal close/reuse reproduction:
+FAILED — cleanup closed the sentinel FD reused after the real traversal close
+
+foreign-thread SecureConnection.close reproduction:
+FAILED — SQLite raised ProgrammingError, but factory provenance was already invalidated
+```
+
+Resolved behavior:
+
+- Helper supervision now applies the original monotonic deadline to child lifetime after stdout/stderr EOF. `wait(timeout=remaining)` expiry kills the process group and reaps the direct child; the regression also verifies a forked descendant that closed both pipes is gone.
+- `_open_private_parent` now gives every traversal descriptor explicit `_DirectoryHandle` ownership and transfers the final live descriptor through `release()`. Trace interruption after real close cannot make cleanup close a reused sentinel.
+- Raw owned-FD transitions in `db.py`, `migrations.py`, and `migration_helper.py` were audited. Database-file preparation, migration directory traversal, migration resource reads, success/failure cleanup, and final transfer use idempotent ownership. An AST regression permits raw `os.close` only inside `_DirectoryHandle.close`.
+- `SecureConnection.close` and the analogous internal connection close retained directory provenance only after SQLite close succeeds. A failed foreign-thread close leaves the connection queryable and factory provenance valid; owner-thread close later releases SQLite and the directory descriptor.
+- Migration SQL 001-003 remained unchanged.
+
+Focused and full verification:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run pytest -q \
+  tests/persistence/test_architectural_redesign.py \
+  tests/persistence/test_append_only.py \
+  tests/persistence/test_migrations.py \
+  tests/test_package_policy.py
+332 passed in 11.56s
+
+PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
+815 passed in 24.82s
+```
+
+Final gates all exited 0:
+
+```text
+uv run ruff check .
+All checks passed!
+
+uv run ruff format --check .
+35 files already formatted
+
+uv run mypy src
+Success: no issues found in 17 source files
+
+PYTHONDONTWRITEBYTECODE=1 python3 -I scripts/policy_preflight.py
+Policy preflight passed.
+
+uv lock --check
+Resolved 64 packages in 1ms
+
+uv sync --frozen --all-groups
+Checked 63 packages in 0.57ms
+
+uv run pip-audit --strict --requirement audit-requirements.txt \
+  --no-deps --disable-pip
+No known vulnerabilities found
+
+uv build --no-build-isolation
+Successfully built dist/jev_trading_lab-0.1.0.tar.gz
+Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
+
+JEV_REQUIRE_BUILT_ARTIFACTS=1 PYTHONDONTWRITEBYTECODE=1 \
+  uv run pytest tests/test_package_policy.py -q
+59 passed in 2.92s
+
+PYTHONDONTWRITEBYTECODE=1 uv run python scripts/wheel_migration_smoke.py
+Installed-wheel migration and controlled journal write smoke passed.
+
+git diff --check
+exit 0
+
+git diff --exit-code c36a1d8 -- \
+  src/jev_trading_lab/persistence/schema/001_migration_metadata.sql \
+  src/jev_trading_lab/persistence/schema/002_core_entities.sql \
+  src/jev_trading_lab/persistence/schema/003_append_only_guards.sql
+exit 0
+```
+
+The default, focused, and mandatory built-artifact suites reported zero skips. The transient audit requirements file was removed. Build artifacts remain ignored.
+
+Exact production snapshot:
+
+```text
+c668b60d132a8be13f2915b2eef727552ebc06ba  production commit
+addc3c88a66c52099db1a7ae9e9255e4cf8e9932a57ddc5248591b0fb711daea  src/jev_trading_lab/persistence/db.py
+3dac817b7a2d52e35b40d79a50cd5880b2b4b7b123f6b7167bedb5b8bcfa8a98  src/jev_trading_lab/persistence/migrations.py
+d3187180b1319fd6100c8c96d002acf0e5134a87eea87f5ae49b3aec37977263  src/jev_trading_lab/persistence/migration_helper.py
+6fabb2c59f17e424211a9228e634ebbf4f2cec7f4f4440e35978892f5cfa890f  tests/persistence/test_architectural_redesign.py
+10fe3175b2f0c739d67b8aa5b11d0cb681f347908da89e6d6ffc1bae1881870d  scripts/policy_preflight.py
+69cdd7c9c88d031b62f7b6878ab2980336123115732b7cdd28fd529461368025  tests/test_package_policy.py
+47ebea0cc43c2aa703dd215b7b116c6f2a74bc6cfb44d2b7920a6c3818aacd5e  .github/workflows/ci.yml
+```
+
 ## Review state
 
 **PENDING INDEPENDENT RE-REVIEW.** This agent did not independently approve the change.
