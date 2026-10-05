@@ -39,6 +39,26 @@ def test_test_process_disables_bytecode_writes() -> None:
     assert sys.dont_write_bytecode
 
 
+def test_blob_module_is_packaged_in_wheel_and_sdist() -> None:
+    artifact = "jev_trading_lab/persistence/blobs.py"
+    wheel, sdist = _built_artifacts()
+    newest_source = max(
+        (ROOT / relative).stat().st_mtime_ns
+        for relative in (
+            "pyproject.toml",
+            "src/jev_trading_lab/persistence/blobs.py",
+        )
+    )
+    if min(wheel.stat().st_mtime_ns, sdist.stat().st_mtime_ns) < newest_source:
+        if _REQUIRE_BUILT_ARTIFACTS:
+            pytest.fail("built wheel or sdist is stale")
+        pytest.skip("stale build artifacts are replaced by the build gate")
+    with zipfile.ZipFile(wheel) as archive:
+        assert artifact in archive.namelist()
+    with tarfile.open(sdist) as archive:
+        assert any(name.endswith("/src/" + artifact) for name in archive.getnames())
+
+
 def test_calendar_schedule_artifact_is_packaged_in_wheel_and_sdist() -> None:
     artifact = "jev_trading_lab/artifacts/xnys-schedule-2020-2036.json"
     wheel, sdist = _built_artifacts()
@@ -179,6 +199,9 @@ _APPROVED_SOURCE_HASHES = {
     "src/jev_trading_lab/persistence/core_repo.py": (
         "b4c2a856b006ee6bde860e8abff04c209915eb420e1c55425805e3e25042d133"
     ),
+    "src/jev_trading_lab/persistence/blobs.py": (
+        "e681215701c1064f3bf95d9bfb782898ea3a48867e4c346bf28aace8bbe853e4"
+    ),
     "src/jev_trading_lab/persistence/journal.py": (
         "74c92b09eeb9c10e713c99354df7d40e43c2d90e7de0088968e95197f1a0dce2"
     ),
@@ -260,10 +283,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "6e69bdf14d494954a690e62f92b33ec6fc003c73c2f089c35b701f09f19e0a30"
+    "37067edb3ae2bb4adf1e5b89f61fe7fd9e4ea005ee38b81550e4f17c3a405eb8"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "0fcd66e67ae4c8f53e25da2d46816f08c9b071b07b9795a80e88dcf998763f14"
+    "acae422c7b210c766f2917e4fb8b6a23fb9ea1239483d6a53a50c2efd0fda658"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = [
     "exchange-calendars==4.11.2",
@@ -693,6 +716,7 @@ def _initialize_approved_source_fixture(tmp_path: Path) -> Path:
         "core/values.py",
         "persistence/__init__.py",
         "persistence/core_repo.py",
+        "persistence/blobs.py",
         "persistence/journal.py",
         "persistence/db.py",
         "persistence/migrations.py",
@@ -1561,6 +1585,7 @@ def test_built_artifacts_exclude_repository_and_host_junk(tmp_path: Path) -> Non
         "jev_trading_lab/core/time.py",
         "jev_trading_lab/core/values.py",
         "jev_trading_lab/persistence/__init__.py",
+        "jev_trading_lab/persistence/blobs.py",
         "jev_trading_lab/persistence/core_repo.py",
         "jev_trading_lab/persistence/db.py",
         "jev_trading_lab/persistence/journal.py",

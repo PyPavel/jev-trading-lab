@@ -71,6 +71,9 @@ EXPECTED_SOURCE_HASHES = {
     "src/jev_trading_lab/persistence/core_repo.py": (
         "b4c2a856b006ee6bde860e8abff04c209915eb420e1c55425805e3e25042d133"
     ),
+    "src/jev_trading_lab/persistence/blobs.py": (
+        "e681215701c1064f3bf95d9bfb782898ea3a48867e4c346bf28aace8bbe853e4"
+    ),
     "src/jev_trading_lab/persistence/journal.py": (
         "74c92b09eeb9c10e713c99354df7d40e43c2d90e7de0088968e95197f1a0dce2"
     ),
