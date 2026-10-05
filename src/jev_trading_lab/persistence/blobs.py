@@ -295,20 +295,24 @@ _CREDENTIAL_TERMINAL_PHRASES = (
     "idtoken",
     "cookie",
 )
-_MAX_CREDENTIAL_VERSION_SUFFIXES = 8
 
 
 def _strip_credential_versions(compact: str) -> str:
-    for _ in range(_MAX_CREDENTIAL_VERSION_SUFFIXES):
-        start = len(compact)
-        while start and compact[start - 1].isdecimal():
-            start -= 1
-        if start == len(compact):
+    end = len(compact)
+    cursor = end
+    while cursor:
+        component_end = cursor
+        while cursor and compact[cursor - 1].isdecimal():
+            cursor -= 1
+        if cursor < component_end:
+            if cursor and compact[cursor - 1] == "v":
+                cursor -= 1
+        elif compact[cursor - 1] == "v":
+            cursor -= 1
+        else:
             break
-        if start and compact[start - 1] == "v":
-            start -= 1
-        compact = compact[:start]
-    return compact
+        end = cursor
+    return compact[:end]
 
 
 def _is_structured_credential_name(name: str, exact: frozenset[str]) -> bool:

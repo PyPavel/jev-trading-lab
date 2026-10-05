@@ -1626,6 +1626,173 @@ def test_acronym_credential_json_errors_never_include_values(
     assert secret not in rendered
 
 
+_VERSION_SUFFIX_BUILDERS = {
+    "underscore-v": lambda count: "".join(
+        f"_v{index}" for index in range(1, count + 1)
+    ),
+    "dot-v": lambda count: "".join(f".v{index}" for index in range(1, count + 1)),
+    "hyphen-numeric": lambda count: "".join(
+        f"-{index}" for index in range(1, count + 1)
+    ),
+    "attached-v": lambda count: "".join(f"v{index}" for index in range(1, count + 1)),
+    "attached-numeric": lambda count: "".join(
+        str(index) for index in range(1, count + 1)
+    ),
+}
+
+
+@pytest.mark.parametrize("count", (9, 10, 32))
+@pytest.mark.parametrize("style", tuple(_VERSION_SUFFIX_BUILDERS))
+@pytest.mark.parametrize("surface", ("query", "header", "json"))
+def test_unlimited_credential_version_suffixes_are_redacted_on_every_surface(
+    tmp_path: Path, count: int, style: str, surface: str
+) -> None:
+    api = _api()
+    name = "OPENAIAPIKey" + _VERSION_SUFFIX_BUILDERS[style](count)
+    secret = f"{surface}-{style}-{count}-VERSION-CREDENTIAL-LEAK"
+    kwargs: dict[str, Any] = {"body": b"opaque"}
+    if surface == "query":
+        kwargs["url"] = f"https://e.test/?{name}={secret}&safe=keep"
+    elif surface == "header":
+        kwargs["headers"] = {name: secret, "Safe": "keep"}
+    else:
+        kwargs["body"] = json.dumps({name: secret, "safe": "keep"}).encode()
+        kwargs["headers"] = {"Content-Type": "application/json"}
+    envelope = api.ArtifactEnvelope(**kwargs)
+
+    with _store(tmp_path) as store:
+        ref = store.publish(envelope)
+        stored = store.read_verified(ref)
+        stored_file = _final_path(store, ref).read_bytes()
+
+        assert secret.encode() not in stored
+        assert secret.encode() not in stored_file
+        if surface == "json":
+            stored_body = __import__("base64").b64decode(
+                json.loads(stored)["body_base64"]
+            )
+            assert secret.encode() not in stored_body
+    assert secret not in repr(envelope)
+
+
+@pytest.mark.parametrize("count", (9, 10, 32))
+@pytest.mark.parametrize("style", tuple(_VERSION_SUFFIX_BUILDERS))
+def test_unlimited_credential_version_suffixes_in_escaped_json_keys_are_redacted(
+    tmp_path: Path, count: int, style: str
+) -> None:
+    api = _api()
+    escaped_name = (
+        b"OPENAI\\u0041PIKey" + _VERSION_SUFFIX_BUILDERS[style](count).encode()
+    )
+    secret = f"escaped-{style}-{count}-VERSION-CREDENTIAL-LEAK"
+    envelope = api.ArtifactEnvelope(
+        body=b'{"' + escaped_name + b'":"' + secret.encode() + b'","safe":"keep"}',
+        headers={"Content-Type": "application/json"},
+    )
+
+    with _store(tmp_path) as store:
+        ref = store.publish(envelope)
+        stored = store.read_verified(ref)
+
+        assert secret.encode() not in stored
+        assert secret.encode() not in _final_path(store, ref).read_bytes()
+    assert secret not in repr(envelope)
+
+
+def _maximum_versioned_credential_name(limit: int, style: str) -> str:
+    suffix = _VERSION_SUFFIX_BUILDERS[style](32)
+    phrase = "APIKey"
+    return "p" * (limit - len(phrase) - len(suffix)) + phrase + suffix
+
+
+@pytest.mark.parametrize("style", tuple(_VERSION_SUFFIX_BUILDERS))
+def test_maximum_classifier_name_length_version_chain_is_credential(style: str) -> None:
+    api = _api()
+    name = _maximum_versioned_credential_name(api._MAX_CREDENTIAL_NAME_CHARS, style)
+
+    assert len(name) == api._MAX_CREDENTIAL_NAME_CHARS
+    assert api._is_secret_field(name)
+
+
+@pytest.mark.parametrize("style", tuple(_VERSION_SUFFIX_BUILDERS))
+@pytest.mark.parametrize("surface", ("query", "header", "json", "escaped-json"))
+def test_maximum_surface_name_length_version_chain_is_redacted(
+    tmp_path: Path, style: str, surface: str
+) -> None:
+    api = _api()
+    secret = f"{surface}-{style}-MAXIMUM-VERSION-CREDENTIAL-LEAK"
+    if surface == "query":
+        overhead = len(f"https://e.test/?={secret}&safe=keep")
+        name = _maximum_versioned_credential_name(api._MAX_URL_BYTES - overhead, style)
+        envelope = api.ArtifactEnvelope(
+            body=b"opaque", url=f"https://e.test/?{name}={secret}&safe=keep"
+        )
+    elif surface == "header":
+        name = _maximum_versioned_credential_name(api._MAX_HEADER_NAME_BYTES, style)
+        envelope = api.ArtifactEnvelope(body=b"opaque", headers={name: secret})
+    elif surface == "json":
+        name = _maximum_versioned_credential_name(api._MAX_JSON_KEY_BYTES - 2, style)
+        envelope = api.ArtifactEnvelope(
+            body=json.dumps({name: secret}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+    else:
+        escaped_prefix = b"p\\u0070"
+        name = _maximum_versioned_credential_name(
+            api._MAX_JSON_KEY_BYTES - 2 - (len(escaped_prefix) - 2), style
+        )
+        escaped_name = escaped_prefix + name[2:].encode()
+        envelope = api.ArtifactEnvelope(
+            body=b'{"' + escaped_name + b'":"' + secret.encode() + b'"}',
+            headers={"Content-Type": "application/json"},
+        )
+
+    with _store(tmp_path) as store:
+        ref = store.publish(envelope)
+        stored = store.read_verified(ref)
+
+        assert secret.encode() not in stored
+        assert secret.encode() not in _final_path(store, ref).read_bytes()
+    assert secret not in repr(envelope)
+
+
+@pytest.mark.parametrize("style", tuple(_VERSION_SUFFIX_BUILDERS))
+@pytest.mark.parametrize("surface", ("query", "header", "json"))
+def test_versioned_semantic_near_miss_remains_exact(
+    tmp_path: Path, style: str, surface: str
+) -> None:
+    api = _api()
+    name = "apiKeyMetadata" + _VERSION_SUFFIX_BUILDERS[style](32)
+    marker = "SAFE-VERSIONED-NEAR-MISS"
+    kwargs: dict[str, Any] = {"body": b"opaque"}
+    if surface == "query":
+        kwargs["url"] = f"https://e.test/?{name}={marker}"
+    elif surface == "header":
+        kwargs["headers"] = {name: marker}
+    else:
+        kwargs["body"] = json.dumps({name: marker}).encode()
+        kwargs["headers"] = {"Content-Type": "application/json"}
+    envelope = api.ArtifactEnvelope(**kwargs)
+
+    with _store(tmp_path) as store:
+        ref = store.publish(envelope)
+        stored = store.read_verified(ref)
+        document = json.loads(stored)
+        stored_body = __import__("base64").b64decode(document["body_base64"])
+
+        assert not api._is_secret_field(name)
+        if surface == "json":
+            assert marker.encode() in stored_body
+        else:
+            assert marker.encode() in stored
+            assert marker.encode() in _final_path(store, ref).read_bytes()
+
+
+@pytest.mark.parametrize("name", ("OPENAIAPIKeyv1v", "OPENAIAPIKeyvv2"))
+def test_malformed_terminal_version_chain_fails_closed(name: str) -> None:
+    assert _api()._is_secret_field(name)
+
+
 def test_oauth_body_redaction_and_stored_bytes(tmp_path: Path) -> None:
     api = _api()
     body = (
