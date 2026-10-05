@@ -66,6 +66,7 @@ include = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--basetemp=.pytest-tmp"
 
 [tool.ruff]
 target-version = "py312"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import gc
 import hashlib
 import json
 import os
@@ -480,7 +481,7 @@ def test_preexisting_directories_are_not_reported_as_newly_durable(
     monkeypatch.setattr(api.os, "fsync", traced_fsync)
     second = api.BlobStore(tmp_path / "root").publish(b"same-shard")
     assert second == first
-    assert directories == [first.sha256[2:4]]
+    assert directories == [tmp_path.name, first.sha256[2:4]]
 
 
 def test_scavenger_directory_replacement_cannot_delete_outside_victim(
@@ -625,7 +626,7 @@ def test_invalid_declared_json_with_escaped_secret_marker_fails_closed(
     assert secret not in str(caught.value)
 
 
-def test_invalid_declared_json_without_secret_marker_is_preserved(
+def test_invalid_declared_json_without_secret_marker_fails_closed(
     tmp_path: Path,
 ) -> None:
     api = _api()
@@ -633,9 +634,8 @@ def test_invalid_declared_json_without_secret_marker_is_preserved(
     envelope = api.ArtifactEnvelope(
         body=body, headers={"Content-Type": "application/json"}
     )
-    store = _store(tmp_path)
-    document = json.loads(store.read_verified(store.publish(envelope)))
-    assert __import__("base64").b64decode(document["body_base64"]) == body
+    with pytest.raises(ValueError, match="declared JSON body is unsafe"):
+        _store(tmp_path).publish(envelope)
 
 
 @pytest.mark.parametrize("error_number", [errno.ENOSYS, errno.EOPNOTSUPP])
@@ -722,7 +722,7 @@ def test_fifo_target_never_blocks(tmp_path: Path) -> None:
         raise SystemExit(2)
         """
     )
-    result = subprocess.run([sys.executable, "-c", code], timeout=3, check=False)
+    result = subprocess.run([sys.executable, "-B", "-c", code], timeout=3, check=False)
     assert result.returncode == 0
 
 
@@ -771,7 +771,7 @@ def test_real_process_crash_boundaries_reopen_safely(
         BlobStore({str(root)!r}, failpoint=stop).publish(b'crash-data')
         """
     )
-    result = subprocess.run([sys.executable, "-c", code], check=False)
+    result = subprocess.run([sys.executable, "-B", "-c", code], check=False)
     assert result.returncode == 91
     store = _api().BlobStore(root)
     digest = hashlib.sha256(b"crash-data").hexdigest()
@@ -915,3 +915,239 @@ def test_renameat2_symbol_absence_fails_closed(
         store.publish_and_reference(b"x", called.append)
     assert called == []
     assert not list(store.root.rglob(".tmp-*"))
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        b'{"bad\\q":0,"pass\\u0077ord":"LEAK-ME"',
+        b'{"x":"\\q","pass\\u0077ord":"TOPLEAK"}',
+        b'{"safe":"\xff"}',
+        b'{"safe":"\\q"}',
+        b'{"safe":[{"nested":0}',
+    ),
+)
+def test_any_malformed_declared_json_fails_closed_without_original_bytes(
+    tmp_path: Path, body: bytes
+) -> None:
+    api = _api()
+    envelope = api.ArtifactEnvelope(
+        body=body, headers={"Content-Type": "application/json"}
+    )
+
+    with pytest.raises(ValueError, match="declared JSON body is unsafe") as caught:
+        _store(tmp_path).publish(envelope)
+
+    for secret in ("LEAK-ME", "TOPLEAK"):
+        assert secret not in str(caught.value)
+        assert secret not in repr(caught.value)
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "client_secret",
+        "client-secret",
+        "clientSecret",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "code",
+    ),
+)
+def test_oauth_query_fields_are_redacted(tmp_path: Path, name: str) -> None:
+    api = _api()
+    envelope = api.ArtifactEnvelope(
+        body=b"opaque", url=f"https://e.test/callback?{name}=OAUTH-QUERY-SECRET&safe=ok"
+    )
+    store = _store(tmp_path)
+    stored = store.read_verified(store.publish(envelope))
+
+    assert b"OAUTH-QUERY-SECRET" not in stored
+    assert b"safe=ok" in stored
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "Client-Secret",
+        "client_secret",
+        "clientSecret",
+        "Access-Token",
+        "access_token",
+        "accessToken",
+        "Refresh-Token",
+        "refresh_token",
+        "refreshToken",
+    ),
+)
+def test_oauth_header_fields_are_redacted(tmp_path: Path, name: str) -> None:
+    api = _api()
+    envelope = api.ArtifactEnvelope(
+        body=b"opaque", headers={name: "OAUTH-HEADER-SECRET", "Safe": "keep"}
+    )
+    store = _store(tmp_path)
+    stored = store.read_verified(store.publish(envelope))
+
+    assert b"OAUTH-HEADER-SECRET" not in stored
+    assert json.loads(stored)["headers"]["Safe"] == "keep"
+
+
+def test_oauth_body_redaction_and_stored_bytes(tmp_path: Path) -> None:
+    api = _api()
+    body = (
+        b'{"client_secret":"BODY-A","access_token":"BODY-B",'
+        b'"refresh_token":"BODY-C","id_token":"BODY-D","code":"keep"}'
+    )
+    envelope = api.ArtifactEnvelope(
+        body=body, headers={"Content-Type": "application/json"}
+    )
+    store = _store(tmp_path)
+    stored = store.read_verified(store.publish(envelope))
+    redacted = json.loads(
+        __import__("base64").b64decode(json.loads(stored)["body_base64"])
+    )
+
+    assert redacted == {
+        "client_secret": "[REDACTED]",
+        "access_token": "[REDACTED]",
+        "refresh_token": "[REDACTED]",
+        "id_token": "[REDACTED]",
+        "code": "keep",
+    }
+    assert all(
+        secret not in stored for secret in (b"BODY-A", b"BODY-B", b"BODY-C", b"BODY-D")
+    )
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    (
+        lambda api: api.ArtifactEnvelope(
+            body=b"x", url="https://e.test/\ud800URL-LEAK"
+        ),
+        lambda api: api.ArtifactEnvelope(
+            body=b"x", headers={"X-\ud800HEADER-LEAK": "v"}
+        ),
+        lambda api: api.ArtifactEnvelope(body=b"x", headers={"X": "\ud800VALUE-LEAK"}),
+        lambda api: api.ArtifactEnvelope(
+            body=b'{"password":"\xed\xa0\x80BODY-LEAK"}',
+            headers={"Content-Type": "application/json"},
+        ),
+    ),
+)
+def test_lone_surrogate_inputs_raise_generic_errors_without_originals(
+    tmp_path: Path, envelope: Any
+) -> None:
+    api = _api()
+    value = envelope(api)
+
+    with pytest.raises(ValueError) as caught:
+        _store(tmp_path).publish(value)
+
+    rendered = str(caught.value) + repr(caught.value)
+    for secret in ("URL-LEAK", "HEADER-LEAK", "VALUE-LEAK", "BODY-LEAK"):
+        assert secret not in rendered
+
+
+def test_nested_root_ancestors_are_fsynced_before_callback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = _api()
+    existing = tmp_path / "existing"
+    existing.mkdir(mode=0o700)
+    real_fsync = os.fsync
+    events: list[str] = []
+
+    def traced_fsync(descriptor: int) -> None:
+        target = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        if ".tmp-" not in target.name:
+            events.append(target.name)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(api.os, "fsync", traced_fsync)
+    store = api.BlobStore(existing / "a" / "b" / "root")
+    store.publish_and_reference(b"nested", lambda _ref: events.append("callback"))
+
+    assert events.index("existing") < events.index("a") < events.index("b")
+    assert events.index("b") < events.index("root") < events.index("callback")
+
+
+def test_root_replacement_is_never_accepted_during_rapid_recreate_attempts(
+    tmp_path: Path,
+) -> None:
+    api = _api()
+    for attempt in range(200):
+        parent = tmp_path / f"attempt-{attempt}"
+        root = parent / "root"
+        store = api.BlobStore(root, filesystem_resolver=lambda _path: "ext4")
+        root.rename(parent / "pinned")
+        root.mkdir(mode=0o700)
+        try:
+            with pytest.raises(api.BlobSecurityError):
+                store.publish(b"must-not-publish")
+            assert not any(root.iterdir())
+        finally:
+            store.close()
+
+
+def test_blob_store_close_context_and_finalizer_do_not_leak_descriptors(
+    tmp_path: Path,
+) -> None:
+    api = _api()
+    gc.collect()
+    before = len(os.listdir("/proc/self/fd"))
+    for attempt in range(100):
+        store = api.BlobStore(
+            tmp_path / f"closed-{attempt}", filesystem_resolver=lambda _path: "ext4"
+        )
+        store.close()
+        store.close()
+    for attempt in range(100):
+        with api.BlobStore(
+            tmp_path / f"context-{attempt}", filesystem_resolver=lambda _path: "ext4"
+        ) as store:
+            store.publish(b"x")
+    for attempt in range(100):
+        store = api.BlobStore(
+            tmp_path / f"finalized-{attempt}", filesystem_resolver=lambda _path: "ext4"
+        )
+        del store
+    gc.collect()
+
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_json_redactor_rejects_oversize_keys_before_decoding() -> None:
+    api = _api()
+    body = b'{"' + b"a" * (api._MAX_JSON_KEY_BYTES + 1) + b'":0}'
+    with pytest.raises(ValueError, match="declared JSON body is unsafe"):
+        api._redact_json_bytes(body)
+
+
+def test_json_redactor_handles_default_maximum_with_linear_memory() -> None:
+    api = _api()
+    body = b'{"safe":"' + b"a" * (64 * 1024 * 1024 - 32) + b'"}'
+    tracemalloc.start()
+    try:
+        redacted = api._redact_json_bytes(body)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert redacted == body
+    assert peak < len(body) * 4
+
+
+def test_json_redactor_memory_is_bounded_for_one_megabyte_safe_document() -> None:
+    api = _api()
+    body = b'{"safe":"' + b"a" * (1024 * 1024) + b'","n":1.00}'
+    tracemalloc.start()
+    try:
+        redacted = api._redact_json_bytes(body)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert redacted == body
+    assert peak < len(body) * 10

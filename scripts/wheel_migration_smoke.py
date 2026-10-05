@@ -25,6 +25,7 @@ def main() -> int:
         subprocess.run(
             [
                 str(python),
+                "-B",
                 "-c",
                 "import sys; assert sys.version_info[:2] == (3, 12), sys.version",
             ],
@@ -32,7 +33,16 @@ def main() -> int:
             check=True,
         )
         subprocess.run(
-            [str(python), "-I", "-m", "pip", "install", "--no-deps", str(wheels[0])],
+            [
+                str(python),
+                "-I",
+                "-B",
+                "-m",
+                "pip",
+                "install",
+                "--no-deps",
+                str(wheels[0]),
+            ],
             cwd=outside,
             check=True,
         )
@@ -123,7 +133,7 @@ with tempfile.TemporaryDirectory(prefix="jev-wheel-db-") as temporary:
         connection.close()
 print("Installed-wheel migration and controlled journal write smoke passed.")
 """
-        subprocess.run([str(python), "-I", "-c", code], cwd=outside, check=True)
+        subprocess.run([str(python), "-I", "-B", "-c", code], cwd=outside, check=True)
     return 0
 
 

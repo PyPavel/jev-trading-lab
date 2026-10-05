@@ -718,6 +718,7 @@ def test_migration_helper_output_is_capped_while_streaming(
 ) -> None:
     command = (
         sys.executable,
+        "-B",
         "-c",
         "import os,time; os.write(1, b'x' * 20000); time.sleep(10)",
     )
@@ -734,10 +735,10 @@ def test_migration_helper_timeout_kills_process_group(
     pid_file = tmp_path / "grandchild.pid"
     code = (
         "import pathlib,subprocess,sys,time; "
-        "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
+        "p=subprocess.Popen([sys.executable,'-B','-c','import time; time.sleep(30)']); "
         "pathlib.Path(sys.argv[1]).write_text(str(p.pid)); time.sleep(30)"
     )
-    command = (sys.executable, "-c", code, str(pid_file))
+    command = (sys.executable, "-B", "-c", code, str(pid_file))
     monkeypatch.setattr(migration_module, "_helper_command", lambda *_args: command)
     monkeypatch.setattr(migration_module, "_HELPER_TIMEOUT_SECONDS", 0.2)
     with pytest.raises(Exception, match="timed out"):
@@ -755,12 +756,12 @@ def test_migration_helper_eof_still_enforces_lifetime_deadline(
     pid_file = tmp_path / "descendant.pid"
     code = (
         "import os,pathlib,subprocess,sys,time; "
-        "p=subprocess.Popen([sys.executable,'-c',"
+        "p=subprocess.Popen([sys.executable,'-B','-c',"
         "'import os,time; os.close(1); os.close(2); time.sleep(30)']); "
         "pathlib.Path(sys.argv[1]).write_text(str(p.pid)); "
         "os.close(1); os.close(2); time.sleep(1)"
     )
-    command = (sys.executable, "-c", code, str(pid_file))
+    command = (sys.executable, "-B", "-c", code, str(pid_file))
     monkeypatch.setattr(migration_module, "_helper_command", lambda *_args: command)
     monkeypatch.setattr(migration_module, "_HELPER_TIMEOUT_SECONDS", 0.1)
 
@@ -784,12 +785,12 @@ def test_successful_helper_cleans_same_group_descendant_after_parent_exit(
     reply = '{"protocol":1,"status":"ok"}'
     code = (
         "import os,pathlib,subprocess,sys; "
-        "p=subprocess.Popen([sys.executable,'-c',"
+        "p=subprocess.Popen([sys.executable,'-B','-c',"
         "'import os,time; os.close(1); os.close(2); time.sleep(30)']); "
         "pathlib.Path(sys.argv[1]).write_text(str(p.pid)); "
         f"os.write(1,{reply.encode()!r})"
     )
-    command = (sys.executable, "-c", code, str(pid_file))
+    command = (sys.executable, "-B", "-c", code, str(pid_file))
     monkeypatch.setattr(migration_module, "_helper_command", lambda *_args: command)
 
     completed = migration_module._run_migration_helper(Path("/tmp/db"), 1000, (1, 2))
@@ -808,6 +809,7 @@ def test_migration_helper_wait_keyboardinterrupt_kills_process_group(
     pid_file = tmp_path / "wait.pid"
     command = (
         sys.executable,
+        "-B",
         "-c",
         "import os,pathlib,sys,time; "
         "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
@@ -857,9 +859,10 @@ def test_migration_helper_baseexception_kills_and_reaps_process_group(
     pid_file = tmp_path / "helper.pid"
     command = (
         sys.executable,
+        "-B",
         "-c",
         "import os,pathlib,subprocess,sys,time; "
-        "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
+        "p=subprocess.Popen([sys.executable,'-B','-c','import time; time.sleep(30)']); "
         "pathlib.Path(sys.argv[1]).write_text(f'{os.getpid()} {p.pid}'); "
         "time.sleep(30)",
         str(pid_file),
@@ -928,7 +931,7 @@ def test_migration_helper_baseexception_kills_and_reaps_process_group(
 def test_migration_helper_enforces_one_combined_output_limit(
     monkeypatch: pytest.MonkeyPatch, code: str
 ) -> None:
-    command = (sys.executable, "-c", code)
+    command = (sys.executable, "-B", "-c", code)
     monkeypatch.setattr(migration_module, "_helper_command", lambda *_args: command)
 
     with pytest.raises(Exception, match="output exceeded"):
@@ -1185,7 +1188,7 @@ connection.close()
 assert events
 """
     result = subprocess.run(
-        [sys.executable, "-c", code, str(tmp_path / "audit" / "db.sqlite3")],
+        [sys.executable, "-B", "-c", code, str(tmp_path / "audit" / "db.sqlite3")],
         capture_output=True,
         text=True,
         check=False,

@@ -112,7 +112,7 @@ def test_manifest_hash_stable() -> None:
         f"print(load_manifest(Path({str(EXAMPLE)!r})).manifest_hash)"
     )
     result = subprocess.run(
-        [sys.executable, "-c", code],
+        [sys.executable, "-B", "-c", code],
         check=True,
         capture_output=True,
         text=True,

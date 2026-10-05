@@ -1891,7 +1891,7 @@ else:
     raise AssertionError("recursive resolver unexpectedly connected")
 """
     completed = subprocess.run(
-        [sys.executable, "-c", script],
+        [sys.executable, "-B", "-c", script],
         cwd=ROOT,
         check=True,
         capture_output=True,

@@ -34,7 +34,7 @@ EXPECTED_CONFIG_HASHES = {
 }
 EXPECTED_OPERATIONAL_HASHES = {
     "scripts/wheel_migration_smoke.py": (
-        "a9792c0e8dc9d7a9ed8a1ea57e1caf6f0b5eea03ecf8930bdef0ba394190568c"
+        "cc9789a277c503e229973cd2eca8662031a451cf3787a2e02143837366bfe68b"
     )
 }
 EXPECTED_SOURCE_HASHES = {
@@ -72,7 +72,7 @@ EXPECTED_SOURCE_HASHES = {
         "b4c2a856b006ee6bde860e8abff04c209915eb420e1c55425805e3e25042d133"
     ),
     "src/jev_trading_lab/persistence/blobs.py": (
-        "25e354fa6f136f2b19011e291b0b70989472743cb521e2fb9d1d485f55c5045b"
+        "9e78ded96f0ab990d5d8d932d3c82e624127c844fd582bfc220dc40a9b0118eb"
     ),
     "src/jev_trading_lab/persistence/journal.py": (
         "74c92b09eeb9c10e713c99354df7d40e43c2d90e7de0088968e95197f1a0dce2"
@@ -170,7 +170,9 @@ EXPECTED_TOOL = {
             },
         }
     },
-    "pytest": {"ini_options": {"testpaths": ["tests"]}},
+    "pytest": {
+        "ini_options": {"testpaths": ["tests"], "addopts": "--basetemp=.pytest-tmp"}
+    },
     "ruff": {
         "target-version": "py312",
         "line-length": 88,
@@ -246,7 +248,7 @@ jobs:
       - name: Verify policy preflight
         run: echo "{script_hash}  scripts/policy_preflight.py" | sha256sum -c -
       - name: Run policy preflight before dependency tooling
-        run: python3 -I scripts/policy_preflight.py
+        run: python3 -I -B scripts/policy_preflight.py
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
         with:
           version: "0.11.7"
@@ -268,7 +270,7 @@ jobs:
           --no-deps --disable-pip
       - run: uv build --no-build-isolation
       - run: JEV_REQUIRE_BUILT_ARTIFACTS=1 uv run pytest tests/test_package_policy.py -q
-      - run: uv run python scripts/wheel_migration_smoke.py
+      - run: uv run python -B scripts/wheel_migration_smoke.py
       # Clean-wheel render smoke becomes mandatory when those resources exist.
 '''.encode()
 

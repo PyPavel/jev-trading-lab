@@ -251,7 +251,7 @@ def test_fresh_process_identity_is_stable() -> None:
         "print(w.canonical_bytes.decode()); print(w.run_window_id)"
     )
     result = subprocess.run(
-        [sys.executable, "-c", code],
+        [sys.executable, "-B", "-c", code],
         check=True,
         capture_output=True,
         text=True,

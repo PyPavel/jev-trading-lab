@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import codecs
 import ctypes
 import errno
 import hashlib
@@ -11,6 +12,7 @@ import os
 import re
 import secrets
 import stat
+import threading
 import time
 import unicodedata
 from collections.abc import Callable, Mapping
@@ -31,6 +33,8 @@ _MAX_HEADER_NAME_BYTES = 1024
 _MAX_HEADER_VALUE_BYTES = 16 * 1024
 _MAX_HEADER_BYTES = 64 * 1024
 _MAX_QUERY_FIELDS = 256
+_MAX_JSON_DEPTH = 256
+_MAX_JSON_KEY_BYTES = 16 * 1024
 
 _SECRET_FIELDS = frozenset(
     {
@@ -182,6 +186,9 @@ _SECRET_HEADER_COMPACT = frozenset(
         "xapikey",
         "xauthtoken",
         "xamzsecuritytoken",
+        "clientsecret",
+        "accesstoken",
+        "refreshtoken",
     }
 )
 _SIGNED_QUERY_COMPACT = frozenset(
@@ -222,6 +229,11 @@ _SIGNED_QUERY_COMPACT = frozenset(
         "password",
         "session",
         "cookie",
+        "clientsecret",
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "code",
     }
 )
 
@@ -240,123 +252,136 @@ def _json_string_end(data: bytes, start: int) -> int:
         if byte == 0x22:
             return index + 1
         if byte == 0x5C:
-            index += 2
-        else:
-            if byte < 0x20:
-                raise ValueError("declared JSON body is unsafe")
             index += 1
+            if index >= len(data):
+                break
+            escape = data[index]
+            if escape == 0x75:
+                if index + 4 >= len(data) or any(
+                    item not in b"0123456789abcdefABCDEF"
+                    for item in data[index + 1 : index + 5]
+                ):
+                    raise ValueError("declared JSON body is unsafe")
+                index += 5
+                continue
+            if escape not in b'"\\/bfnrt':
+                raise ValueError("declared JSON body is unsafe")
+        elif byte < 0x20:
+            raise ValueError("declared JSON body is unsafe")
+        index += 1
     raise ValueError("declared JSON body is unsafe")
 
 
-def _contains_json_secret_marker(data: bytes) -> bool:
-    try:
-        text = data.decode("utf-8")
-    except UnicodeError:
-        return True
-    index = 0
-    while index < len(data):
-        if data[index] != 0x22:
-            index += 1
-            continue
-        try:
-            end = _json_string_end(data, index)
-            value = json.loads(data[index:end])
-        except (ValueError, UnicodeError, json.JSONDecodeError):
-            break
-        if type(value) is str and _is_secret_field(value):
-            return True
-        index = end
-    return any(item in _compact_secret_name(text) for item in _SECRET_FIELD_COMPACT)
-
-
 def _redact_json_bytes(data: bytes) -> bytes:
+    decoder = codecs.getincrementaldecoder("utf-8")()
     try:
-        text = data.decode("utf-8")
+        for start in range(0, len(data), _CHUNK_SIZE):
+            decoder.decode(memoryview(data)[start : start + _CHUNK_SIZE])
+        decoder.decode(b"", final=True)
     except UnicodeError:
         raise ValueError("declared JSON body is unsafe") from None
-    offsets: list[int] = [0]
-    for character in text:
-        offsets.append(offsets[-1] + len(character.encode("utf-8")))
-    spans: list[tuple[int, int]] = []
+    output = bytearray()
+    scalar = re.compile(
+        rb"(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)"
+    )
+
+    def copy(start: int, end: int) -> None:
+        output.extend(memoryview(data)[start:end])
 
     def skip(index: int) -> int:
+        start = index
         while index < len(data) and data[index] in b" \t\r\n":
             index += 1
+        copy(start, index)
         return index
 
-    def string(index: int) -> tuple[str, int]:
+    def string(index: int, *, decode: bool = False) -> tuple[str | None, int]:
         end = _json_string_end(data, index)
-        try:
-            value = json.loads(data[index:end])
-        except (UnicodeError, json.JSONDecodeError):
-            raise ValueError("declared JSON body is unsafe") from None
-        if type(value) is not str:
-            raise ValueError("declared JSON body is unsafe")
+        value: str | None = None
+        if decode:
+            try:
+                decoded = json.loads(data[index:end])
+            except (UnicodeError, json.JSONDecodeError):
+                raise ValueError("declared JSON body is unsafe") from None
+            if type(decoded) is not str:
+                raise ValueError("declared JSON body is unsafe")
+            value = decoded
+        copy(index, end)
         return value, end
 
-    def value(index: int, secret: bool = False) -> int:
+    def value(index: int, depth: int = 0, secret: bool = False) -> int:
+        if depth > _MAX_JSON_DEPTH:
+            raise ValueError("declared JSON body is unsafe")
         index = skip(index)
         if index >= len(data):
             raise ValueError("declared JSON body is unsafe")
         if data[index] == 0x22:
-            _item, end = string(index)
             if secret:
-                spans.append((index, end))
-            return end
+                end = _json_string_end(data, index)
+                output.extend(b'"[REDACTED]"')
+                return end
+            return string(index)[1]
         if secret:
             raise ValueError("declared JSON body is unsafe")
         if data[index] == 0x7B:
+            copy(index, index + 1)
             index = skip(index + 1)
             if index < len(data) and data[index] == 0x7D:
+                copy(index, index + 1)
                 return index + 1
             while True:
                 if index >= len(data) or data[index] != 0x22:
                     raise ValueError("declared JSON body is unsafe")
-                key, index = string(index)
+                key_start = index
+                key, index = string(index, decode=True)
+                if index - key_start > _MAX_JSON_KEY_BYTES:
+                    raise ValueError("declared JSON body is unsafe")
+                assert key is not None
                 index = skip(index)
                 if index >= len(data) or data[index] != 0x3A:
                     raise ValueError("declared JSON body is unsafe")
-                index = value(index + 1, _is_secret_field(key))
+                copy(index, index + 1)
+                index = value(index + 1, depth + 1, _is_secret_field(key))
                 index = skip(index)
                 if index < len(data) and data[index] == 0x7D:
+                    copy(index, index + 1)
                     return index + 1
                 if index >= len(data) or data[index] != 0x2C:
                     raise ValueError("declared JSON body is unsafe")
+                copy(index, index + 1)
                 index = skip(index + 1)
         if data[index] == 0x5B:
+            copy(index, index + 1)
             index = skip(index + 1)
             if index < len(data) and data[index] == 0x5D:
+                copy(index, index + 1)
                 return index + 1
             while True:
-                index = value(index)
+                index = value(index, depth + 1)
                 index = skip(index)
                 if index < len(data) and data[index] == 0x5D:
+                    copy(index, index + 1)
                     return index + 1
                 if index >= len(data) or data[index] != 0x2C:
                     raise ValueError("declared JSON body is unsafe")
+                copy(index, index + 1)
                 index = skip(index + 1)
-        match = re.match(
-            rb"(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)",
-            data[index:],
-        )
+        match = scalar.match(data, index)
         if match is None:
             raise ValueError("declared JSON body is unsafe")
-        return index + len(match.group())
+        copy(index, match.end())
+        return match.end()
 
     end = skip(value(0))
     if end != len(data):
         raise ValueError("declared JSON body is unsafe")
-    result = data
-    replacement = json.dumps(_REDACTED).encode("ascii")
-    for start, end in reversed(spans):
-        result = result[:start] + replacement + result[end:]
-    return result
+    return bytes(output)
 
 
 def _redact_url(value: str) -> str:
-    if len(value.encode("utf-8")) > _MAX_URL_BYTES:
-        raise ValueError("artifact URL exceeds maximum size")
     try:
+        if len(value.encode("utf-8")) > _MAX_URL_BYTES:
+            raise ValueError
         parsed = urlsplit(value)
         hostname = parsed.hostname
         if hostname is None:
@@ -411,10 +436,13 @@ def _redacted_payload(payload: bytes | ArtifactEnvelope, max_bytes: int) -> byte
     if minimum_envelope_bytes > max_bytes:
         raise ValueError("payload exceeds maximum size")
 
-    if payload.url is not None and len(payload.url.encode("utf-8")) > min(
-        max_bytes, _MAX_URL_BYTES
-    ):
-        raise ValueError("artifact URL exceeds maximum size")
+    if payload.url is not None:
+        try:
+            url_bytes = len(payload.url.encode("utf-8"))
+        except UnicodeError:
+            raise ValueError("artifact URL is invalid") from None
+        if url_bytes > min(max_bytes, _MAX_URL_BYTES):
+            raise ValueError("artifact URL exceeds maximum size")
     if payload.headers is not None and len(payload.headers) > _MAX_HEADERS:
         raise ValueError("envelope has too many headers")
     headers: dict[str, str] = {}
@@ -422,8 +450,11 @@ def _redacted_payload(payload: bytes | ArtifactEnvelope, max_bytes: int) -> byte
     for key, value in (payload.headers or {}).items():
         if type(key) is not str or type(value) is not str:
             raise TypeError("envelope headers must contain strings")
-        key_bytes = len(key.encode("utf-8"))
-        value_bytes = len(value.encode("utf-8"))
+        try:
+            key_bytes = len(key.encode("utf-8"))
+            value_bytes = len(value.encode("utf-8"))
+        except UnicodeError:
+            raise ValueError("envelope headers are invalid") from None
         header_bytes += key_bytes + value_bytes
         if (
             key_bytes > _MAX_HEADER_NAME_BYTES
@@ -447,31 +478,15 @@ def _redacted_payload(payload: bytes | ArtifactEnvelope, max_bytes: int) -> byte
     if "json" in content_type.casefold():
         try:
             redacted_body = _redact_json_bytes(payload.body)
-        except ValueError:
-            if _contains_json_secret_marker(payload.body):
-                raise ValueError("declared JSON body is unsafe") from None
-        else:
-            document["body_base64"] = base64.b64encode(redacted_body).decode("ascii")
+        except (UnicodeError, ValueError, json.JSONDecodeError):
+            raise ValueError("declared JSON body is unsafe") from None
+        document["body_base64"] = base64.b64encode(redacted_body).decode("ascii")
     result = json.dumps(
         document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode()
     if len(result) > max_bytes:
         raise ValueError("payload exceeds maximum size")
     return result
-
-
-def _reject_symlink_ancestors(path: Path) -> None:
-    current = Path(path.anchor)
-    for part in path.parts[1:]:
-        current /= part
-        try:
-            metadata = current.lstat()
-        except FileNotFoundError:
-            continue
-        except OSError as error:
-            raise BlobSecurityError("blob root ancestor is unavailable") from error
-        if stat.S_ISLNK(metadata.st_mode):
-            raise BlobSecurityError("blob root ancestor must not be a symlink")
 
 
 def _open_directory(path: Path) -> int:
@@ -495,7 +510,13 @@ def _validate_directory(
     return metadata
 
 
-def _ensure_child_directory(parent_fd: int, name: str) -> int:
+def _ensure_child_directory(
+    parent_fd: int,
+    name: str,
+    *,
+    label: str = "blob shard",
+    fsync_existing: bool = False,
+) -> tuple[int, bool]:
     created = False
     try:
         os.mkdir(name, 0o700, dir_fd=parent_fd)
@@ -508,17 +529,65 @@ def _ensure_child_directory(parent_fd: int, name: str) -> int:
     except OSError as error:
         raise BlobSecurityError("blob shard cannot be opened safely") from error
     try:
-        _validate_directory(descriptor, label="blob shard")
+        _validate_directory(descriptor, label=label)
     except BlobSecurityError:
         os.close(descriptor)
         raise
-    if created:
+    if created or fsync_existing:
         try:
             os.fsync(parent_fd)
         except BaseException:
             os.close(descriptor)
             raise
-    return descriptor
+    return descriptor, created
+
+
+def _open_or_create_root(root: Path, resolver: FilesystemResolver) -> int:
+    missing = [root.name]
+    ancestor = root.parent
+    while True:
+        try:
+            metadata = ancestor.lstat()
+        except FileNotFoundError:
+            if ancestor == ancestor.parent:
+                raise BlobSecurityError("blob root ancestor is unavailable") from None
+            missing.append(ancestor.name)
+            ancestor = ancestor.parent
+            continue
+        except OSError as error:
+            raise BlobSecurityError("blob root ancestor is unavailable") from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise BlobSecurityError("blob root ancestor must not be a symlink")
+        break
+
+    descriptors = [_open_directory(ancestor)]
+    created: list[bool] = []
+    names = list(reversed(missing))
+    try:
+        _validate_directory(descriptors[0], label="blob root ancestor")
+        for index, name in enumerate(names):
+            label = "blob root" if index == len(names) - 1 else "blob root ancestor"
+            descriptor, was_created = _ensure_child_directory(
+                descriptors[-1], name, label=label, fsync_existing=True
+            )
+            descriptors.append(descriptor)
+            created.append(was_created)
+        root_fd = descriptors[-1]
+        _require_local_filesystem(Path(f"/proc/self/fd/{root_fd}"), resolver)
+        descriptors.pop()
+    except BaseException:
+        for index in range(len(created) - 1, -1, -1):
+            if created[index]:
+                try:
+                    os.rmdir(names[index], dir_fd=descriptors[index])
+                    os.fsync(descriptors[index])
+                except OSError:
+                    pass
+        raise
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+    return root_fd
 
 
 def _rename_noreplace(source: str, target: str, directory_fd: int) -> None:
@@ -613,93 +682,71 @@ class BlobStore:
         root_path = Path(root)
         if not root_path.is_absolute():
             root_path = root_path.absolute()
-        _reject_symlink_ancestors(root_path.parent)
-        root_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        _reject_symlink_ancestors(root_path.parent)
-        parent_fd = _open_directory(root_path.parent)
-        created = False
-        try:
-            try:
-                os.mkdir(root_path.name, 0o700, dir_fd=parent_fd)
-                created = True
-            except FileExistsError:
-                pass
-            flags = (
-                os.O_RDONLY
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
-            )
-            try:
-                root_fd = os.open(root_path.name, flags, dir_fd=parent_fd)
-            except OSError as error:
-                raise BlobSecurityError(
-                    "blob directory cannot be opened safely"
-                ) from error
-            try:
-                root_metadata = _validate_directory(root_fd, label="blob root")
-                if created:
-                    os.fsync(parent_fd)
-                _require_local_filesystem(
-                    Path(f"/proc/self/fd/{root_fd}"), filesystem_resolver
-                )
-            except BaseException:
-                os.close(root_fd)
-                if created:
-                    try:
-                        os.rmdir(root_path.name, dir_fd=parent_fd)
-                    except OSError:
-                        pass
-                raise
-            os.close(root_fd)
-        finally:
-            os.close(parent_fd)
+        root_fd = _open_or_create_root(root_path, filesystem_resolver)
         self.root = root_path
-        self._root_identity = (root_metadata.st_dev, root_metadata.st_ino)
         self.max_bytes = max_bytes
         self._failpoint = failpoint or (lambda _name: None)
+        self._root_fd = root_fd
+        self._state_lock = threading.Lock()
         self._closed = False
 
     def close(self) -> None:
-        self._closed = True
+        with self._state_lock:
+            if not self._closed:
+                os.close(self._root_fd)
+                self._closed = True
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except (AttributeError, OSError):
+            pass
 
     def __enter__(self) -> BlobStore:
-        if self._closed:
-            raise BlobSecurityError("blob store is closed")
+        with self._state_lock:
+            if self._closed:
+                raise BlobSecurityError("blob store is closed")
         return self
 
     def __exit__(self, *_args: object) -> None:
         self.close()
 
     def _open_root(self) -> int:
-        if self._closed:
-            raise BlobSecurityError("blob store is closed")
-        parent_fd = _open_directory(self.root.parent)
-        flags = (
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        )
-        try:
-            descriptor = os.open(self.root.name, flags, dir_fd=parent_fd)
-        except OSError as error:
-            raise BlobSecurityError("blob directory cannot be opened safely") from error
-        finally:
-            os.close(parent_fd)
-        try:
-            metadata = _validate_directory(descriptor, label="blob root")
-            if (metadata.st_dev, metadata.st_ino) != self._root_identity:
-                raise BlobSecurityError("blob root identity changed")
-        except BaseException:
-            os.close(descriptor)
-            raise
-        return descriptor
+        with self._state_lock:
+            if self._closed:
+                raise BlobSecurityError("blob store is closed")
+            pinned = _validate_directory(self._root_fd, label="blob root")
+            parent_fd = _open_directory(self.root.parent)
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                visible_fd = os.open(self.root.name, flags, dir_fd=parent_fd)
+            except OSError as error:
+                raise BlobSecurityError(
+                    "blob directory cannot be opened safely"
+                ) from error
+            finally:
+                os.close(parent_fd)
+            try:
+                visible = _validate_directory(visible_fd, label="blob root")
+                if not os.path.samestat(pinned, visible):
+                    raise BlobSecurityError("blob root identity changed")
+                return os.dup(self._root_fd)
+            finally:
+                os.close(visible_fd)
 
     def _open_shard(self, digest: str) -> int:
         root_fd = self._open_root()
         try:
-            first_fd = _ensure_child_directory(root_fd, digest[:2])
+            first_fd, _created = _ensure_child_directory(root_fd, digest[:2])
         finally:
             os.close(root_fd)
         try:
-            return _ensure_child_directory(first_fd, digest[2:4])
+            descriptor, _created = _ensure_child_directory(first_fd, digest[2:4])
+            return descriptor
         finally:
             os.close(first_fd)
 

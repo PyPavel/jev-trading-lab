@@ -162,7 +162,7 @@ _APPROVED_CONFIG_HASHES = {
 }
 _APPROVED_OPERATIONAL_HASHES = {
     "scripts/wheel_migration_smoke.py": (
-        "a9792c0e8dc9d7a9ed8a1ea57e1caf6f0b5eea03ecf8930bdef0ba394190568c"
+        "cc9789a277c503e229973cd2eca8662031a451cf3787a2e02143837366bfe68b"
     )
 }
 _APPROVED_SOURCE_HASHES = {
@@ -200,7 +200,7 @@ _APPROVED_SOURCE_HASHES = {
         "b4c2a856b006ee6bde860e8abff04c209915eb420e1c55425805e3e25042d133"
     ),
     "src/jev_trading_lab/persistence/blobs.py": (
-        "25e354fa6f136f2b19011e291b0b70989472743cb521e2fb9d1d485f55c5045b"
+        "9e78ded96f0ab990d5d8d932d3c82e624127c844fd582bfc220dc40a9b0118eb"
     ),
     "src/jev_trading_lab/persistence/journal.py": (
         "74c92b09eeb9c10e713c99354df7d40e43c2d90e7de0088968e95197f1a0dce2"
@@ -268,7 +268,9 @@ _ALLOWED_TOOL_CONFIG = {
             },
         }
     },
-    "pytest": {"ini_options": {"testpaths": ["tests"]}},
+    "pytest": {
+        "ini_options": {"testpaths": ["tests"], "addopts": "--basetemp=.pytest-tmp"}
+    },
     "ruff": {
         "target-version": "py312",
         "line-length": 88,
@@ -283,10 +285,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "334517eea5b8893a85059b81fae07d13df14fdfccd4027a20cd922a722810fcf"
+    "9d7a7780ba94185432406a731b9938fe7bcdbb3c4cc6da22ed5542ad01cfe2f0"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "eff06bebe331f2e1084a90c366ba6227ecacc3d9ebbb8ff7d0eff64625e8c210"
+    "e88b5ede4ea233c5bd8016154c97fbdafb8021820a8bebec00ef08523b32dff3"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = [
     "exchange-calendars==4.11.2",
@@ -1069,7 +1071,7 @@ def _copy_preflight_fixture(tmp_path: Path) -> Path:
 
 def _run_preflight(repo: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["python3", "-I", "scripts/policy_preflight.py"],
+        ["python3", "-I", "-B", "scripts/policy_preflight.py"],
         cwd=repo,
         capture_output=True,
         text=True,
@@ -1237,7 +1239,7 @@ def test_preflight_rejects_registry_artifact_substitution(tmp_path: Path) -> Non
         )
         assert sync.returncode == 0, sync.stderr
         subprocess.run(
-            [str(environment / "bin/python"), "-c", "pass"],
+            [str(environment / "bin/python"), "-B", "-c", "pass"],
             cwd=repo,
             check=True,
             capture_output=True,
@@ -1389,11 +1391,13 @@ def test_ci_uses_immutable_actions_and_locked_audit() -> None:
     assert "persist-credentials: false" in checkout_block
     assert "permissions:\n  contents: read" in workflow
     assert 'PYTHONDONTWRITEBYTECODE: "1"' in workflow
+    assert "run: python3 -I -B scripts/policy_preflight.py" in workflow
+    assert "run: uv run python -B scripts/wheel_migration_smoke.py" in workflow
     hash_check = (
         f'echo "{_APPROVED_PREFLIGHT_HASH}  scripts/policy_preflight.py" '
         "| sha256sum -c -"
     )
-    preflight = "run: python3 -I scripts/policy_preflight.py"
+    preflight = "run: python3 -I -B scripts/policy_preflight.py"
     assert hash_check in workflow
     assert preflight in workflow
     assert workflow.index(hash_check) < workflow.index(preflight)
@@ -1422,6 +1426,7 @@ def test_required_artifact_mode_fails_instead_of_skipping_missing_dist(
     result = subprocess.run(
         [
             sys.executable,
+            "-B",
             "-m",
             "pytest",
             str(test_file),
@@ -1447,7 +1452,7 @@ def test_ci_builds_before_required_artifact_policy_and_wheel_smoke() -> None:
         "run: JEV_REQUIRE_BUILT_ARTIFACTS=1 "
         "uv run pytest tests/test_package_policy.py -q"
     )
-    smoke = "run: uv run python scripts/wheel_migration_smoke.py"
+    smoke = "run: uv run python -B scripts/wheel_migration_smoke.py"
     assert artifact_policy in workflow
     assert smoke in workflow
     assert (
@@ -1599,3 +1604,29 @@ def test_built_artifacts_exclude_repository_and_host_junk(tmp_path: Path) -> Non
         "jev_trading_lab/stocks/calendar.py",
     }
     assert not _wheel_entry_point_violations(wheel)
+
+
+def test_python_subprocess_path_cannot_create_source_bytecode(tmp_path: Path) -> None:
+    source_caches = tuple(SRC.rglob("__pycache__"))
+    assert source_caches == ()
+    code = (
+        "from jev_trading_lab.persistence.blobs import BlobStore; "
+        "s=BlobStore(__import__('pathlib').Path(__import__('sys').argv[1]), "
+        "filesystem_resolver=lambda _:'ext4'); s.publish(b'x'); s.close()"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", code, str(tmp_path / "root")],
+        cwd=ROOT,
+        env={
+            key: value
+            for key, value in os.environ.items()
+            if key != "PYTHONDONTWRITEBYTECODE"
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert tuple(SRC.rglob("__pycache__")) == ()
