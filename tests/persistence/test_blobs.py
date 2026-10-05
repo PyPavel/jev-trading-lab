@@ -1793,6 +1793,236 @@ def test_malformed_terminal_version_chain_fails_closed(name: str) -> None:
     assert _api()._is_secret_field(name)
 
 
+_EXACT_ONLY_CREDENTIALS = {
+    "query": (
+        "awsaccesskeyid",
+        "code",
+        "credential",
+        "googleaccessid",
+        "key",
+        "keypairid",
+        "policy",
+        "se",
+        "secret",
+        "si",
+        "sig",
+        "signature",
+        "sip",
+        "sp",
+        "spr",
+        "sr",
+        "st",
+        "sv",
+        "token",
+        "xgoogalgorithm",
+        "xgoogcredential",
+        "xgoogdate",
+        "xgoogexpires",
+        "xgoogsignature",
+        "xgoogsignedheaders",
+    ),
+    "header": ("authorization", "proxyauth", "proxyauthorization"),
+    "json": ("authorization", "secret", "token"),
+}
+_EXACT_VERSION_VARIANTS = (
+    "underscore-v1",
+    "hyphen-v2",
+    "dot-3",
+    "attached-2",
+    "attached-V2",
+    "long-chain",
+    "maximum-chain",
+    "nfkc-camel-mixed",
+    "malformed-v1v",
+    "malformed-vv2",
+)
+
+
+def _exact_allowlist_parameters() -> tuple[Any, ...]:
+    return tuple(
+        pytest.param(surface, base, id=f"{surface}-{base}")
+        for surface, bases in _EXACT_ONLY_CREDENTIALS.items()
+        for base in bases
+    )
+
+
+def _mixed_exact_name(base: str) -> str:
+    pieces = [
+        (chr(ord(character.upper()) + 0xFEE0) if index == 0 else character.upper())
+        for index, character in enumerate(base)
+    ]
+    return "_-．".join(pieces)
+
+
+def _maximum_version_suffix(length: int) -> str:
+    repetitions, remainder = divmod(length, 3)
+    prefix = ("", "v", "v1")[remainder]
+    return prefix + "_v1" * repetitions
+
+
+def _exact_versioned_name(
+    base: str, variant: str, surface: str, *, escaped: bool = False
+) -> str:
+    suffixes = {
+        "underscore-v1": "_v1",
+        "hyphen-v2": "-v2",
+        "dot-3": ".3",
+        "attached-2": "2",
+        "attached-V2": "V2",
+        "long-chain": "_v1-v2.3V4_v5-v6.7V8_v9-v10",
+        "malformed-v1v": "v1v",
+        "malformed-vv2": "vv2",
+    }
+    if variant == "nfkc-camel-mixed":
+        return _mixed_exact_name(base) + "＿ｖ１-V2.3"
+    if variant == "maximum-chain":
+        escape_overhead = 5 if escaped else 0
+        limits = {
+            "query": _api()._MAX_URL_BYTES
+            - len("https://e.test/?=EXACT-CREDENTIAL-LEAK"),
+            "header": _api()._MAX_HEADER_NAME_BYTES,
+            "json": _api()._MAX_JSON_KEY_BYTES - 2 - escape_overhead,
+        }
+        return base + _maximum_version_suffix(limits[surface] - len(base))
+    return base + suffixes[variant]
+
+
+def _json_credential_body(name: str, value: str, *, escaped: bool = False) -> bytes:
+    encoded_name = json.dumps(name, ensure_ascii=False)
+    if escaped:
+        encoded_name = f'"\\u{ord(name[0]):04x}{encoded_name[2:]}'
+    return f"{{{encoded_name}:{json.dumps(value)}}}".encode()
+
+
+def _credential_envelope(
+    surface: str, name: str, value: str, *, escaped: bool = False
+) -> Any:
+    api = _api()
+    if surface == "query":
+        return api.ArtifactEnvelope(
+            body=b"opaque", url=f"https://e.test/?{name}={value}"
+        )
+    if surface == "header":
+        return api.ArtifactEnvelope(body=b"opaque", headers={name: value})
+    return api.ArtifactEnvelope(
+        body=_json_credential_body(name, value, escaped=escaped),
+        headers={"Content-Type": "application/json"},
+    )
+
+
+def test_exact_only_credential_families_match_current_surface_allowlists() -> None:
+    api = _api()
+    phrases = api._CREDENTIAL_TERMINAL_PHRASES
+    expected = {
+        "query": tuple(
+            sorted(
+                name
+                for name in api._SIGNED_QUERY_COMPACT
+                if not name.startswith("xamz") and not name.endswith(phrases)
+            )
+        ),
+        "header": tuple(
+            sorted(
+                name
+                for name in api._SECRET_HEADER_COMPACT
+                if not name.endswith(phrases)
+            )
+        ),
+        "json": tuple(
+            sorted(
+                name for name in api._SECRET_FIELD_COMPACT if not name.endswith(phrases)
+            )
+        ),
+    }
+
+    assert _EXACT_ONLY_CREDENTIALS == expected
+
+
+@pytest.mark.parametrize("variant", _EXACT_VERSION_VARIANTS)
+@pytest.mark.parametrize("surface,base", _exact_allowlist_parameters())
+def test_versioned_exact_allowlist_credentials_are_absent_from_every_observable_surface(
+    tmp_path: Path, surface: str, base: str, variant: str
+) -> None:
+    name = _exact_versioned_name(base, variant, surface)
+    secret = "EXACT-CREDENTIAL-LEAK"
+    envelope = _credential_envelope(surface, name, secret)
+
+    with _store(tmp_path) as store:
+        ref = store.publish(envelope)
+        serialized = store.read_verified(ref)
+        on_disk = _final_path(store, ref).read_bytes()
+    decoded_body = __import__("base64").b64decode(json.loads(serialized)["body_base64"])
+
+    assert secret.encode() not in serialized
+    assert secret.encode() not in on_disk
+    assert secret.encode() not in decoded_body
+    assert secret not in repr(envelope)
+
+
+@pytest.mark.parametrize("base", _EXACT_ONLY_CREDENTIALS["json"])
+@pytest.mark.parametrize("variant", _EXACT_VERSION_VARIANTS)
+def test_versioned_exact_allowlist_escaped_json_keys_are_redacted(
+    tmp_path: Path, base: str, variant: str
+) -> None:
+    name = _exact_versioned_name(base, variant, "json", escaped=True)
+    secret = "ESCAPED-EXACT-CREDENTIAL-LEAK"
+    envelope = _credential_envelope("json", name, secret, escaped=True)
+
+    with _store(tmp_path) as store:
+        ref = store.publish(envelope)
+        serialized = store.read_verified(ref)
+        on_disk = _final_path(store, ref).read_bytes()
+    decoded_body = __import__("base64").b64decode(json.loads(serialized)["body_base64"])
+
+    assert secret.encode() not in serialized
+    assert secret.encode() not in on_disk
+    assert secret.encode() not in decoded_body
+    assert secret not in repr(envelope)
+
+
+@pytest.mark.parametrize("variant", _EXACT_VERSION_VARIANTS)
+@pytest.mark.parametrize("surface,base", _exact_allowlist_parameters())
+def test_versioned_exact_allowlist_near_misses_remain_exact(
+    tmp_path: Path, surface: str, base: str, variant: str
+) -> None:
+    name = _exact_versioned_name(base + "metadata", variant, surface)
+    marker = "SAFE-EXACT-NEAR-MISS"
+    envelope = _credential_envelope(surface, name, marker)
+
+    with _store(tmp_path) as store:
+        ref = store.publish(envelope)
+        serialized = store.read_verified(ref)
+        on_disk = _final_path(store, ref).read_bytes()
+    decoded_body = __import__("base64").b64decode(json.loads(serialized)["body_base64"])
+
+    if surface == "json":
+        assert marker.encode() in decoded_body
+    else:
+        assert marker.encode() in serialized
+        assert marker.encode() in on_disk
+
+
+@pytest.mark.parametrize("variant", _EXACT_VERSION_VARIANTS)
+@pytest.mark.parametrize("surface,base", _exact_allowlist_parameters())
+def test_versioned_exact_allowlist_errors_and_repr_never_expose_values(
+    tmp_path: Path, surface: str, base: str, variant: str
+) -> None:
+    name = _exact_versioned_name(base, variant, surface)
+    secret = "EXACT-CREDENTIAL-LEAK"
+    envelope = _credential_envelope(surface, name, secret)
+    envelope = _api().ArtifactEnvelope(
+        body=envelope.body[:-1],
+        url=envelope.url,
+        headers={**(envelope.headers or {}), "Content-Type": "application/json"},
+    )
+
+    with pytest.raises(ValueError) as caught:
+        _store(tmp_path).publish(envelope)
+
+    rendered = str(caught.value) + repr(caught.value) + repr(envelope)
+    assert secret not in rendered
+
+
 def test_oauth_body_redaction_and_stored_bytes(tmp_path: Path) -> None:
     api = _api()
     body = (

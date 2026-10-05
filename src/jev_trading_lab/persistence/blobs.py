@@ -297,7 +297,9 @@ _CREDENTIAL_TERMINAL_PHRASES = (
 )
 
 
-def _strip_credential_versions(compact: str) -> str:
+def _strip_credential_versions(
+    compact: str, exact: frozenset[str] = frozenset()
+) -> str:
     end = len(compact)
     cursor = end
     while cursor:
@@ -305,6 +307,9 @@ def _strip_credential_versions(compact: str) -> str:
         while cursor and compact[cursor - 1].isdecimal():
             cursor -= 1
         if cursor < component_end:
+            if any(cursor == len(item) and compact.startswith(item) for item in exact):
+                end = cursor
+                break
             if cursor and compact[cursor - 1] == "v":
                 cursor -= 1
         elif compact[cursor - 1] == "v":
@@ -312,13 +317,19 @@ def _strip_credential_versions(compact: str) -> str:
         else:
             break
         end = cursor
+        if any(end == len(item) and compact.startswith(item) for item in exact):
+            break
     return compact[:end]
 
 
 def _is_structured_credential_name(name: str, exact: frozenset[str]) -> bool:
     _words, compact = _secret_name_forms(name)
-    candidate = _strip_credential_versions(compact)
-    return compact in exact or candidate.endswith(_CREDENTIAL_TERMINAL_PHRASES)
+    candidate = _strip_credential_versions(compact, exact)
+    return (
+        compact in exact
+        or candidate in exact
+        or candidate.endswith(_CREDENTIAL_TERMINAL_PHRASES)
+    )
 
 
 def _is_secret_field(name: str) -> bool:
