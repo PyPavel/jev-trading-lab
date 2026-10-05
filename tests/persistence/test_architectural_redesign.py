@@ -337,32 +337,25 @@ def test_connection_close_uses_one_success_gated_cleanup_helper() -> None:
     assert "_close_sqlite_with_handle" in internal
 
 
-def test_secure_close_signal_during_post_sqlite_cleanup_relinquishes_provenance(
+def test_secure_close_cooperative_cancellation_after_ownership_relinquishes_provenance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    connection = _connect(tmp_path / "signal-close" / "db.sqlite3")
+    connection = _connect(tmp_path / "cooperative-close" / "db.sqlite3")
     handle = db_module._secure_slot(connection, "_directory_handle")
     assert isinstance(handle, db_module._DirectoryHandle)
     descriptor = handle.descriptor
     real_close = os.close
 
-    def interrupting_close(fd: int) -> None:
+    def cancel_at_owned_close(fd: int) -> None:
         if fd == descriptor:
-            signal.setitimer(signal.ITIMER_REAL, 0.01)
-            time.sleep(1)
+            raise KeyboardInterrupt("cooperative close cancellation")
         real_close(fd)
 
-    def interrupt(_signum: int, _frame: object) -> None:
-        raise KeyboardInterrupt("scheduled close interruption")
-
-    previous = signal.signal(signal.SIGALRM, interrupt)
-    monkeypatch.setattr(db_module.os, "close", interrupting_close)
+    monkeypatch.setattr(db_module.os, "close", cancel_at_owned_close)
     try:
-        with pytest.raises(KeyboardInterrupt, match="scheduled close interruption"):
+        with pytest.raises(KeyboardInterrupt, match="cooperative close cancellation"):
             connection.close()
     finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
         monkeypatch.undo()
 
     assert handle.closed
@@ -1125,24 +1118,43 @@ def test_source_policy_states_precise_lifetime_boundary() -> None:
             )
         ).split()
     ).casefold()
+    acquisition_exclusion = (
+        "asynchronous python signal/keyboardinterrupt/systemexit delivery during "
+        "native resource acquisition or before python ownership/cleanup guard is "
+        "established"
+    )
     required = (
         "passive trace/profile/audit hooks",
-        "ordinary signal cancellation",
+        (
+            "cooperative cancellation at documented safe points after ownership "
+            "is established"
+        ),
+        (
+            "exceptions during blocking operations where cleanup guards already "
+            "own resources"
+        ),
         "public api callbacks using the public handle",
         "trusted fixed packaged helper",
         "ordinary hangs, crashes, closed pipes, same-group descendants, "
         "and output overflow",
-        "keyboardinterrupt/systemexit during normal blocking operations",
+        acquisition_exclusion,
         "exact bytecode between c resource acquisition and python ownership assignment",
         "frame inspection",
         "private helper import",
         "base descriptors",
         "process memory",
         "setsid escape",
-        "does not promise bytecode atomicity",
+        "does not promise acquisition or bytecode atomicity",
     )
     for claim in required:
         assert claim in policy
+    broad_signal_claims = (
+        "ordinary signal cancellation",
+        "asynchronous signal cancellation",
+    )
+    if any(claim in policy for claim in broad_signal_claims):
+        assert acquisition_exclusion in policy
+    assert "ordinary signal cancellation" not in policy
     forbidden_overclaims = (
         "every baseexception after popen",
         "trace interruption after real close cannot",

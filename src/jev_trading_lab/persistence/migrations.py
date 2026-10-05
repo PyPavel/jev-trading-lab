@@ -6,9 +6,9 @@ committed independently, so no migration prefix may expose an unguarded table.
 Filesystem package resources require trusted parent metadata; archive Traversables
 use bounded streams and rely on the exact locked, hash-protected wheel artifact.
 Migration connections are dedicated: this runner owns and clears the authorizer.
-The trusted fixed packaged helper is supervised for ordinary hangs,
-crashes, closed pipes, same-group descendants, and output overflow, plus parent
-``KeyboardInterrupt``/``SystemExit`` during normal blocking operations. Malicious
+The trusted fixed packaged helper is supervised for ordinary hangs, crashes, closed
+pipes, same-group descendants, and output overflow. Exceptions during blocking
+operations where cleanup guards already own resources trigger helper cleanup. Malicious
 replacement/modification of the helper, including a setsid escape, is excluded.
 """
 

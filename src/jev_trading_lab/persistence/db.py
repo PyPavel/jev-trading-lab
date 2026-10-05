@@ -1,12 +1,15 @@
 """Create SQLite connections that satisfy the local persistence contract.
 
-The supported lifetime boundary includes passive trace/profile/audit hooks, ordinary
-signal cancellation, and public API callbacks using the public handle. It supports
-KeyboardInterrupt/SystemExit during normal blocking operations. Deliberate
-private-capability sabotage is excluded: a malicious trace/profile callback raising
-at the exact bytecode between C resource acquisition and Python ownership assignment,
-frame inspection, private helper import, base descriptors, or process memory access.
-The implementation does not promise bytecode atomicity.
+The supported lifetime boundary includes passive trace/profile/audit hooks, public API
+callbacks using the public handle, cooperative cancellation at documented safe points
+after ownership is established, and exceptions during blocking operations where
+cleanup guards already own resources. Unsupported cases include asynchronous Python
+signal/KeyboardInterrupt/SystemExit delivery during native resource acquisition or
+before Python ownership/cleanup guard is established; a malicious trace/profile
+callback raising at the exact bytecode between C resource acquisition and Python
+ownership assignment; frame inspection; private helper import; base descriptors; and
+process memory access. The implementation does not promise acquisition or bytecode
+atomicity.
 """
 
 from __future__ import annotations
