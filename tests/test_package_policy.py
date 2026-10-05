@@ -283,10 +283,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "4c6e82534d220c7068d439b038148f48470ba3743a05c60c8c0525cb27e1a3c3"
+    "334517eea5b8893a85059b81fae07d13df14fdfccd4027a20cd922a722810fcf"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "2a93dd79d494aef6743cbd1d08c0f149b9039f20c45e60c678215db8d7dbb6dc"
+    "eff06bebe331f2e1084a90c366ba6227ecacc3d9ebbb8ff7d0eff64625e8c210"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = [
     "exchange-calendars==4.11.2",
