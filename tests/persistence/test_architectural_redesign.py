@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import inspect
 import os
@@ -324,46 +325,60 @@ def test_append_rejects_schema_prefix_checksum_drift(tmp_path: Path) -> None:
         connection.close()
 
 
-def test_directory_handle_close_is_idempotent_and_retains_on_failure(
-    monkeypatch: pytest.MonkeyPatch,
+def test_directory_handle_ambiguous_close_never_closes_reused_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    closed: list[int] = []
-    observed_open = False
-    handle = db_module._DirectoryHandle(123)
+    owned = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    handle = db_module._DirectoryHandle(owned)
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_text("safe", encoding="utf-8")
+    real_close = os.close
+    reused: int | None = None
 
-    def close_fd(fd: int) -> None:
-        nonlocal observed_open
-        observed_open = not handle.closed
-        closed.append(fd)
-        if len(closed) == 1:
-            raise RuntimeError("close failed before ownership ended")
+    def close_then_interrupt(fd: int) -> None:
+        nonlocal reused
+        real_close(fd)
+        replacement = os.open(sentinel, os.O_RDONLY)
+        if replacement != fd:
+            os.dup2(replacement, fd)
+            real_close(replacement)
+        reused = fd
+        raise KeyboardInterrupt
 
-    monkeypatch.setattr(db_module.os, "close", close_fd)
-    with pytest.raises(RuntimeError, match="close failed"):
-        handle.close()
-    handle.close()
-    assert observed_open
-    assert closed == [123, 123]
-
-
-def test_directory_handle_close_retries_after_interruption(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[int] = []
-    handle = db_module._DirectoryHandle(123)
-
-    def close_fd(fd: int) -> None:
-        calls.append(fd)
-        if len(calls) == 1:
-            raise KeyboardInterrupt
-
-    monkeypatch.setattr(db_module.os, "close", close_fd)
+    monkeypatch.setattr(db_module.os, "close", close_then_interrupt)
     with pytest.raises(KeyboardInterrupt):
         handle.close()
-    assert not handle.closed
-    handle.close()
     assert handle.closed
-    assert calls == [123, 123]
+    assert reused == owned
+
+    handle.close()
+    del handle
+    gc.collect()
+    assert os.fstat(owned).st_ino == sentinel.stat().st_ino
+    real_close(owned)
+
+
+def test_directory_handle_ordinary_close_has_no_leak(tmp_path: Path) -> None:
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    handle = db_module._DirectoryHandle(descriptor)
+
+    handle.close()
+    handle.close()
+
+    assert handle.closed
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_directory_handle_finalizer_closes_owned_fd(tmp_path: Path) -> None:
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    handle = db_module._DirectoryHandle(descriptor)
+
+    del handle
+    gc.collect()
+
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
 
 
 def test_internal_writer_cleanup_preserves_original_exception(
@@ -446,6 +461,90 @@ def test_migration_helper_timeout_kills_process_group(
     assert not Path(f"/proc/{child_pid}").exists()
 
 
+def test_migration_helper_baseexception_kills_and_reaps_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_file = tmp_path / "helper.pid"
+    command = (
+        sys.executable,
+        "-c",
+        "import os,pathlib,subprocess,sys,time; "
+        "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
+        "pathlib.Path(sys.argv[1]).write_text(f'{os.getpid()} {p.pid}'); "
+        "time.sleep(30)",
+        str(pid_file),
+    )
+    real_selector = migration_module.selectors.DefaultSelector
+
+    class InterruptingSelector:
+        def __init__(self) -> None:
+            self._selector = real_selector()
+
+        def register(self, fileobj: object, events: int) -> object:
+            return self._selector.register(fileobj, events)  # type: ignore[arg-type]
+
+        def get_map(self) -> object:
+            return self._selector.get_map()
+
+        def select(self, _timeout: float | None = None) -> object:
+            deadline = time.monotonic() + 2
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert pid_file.exists()
+            raise KeyboardInterrupt("selector interrupted")
+
+        def close(self) -> None:
+            self._selector.close()
+
+    monkeypatch.setattr(migration_module, "_helper_command", lambda *_args: command)
+    monkeypatch.setattr(
+        migration_module.selectors, "DefaultSelector", InterruptingSelector
+    )
+    with pytest.raises(KeyboardInterrupt, match="selector interrupted"):
+        migration_module._run_migration_helper(Path("/tmp/db"), 1000, (1, 2))
+
+    helper_pid, child_pid = (int(value) for value in pid_file.read_text().split())
+    deadline = time.monotonic() + 2
+    while (
+        any(Path(f"/proc/{pid}").exists() for pid in (helper_pid, child_pid))
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
+    remained = [pid for pid in (helper_pid, child_pid) if Path(f"/proc/{pid}").exists()]
+    if remained:
+        try:
+            os.killpg(helper_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(helper_pid, 0)
+        except ChildProcessError:
+            pass
+    assert not remained
+
+
+@pytest.mark.parametrize(
+    "code",
+    (
+        "import os; os.write(1, b'x' * 16385)",
+        "import os; os.write(2, b'x' * 16385)",
+        "import os; os.write(1, b'x' * 12000); os.write(2, b'y' * 12000)",
+        "import os; "
+        "[(os.write(1, b'x' * 1024), os.write(2, b'y' * 1024)) for _ in range(9)]",
+        "import os; os.write(1, b'x' * 16384); os.write(2, b'!')",
+    ),
+    ids=("stdout", "stderr", "combined", "interleaved", "trailing"),
+)
+def test_migration_helper_enforces_one_combined_output_limit(
+    monkeypatch: pytest.MonkeyPatch, code: str
+) -> None:
+    command = (sys.executable, "-c", code)
+    monkeypatch.setattr(migration_module, "_helper_command", lambda *_args: command)
+
+    with pytest.raises(Exception, match="output exceeded"):
+        migration_module._run_migration_helper(Path("/tmp/db"), 1000, (1, 2))
+
+
 @pytest.mark.parametrize(
     "completed,match",
     (
@@ -478,6 +577,31 @@ def test_post_commit_reply_loss_uses_database_readback(
         return subprocess.CompletedProcess(completed.args, 17, b"", b"lost reply")
 
     monkeypatch.setattr(migration_module, "_run_migration_helper", lose_reply)
+    try:
+        apply_migrations(connection)
+        assert (
+            connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0]
+            == 3
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("reply", (b"", b"{", b'{"protocol":1'))
+def test_complete_prefix_wins_over_malformed_success_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reply: bytes
+) -> None:
+    connection = _connect(tmp_path / f"malformed-{len(reply)}" / "db.sqlite3")
+    real_run = migration_module._run_migration_helper
+
+    def corrupt_reply(
+        path: Path, timeout_ms: int, identity: tuple[int, int]
+    ) -> subprocess.CompletedProcess[bytes]:
+        completed = real_run(path, timeout_ms, identity)
+        assert completed.returncode == 0
+        return subprocess.CompletedProcess(completed.args, 0, reply, b"")
+
+    monkeypatch.setattr(migration_module, "_run_migration_helper", corrupt_reply)
     try:
         apply_migrations(connection)
         assert (
@@ -525,6 +649,61 @@ def test_private_writer_rejects_database_inode_replacement(tmp_path: Path) -> No
             apply_migrations(connection)
     finally:
         connection.close()
+
+
+def test_private_writer_binds_sqlite_fd_across_swap_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "real" / "db.sqlite3"
+    connection = _connect(database)
+    apply_migrations(connection)
+    run_id = _insert_run(connection)
+    journal = AppendOnlyJournal(connection)
+    record = make_journal_entity(
+        run_id=run_id,
+        entity_type="order_intent",
+        logical_identity=_hex("swap-restore"),
+        created_at_us=100,
+        payload={"value": 1},
+    )
+
+    decoy = tmp_path / "decoy" / "db.sqlite3"
+    decoy_connection = _connect(decoy)
+    apply_migrations(decoy_connection)
+    assert _insert_run(decoy_connection) == run_id
+    decoy_connection.close()
+
+    parked_real = tmp_path / "parked-real.sqlite3"
+    parked_decoy = tmp_path / "parked-decoy.sqlite3"
+    real_connect = sqlite3.connect
+
+    def swap_restore(*args: object, **kwargs: object) -> sqlite3.Connection:
+        database.rename(parked_real)
+        decoy.rename(database)
+        writer = real_connect(*args, **kwargs)  # type: ignore[arg-type]
+        database.rename(parked_decoy)
+        parked_real.rename(database)
+        return writer
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", swap_restore)
+    try:
+        with pytest.raises(Exception, match="inode|identity|descriptor"):
+            journal.append_entity(record)
+    finally:
+        connection.close()
+
+    for path in (database, parked_decoy):
+        check = real_connect(path)
+        try:
+            assert (
+                check.execute(
+                    "SELECT count(*) FROM journal_entities WHERE entity_id = ?",
+                    (record.entity_id,),
+                ).fetchone()[0]
+                == 0
+            )
+        finally:
+            check.close()
 
 
 def test_audit_hook_capability_theft_policy_is_explicit() -> None:

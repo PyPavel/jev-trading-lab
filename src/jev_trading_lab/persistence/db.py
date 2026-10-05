@@ -86,13 +86,12 @@ _INTERNAL_CONNECTION = object()
 
 
 class _DirectoryHandle:
-    """Own one directory descriptor with idempotent, reentrancy-safe cleanup."""
+    """Own one FD, relinquishing its number before an ambiguous ``os.close``."""
 
-    __slots__ = ("_closing", "_descriptor", "_lock")
+    __slots__ = ("_descriptor", "_lock")
 
     def __init__(self, descriptor: int) -> None:
         self._descriptor: int | None = descriptor
-        self._closing = False
         self._lock = threading.RLock()
 
     @property
@@ -109,16 +108,10 @@ class _DirectoryHandle:
     def close(self) -> None:
         with self._lock:
             descriptor = self._descriptor
-            if descriptor is None or self._closing:
+            if descriptor is None:
                 return
-            self._closing = True
-            try:
-                os.close(descriptor)
-            except BaseException:
-                self._closing = False
-                raise
             self._descriptor = None
-            self._closing = False
+            os.close(descriptor)
 
     def __del__(self) -> None:
         try:
@@ -331,6 +324,33 @@ class SecureConnection(sqlite3.Connection):
             pass
 
 
+class _InternalConnection(sqlite3.Connection):
+    """Fixed-role connection retaining descriptor-verification state."""
+
+    __slots__ = ("_before_fds", "_directory_handle", "_expected_identity", "_path")
+    _before_fds: dict[int, tuple[int, int]]
+    _directory_handle: _DirectoryHandle
+    _expected_identity: tuple[int, int]
+    _path: Path
+    _close_sqlite = sqlite3.Connection.close
+
+    def close(self) -> None:
+        try:
+            self._close_sqlite()
+        finally:
+            try:
+                handle = self._directory_handle
+            except AttributeError:
+                return
+            _close_directory_handle(handle)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            pass
+
+
 def _runtime_authorizer(
     action: int,
     argument1: str | None,
@@ -468,6 +488,24 @@ def _seal_runtime_authorizer(connection: SecureConnection) -> None:
     object.__setattr__(connection, "_authorizer_sealed", True)
 
 
+def _verify_internal_connection_storage(connection: sqlite3.Connection) -> None:
+    if type(connection) is not _InternalConnection:
+        raise DatabaseConfigurationError("invalid internal database connection")
+    path = connection._path
+    identity = connection._expected_identity
+    handle = connection._directory_handle
+    _verify_sqlite_descriptors(
+        connection._before_fds, identity, path, handle.descriptor
+    )
+    _verify_main_database_path(connection, path)
+    metadata = os.stat(path.name, dir_fd=handle.descriptor, follow_symlinks=False)
+    _validate_database_metadata(metadata, path)
+    if (metadata.st_dev, metadata.st_ino) != identity:
+        raise DatabaseSafetyError("database inode identity changed")
+    _check_directory_entries(path, handle.descriptor)
+    _check_sidecars(path, handle.descriptor)
+
+
 def _internal_connection(
     path: Path,
     *,
@@ -478,21 +516,27 @@ def _internal_connection(
     """Open a fixed-role internal connection whose authorizer never changes."""
     if not path.is_absolute() or type(timeout_ms) is not int:
         raise DatabaseConfigurationError("invalid internal database locator")
-    parent = _open_private_parent(path.parent)
-    handle = _DirectoryHandle(parent)
-    connection: sqlite3.Connection | None = None
+    handle = _DirectoryHandle(_open_private_parent(path.parent))
+    connection: _InternalConnection | None = None
     try:
         metadata = os.stat(path.name, dir_fd=handle.descriptor, follow_symlinks=False)
         _validate_database_metadata(metadata, path)
         if (metadata.st_dev, metadata.st_ino) != expected_identity:
             raise DatabaseSafetyError("database inode identity changed")
         _check_sidecars(path, handle.descriptor)
+        before_fds = _open_fd_identities()
         connection = sqlite3.connect(
             f"/proc/self/fd/{handle.descriptor}/{path.name}",
             timeout=timeout_ms / 1_000,
             isolation_level=None,
             check_same_thread=True,
+            factory=_InternalConnection,
         )
+        connection._before_fds = before_fds
+        connection._directory_handle = handle
+        connection._expected_identity = expected_identity
+        connection._path = path
+        _verify_internal_connection_storage(connection)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA recursive_triggers = ON")
@@ -500,19 +544,14 @@ def _internal_connection(
         connection.execute("PRAGMA synchronous = FULL")
         connection.execute("PRAGMA trusted_schema = OFF")
         connection.set_authorizer(authorizer)
-        _verify_main_database_path(connection, path)
-        metadata = os.stat(path.name, dir_fd=handle.descriptor, follow_symlinks=False)
-        if (metadata.st_dev, metadata.st_ino) != expected_identity:
-            raise DatabaseSafetyError("database inode identity changed")
-        _check_directory_entries(path, handle.descriptor)
-        _check_sidecars(path, handle.descriptor)
+        _verify_internal_connection_storage(connection)
         return connection
     except BaseException:
         if connection is not None:
             connection.close()
+        else:
+            _close_directory_handle(handle)
         raise
-    finally:
-        _close_directory_handle(handle)
 
 
 def _open_journal_writer(
@@ -751,11 +790,16 @@ def _verify_sqlite_descriptors(
         for candidate in candidates
         if (candidate[1].st_dev, candidate[1].st_ino) == expected
     ]
-    if len(main) != 1:
+    if len(main) > 1:
         raise DatabaseConfigurationError(
             "SQLite main database descriptor ambiguity or validated inode mismatch"
         )
-    _validate_database_metadata(main[0][1], path)
+    if main:
+        _validate_database_metadata(main[0][1], path)
+    elif expected not in _open_fd_identities().values():
+        raise DatabaseConfigurationError(
+            "SQLite main database descriptor ambiguity or validated inode mismatch"
+        )
 
     try:
         parent_target = Path(os.readlink(f"/proc/self/fd/{parent_descriptor}"))
@@ -765,7 +809,7 @@ def _verify_sqlite_descriptors(
         ) from error
     sidecars = set(_sidecar_names(path))
     for descriptor, metadata, target in candidates:
-        if descriptor == main[0][0]:
+        if main and descriptor == main[0][0]:
             continue
         candidate_path = _target_path(target)
         if (

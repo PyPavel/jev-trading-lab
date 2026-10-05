@@ -14,9 +14,11 @@ from jev_trading_lab.core.ids import canonical_hash, canonical_json_bytes
 from jev_trading_lab.core.time import MAX_DATETIME_US, MIN_DATETIME_US
 from jev_trading_lab.persistence.db import (
     SecureConnection,
+    _connection_fd_activity,
     _is_factory_connection,
     _open_journal_writer,
     _reject_user_temp_schema,
+    _verify_internal_connection_storage,
 )
 from jev_trading_lab.persistence.migrations import verify_migration_prefix
 
@@ -394,21 +396,24 @@ class AppendOnlyJournal:
     @contextmanager
     def _write(self, table: str) -> Iterator[sqlite3.Connection]:
         self._verify_write_boundary()
-        writer = _open_journal_writer(self._connection, table)
-        owned = False
-        try:
-            writer.execute("BEGIN IMMEDIATE")
-            owned = True
-            verify_migration_prefix(writer)
-            yield writer
-            writer.execute("COMMIT")
+        with _connection_fd_activity():
+            writer = _open_journal_writer(self._connection, table)
             owned = False
-        except BaseException:
-            if owned and writer.in_transaction:
-                writer.execute("ROLLBACK")
-            raise
-        finally:
-            writer.close()
+            try:
+                _verify_internal_connection_storage(writer)
+                writer.execute("BEGIN IMMEDIATE")
+                owned = True
+                _verify_internal_connection_storage(writer)
+                verify_migration_prefix(writer)
+                yield writer
+                writer.execute("COMMIT")
+                owned = False
+            except BaseException:
+                if owned and writer.in_transaction:
+                    writer.execute("ROLLBACK")
+                raise
+            finally:
+                writer.close()
 
     def _append_exact(
         self,

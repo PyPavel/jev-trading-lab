@@ -39,6 +39,7 @@ from jev_trading_lab.persistence.db import (
     _connection_locator,
     _is_factory_connection,
     _reject_user_temp_schema,
+    _verify_internal_connection_storage,
 )
 
 MAX_MIGRATION_BYTES = 1_048_576
@@ -668,28 +669,34 @@ def _run_migration_helper(
         )
     except OSError as error:
         raise MigrationError("cannot launch isolated migration helper") from error
-    assert process.stdout is not None and process.stderr is not None
+    selector: selectors.BaseSelector | None = None
     stdout = bytearray()
     stderr = bytearray()
-    output = {process.stdout.fileno(): stdout, process.stderr.fileno(): stderr}
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
-    selector.register(process.stderr, selectors.EVENT_READ)
-    deadline = time.monotonic() + _HELPER_TIMEOUT_SECONDS
     failure: MigrationError | None = None
     try:
+        assert process.stdout is not None and process.stderr is not None
+        output = {process.stdout.fileno(): stdout, process.stderr.fileno(): stderr}
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        selector.register(process.stderr, selectors.EVENT_READ)
+        deadline = time.monotonic() + _HELPER_TIMEOUT_SECONDS
+        total_output = 0
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 failure = MigrationError("isolated migration helper timed out")
                 break
             for key, _events in selector.select(remaining):
-                chunk = os.read(key.fd, 4096)
+                chunk = os.read(
+                    key.fd,
+                    min(4096, _HELPER_OUTPUT_LIMIT + 1 - total_output),
+                )
                 if not chunk:
                     selector.unregister(key.fileobj)
                     continue
                 output[key.fd].extend(chunk)
-                if len(output[key.fd]) > _HELPER_OUTPUT_LIMIT:
+                total_output += len(chunk)
+                if total_output > _HELPER_OUTPUT_LIMIT:
                     failure = MigrationError(
                         "isolated migration helper output exceeded limit"
                     )
@@ -699,10 +706,31 @@ def _run_migration_helper(
         if failure is not None:
             os.killpg(process.pid, signal.SIGKILL)
         returncode = process.wait()
+    except BaseException:
+        try:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                process.wait()
+            except BaseException:
+                pass
+        finally:
+            raise
     finally:
-        selector.close()
-        process.stdout.close()
-        process.stderr.close()
+        active = sys.exception()
+        cleanup_error: BaseException | None = None
+        for stream in (selector, process.stdout, process.stderr):
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except BaseException as error:
+                if active is None and cleanup_error is None:
+                    cleanup_error = error
+        if cleanup_error is not None:
+            raise cleanup_error
     if failure is not None:
         raise failure
     return subprocess.CompletedProcess(
@@ -764,10 +792,7 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
     except MigrationError:
         _validate_helper_reply(completed)
         raise
-    if completed.returncode == 0:
-        _validate_helper_reply(completed)
-    # A lost or malformed post-commit reply is resolved by authoritative DB readback.
-    verify_migration_prefix(connection)
+    # Helper replies are diagnostic; exact authoritative DB readback decides success.
 
 
 def _apply_packaged_migrations(connection: sqlite3.Connection) -> None:
@@ -781,8 +806,10 @@ def _apply_packaged_migrations(connection: sqlite3.Connection) -> None:
     ):
         owned_transaction = False
         try:
+            _verify_internal_connection_storage(connection)
             connection.execute("BEGIN IMMEDIATE")
             owned_transaction = True
+            _verify_internal_connection_storage(connection)
             applied = _applied_rows(connection)
             _validate_applied(applied, migrations)
             if migration.version > len(applied):
