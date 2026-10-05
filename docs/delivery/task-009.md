@@ -294,9 +294,9 @@ Dependencies, `pyproject.toml`, and `uv.lock` were unchanged.
 
 ## Trust boundary
 
-Supported guarantee: one-host local-filesystem durability through the provided API, assuming OS/filesystem fsync and atomic rename/link semantics. The store rejects non-allowlisted filesystem types and common path/link attacks. It prevents bad references through `publish_and_reference`; it does not control callbacks that independently write a DB reference before invocation or malicious same-process code with raw filesystem/process-memory access.
+Supported guarantee: one-host crash and power-loss durability under documented filesystem semantics. The descriptor-relative no-follow validation rejects non-allowlisted filesystem types and common path/link attacks, and fails closed on preexisting or checkpoint-observed state drift. The `publish_and_reference` callback runs only after fsync and final canonical-state verification as observed at that checkpoint.
 
-Publication after rename but before directory fsync may leave either no directory entry or a valid orphan after real power loss; it cannot leave a callback-created dangling reference because reference invocation occurs only after directory fsync and final descriptor verification. Test failpoints model boundary exceptions and fresh-store reopen, not fabricated power-loss guarantees.
+Concurrent same-user raw filesystem mutation is unsupported for the entire operation, as are malicious process-wide or private hooks. Filesystem verification and a later Python callback do not form an atomic transaction against those excluded actors. Publication interrupted after rename but before directory fsync may leave either no directory entry or a valid orphan under the documented filesystem semantics. Test failpoints model boundary exceptions and fresh-store reopen; observable drift checks remain supported, but test hooks do not establish guarantees against arbitrary same-user mutation.
 
 ## Task 8 replacement-race regression remediation
 
@@ -577,3 +577,87 @@ Migrations `001`-`003` remain byte-for-byte unchanged at hashes
 `9026b984313d972dec6c3db8b442e4324f2a7f02ec71bd555c0c17f8ed362c54`, and
 `d18492f31e6c0948fa87f11927f2bc4fb2a5a41ffb45c27c9e966339d5e35995`.
 No push or independent approval occurred.
+
+
+## Final acronym/default-temp/boundary remediation at `66027fc`
+
+Status remains **PENDING INDEPENDENT RE-REVIEW**. Production commit `66027fc`
+closes the acronym credential, default temporary-directory, and contradictory
+boundary-documentation findings without changing Task 8 or migration SQL.
+
+### RED and delivered behavior
+
+The new regression selection initially reported 55 failures and one pass. Existing
+ancestor validation rejected root-owned mode-01777 `/tmp`; acronym runs such as
+`APIKey`, `SESSIONToken`, `ACCESSToken`, `REFRESHToken`, `IDToken`, `OAUTHToken`,
+and `CLIENTSecret` were not semantically split; numeric credential versions and dot
+separators were not classified; and historical delivery text retained two obsolete
+absolute callback claims.
+
+Credential tokenization now applies NFKC, acronym-to-word and lower/digit-to-upper
+boundaries, nonalphanumeric boundaries, and casefolding. Terminal pure-number version
+tokens are ignored only for phrase matching. Exact terminal credential phrases redact
+on URL query, header, and declared-JSON surfaces, including decoded escaped JSON keys.
+Safe near-misses remain byte-exact.
+
+Descriptor-relative `O_NOFOLLOW` traversal accepts a sticky world-writable ancestor
+only when it is a directory owned by uid 0 or the effective uid. Non-sticky mode-0777
+ancestors, symlink ancestors, and a sticky blob root still fail closed. Every created
+private descendant and shard remains owner-current-user mode 0700.
+
+Source and delivery contracts now state the checkpoint guarantee consistently: the
+callback runs only after fsync and final canonical verification as observed at that
+checkpoint. Concurrent malicious same-user raw filesystem mutation and private hooks
+at any point remain outside the boundary; crash/power-loss durability under documented
+filesystem semantics and observable drift checks remain supported.
+
+### Fresh verification
+
+```text
+Task 9 focused blob suite:
+286 passed in 86.92s
+
+Task 8/9 focused migrations, architectural redesign, blobs, append-only:
+566 passed in 115.36s
+
+Task 8 descriptor-pinned inode replacement regression:
+1 passed in 0.51s
+
+exact default-temp CI command, sequential run 1:
+PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
+1111 passed in 108.97s (0:01:48); zero skips; source/test bytecode = []
+
+exact default-temp CI command, sequential run 2:
+PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
+1111 passed in 109.56s (0:01:49); zero skips; source/test bytecode = []
+
+mandatory built-artifact full suite:
+JEV_REQUIRE_BUILT_ARTIFACTS=1 PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
+1111 passed in 108.66s (0:01:48); zero skips
+
+mandatory built-artifact policy suite: 62 passed in 2.45s
+ruff check: All checks passed!
+ruff format --check: 37 files already formatted
+mypy: Success: no issues found in 18 source files
+policy preflight: Policy preflight passed.
+uv lock --check: Resolved 64 packages
+uv sync --frozen --all-groups: Checked 63 packages
+build: wheel and sdist built successfully
+pip-audit: No known vulnerabilities found
+wheel smoke: Installed-wheel migration and controlled journal write smoke passed.
+git diff --check: exit 0
+```
+
+Stable hashes:
+
+```text
+614f8a80b05b05d5c58ba3f72dfb21251b303c5f390c15005af71f090f4614ed  src/jev_trading_lab/persistence/blobs.py
+7c7c908d6048ea52e12070ee7fd3c6abfaa1f6b31aa8110b2aeffdd1dc7914f4  tests/persistence/test_blobs.py
+9f372879ac11334a1e686e7fbe2036db3b489aac11cdaf979e9c626f5bd9df2e  scripts/policy_preflight.py
+4b203408bcdc891d0da737db65fea65281cddf8a16d38a6de299249bfe61cf2e  tests/test_package_policy.py
+bed023031e0aaec7e4de2c3a74c5a8683011ad380a217838d970aa99c7cb29a7  .github/workflows/ci.yml
+```
+
+Migrations `001`-`003`, `pyproject.toml`, and `uv.lock` are unchanged from `744d543`.
+The preserved `.hermes-tmp.W3Xrv5` sentinel remains untracked and byte-identical. No
+push or independent approval occurred.
