@@ -1375,6 +1375,10 @@ def test_harmless_structured_names_remain_exact(tmp_path: Path, name: str) -> No
         "donkey",
         "apikeynote",
         "accessibilityToken",
+        "apiKeyMetadata",
+        "secretKeyAlgorithm",
+        "passwordResetUrl",
+        "clientSecretRotationEnabled",
     ),
 )
 def test_semantically_harmless_names_remain_exact_on_every_surface(
@@ -1503,6 +1507,14 @@ def test_declared_json_credential_errors_never_include_values(
         "ProviderAPIKey",
         "openaiAPIKey",
         "vendorAPIKey",
+        "OPENAIAPIKey",
+        "OPENAIAPIKEY",
+        "GPT4OAPIKey",
+        "vendorAPIKey2",
+        "vendorAPIKey_v2",
+        "vendorAPIKey.v2",
+        "vendorAPIKeyV2",
+        "vendorAPIKey_v2_v3",
         "vendorSESSIONToken",
         "vendorACCESSToken",
         "vendorREFRESHToken",
@@ -1540,16 +1552,29 @@ def test_acronym_credentials_are_redacted_on_every_structured_surface(
     envelope = api.ArtifactEnvelope(**kwargs)
 
     stored = _store(tmp_path).read_verified(_store(tmp_path).publish(envelope))
+    stored_document = json.loads(stored)
+    stored_body = __import__("base64").b64decode(stored_document["body_base64"])
 
     assert secret.encode() not in stored
+    assert secret.encode() not in stored_body
     assert secret not in repr(envelope)
 
 
-def test_escaped_json_acronym_credential_key_is_redacted(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "escaped_name",
+    (
+        b"OPENAI\\u0041PIKey_v2",
+        b"OPENAI\\u0041PIKEY",
+        b"GPT4O\\u0041PIKey",
+    ),
+)
+def test_escaped_json_acronym_credential_key_is_redacted(
+    tmp_path: Path, escaped_name: bytes
+) -> None:
     api = _api()
     secret = "ESCAPED-ACRONYM-CREDENTIAL-LEAK"
     envelope = api.ArtifactEnvelope(
-        body=b'{"vendor\\u0041PIKey":"' + secret.encode() + b'","safe":"keep"}',
+        body=b'{"' + escaped_name + b'":"' + secret.encode() + b'","safe":"keep"}',
         headers={"Content-Type": "application/json"},
     )
 
@@ -1563,6 +1588,14 @@ def test_escaped_json_acronym_credential_key_is_redacted(tmp_path: Path) -> None
     "name",
     (
         "providerAPIKey",
+        "OPENAIAPIKey",
+        "OPENAIAPIKEY",
+        "GPT4OAPIKey",
+        "vendorAPIKey2",
+        "vendorAPIKey_v2",
+        "vendorAPIKey.v2",
+        "vendorAPIKeyV2",
+        "vendorAPIKey_v2_v3",
         "vendorSESSIONToken",
         "vendorACCESSToken",
         "vendorREFRESHToken",
@@ -1573,6 +1606,7 @@ def test_escaped_json_acronym_credential_key_is_redacted(tmp_path: Path) -> None
         "vendor.api-key",
         "ｖｅｎｄｏｒＡＰＩＫｅｙ",
         "vendor\\u0041PIKey",
+        "OPENAI\\u0041PIKey_v2",
     ),
 )
 def test_acronym_credential_json_errors_never_include_values(
@@ -1715,6 +1749,19 @@ def test_blob_store_close_context_and_finalizer_do_not_leak_descriptors(
     gc.collect()
 
     assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_credential_classifier_rejects_oversize_names_without_reflection() -> None:
+    api = _api()
+    name = "SENSITIVE-NAME-" + "a" * (16 * 1024) + "APIKey"
+
+    with pytest.raises(
+        ValueError, match="credential name exceeds maximum size"
+    ) as caught:
+        api._is_secret_field(name)
+
+    assert name not in str(caught.value)
+    assert name not in repr(caught.value)
 
 
 def test_json_redactor_rejects_oversize_keys_before_decoding() -> None:

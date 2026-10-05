@@ -174,18 +174,46 @@ def _valid_ref(ref: object) -> bool:
     return ref.relative_path == f"{digest[:2]}/{digest[2:4]}/{digest}"
 
 
-def _normalized_secret_name(name: str) -> str:
+_MAX_CREDENTIAL_NAME_CHARS = 16 * 1024
+
+
+def _secret_name_forms(name: str) -> tuple[tuple[str, ...], str]:
+    if len(name) > _MAX_CREDENTIAL_NAME_CHARS:
+        raise ValueError("credential name exceeds maximum size")
     normalized = unicodedata.normalize("NFKC", name)
-    normalized = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", normalized)
-    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", normalized)
-    normalized = "".join(
-        character if character.isalnum() else "_" for character in normalized
+    if len(normalized) > _MAX_CREDENTIAL_NAME_CHARS:
+        raise ValueError("credential name exceeds maximum size")
+
+    words: list[str] = []
+    start = 0
+    for index, character in enumerate(normalized):
+        if not character.isalnum():
+            if start < index:
+                words.append(normalized[start:index].casefold())
+            start = index + 1
+            continue
+        if index == start:
+            continue
+        previous = normalized[index - 1]
+        following = normalized[index + 1] if index + 1 < len(normalized) else ""
+        if (
+            (previous.islower() or previous.isdecimal())
+            and character.isupper()
+            or (previous.isupper() and character.isupper() and following.islower())
+        ):
+            words.append(normalized[start:index].casefold())
+            start = index
+    if start < len(normalized):
+        words.append(normalized[start:].casefold())
+
+    compact = "".join(
+        character for character in normalized.casefold() if character.isalnum()
     )
-    return re.sub(r"_+", "_", normalized.casefold()).strip("_")
+    return tuple(filter(None, words)), compact
 
 
 def _compact_secret_name(name: str) -> str:
-    return _normalized_secret_name(name).replace("_", "")
+    return _secret_name_forms(name)[1]
 
 
 _SECRET_FIELD_COMPACT = frozenset(name.replace("_", "") for name in _SECRET_FIELDS)
@@ -250,48 +278,43 @@ _SIGNED_QUERY_COMPACT = frozenset(
     }
 )
 _CREDENTIAL_TERMINAL_PHRASES = (
-    ("api", "key"),
-    ("session", "token"),
-    ("access", "token"),
-    ("refresh", "token"),
-    ("id", "token"),
-    ("oauth", "token"),
-    ("oauth", "token", "secret"),
-    ("client", "secret"),
-    ("password",),
-    ("passphrase",),
-    ("private", "key"),
-    ("secret", "key"),
-    ("security", "token"),
-    ("bearer", "token"),
-    ("cookie",),
-    ("auth", "token"),
+    "oauthtokensecret",
+    "sessiontoken",
+    "refreshtoken",
+    "securitytoken",
+    "bearertoken",
+    "clientsecret",
+    "accesstoken",
+    "oauthtoken",
+    "privatekey",
+    "secretkey",
+    "authtoken",
+    "passphrase",
+    "password",
+    "apikey",
+    "idtoken",
+    "cookie",
 )
+_MAX_CREDENTIAL_VERSION_SUFFIXES = 8
 
 
-def _secret_name_words(name: str) -> tuple[str, ...]:
-    raw_words = tuple(filter(None, _normalized_secret_name(name).split("_")))
-    words: tuple[str, ...] = ()
-    index = 0
-    while index < len(raw_words):
-        if raw_words[index : index + 2] == ("o", "auth"):
-            words += ("oauth",)
-            index += 2
-        else:
-            words += (raw_words[index],)
-            index += 1
-    while words and words[-1].isdecimal():
-        words = words[:-1]
-    return words
+def _strip_credential_versions(compact: str) -> str:
+    for _ in range(_MAX_CREDENTIAL_VERSION_SUFFIXES):
+        start = len(compact)
+        while start and compact[start - 1].isdecimal():
+            start -= 1
+        if start == len(compact):
+            break
+        if start and compact[start - 1] == "v":
+            start -= 1
+        compact = compact[:start]
+    return compact
 
 
 def _is_structured_credential_name(name: str, exact: frozenset[str]) -> bool:
-    compact = _compact_secret_name(name)
-    words = _secret_name_words(name)
-    return compact in exact or any(
-        len(words) >= len(phrase) and words[-len(phrase) :] == phrase
-        for phrase in _CREDENTIAL_TERMINAL_PHRASES
-    )
+    _words, compact = _secret_name_forms(name)
+    candidate = _strip_credential_versions(compact)
+    return compact in exact or candidate.endswith(_CREDENTIAL_TERMINAL_PHRASES)
 
 
 def _is_secret_field(name: str) -> bool:
