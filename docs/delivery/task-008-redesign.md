@@ -240,6 +240,130 @@ d3187180b1319fd6100c8c96d002acf0e5134a87eea87f5ae49b3aec37977263  src/jev_tradin
 47ebea0cc43c2aa703dd215b7b116c6f2a74bc6cfb44d2b7920a6c3818aacd5e  .github/workflows/ci.yml
 ```
 
+## Final actionable ownership/lifetime closure
+
+Production commit: `2eebf34 fix(persistence): finalize ownership lifetimes`
+
+TDD RED evidence captured before production edits:
+
+```text
+private-parent ownership boundary:
+2 failed — `_open_private_parent` returned raw FD 12 and still used `release()`
+
+child traversal transition:
+1 failed — source retained an unowned `child_descriptor` between `os.open` and wrapper construction
+
+connection cleanup helper:
+1 failed — `_close_sqlite_with_handle` did not exist
+
+successful direct helper exit with same-group descendant:
+1 failed — descendant PID remained alive after helper return
+
+precise source boundary policy:
+1 failed — passive trace/profile/audit and bytecode-atomicity boundary text was absent
+
+package policy after source edits:
+1 failed — reviewed source hashes rejected changed `db.py` and `migrations.py`
+```
+
+Resolved behavior:
+
+- `_open_private_parent` returns `_DirectoryHandle`; public and internal connection paths retain the object without `release()` or raw-FD rewrapping. Each traversed child is wrapped directly at `os.open` before validation/transition work.
+- One `_close_sqlite_with_handle` helper gates directory/provenance cleanup on successful SQLite close and performs handle cleanup from `finally`. Foreign-thread failure preserves the live connection; scheduled ordinary signal interruption after SQLite success leaves the handle relinquished.
+- Helper launch is inside the outer cleanup region. Ordinary selector/wait `BaseException` kills/reaps the same group, and successful direct-child exit also cleans remaining same-group descendants before return. The existing deadline remains active after pipe EOF.
+- The malicious exact-bytecode trace sabotage test was removed. Source and delivery policy now state supported and excluded cases without promising bytecode atomicity or containment of a modified helper using `setsid`.
+- Migration SQL 001-003 remained unchanged.
+
+Focused GREEN evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run pytest -q \
+  tests/persistence/test_architectural_redesign.py \
+  tests/persistence/test_append_only.py \
+  tests/persistence/test_migrations.py \
+  tests/test_package_policy.py
+339 passed in 11.75s
+
+uv run ruff check .
+All checks passed!
+
+uv run ruff format --check .
+35 files already formatted
+
+uv run mypy src
+Success: no issues found in 17 source files
+
+PYTHONDONTWRITEBYTECODE=1 python3 -I scripts/policy_preflight.py
+Policy preflight passed.
+
+git diff --check
+exit 0
+```
+
+Full final gates all exited 0; default and required-artifact suites reported zero skips:
+
+```text
+uv lock --check
+Resolved 64 packages in 1ms
+
+uv sync --frozen --all-groups
+Checked 63 packages in 0.58ms
+
+PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
+822 passed in 25.83s
+
+uv run ruff check .
+All checks passed!
+
+uv run ruff format --check .
+35 files already formatted
+
+uv run mypy src
+Success: no issues found in 17 source files
+
+PYTHONDONTWRITEBYTECODE=1 python3 -I scripts/policy_preflight.py
+Policy preflight passed.
+
+uv run pip-audit --strict --requirement /tmp/jev-task8-audit-requirements.txt \
+  --no-deps --disable-pip
+No known vulnerabilities found
+
+uv build --no-build-isolation
+Successfully built dist/jev_trading_lab-0.1.0.tar.gz
+Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
+
+JEV_REQUIRE_BUILT_ARTIFACTS=1 PYTHONDONTWRITEBYTECODE=1 \
+  uv run pytest tests/test_package_policy.py -q
+59 passed in 2.97s
+
+PYTHONDONTWRITEBYTECODE=1 uv run python scripts/wheel_migration_smoke.py
+Installed-wheel migration and controlled journal write smoke passed.
+
+git diff --check
+exit 0
+
+git diff --exit-code b5b0fa4 -- \
+  src/jev_trading_lab/persistence/schema/001_migration_metadata.sql \
+  src/jev_trading_lab/persistence/schema/002_core_entities.sql \
+  src/jev_trading_lab/persistence/schema/003_append_only_guards.sql
+exit 0
+```
+
+`pip-audit` emitted only its standard `--no-deps` advisories. The transient audit requirements file was removed. Build artifacts remain ignored.
+
+Exact production snapshot:
+
+```text
+2eebf34  production commit
+607b79fe6431dab082408026b9e9ec6017f7d432f5b6b197ad29aa8ac5753f38  src/jev_trading_lab/persistence/db.py
+d6dbb2ddb602c2beae239656867fb414362578434185e3890850c76c74f251e1  src/jev_trading_lab/persistence/migrations.py
+d3187180b1319fd6100c8c96d002acf0e5134a87eea87f5ae49b3aec37977263  src/jev_trading_lab/persistence/migration_helper.py
+46ac00ad3f5f469377985c6e4294e15c9e9c953fecaaccc069c4babdd4406d91  tests/persistence/test_architectural_redesign.py
+bb4a0d9bb9bb55ea5ec2efa151a5e4409eabc1e8b3676f39bd8891ad2dcdf6bc  scripts/policy_preflight.py
+852d960ae7f2011fe600d21fa87d54834118f6393dc98dab5069b9150eef0988  tests/test_package_policy.py
+49ed3c38d72fd46e5dcd1c9d35d3b7d1f996d7d18d21523d5448f7fb6f9ef9f9  .github/workflows/ci.yml
+```
+
 ## Review state
 
-**PENDING INDEPENDENT RE-REVIEW.** This agent did not independently approve the change.
+**PENDING INDEPENDENT RE-REVIEW.** No independent approval is claimed.
