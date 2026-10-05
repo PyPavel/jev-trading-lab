@@ -351,6 +351,23 @@ def test_rejects_nonlocal_filesystem_before_creating_root(tmp_path: Path) -> Non
     assert not root.exists()
 
 
+def test_filesystem_root_cannot_be_used_as_blob_root() -> None:
+    api = _api()
+
+    with pytest.raises(api.BlobSecurityError, match="root"):
+        api.BlobStore("/", filesystem_resolver=lambda _path: "ext4")
+
+
+def test_parent_traversal_component_is_rejected(tmp_path: Path) -> None:
+    api = _api()
+    lexical = tmp_path / "child" / ".." / "root"
+
+    with pytest.raises(api.BlobSecurityError, match="root"):
+        api.BlobStore(lexical, filesystem_resolver=lambda _path: "ext4")
+
+    assert not (tmp_path / "root").exists()
+
+
 def test_rejects_symlinked_root_ancestor(tmp_path: Path) -> None:
     api = _api()
     real_parent = tmp_path / "real-parent"
@@ -432,6 +449,45 @@ def test_concurrent_same_bytes_converge_and_different_bytes_do_not_overwrite(
     assert len([path for path in root.rglob("*") if path.is_file()]) == 9
 
 
+def test_multiprocess_same_bytes_deduplicate_to_one_verified_blob(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "multiprocess"
+    code = textwrap.dedent(
+        f"""
+        import multiprocessing
+        from pathlib import Path
+        from jev_trading_lab.persistence.blobs import BlobStore
+
+        root = Path({str(root)!r})
+        payload = b'multiprocess-dedup'
+        queue = multiprocessing.Queue()
+
+        def publish():
+            try:
+                queue.put(BlobStore(root).publish(payload).relative_path)
+            except BaseException as error:
+                queue.put(type(error).__name__ + ':' + str(error))
+
+        processes = [multiprocessing.Process(target=publish) for _ in range(12)]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(10)
+        assert all(process.exitcode == 0 for process in processes)
+        references = [queue.get(timeout=1) for _ in processes]
+        assert len(set(references)) == 1, references
+        store = BlobStore(root)
+        assert store.read_verified(store.publish(payload)) == payload
+        assert len([path for path in root.rglob('*') if path.is_file()]) == 1
+        """
+    )
+
+    result = subprocess.run([sys.executable, "-B", "-c", code], timeout=30, check=False)
+
+    assert result.returncode == 0
+
+
 def test_blob_ref_is_frozen_and_validated(tmp_path: Path) -> None:
     api = _api()
     store = _store(tmp_path)
@@ -459,29 +515,142 @@ def test_fresh_directory_entries_are_fsynced_in_creation_order(
     store = api.BlobStore(tmp_path / "root")
     ref = store.publish(b"ordered")
 
-    assert events == [tmp_path.name, "root", ref.sha256[:2], "file", ref.sha256[2:4]]
+    expected_ancestors = [Path((tmp_path / "root").anchor).name]
+    expected_ancestors.extend((tmp_path / "root").parts[1:-1])
+    assert events == expected_ancestors + [
+        "root",
+        ref.sha256[:2],
+        "file",
+        ref.sha256[2:4],
+    ]
     reopened = api.BlobStore(tmp_path / "root")
     assert reopened.read_verified(ref) == b"ordered"
 
 
-def test_preexisting_directories_are_not_reported_as_newly_durable(
+def test_preexisting_directories_fsync_each_parent_before_descent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     api = _api()
     first = api.BlobStore(tmp_path / "root").publish(b"same-shard")
     real_fsync = os.fsync
-    directories: list[str] = []
+    events: list[str] = []
 
     def traced_fsync(descriptor: int) -> None:
         target = os.readlink(f"/proc/self/fd/{descriptor}")
         if ".tmp-" not in target:
-            directories.append(Path(target).name)
+            events.append(Path(target).name)
         real_fsync(descriptor)
 
     monkeypatch.setattr(api.os, "fsync", traced_fsync)
     second = api.BlobStore(tmp_path / "root").publish(b"same-shard")
+
     assert second == first
-    assert directories == [tmp_path.name, first.sha256[2:4]]
+    root_index = events.index("root")
+    first_index = events.index(first.sha256[:2], root_index + 1)
+    second_index = events.index(first.sha256[2:4], first_index + 1)
+    assert root_index < first_index < second_index
+
+
+def test_existing_child_is_fsynced_before_caller_can_descend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = _api()
+    parent = tmp_path / "parent"
+    child = parent / "child"
+    child.mkdir(parents=True, mode=0o700)
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    events: list[str] = []
+    real_fsync = os.fsync
+
+    def traced_fsync(descriptor: int) -> None:
+        events.append("parent-fsync")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(api.os, "fsync", traced_fsync)
+    try:
+        child_fd, created = api._ensure_child_directory(parent_fd, "child")
+        events.append("descend")
+    finally:
+        if "child_fd" in locals():
+            os.close(child_fd)
+        os.close(parent_fd)
+
+    assert created is False
+    assert events == ["parent-fsync", "descend"]
+
+
+def test_raced_second_shard_replacement_fails_before_reference(tmp_path: Path) -> None:
+    api = _api()
+    root = tmp_path / "root"
+    called: list[Any] = []
+    moved: Path | None = None
+
+    def failpoint(name: str) -> None:
+        nonlocal moved
+        if name != "before_reference":
+            return
+        digest = hashlib.sha256(b"replacement-race").hexdigest()
+        visible = root / digest[:2] / digest[2:4]
+        moved = visible.with_name(visible.name + "-moved")
+        visible.rename(moved)
+        visible.mkdir(mode=0o700)
+
+    store = api.BlobStore(root, failpoint=failpoint)
+    with pytest.raises(api.BlobSecurityError):
+        store.publish_and_reference(b"replacement-race", called.append)
+
+    assert moved is not None
+    assert called == []
+
+
+def test_raced_second_shard_mode_drift_fails_before_reference(tmp_path: Path) -> None:
+    api = _api()
+    root = tmp_path / "root"
+    called: list[Any] = []
+
+    def failpoint(name: str) -> None:
+        if name == "before_reference":
+            digest = hashlib.sha256(b"mode-race").hexdigest()
+            (root / digest[:2] / digest[2:4]).chmod(0o755)
+
+    store = api.BlobStore(root, failpoint=failpoint)
+    with pytest.raises(api.BlobSecurityError):
+        store.publish_and_reference(b"mode-race", called.append)
+
+    assert called == []
+
+
+def test_nested_existing_symlink_ancestor_is_rejected_lexically(tmp_path: Path) -> None:
+    api = _api()
+    real = tmp_path / "real"
+    existing = real / "existing"
+    existing.mkdir(parents=True, mode=0o700)
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(api.BlobSecurityError, match="ancestor"):
+        api.BlobStore(
+            link / "existing" / "new" / "root",
+            filesystem_resolver=lambda _path: "ext4",
+        )
+
+    assert not (existing / "new").exists()
+
+
+def test_higher_existing_symlink_ancestor_is_rejected_lexically(tmp_path: Path) -> None:
+    api = _api()
+    real = tmp_path / "real"
+    (real / "one" / "two").mkdir(parents=True, mode=0o700)
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(api.BlobSecurityError, match="ancestor"):
+        api.BlobStore(
+            link / "one" / "two" / "three" / "root",
+            filesystem_resolver=lambda _path: "ext4",
+        )
+
+    assert not (real / "one" / "two" / "three").exists()
 
 
 def test_scavenger_directory_replacement_cannot_delete_outside_victim(
@@ -991,6 +1160,86 @@ def test_oauth_header_fields_are_redacted(tmp_path: Path, name: str) -> None:
 
     assert b"OAUTH-HEADER-SECRET" not in stored
     assert json.loads(stored)["headers"]["Safe"] == "keep"
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "oauth_token",
+        "oauth-token-secret",
+        "oauthToken",
+        "providerOAuthTokenSecret",
+        "x_oidc_id_token",
+        "ＯＡｕｔｈ＿Ｔｏｋｅｎ",
+    ),
+)
+def test_oauth_oidc_query_credential_variants_never_reach_stored_bytes(
+    tmp_path: Path, name: str
+) -> None:
+    api = _api()
+    envelope = api.ArtifactEnvelope(
+        body=b"opaque",
+        url=f"https://e.test/callback?{name}=QUERY-CREDENTIAL-LEAK&safe_name=keep",
+    )
+    store = _store(tmp_path)
+    stored = store.read_verified(store.publish(envelope))
+
+    assert b"QUERY-CREDENTIAL-LEAK" not in stored
+    assert b"safe_name=keep" in stored
+    assert "QUERY-CREDENTIAL-LEAK" not in repr(envelope)
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "Id-Token",
+        "OAuth-Token",
+        "X-Client-Secret",
+        "xOAuthToken",
+        "X-OIDC-Id-Token",
+        "ＯＡｕｔｈ－Ｔｏｋｅｎ",
+    ),
+)
+def test_oauth_oidc_header_credential_variants_never_reach_stored_bytes(
+    tmp_path: Path, name: str
+) -> None:
+    api = _api()
+    envelope = api.ArtifactEnvelope(
+        body=b"opaque", headers={name: "HEADER-CREDENTIAL-LEAK", "Safe-Name": "keep"}
+    )
+    store = _store(tmp_path)
+    stored = store.read_verified(store.publish(envelope))
+
+    assert b"HEADER-CREDENTIAL-LEAK" not in stored
+    assert json.loads(stored)["headers"]["Safe-Name"] == "keep"
+    assert "HEADER-CREDENTIAL-LEAK" not in repr(envelope)
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "token_count",
+        "secretary",
+        "password_policy",
+        "session_duration",
+        "cookie_size",
+        "code_version",
+        "keynote",
+    ),
+)
+def test_harmless_structured_names_remain_exact(tmp_path: Path, name: str) -> None:
+    api = _api()
+    marker_value = f"safe-{name}"
+    envelope = api.ArtifactEnvelope(
+        body=b"opaque",
+        url=f"https://e.test/?{name}={marker_value}",
+        headers={name: marker_value},
+    )
+    store = _store(tmp_path)
+    document = json.loads(store.read_verified(store.publish(envelope)))
+
+    assert marker_value in document["url"]
+    assert document["headers"][name] == marker_value
 
 
 def test_oauth_body_redaction_and_stored_bytes(tmp_path: Path) -> None:

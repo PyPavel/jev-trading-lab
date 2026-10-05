@@ -236,6 +236,21 @@ _SIGNED_QUERY_COMPACT = frozenset(
         "code",
     }
 )
+_CREDENTIAL_SUFFIXES = (
+    "accesstoken",
+    "clientsecret",
+    "idtoken",
+    "oauthtoken",
+    "oauthtokensecret",
+    "oidcidtoken",
+    "oidctoken",
+    "refreshtoken",
+)
+
+
+def _is_structured_credential_name(name: str, exact: frozenset[str]) -> bool:
+    compact = _compact_secret_name(name)
+    return compact in exact or compact.endswith(_CREDENTIAL_SUFFIXES)
 
 
 def _is_secret_field(name: str) -> bool:
@@ -400,7 +415,7 @@ def _redact_url(value: str) -> str:
                     key,
                     _REDACTED
                     if (
-                        _compact_secret_name(key) in _SIGNED_QUERY_COMPACT
+                        _is_structured_credential_name(key, _SIGNED_QUERY_COMPACT)
                         or _compact_secret_name(key).startswith("xamz")
                     )
                     else item,
@@ -463,7 +478,9 @@ def _redacted_payload(payload: bytes | ArtifactEnvelope, max_bytes: int) -> byte
         ):
             raise ValueError("envelope headers exceed maximum size")
         headers[key] = (
-            _REDACTED if _compact_secret_name(key) in _SECRET_HEADER_COMPACT else value
+            _REDACTED
+            if _is_structured_credential_name(key, _SECRET_HEADER_COMPACT)
+            else value
         )
 
     content_type = next(
@@ -510,12 +527,23 @@ def _validate_directory(
     return metadata
 
 
+def _validate_ancestor_directory(descriptor: int) -> os.stat_result:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid not in {0, os.geteuid()}
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise BlobSecurityError("blob root ancestor is not safe")
+    return metadata
+
+
 def _ensure_child_directory(
     parent_fd: int,
     name: str,
     *,
     label: str = "blob shard",
-    fsync_existing: bool = False,
+    require_private: bool = True,
 ) -> tuple[int, bool]:
     created = False
     try:
@@ -527,48 +555,36 @@ def _ensure_child_directory(
     try:
         descriptor = os.open(name, flags, dir_fd=parent_fd)
     except OSError as error:
-        raise BlobSecurityError("blob shard cannot be opened safely") from error
+        raise BlobSecurityError(f"{label} cannot be opened safely") from error
     try:
-        _validate_directory(descriptor, label=label)
-    except BlobSecurityError:
+        if created or require_private:
+            _validate_directory(descriptor, label=label)
+        else:
+            _validate_ancestor_directory(descriptor)
+        os.fsync(parent_fd)
+    except BaseException:
         os.close(descriptor)
         raise
-    if created or fsync_existing:
-        try:
-            os.fsync(parent_fd)
-        except BaseException:
-            os.close(descriptor)
-            raise
     return descriptor, created
 
 
 def _open_or_create_root(root: Path, resolver: FilesystemResolver) -> int:
-    missing = [root.name]
-    ancestor = root.parent
-    while True:
-        try:
-            metadata = ancestor.lstat()
-        except FileNotFoundError:
-            if ancestor == ancestor.parent:
-                raise BlobSecurityError("blob root ancestor is unavailable") from None
-            missing.append(ancestor.name)
-            ancestor = ancestor.parent
-            continue
-        except OSError as error:
-            raise BlobSecurityError("blob root ancestor is unavailable") from error
-        if stat.S_ISLNK(metadata.st_mode):
-            raise BlobSecurityError("blob root ancestor must not be a symlink")
-        break
-
-    descriptors = [_open_directory(ancestor)]
+    if not root.is_absolute() or root == Path(root.anchor):
+        raise BlobSecurityError("blob root path is invalid")
+    names = list(root.parts[1:])
+    if any(name in {"", ".", ".."} for name in names):
+        raise BlobSecurityError("blob root path is invalid")
+    descriptors = [_open_directory(Path(root.anchor))]
     created: list[bool] = []
-    names = list(reversed(missing))
     try:
-        _validate_directory(descriptors[0], label="blob root ancestor")
+        _validate_ancestor_directory(descriptors[0])
         for index, name in enumerate(names):
-            label = "blob root" if index == len(names) - 1 else "blob root ancestor"
+            is_root = index == len(names) - 1
             descriptor, was_created = _ensure_child_directory(
-                descriptors[-1], name, label=label, fsync_existing=True
+                descriptors[-1],
+                name,
+                label="blob root" if is_root else "blob root ancestor",
+                require_private=is_root,
             )
             descriptors.append(descriptor)
             created.append(was_created)
@@ -711,25 +727,44 @@ class BlobStore:
     def __exit__(self, *_args: object) -> None:
         self.close()
 
+    def _open_visible_root(self) -> int:
+        names = list(self.root.parts[1:])
+        descriptors = [_open_directory(Path(self.root.anchor))]
+        try:
+            _validate_ancestor_directory(descriptors[0])
+            for index, name in enumerate(names):
+                flags = (
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                try:
+                    descriptor = os.open(name, flags, dir_fd=descriptors[-1])
+                except OSError as error:
+                    raise BlobSecurityError(
+                        "blob directory cannot be opened safely"
+                    ) from error
+                try:
+                    if index == len(names) - 1:
+                        _validate_directory(descriptor, label="blob root")
+                    else:
+                        _validate_ancestor_directory(descriptor)
+                except BaseException:
+                    os.close(descriptor)
+                    raise
+                descriptors.append(descriptor)
+            root_fd = descriptors.pop()
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
+        return root_fd
+
     def _open_root(self) -> int:
         with self._state_lock:
             if self._closed:
                 raise BlobSecurityError("blob store is closed")
             pinned = _validate_directory(self._root_fd, label="blob root")
-            parent_fd = _open_directory(self.root.parent)
-            flags = (
-                os.O_RDONLY
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
-            )
-            try:
-                visible_fd = os.open(self.root.name, flags, dir_fd=parent_fd)
-            except OSError as error:
-                raise BlobSecurityError(
-                    "blob directory cannot be opened safely"
-                ) from error
-            finally:
-                os.close(parent_fd)
+            visible_fd = self._open_visible_root()
             try:
                 visible = _validate_directory(visible_fd, label="blob root")
                 if not os.path.samestat(pinned, visible):
@@ -738,7 +773,7 @@ class BlobStore:
             finally:
                 os.close(visible_fd)
 
-    def _open_shard(self, digest: str) -> int:
+    def _open_shard(self, digest: str) -> tuple[int, int]:
         root_fd = self._open_root()
         try:
             first_fd, _created = _ensure_child_directory(root_fd, digest[:2])
@@ -746,11 +781,12 @@ class BlobStore:
             os.close(root_fd)
         try:
             descriptor, _created = _ensure_child_directory(first_fd, digest[2:4])
-            return descriptor
-        finally:
+            return first_fd, descriptor
+        except BaseException:
             os.close(first_fd)
+            raise
 
-    def _open_existing_shard(self, digest: str) -> int:
+    def _open_existing_shard_pair(self, digest: str) -> tuple[int, int]:
         root_fd = self._open_root()
         flags = (
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -758,31 +794,38 @@ class BlobStore:
         try:
             first_fd = os.open(digest[:2], flags, dir_fd=root_fd)
         except FileNotFoundError as error:
-            os.close(root_fd)
-            raise BlobMissingError("blob is missing") from error
-        except OSError as error:
-            os.close(root_fd)
-            raise BlobCorruptError("blob verification failed") from error
-        os.close(root_fd)
-        first_metadata = os.fstat(first_fd)
-        if (
-            first_metadata.st_uid != os.geteuid()
-            or stat.S_IMODE(first_metadata.st_mode) != 0o700
-        ):
-            os.close(first_fd)
-            raise BlobCorruptError("blob verification failed")
-        try:
-            descriptor = os.open(digest[2:4], flags, dir_fd=first_fd)
-        except FileNotFoundError as error:
             raise BlobMissingError("blob is missing") from error
         except OSError as error:
             raise BlobCorruptError("blob verification failed") from error
         finally:
+            os.close(root_fd)
+        try:
+            try:
+                _validate_directory(first_fd, label="blob shard")
+            except BlobSecurityError as error:
+                raise BlobCorruptError("blob verification failed") from error
+            try:
+                descriptor = os.open(digest[2:4], flags, dir_fd=first_fd)
+            except FileNotFoundError as error:
+                raise BlobMissingError("blob is missing") from error
+            except OSError as error:
+                raise BlobCorruptError("blob verification failed") from error
+            try:
+                _validate_directory(descriptor, label="blob shard")
+            except BlobSecurityError as error:
+                os.close(descriptor)
+                raise BlobCorruptError("blob verification failed") from error
+            except BaseException:
+                os.close(descriptor)
+                raise
+            return first_fd, descriptor
+        except BaseException:
             os.close(first_fd)
-        metadata = os.fstat(descriptor)
-        if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
-            os.close(descriptor)
-            raise BlobCorruptError("blob verification failed")
+            raise
+
+    def _open_existing_shard(self, digest: str) -> int:
+        first_fd, descriptor = self._open_existing_shard_pair(digest)
+        os.close(first_fd)
         return descriptor
 
     def _read_from_shard(self, shard_fd: int, ref: BlobRef) -> bytes:
@@ -802,7 +845,9 @@ class BlobStore:
         finally:
             os.close(descriptor)
 
-    def publish(self, payload: bytes | ArtifactEnvelope) -> BlobRef:
+    def _publish(
+        self, payload: bytes | ArtifactEnvelope
+    ) -> tuple[BlobRef, os.stat_result, os.stat_result]:
         content = _redacted_payload(payload, self.max_bytes)
         digest = hashlib.sha256(content).hexdigest()
         ref = BlobRef(
@@ -810,7 +855,7 @@ class BlobStore:
             byte_length=len(content),
             relative_path=f"{digest[:2]}/{digest[2:4]}/{digest}",
         )
-        shard_fd = self._open_shard(digest)
+        first_fd, shard_fd = self._open_shard(digest)
         temporary = f".tmp-{secrets.token_hex(16)}"
         temp_owned = False
         descriptor = -1
@@ -844,7 +889,9 @@ class BlobStore:
             os.fsync(shard_fd)
             self._failpoint("after_dir_fsync")
             self._read_from_shard(shard_fd, ref)
-            return ref
+            first_metadata = _validate_directory(first_fd, label="blob shard")
+            shard_metadata = _validate_directory(shard_fd, label="blob shard")
+            return ref, first_metadata, shard_metadata
         except BaseException:
             if temp_owned:
                 try:
@@ -856,14 +903,44 @@ class BlobStore:
             if descriptor >= 0:
                 os.close(descriptor)
             os.close(shard_fd)
+            os.close(first_fd)
+
+    def publish(self, payload: bytes | ArtifactEnvelope) -> BlobRef:
+        ref, _first_metadata, _shard_metadata = self._publish(payload)
+        return ref
+
+    def _verify_canonical_publication(
+        self,
+        ref: BlobRef,
+        first_metadata: os.stat_result,
+        shard_metadata: os.stat_result,
+    ) -> None:
+        try:
+            canonical_first_fd, canonical_shard_fd = self._open_existing_shard_pair(
+                ref.sha256
+            )
+        except (BlobMissingError, BlobCorruptError) as error:
+            raise BlobSecurityError("canonical blob path changed") from error
+        try:
+            if not os.path.samestat(first_metadata, os.fstat(canonical_first_fd)):
+                raise BlobSecurityError("blob shard identity changed")
+            if not os.path.samestat(shard_metadata, os.fstat(canonical_shard_fd)):
+                raise BlobSecurityError("blob shard identity changed")
+            self._read_from_shard(canonical_shard_fd, ref)
+            _validate_directory(canonical_first_fd, label="blob shard")
+            _validate_directory(canonical_shard_fd, label="blob shard")
+        finally:
+            os.close(canonical_shard_fd)
+            os.close(canonical_first_fd)
 
     def publish_and_reference(
         self, payload: bytes | ArtifactEnvelope, reference_writer: ReferenceWriter
     ) -> BlobRef:
         if not callable(reference_writer):
             raise TypeError("reference_writer must be callable")
-        ref = self.publish(payload)
+        ref, first_metadata, shard_metadata = self._publish(payload)
         self._failpoint("before_reference")
+        self._verify_canonical_publication(ref, first_metadata, shard_metadata)
         reference_writer(ref)
         return ref
 
