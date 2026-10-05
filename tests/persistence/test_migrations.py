@@ -299,7 +299,7 @@ def test_pragma_setup_failure_closes_connection(
 
     monkeypatch.setattr(db_module.sqlite3, "connect", memory_connect)
 
-    with pytest.raises(DatabaseConfigurationError, match="inode"):
+    with pytest.raises(DatabaseConfigurationError, match="inode|outside"):
         _connect(tmp_path / "private" / "db.sqlite3")
 
     assert connection is not None

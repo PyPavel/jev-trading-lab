@@ -564,10 +564,11 @@ def test_database_file_cleanup_cannot_close_reused_fd(
     try:
         with monkeypatch.context() as context:
             context.setattr(db_module.os, "close", close_then_interrupt)
+            handle, _identity = db_module._prepare_database_file(
+                parent / "database.sqlite3", parent_descriptor
+            )
             with pytest.raises(KeyboardInterrupt, match="file cleanup interrupted"):
-                db_module._prepare_database_file(
-                    parent / "database.sqlite3", parent_descriptor
-                )
+                db_module._close_directory_handle(handle)
         assert reused is not None
         assert os.fstat(reused).st_ino == sentinel.stat().st_ino
         real_close(reused)
