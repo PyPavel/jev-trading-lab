@@ -110,3 +110,15 @@
 - MAJOR: FIFO target open could block.
 - MAJOR: metadata parsing had no early aggregate bounds.
 - Decision: fix every finding test-first with real subprocess/filesystem tests before re-review.
+
+## Task 9 remediation re-review at `8c340d1`
+
+- Result: NOT APPROVED.
+- BLOCKER: malformed declared JSON could fail open after an earlier malformed escape and preserve an escaped secret key/value.
+- BLOCKER: common OAuth query/header credentials (`client_secret`, `access_token`, `Client-Secret`, `Access-Token`) were not redacted.
+- BLOCKER: nested root ancestors were created recursively without fsyncing every new directory entry.
+- MAJOR: blob-root path identity relied on `(st_dev, st_ino)` after closing the validated descriptor, allowing immediate inode reuse.
+- MAJOR: Unicode encoding errors could expose original secrets in exception text/repr.
+- MAJOR: JSON redaction allocated an unused per-character offsets list, causing ~43x memory amplification.
+- MAJOR: exact CI pytest command could create source-tree `__pycache__`; root cause required rather than workaround.
+- Decision: exact RED reproductions first; pin blob-root descriptor, create/fsync ancestry descriptor-relatively, fail malformed declared JSON closed, broaden structured OAuth redaction, sanitize all validation errors, remove amplification, and fix bytecode-producing test subprocesses.

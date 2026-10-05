@@ -333,3 +333,83 @@ Migrations `001`-`003` remain byte-for-byte unchanged.
 ## Review state
 
 **PENDING INDEPENDENT RE-REVIEW.**
+
+
+## Task 9 re-review remediation at `171944d`
+
+Status remains **PENDING INDEPENDENT RE-REVIEW**. Production commit `171944d`
+closes the seven remaining re-review findings without changing Task 8 migration SQL.
+
+### RED and root-cause evidence
+
+The new focused regressions initially failed 25 cases: malformed declared JSON failed
+open, OAuth query/header credentials remained stored, lone-surrogate exceptions exposed
+original input, nested ancestor fsyncs were absent, and the 1 MiB JSON case peaked at
+45,143,424 bytes (>10x). The exact malformed inputs from review reproduced directly.
+
+Bytecode tracing isolated unguarded child interpreter launches in blob crash/FIFO,
+migration-helper adversarial, recursive-resolver, artifact-policy, and wheel-smoke test
+paths. `conftest.py` only sets `sys.dont_write_bytecode` in the pytest parent; that
+runtime flag does not propagate to child interpreters. Running each affected test file
+without the CI environment reproduced source-package `.pyc` creation under
+`src/jev_trading_lab`. Every Python child now uses `-B`; CI still exports
+`PYTHONDONTWRITEBYTECODE=1` as a second independent control. The package-policy
+regression removes that environment variable for its child and proves `-B` alone
+leaves `src` free of `__pycache__`.
+
+### Delivered remediation
+
+- Any malformed declared JSON now fails closed with stable generic `ValueError` text.
+  Invalid UTF-8, invalid escapes, truncated nesting, and the two exact escaped-key
+  attacks cannot reach stored bytes or exception text/repr.
+- OAuth query fields (`client_secret`, `access_token`, `refresh_token`, `id_token`,
+  `code`) and normalized credential header variants redact before hashing. Generic
+  body field `code` remains exact because only structural query context treats it as
+  a credential.
+- Root ancestry is created descriptor-relatively from the nearest trusted existing
+  directory. Each parent is fsynced immediately after child creation; observed
+  existing entries are also fsynced before descent to cover concurrent `EEXIST`.
+- `BlobStore` retains its validated root descriptor for its lifetime. Every operation
+  validates pinned owner/type/mode, compares the visible path to the pinned descriptor,
+  and duplicates only that descriptor. Idempotent `close`, context management, and
+  finalization release it; 200 replacement attempts never publish to replacements.
+- URL/header/body Unicode and parser failures become generic errors without reflected
+  input.
+- JSON lexical redaction now emits in one forward pass with bounded key decoding and
+  no offsets/spans lists. The 1 MiB check stays below 10x; the 64 MiB default-limit
+  check stays below 4x.
+- Python subprocess invocations use `-B`; workflow and exact policy hashes were
+  refreshed. `.pytest-tmp` contains test-generated caches without polluting package
+  source, and is ignored as generated state.
+
+### Fresh gates
+
+```text
+focused blobs: 127 passed in 97.01s
+Task 8 local/storage: 195 passed in 6.61s
+package policy after build: 61 passed in 3.14s
+required built-artifact policy: 61 passed in 3.15s
+
+exact CI command, clean generated state, run 1:
+PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
+951 passed in 126.72s (0:02:06); source __pycache__ = []
+
+exact CI command, clean generated state, run 2:
+PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
+951 passed in 122.07s (0:02:02); source __pycache__ = []
+
+policy preflight: Policy preflight passed.
+uv lock --check: Resolved 64 packages
+uv sync --frozen --all-groups: Checked 63 packages
+ruff check: All checks passed!
+ruff format --check: 37 files already formatted
+mypy: Success: no issues found in 18 source files
+build: wheel and sdist built successfully
+pip-audit: No known vulnerabilities found
+wheel smoke: Installed-wheel migration and controlled journal write smoke passed.
+git diff --check: exit 0
+```
+
+Migration files `001`-`003` remain byte-for-byte unchanged. No dependency or lockfile
+change occurred. Evidence is committed separately from production; no push or
+independent approval occurred.
