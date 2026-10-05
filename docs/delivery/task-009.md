@@ -499,3 +499,81 @@ mode. Migrations `001`-`003` remain byte-for-byte unchanged at hashes
 `9026b984313d972dec6c3db8b442e4324f2a7f02ec71bd555c0c17f8ed362c54`, and
 `d18492f31e6c0948fa87f11927f2bc4fb2a5a41ffb45c27c9e966339d5e35995`.
 No push or independent approval occurred.
+
+
+## Structured-credential and test-isolation remediation at `5842198`
+
+Status remains **PENDING INDEPENDENT RE-REVIEW**. Production commit `5842198`
+closes the final structured-credential findings, corrects the filesystem concurrency
+boundary, and removes pytest's shared basetemp.
+
+### Root cause and RED evidence
+
+- Credential matching compacted arbitrary names and accepted broad terminal suffixes.
+  That leaked provider-prefixed API-key and session-token variants while falsely
+  redacting unrelated names such as `possession`.
+- The failed 1/1026 full run was
+  `test_sealed_connection_rejects_mutable_callback_and_database_surfaces`
+  `[set_progress_handler-arguments5-keyword_arguments5]`. The helper result was
+  `returncode=1`, `stdout_len=0`, `stdout=b''`, `stderr_len=0`, `stderr=b''`.
+  The failing helper's internal exception is not recoverable: its fixed protocol
+  intentionally returned no diagnostic body, and a later full run replaced the shared
+  fixture tree. Run transcripts did establish the harness defect: independent pytest
+  processes in this worktree were all forced onto `.pytest-tmp`, which pytest
+  removes/recreates at startup. One hundred isolated reproductions passed, and
+  sequential full runs with unique basetemps did not reproduce the empty frame. The
+  deterministic RED policy regression proved `[tool.pytest.ini_options].addopts` forced
+  this unsafe cross-process sharing. The remediation therefore fixes the demonstrated
+  concurrency boundary without weakening helper-reply or migration-prefix validation.
+
+### Delivered remediation
+
+- Structured fields now recognize exact compact allowlisted names or normalized
+  terminal word phrases. Provider prefixes, camelCase, separators, and NFKC forms of
+  API keys/session tokens redact on query, header, and JSON surfaces; harmless whole
+  words remain exact.
+- Corruption detection remains strict. Authoritative DB readback still decides
+  post-commit success; malformed replies cannot validate an incomplete prefix.
+- The module contract now states the supported checkpoint guarantees and excludes
+  concurrent same-user raw filesystem mutation/private-hook sabotage for the entire
+  operation. It no longer claims filesystem verification plus a later Python callback
+  is atomic.
+- The fixed `--basetemp=.pytest-tmp` option was removed. Pytest now supplies a
+  process-isolated default basetemp; explicit verification runs use unique basetemps.
+  Exact policy, preflight, and workflow hashes were refreshed.
+
+### Fresh sequential verification
+
+```text
+focused migrations/architecture/blobs/append-only:
+482 passed in 113.42s
+
+full run 1, unique basetemp:
+1022 passed, 5 skipped in 130.00s
+(the five pre-build artifact checks skipped because pyproject.toml was newer than dist)
+
+build: wheel and sdist built successfully
+
+mandatory built-artifact full run 2, unique basetemp:
+JEV_REQUIRE_BUILT_ARTIFACTS=1 PYTHONDONTWRITEBYTECODE=1 uv run pytest -q -rs
+1027 passed in 135.74s; zero skips
+
+mandatory built-artifact full run 3, unique basetemp:
+1027 passed in 129.55s; zero skips
+
+policy preflight: Policy preflight passed.
+uv lock --check: Resolved 64 packages
+uv sync --frozen --all-groups: Checked 63 packages
+ruff check: All checks passed!
+ruff format --check: 37 files already formatted
+mypy: Success: no issues found in 18 source files
+pip-audit: No known vulnerabilities found
+wheel smoke: Installed-wheel migration and controlled journal write smoke passed.
+source/package bytecode outside generated state: none
+```
+
+Migrations `001`-`003` remain byte-for-byte unchanged at hashes
+`1be6dbbcb20a6ab8efe016172d786280470fc7a450f403825e2a61e199a1cb48`,
+`9026b984313d972dec6c3db8b442e4324f2a7f02ec71bd555c0c17f8ed362c54`, and
+`d18492f31e6c0948fa87f11927f2bc4fb2a5a41ffb45c27c9e966339d5e35995`.
+No push or independent approval occurred.

@@ -122,3 +122,11 @@
 - MAJOR: JSON redaction allocated an unused per-character offsets list, causing ~43x memory amplification.
 - MAJOR: exact CI pytest command could create source-tree `__pycache__`; root cause required rather than workaround.
 - Decision: exact RED reproductions first; pin blob-root descriptor, create/fsync ancestry descriptor-relatively, fail malformed declared JSON closed, broaden structured OAuth redaction, sanitize all validation errors, remove amplification, and fix bytecode-producing test subprocesses.
+
+## Task 9 final review at `2013a8a`
+
+- Result: one spec reviewer PASS; quality/security NOT APPROVED.
+- BLOCKER: `session_token`/`X-Session-Token` and provider-prefixed API-key names leaked across structured surfaces.
+- MAJOR: broad suffix matching falsely redacted harmless names such as `possession`.
+- Reviewers also demanded atomic protection against a malicious same-user process replacing/unlinking the canonical path after the final verification but before the Python reference callback. That is not implementable as a filesystem+Python atomic transaction. Contract correction: crash durability and observable-state verification are supported; concurrent same-user raw filesystem mutation/private hook sabotage is outside scope at all times, not only during/after callback.
+- Decision: fix credential classification exactly, add false-positive tests, and narrow the no-dangling-reference claim honestly. Preserve descriptor-relative/no-follow defenses against preexisting and observed drift.
