@@ -298,6 +298,38 @@ Supported guarantee: one-host local-filesystem durability through the provided A
 
 Publication after rename but before directory fsync may leave either no directory entry or a valid orphan after real power loss; it cannot leave a callback-created dangling reference because reference invocation occurs only after directory fsync and final descriptor verification. Test failpoints model boundary exceptions and fresh-store reopen, not fabricated power-loss guarantees.
 
+## Task 8 replacement-race regression remediation
+
+The intermittent migration regression was inode reuse, not monkeypatch ordering or
+test contamination. A minimal diagnostic showed unlink plus create on
+`/home/pavel/.pytest-local` preserving `(st_dev, st_ino)` while `st_ctime_ns`
+changed; `/tmp` allocated a different inode. No descriptor pinned the validated
+inode at the SQLite-open boundary, allowing immediate inode-number recycling to
+defeat the two-field identity.
+
+Commit `1c44e04` retains the validated database descriptor until SQLite's main
+descriptor is identified and verified. The deterministic regression asserts the
+validated inode is descriptor-pinned before replacement and that replacement gets
+a distinct identity. Public and internal writers continue using the same descriptor
+census and descriptor/path relationship checks.
+
+Fresh verification after the fix:
+
+```text
+replacement regression, TMPDIR=/home/pavel/.pytest-local: 100/100 passed
+replacement regression, default TMPDIR: 100/100 passed
+Task 8 focused: 195 passed in 6.91s
+Task 9 focused: 95 passed in 3.16s
+full suite, zero skips: 918 passed in 175.79s (0:02:55)
+package policy: 60 passed in 2.45s
+pip-audit: No known vulnerabilities found
+wheel smoke: Installed-wheel migration and controlled journal write smoke passed.
+```
+
+Build, policy, lock, frozen-sync, Ruff, mypy, package, wheel, and audit gates passed.
+The audit input was freshly exported after code stabilization and then removed.
+Migrations `001`-`003` remain byte-for-byte unchanged.
+
 ## Review state
 
 **PENDING INDEPENDENT RE-REVIEW.**
