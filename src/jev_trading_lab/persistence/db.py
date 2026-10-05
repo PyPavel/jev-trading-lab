@@ -1,4 +1,13 @@
-"""Create SQLite connections that satisfy the local persistence contract."""
+"""Create SQLite connections that satisfy the local persistence contract.
+
+The supported lifetime boundary includes passive trace/profile/audit hooks, ordinary
+signal cancellation, and public API callbacks using the public handle. It supports
+KeyboardInterrupt/SystemExit during normal blocking operations. Deliberate
+private-capability sabotage is excluded: a malicious trace/profile callback raising
+at the exact bytecode between C resource acquisition and Python ownership assignment,
+frame inspection, private helper import, base descriptors, or process memory access.
+The implementation does not promise bytecode atomicity.
+"""
 
 from __future__ import annotations
 
@@ -113,13 +122,6 @@ class _DirectoryHandle:
             self._descriptor = None
             os.close(descriptor)
 
-    def release(self) -> int:
-        """Relinquish ownership and return the still-open descriptor."""
-        with self._lock:
-            descriptor = self.descriptor
-            self._descriptor = None
-            return descriptor
-
     def __del__(self) -> None:
         try:
             self.close()
@@ -135,6 +137,19 @@ def _close_directory_handle(handle: _DirectoryHandle) -> None:
     except BaseException:
         if active is None:
             raise
+
+
+def _close_sqlite_with_handle(
+    close_sqlite: Callable[[], None], handle: _DirectoryHandle
+) -> None:
+    """Release provenance only after SQLite reports a successful close."""
+    sqlite_closed = False
+    try:
+        close_sqlite()
+        sqlite_closed = True
+    finally:
+        if sqlite_closed:
+            _close_directory_handle(handle)
 
 
 @contextmanager
@@ -304,13 +319,13 @@ class SecureConnection(sqlite3.Connection):
             ) from error
 
     def close(self) -> None:
-        self._close_sqlite()
         try:
             handle = _secure_slot(self, "_directory_handle")
         except AttributeError:
+            self._close_sqlite()
             return
         assert isinstance(handle, _DirectoryHandle)
-        _close_directory_handle(handle)
+        _close_sqlite_with_handle(self._close_sqlite, handle)
 
     def __del__(self) -> None:
         try:
@@ -330,12 +345,12 @@ class _InternalConnection(sqlite3.Connection):
     _close_sqlite = sqlite3.Connection.close
 
     def close(self) -> None:
-        self._close_sqlite()
         try:
             handle = self._directory_handle
         except AttributeError:
+            self._close_sqlite()
             return
-        _close_directory_handle(handle)
+        _close_sqlite_with_handle(self._close_sqlite, handle)
 
     def __del__(self) -> None:
         try:
@@ -509,7 +524,7 @@ def _internal_connection(
     """Open a fixed-role internal connection whose authorizer never changes."""
     if not path.is_absolute() or type(timeout_ms) is not int:
         raise DatabaseConfigurationError("invalid internal database locator")
-    handle = _DirectoryHandle(_open_private_parent(path.parent))
+    handle = _open_private_parent(path.parent)
     connection: _InternalConnection | None = None
     try:
         metadata = os.stat(path.name, dir_fd=handle.descriptor, follow_symlinks=False)
@@ -647,20 +662,24 @@ def _directory_flags() -> int:
     return flags
 
 
-def _open_private_parent(parent: Path) -> int:
-    """Traverse without symlinks and return an open descriptor for the 0700 parent."""
+def _open_private_parent(parent: Path) -> _DirectoryHandle:
+    """Traverse without symlinks and return an owned handle for the 0700 parent."""
     flags = _directory_flags()
     current = _DirectoryHandle(os.open("/", flags))
     try:
         for component in parent.parts[1:]:
             try:
-                child_descriptor = os.open(component, flags, dir_fd=current.descriptor)
+                child = _DirectoryHandle(
+                    os.open(component, flags, dir_fd=current.descriptor)
+                )
             except FileNotFoundError:
                 try:
                     os.mkdir(component, 0o700, dir_fd=current.descriptor)
                 except FileExistsError:
                     pass
-                child_descriptor = os.open(component, flags, dir_fd=current.descriptor)
+                child = _DirectoryHandle(
+                    os.open(component, flags, dir_fd=current.descriptor)
+                )
             except OSError as error:
                 if error.errno in {errno.ELOOP, errno.ENOTDIR}:
                     raise DatabaseConfigurationError(
@@ -670,7 +689,6 @@ def _open_private_parent(parent: Path) -> int:
                 raise DatabaseConfigurationError(
                     f"cannot securely traverse database parent {parent}: {error}"
                 ) from error
-            child = _DirectoryHandle(child_descriptor)
             current.close()
             current = child
 
@@ -687,7 +705,7 @@ def _open_private_parent(parent: Path) -> int:
             raise DatabaseConfigurationError(
                 f"database parent must have mode 0700: {parent}"
             )
-        return current.release()
+        return current
     except BaseException:
         _close_directory_handle(current)
         raise
@@ -991,7 +1009,7 @@ def connect_database(
         if mount_resolver is None:
             filesystem = _resolve_filesystem(path.parent, _linux_mount_resolver)
             _validate_filesystem(path.parent, filesystem)
-        parent_handle = _DirectoryHandle(_open_private_parent(path.parent))
+        parent_handle = _open_private_parent(path.parent)
         parent_descriptor = parent_handle.descriptor
         parent_metadata = os.fstat(parent_descriptor)
         parent_identity = (parent_metadata.st_dev, parent_metadata.st_ino)

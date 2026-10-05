@@ -6,6 +6,10 @@ committed independently, so no migration prefix may expose an unguarded table.
 Filesystem package resources require trusted parent metadata; archive Traversables
 use bounded streams and rely on the exact locked, hash-protected wheel artifact.
 Migration connections are dedicated: this runner owns and clears the authorizer.
+The trusted fixed packaged helper is supervised for ordinary hangs,
+crashes, closed pipes, same-group descendants, and output overflow, plus parent
+``KeyboardInterrupt``/``SystemExit`` during normal blocking operations. Malicious
+replacement/modification of the helper, including a setsid escape, is excluded.
 """
 
 from __future__ import annotations
@@ -661,26 +665,44 @@ def _helper_command(
     )
 
 
+def _kill_and_reap_helper_group(process: subprocess.Popen[bytes]) -> None:
+    """Kill the helper session and reap its direct child without masking failure."""
+    active = sys.exception()
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except BaseException:
+        if active is None:
+            raise
+    try:
+        process.wait()
+    except BaseException:
+        if active is None:
+            raise
+
+
 def _run_migration_helper(
     path: Path, timeout_ms: int, identity: tuple[int, int]
 ) -> subprocess.CompletedProcess[bytes]:
-    try:
-        process = subprocess.Popen(
-            _helper_command(path, timeout_ms, identity),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            close_fds=True,
-            start_new_session=True,
-        )
-    except OSError as error:
-        raise MigrationError("cannot launch isolated migration helper") from error
+    process: subprocess.Popen[bytes] | None = None
     selector: selectors.BaseSelector | None = None
     stdout = bytearray()
     stderr = bytearray()
     failure: MigrationError | None = None
     returncode = -1
     try:
+        try:
+            process = subprocess.Popen(
+                _helper_command(path, timeout_ms, identity),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                close_fds=True,
+                start_new_session=True,
+            )
+        except OSError as error:
+            raise MigrationError("cannot launch isolated migration helper") from error
         assert process.stdout is not None and process.stderr is not None
         output = {process.stdout.fileno(): stdout, process.stderr.fileno(): stderr}
         selector = selectors.DefaultSelector()
@@ -719,28 +741,16 @@ def _run_migration_helper(
                     returncode = process.wait(timeout=remaining)
                 except subprocess.TimeoutExpired:
                     failure = MigrationError("isolated migration helper timed out")
-        if failure is not None:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            returncode = process.wait()
+        _kill_and_reap_helper_group(process)
     except BaseException:
-        try:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            try:
-                process.wait()
-            except BaseException:
-                pass
-        finally:
-            raise
+        if process is not None:
+            _kill_and_reap_helper_group(process)
+        raise
     finally:
         active = sys.exception()
         cleanup_error: BaseException | None = None
-        for stream in (selector, process.stdout, process.stderr):
+        streams = () if process is None else (process.stdout, process.stderr)
+        for stream in (selector, *streams):
             if stream is None:
                 continue
             try:
@@ -752,6 +762,7 @@ def _run_migration_helper(
             raise cleanup_error
     if failure is not None:
         raise failure
+    assert process is not None
     return subprocess.CompletedProcess(
         process.args, returncode, bytes(stdout), bytes(stderr)
     )

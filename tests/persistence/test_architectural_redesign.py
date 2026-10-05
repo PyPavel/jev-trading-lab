@@ -326,6 +326,49 @@ def test_append_rejects_schema_prefix_checksum_drift(tmp_path: Path) -> None:
         connection.close()
 
 
+def test_connection_close_uses_one_success_gated_cleanup_helper() -> None:
+    helper = inspect.getsource(db_module._close_sqlite_with_handle)
+    secure = inspect.getsource(db_module.SecureConnection.close)
+    internal = inspect.getsource(db_module._InternalConnection.close)
+    assert "finally:" in helper
+    assert "if sqlite_closed:" in helper
+    assert "_close_directory_handle(handle)" in helper
+    assert "_close_sqlite_with_handle" in secure
+    assert "_close_sqlite_with_handle" in internal
+
+
+def test_secure_close_signal_during_post_sqlite_cleanup_relinquishes_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    connection = _connect(tmp_path / "signal-close" / "db.sqlite3")
+    handle = db_module._secure_slot(connection, "_directory_handle")
+    assert isinstance(handle, db_module._DirectoryHandle)
+    descriptor = handle.descriptor
+    real_close = os.close
+
+    def interrupting_close(fd: int) -> None:
+        if fd == descriptor:
+            signal.setitimer(signal.ITIMER_REAL, 0.01)
+            time.sleep(1)
+        real_close(fd)
+
+    def interrupt(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt("scheduled close interruption")
+
+    previous = signal.signal(signal.SIGALRM, interrupt)
+    monkeypatch.setattr(db_module.os, "close", interrupting_close)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="scheduled close interruption"):
+            connection.close()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+        monkeypatch.undo()
+
+    assert handle.closed
+    real_close(descriptor)
+
+
 def test_foreign_thread_close_preserves_live_connection_and_provenance(
     tmp_path: Path,
 ) -> None:
@@ -392,49 +435,6 @@ def test_directory_handle_ambiguous_close_never_closes_reused_fd(
     real_close(owned)
 
 
-def test_private_parent_transition_interrupt_cannot_close_reused_fd(
-    tmp_path: Path,
-) -> None:
-    parent = tmp_path / "private" / "nested"
-    parent.mkdir(parents=True, mode=0o700)
-    sentinel = tmp_path / "sentinel"
-    sentinel.write_text("safe", encoding="utf-8")
-    replacement: int | None = None
-
-    def interrupt_after_close(frame: object, event: str, _arg: object) -> object:
-        nonlocal replacement
-        caller = getattr(frame, "f_back", None)
-        if (
-            event == "return"
-            and getattr(frame, "f_code", None)
-            is db_module._DirectoryHandle.close.__code__
-            and getattr(caller, "f_code", None)
-            is db_module._open_private_parent.__code__
-        ):
-            descriptor = frame.f_locals["descriptor"]  # type: ignore[attr-defined]
-            try:
-                os.fstat(descriptor)
-            except OSError:
-                opened = os.open(sentinel, os.O_RDONLY)
-                if opened != descriptor:
-                    os.dup2(opened, descriptor)
-                    os.close(opened)
-                replacement = descriptor
-                raise KeyboardInterrupt("interrupt after real close")
-        return interrupt_after_close
-
-    sys.settrace(interrupt_after_close)
-    try:
-        with pytest.raises(KeyboardInterrupt, match="interrupt after real close"):
-            db_module._open_private_parent(parent)
-    finally:
-        sys.settrace(None)
-
-    assert replacement is not None
-    assert os.fstat(replacement).st_ino == sentinel.stat().st_ino
-    os.close(replacement)
-
-
 def test_owned_production_fds_never_use_raw_os_close() -> None:
     for module in (db_module, migration_module):
         source = inspect.getsource(module)
@@ -448,18 +448,61 @@ def test_owned_production_fds_never_use_raw_os_close() -> None:
             and node.func.value.id == "os"
             and node.func.attr == "close"
         ]
-        assert raw_closes == ([] if module is migration_module else [114])
+        assert len(raw_closes) == (0 if module is migration_module else 1)
+        if module is db_module:
+            assert "os.close(descriptor)" in inspect.getsource(
+                db_module._DirectoryHandle.close
+            )
 
 
-def test_private_parent_success_transfers_live_descriptor(tmp_path: Path) -> None:
+def test_private_parent_success_transfers_live_handle(tmp_path: Path) -> None:
     parent = tmp_path / "private" / "nested"
     parent.mkdir(parents=True, mode=0o700)
 
-    descriptor = db_module._open_private_parent(parent)
+    handle = db_module._open_private_parent(parent)
+    assert isinstance(handle, db_module._DirectoryHandle)
+    descriptor = handle.descriptor
     try:
         assert os.path.samefile(f"/proc/self/fd/{descriptor}", parent)
     finally:
-        os.close(descriptor)
+        handle.close()
+    assert handle.closed
+
+
+def test_private_parent_keeps_ownership_across_function_boundary() -> None:
+    source = inspect.getsource(db_module._open_private_parent)
+    assert "-> _DirectoryHandle" in source
+    assert ".release()" not in source
+    assert "child_descriptor" not in source
+    assert source.count("_DirectoryHandle(\n                    os.open(") == 2
+    internal = inspect.getsource(db_module._internal_connection)
+    public = inspect.getsource(db_module.connect_database)
+    assert "_DirectoryHandle(_open_private_parent" not in internal + public
+
+
+def test_private_parent_transition_error_closes_child_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "private" / "nested"
+    parent.mkdir(parents=True, mode=0o700)
+    before = {entry.name for entry in os.scandir("/proc/self/fd")}
+    real_close = db_module._DirectoryHandle.close
+    calls = 0
+
+    def fail_first_transition(handle: db_module._DirectoryHandle) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transition failed")
+        real_close(handle)
+
+    monkeypatch.setattr(db_module._DirectoryHandle, "close", fail_first_transition)
+    with pytest.raises(RuntimeError, match="transition failed"):
+        db_module._open_private_parent(parent)
+    gc.collect()
+
+    after = {entry.name for entry in os.scandir("/proc/self/fd")}
+    assert after == before
 
 
 def test_private_parent_failure_cleanup_closes_final_descriptor(tmp_path: Path) -> None:
@@ -631,7 +674,11 @@ def test_directory_handle_finalizer_closes_owned_fd(tmp_path: Path) -> None:
 def test_internal_writer_cleanup_preserves_original_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(db_module, "_open_private_parent", lambda _path: 123)
+    monkeypatch.setattr(
+        db_module,
+        "_open_private_parent",
+        lambda _path: db_module._DirectoryHandle(123),
+    )
 
     def fail_stat(*_args: object, **_kwargs: object) -> os.stat_result:
         raise ValueError("original open failure")
@@ -734,6 +781,80 @@ def test_migration_helper_eof_still_enforces_lifetime_deadline(
     while Path(f"/proc/{descendant_pid}").exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     assert not Path(f"/proc/{descendant_pid}").exists()
+
+
+def test_successful_helper_cleans_same_group_descendant_after_parent_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_file = tmp_path / "descendant.pid"
+    reply = '{"protocol":1,"status":"ok"}'
+    code = (
+        "import os,pathlib,subprocess,sys; "
+        "p=subprocess.Popen([sys.executable,'-c',"
+        "'import os,time; os.close(1); os.close(2); time.sleep(30)']); "
+        "pathlib.Path(sys.argv[1]).write_text(str(p.pid)); "
+        f"os.write(1,{reply.encode()!r})"
+    )
+    command = (sys.executable, "-c", code, str(pid_file))
+    monkeypatch.setattr(migration_module, "_helper_command", lambda *_args: command)
+
+    completed = migration_module._run_migration_helper(Path("/tmp/db"), 1000, (1, 2))
+
+    assert completed.returncode == 0
+    descendant_pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 2
+    while Path(f"/proc/{descendant_pid}").exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not Path(f"/proc/{descendant_pid}").exists()
+
+
+def test_migration_helper_wait_keyboardinterrupt_kills_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_file = tmp_path / "wait.pid"
+    command = (
+        sys.executable,
+        "-c",
+        "import os,pathlib,sys,time; "
+        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+        "os.close(1); os.close(2); time.sleep(30)",
+        str(pid_file),
+    )
+    real_popen = subprocess.Popen
+
+    class InterruptingWait:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._process = real_popen(*args, **kwargs)  # type: ignore[arg-type]
+            self.stdout = self._process.stdout
+            self.stderr = self._process.stderr
+            self.args = self._process.args
+            self.pid = self._process.pid
+            self._interrupted = False
+
+        def wait(self, timeout: float | None = None) -> int:
+            if not self._interrupted:
+                self._interrupted = True
+                raise KeyboardInterrupt("wait interrupted")
+            return self._process.wait(timeout=timeout)
+
+    monkeypatch.setattr(migration_module, "_helper_command", lambda *_args: command)
+    monkeypatch.setattr(migration_module.subprocess, "Popen", InterruptingWait)
+    with pytest.raises(KeyboardInterrupt, match="wait interrupted"):
+        migration_module._run_migration_helper(Path("/tmp/db"), 1000, (1, 2))
+
+    helper_pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 2
+    while Path(f"/proc/{helper_pid}").exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not Path(f"/proc/{helper_pid}").exists()
+
+
+def test_migration_helper_popen_enters_cleanup_region_immediately() -> None:
+    source = inspect.getsource(migration_module._run_migration_helper)
+    launch = source.index("process = subprocess.Popen(")
+    outer_try = source.rfind("    try:", 0, launch)
+    assert outer_try != -1
+    assert "finally:" in source[launch:]
 
 
 def test_migration_helper_baseexception_kills_and_reaps_process_group(
@@ -992,6 +1113,43 @@ def test_audit_hook_capability_theft_policy_is_explicit() -> None:
     assert "handle" in policy and "capture" in policy
     assert "out of scope" in policy
     assert "passive audit hooks" in policy and "supported" in policy
+
+
+def test_source_policy_states_precise_lifetime_boundary() -> None:
+    policy = " ".join(
+        "\n".join(
+            (
+                inspect.getsource(db_module),
+                inspect.getsource(journal_module.AppendOnlyJournal),
+                inspect.getsource(migration_module),
+            )
+        ).split()
+    ).casefold()
+    required = (
+        "passive trace/profile/audit hooks",
+        "ordinary signal cancellation",
+        "public api callbacks using the public handle",
+        "trusted fixed packaged helper",
+        "ordinary hangs, crashes, closed pipes, same-group descendants, "
+        "and output overflow",
+        "keyboardinterrupt/systemexit during normal blocking operations",
+        "exact bytecode between c resource acquisition and python ownership assignment",
+        "frame inspection",
+        "private helper import",
+        "base descriptors",
+        "process memory",
+        "setsid escape",
+        "does not promise bytecode atomicity",
+    )
+    for claim in required:
+        assert claim in policy
+    forbidden_overclaims = (
+        "every baseexception after popen",
+        "trace interruption after real close cannot",
+        "all interpreter callbacks are contained",
+    )
+    for claim in forbidden_overclaims:
+        assert claim not in policy
 
 
 def test_passive_audit_hook_observes_migration_without_changing_result(
