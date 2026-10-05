@@ -14,7 +14,7 @@ No push or independent approval occurred. This document records implementation a
 - Runtime policy denies journal DML, `schema_migrations` DML, schema/TEMP DDL, ATTACH/DETACH, and hardened dangerous configuration surfaces.
 - `AppendOnlyJournal` retains the exact public factory connection only as provenance, path/configuration, and liveness. Each append opens a fresh fixed-role internal writer for exactly one selected journal table.
 - Journal writer policy permits reads and direct main INSERT only into the selected table. It denies other inserts, UPDATE/DELETE, trigger-originated writes, schema/TEMP operations, and ATTACH/DETACH. Each private writer binds the SQLite-opened main FD to the expected `(st_dev, st_ino)`, classifies every SQLite main/sidecar FD, revalidates the restored path, and repeats storage validation around `BEGIN IMMEDIATE` before schema-prefix/checksum, idempotency, conflict, predecessor, and exact-literal checks.
-- `apply_migrations(connection)` validates the parent connection and invokes a packaged helper through `sys.executable -I -B -m jev_trading_lab.persistence.migration_helper`, with `close_fds=True`, disabled stdin, fixed argv protocol, bounded timeout, and one combined bounded stdout/stderr budget. During normal blocking supervision, parent `KeyboardInterrupt`/`SystemExit` kills the same process group, reaps the direct child, closes selector/pipes, and preserves the original exception.
+- `apply_migrations(connection)` validates the parent connection and invokes a packaged helper through `sys.executable -I -B -m jev_trading_lab.persistence.migration_helper`, with `close_fds=True`, disabled stdin, fixed argv protocol, bounded timeout, and one combined bounded stdout/stderr budget. Once helper ownership and cleanup guards are established, exceptions during blocking supervision kill the same process group, reap the direct child, close selector/pipes, and preserve the original exception.
 - The helper independently loads packaged migrations, opens a fresh fixed-role migration connection, validates its opened descriptors/path around every `BEGIN IMMEDIATE`, serializes each migration, and closes. Parent independently verifies the exact packaged prefix/checksums. Complete authoritative DB readback is success regardless of a missing, malformed, or nonzero post-commit helper reply; incomplete/corrupt readback remains an error.
 - `_DirectoryHandle` relinquishes numeric descriptor ownership before `os.close`; explicit close, constructor cleanup, and finalizer cleanup never retry an ambiguously closed FD and therefore cannot close a reused unrelated descriptor. If `os.close` raises before the kernel closes the FD, the handle may leak rather than risk unrelated-FD closure.
 - Migration SQL files 001-003 remained byte-for-byte unchanged.
@@ -131,9 +131,9 @@ The focused gate executed 322 tests, and the fresh mandatory artifact-policy gat
 
 Supported guarantee: public factory connections remain permanently restrictive throughout journal append and migration operations. Privileged work occurs only on fresh private fixed-role connections, and migration privilege additionally runs in a fresh isolated interpreter.
 
-Supported lifetime cases are passive trace/profile/audit hooks; ordinary signal cancellation; public API callbacks using the public handle; the trusted fixed packaged helper's ordinary hangs, crashes, closed pipes, same-group descendants, and output overflow; and parent KeyboardInterrupt/SystemExit during normal blocking operations. A successful direct helper exit is followed by same-process-group descendant cleanup before return. Public callbacks and concurrent threads cannot borrow privileged roles through the supported API.
+Supported lifetime cases are passive trace/profile/audit hooks; public API callbacks using the public handle; cooperative cancellation at documented safe points after ownership is established; exceptions during blocking operations where cleanup guards already own resources; and the trusted fixed packaged helper's ordinary hangs, crashes, closed pipes, same-group descendants, and output overflow. A successful direct helper exit is followed by same-process-group descendant cleanup before return. Public callbacks and concurrent threads cannot borrow privileged roles through the supported API.
 
-Excluded as deliberate interpreter/private-capability sabotage: a malicious `sys.settrace`/profile callback intentionally raising at the exact bytecode between C resource acquisition and Python ownership assignment; frame inspection or private writer theft; private helper import; base descriptors or object-internal mutation; process memory modification; raw separately opened SQLite connections; direct filesystem writes; and adversarial FD ABA outside the cooperative connection lock. Malicious replacement or modification of the fixed packaged migration helper, including a `setsid` escape from its process group, is also excluded. This boundary does not promise bytecode atomicity and is not an in-process sandbox or cryptographic writer authentication.
+Unsupported cases include asynchronous Python signal/`KeyboardInterrupt`/`SystemExit` delivery during native resource acquisition or before Python ownership and cleanup guards are established; a malicious `sys.settrace`/profile callback intentionally raising at the exact bytecode between C resource acquisition and Python ownership assignment; frame inspection or private writer theft; private helper import; base descriptors or object-internal mutation; process memory modification; raw separately opened SQLite connections; direct filesystem writes; and adversarial FD ABA outside the cooperative connection lock. Malicious replacement or modification of the fixed packaged migration helper, including a `setsid` escape from its process group, is also excluded. This boundary promises neither acquisition nor bytecode atomicity and is not an in-process sandbox or cryptographic writer authentication.
 
 Passive CPython audit hooks remain supported. A malicious hook installed with
 `sys.addaudithook` can deliberately capture a newly created SQLite handle before
@@ -269,9 +269,9 @@ package policy after source edits:
 Resolved behavior:
 
 - `_open_private_parent` returns `_DirectoryHandle`; public and internal connection paths retain the object without `release()` or raw-FD rewrapping. Each traversed child is wrapped directly at `os.open` before validation/transition work.
-- One `_close_sqlite_with_handle` helper gates directory/provenance cleanup on successful SQLite close and performs handle cleanup from `finally`. Foreign-thread failure preserves the live connection; scheduled ordinary signal interruption after SQLite success leaves the handle relinquished.
-- Helper launch is inside the outer cleanup region. Ordinary selector/wait `BaseException` kills/reaps the same group, and successful direct-child exit also cleans remaining same-group descendants before return. The existing deadline remains active after pipe EOF.
-- The malicious exact-bytecode trace sabotage test was removed. Source and delivery policy now state supported and excluded cases without promising bytecode atomicity or containment of a modified helper using `setsid`.
+- One `_close_sqlite_with_handle` helper gates directory/provenance cleanup on successful SQLite close and performs handle cleanup from `finally`. Foreign-thread failure preserves the live connection; deterministic cooperative cancellation at the owned close safe point leaves the handle relinquished.
+- Helper launch is inside the outer cleanup region. Once helper ownership and cleanup guards are established, selector/wait `BaseException` kills/reaps the same group, and successful direct-child exit also cleans remaining same-group descendants before return. The existing deadline remains active after pipe EOF.
+- The malicious exact-bytecode trace sabotage test was removed. Source and delivery policy state supported and excluded cases without promising acquisition/bytecode atomicity or containment of a modified helper using `setsid`.
 - Migration SQL 001-003 remained unchanged.
 
 Focused GREEN evidence:
@@ -362,6 +362,90 @@ d3187180b1319fd6100c8c96d002acf0e5134a87eea87f5ae49b3aec37977263  src/jev_tradin
 bb4a0d9bb9bb55ea5ec2efa151a5e4409eabc1e8b3676f39bd8891ad2dcdf6bc  scripts/policy_preflight.py
 852d960ae7f2011fe600d21fa87d54834118f6393dc98dab5069b9150eef0988  tests/test_package_policy.py
 49ed3c38d72fd46e5dcd1c9d35d3b7d1f996d7d18d21523d5448f7fb6f9ef9f9  .github/workflows/ci.yml
+```
+
+## Cooperative cancellation boundary correction
+
+Production commit: `acf5782 fix(persistence): narrow cancellation boundary`
+
+The final adversarial review established that pure Python cannot make ownership atomic between a native resource acquisition returning and the next Python bytecode. The public contract therefore supports cooperative cancellation only after ownership and cleanup guards are established. Asynchronous Python signal/`KeyboardInterrupt`/`SystemExit` delivery during native acquisition or before that ownership boundary is unsupported. Malicious exact-bytecode trace/profile sabotage, private capability theft, and malicious helper replacement or `setsid` escape remain unsupported.
+
+The previous SIGALRM-based close test was replaced with a deterministic safe-point test that injects cooperative cancellation only when `_DirectoryHandle.close` already owns the descriptor and has relinquished its numeric ownership. The source-policy regression requires the acquisition exclusion and rejects the broad phrase `ordinary signal cancellation`. No flaky SIGALRM stress is a passing guarantee; the adversarial stress is evidence for the exclusion.
+
+Focused verification after the correction:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run pytest -q \
+  tests/persistence/test_architectural_redesign.py \
+  tests/persistence/test_append_only.py \
+  tests/persistence/test_migrations.py \
+  tests/test_package_policy.py
+339 passed in 11.71s
+```
+
+Mandatory final gates all exited 0; default and mandatory built-artifact suites reported zero skips:
+
+```text
+uv lock --check
+Resolved 64 packages in 1ms
+
+uv sync --frozen --all-groups
+Checked 63 packages in 0.58ms
+
+PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
+822 passed in 24.38s
+
+uv run ruff check .
+All checks passed!
+
+uv run ruff format --check .
+35 files already formatted
+
+uv run mypy src
+Success: no issues found in 17 source files
+
+PYTHONDONTWRITEBYTECODE=1 python3 -I scripts/policy_preflight.py
+Policy preflight passed.
+
+uv run pip-audit --strict \
+  --requirement /tmp/jev-task8-boundary-audit-requirements.txt \
+  --no-deps --disable-pip
+No known vulnerabilities found
+
+uv build --no-build-isolation
+Successfully built dist/jev_trading_lab-0.1.0.tar.gz
+Successfully built dist/jev_trading_lab-0.1.0-py3-none-any.whl
+
+JEV_REQUIRE_BUILT_ARTIFACTS=1 PYTHONDONTWRITEBYTECODE=1 \
+  uv run pytest tests/test_package_policy.py -q
+59 passed in 2.41s
+
+PYTHONDONTWRITEBYTECODE=1 uv run python scripts/wheel_migration_smoke.py
+Installed-wheel migration and controlled journal write smoke passed.
+
+git diff --check HEAD
+exit 0
+
+git diff --exit-code 35c8a5f -- \
+  src/jev_trading_lab/persistence/schema/001_migration_metadata.sql \
+  src/jev_trading_lab/persistence/schema/002_core_entities.sql \
+  src/jev_trading_lab/persistence/schema/003_append_only_guards.sql
+exit 0
+```
+
+The fresh audit requirements file was removed. Build artifacts remain ignored. Migration SQL 001-003 is unchanged.
+
+Exact corrected production snapshot:
+
+```text
+acf5782  production commit
+ac6765cb29cc6e21ea2d0c2aed1495295d038d466717165f3ce7f3f803080da9  src/jev_trading_lab/persistence/db.py
+6848e5a2c83d91867649079acc32fbe0df6f6059e3d0e03c274f3d86c7d82255  src/jev_trading_lab/persistence/migrations.py
+d3187180b1319fd6100c8c96d002acf0e5134a87eea87f5ae49b3aec37977263  src/jev_trading_lab/persistence/migration_helper.py
+991fc1edfe0a4a69b913df27e05d5699e2c32ee0e6d73e0e56469108653b75cc  tests/persistence/test_architectural_redesign.py
+0fcd66e67ae4c8f53e25da2d46816f08c9b071b07b9795a80e88dcf998763f14  scripts/policy_preflight.py
+c376a55384a7aea29b61eb290f7eeef5015146c6afc00803f5751e346b15b0c5  tests/test_package_policy.py
+6e69bdf14d494954a690e62f92b33ec6fc003c73c2f089c35b701f09f19e0a30  .github/workflows/ci.yml
 ```
 
 ## Review state
