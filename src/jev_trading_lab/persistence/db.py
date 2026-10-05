@@ -729,7 +729,9 @@ def _validate_database_metadata(metadata: os.stat_result, path: Path) -> None:
         )
 
 
-def _prepare_database_file(path: Path, parent_descriptor: int) -> tuple[int, int]:
+def _prepare_database_file(
+    path: Path, parent_descriptor: int
+) -> tuple[_DirectoryHandle, tuple[int, int]]:
     flags = os.O_RDWR | os.O_CREAT
     flags |= getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -740,8 +742,10 @@ def _prepare_database_file(path: Path, parent_descriptor: int) -> tuple[int, int
         )
         metadata = os.fstat(handle.descriptor)
         _validate_database_metadata(metadata, path)
-        return metadata.st_dev, metadata.st_ino
+        return handle, (metadata.st_dev, metadata.st_ino)
     except OSError as error:
+        if handle is not None:
+            _close_directory_handle(handle)
         if error.errno == errno.ELOOP:
             raise DatabaseConfigurationError(
                 f"database path contains symlink: {path}"
@@ -749,9 +753,10 @@ def _prepare_database_file(path: Path, parent_descriptor: int) -> tuple[int, int
         raise DatabaseConfigurationError(
             f"cannot securely open database file: {error}"
         ) from error
-    finally:
+    except BaseException:
         if handle is not None:
             _close_directory_handle(handle)
+        raise
 
 
 def _open_fd_identities() -> dict[int, tuple[int, int]]:
@@ -829,6 +834,10 @@ def _verify_sqlite_descriptors(
         if main and descriptor == main[0][0]:
             continue
         candidate_path = _target_path(target)
+        if candidate_path == path:
+            raise DatabaseConfigurationError(
+                "SQLite main database descriptor validated inode mismatch"
+            )
         if (
             candidate_path.parent != parent_target
             or candidate_path.name not in sidecars
@@ -1017,10 +1026,11 @@ def connect_database(
         parent_metadata = os.fstat(parent_descriptor)
         parent_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
         connection: SecureConnection | None = None
+        file_handle: _DirectoryHandle | None = None
         try:
             if mount_resolver is None:
                 _validate_filesystem(path.parent, filesystem)
-            file_identity = _prepare_database_file(path, parent_descriptor)
+            file_handle, file_identity = _prepare_database_file(path, parent_descriptor)
             _check_directory_entries(path, parent_descriptor)
             _check_sidecars(path, parent_descriptor)
             descriptor_path = f"/proc/self/fd/{parent_descriptor}/{path.name}"
@@ -1045,6 +1055,8 @@ def connect_database(
             _verify_sqlite_descriptors(
                 before_fds, file_identity, path, parent_descriptor
             )
+            _close_directory_handle(file_handle)
+            file_handle = None
             _verify_main_database_path(connection, path)
             _check_directory_entries(path, parent_descriptor)
             _recheck_storage(path, parent_descriptor, parent_identity, file_identity)
@@ -1087,6 +1099,8 @@ def connect_database(
             return connection
         except BaseException:
             try:
+                if file_handle is not None:
+                    _close_directory_handle(file_handle)
                 if connection is not None:
                     connection.close()
             finally:

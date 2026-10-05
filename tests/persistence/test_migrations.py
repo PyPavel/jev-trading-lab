@@ -1131,11 +1131,15 @@ def test_database_path_replacement_during_connect_is_rejected(
     parent.mkdir(mode=0o700)
     database = parent / "db.sqlite3"
     database.touch(mode=0o600)
+    metadata = database.stat()
+    original_identity = (metadata.st_dev, metadata.st_ino)
     real_connect = sqlite3.connect
 
     def replace_database(*args: object, **kwargs: object) -> sqlite3.Connection:
+        assert original_identity in db_module._open_fd_identities().values()
         database.unlink()
         database.touch(mode=0o600)
+        assert (database.stat().st_dev, database.stat().st_ino) != original_identity
         return real_connect(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(db_module.sqlite3, "connect", replace_database)
