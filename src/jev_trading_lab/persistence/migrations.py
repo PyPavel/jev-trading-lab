@@ -16,10 +16,13 @@ import importlib.resources
 import json
 import os
 import re
+import selectors
+import signal
 import sqlite3
 import stat
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -634,7 +637,9 @@ def verify_migration_prefix(connection: sqlite3.Connection) -> None:
         )
 
 
-def _helper_command(path: Path, timeout_ms: int) -> tuple[str, ...]:
+def _helper_command(
+    path: Path, timeout_ms: int, identity: tuple[int, int]
+) -> tuple[str, ...]:
     return (
         sys.executable,
         "-I",
@@ -644,25 +649,65 @@ def _helper_command(path: Path, timeout_ms: int) -> tuple[str, ...]:
         str(_HELPER_PROTOCOL_VERSION),
         str(path),
         str(timeout_ms),
+        str(identity[0]),
+        str(identity[1]),
     )
 
 
 def _run_migration_helper(
-    path: Path, timeout_ms: int
+    path: Path, timeout_ms: int, identity: tuple[int, int]
 ) -> subprocess.CompletedProcess[bytes]:
     try:
-        return subprocess.run(
-            _helper_command(path, timeout_ms),
+        process = subprocess.Popen(
+            _helper_command(path, timeout_ms, identity),
             stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=_HELPER_TIMEOUT_SECONDS,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             close_fds=True,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired as error:
-        raise MigrationError("isolated migration helper timed out") from error
     except OSError as error:
         raise MigrationError("cannot launch isolated migration helper") from error
+    assert process.stdout is not None and process.stderr is not None
+    stdout = bytearray()
+    stderr = bytearray()
+    output = {process.stdout.fileno(): stdout, process.stderr.fileno(): stderr}
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    selector.register(process.stderr, selectors.EVENT_READ)
+    deadline = time.monotonic() + _HELPER_TIMEOUT_SECONDS
+    failure: MigrationError | None = None
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure = MigrationError("isolated migration helper timed out")
+                break
+            for key, _events in selector.select(remaining):
+                chunk = os.read(key.fd, 4096)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                output[key.fd].extend(chunk)
+                if len(output[key.fd]) > _HELPER_OUTPUT_LIMIT:
+                    failure = MigrationError(
+                        "isolated migration helper output exceeded limit"
+                    )
+                    break
+            if failure is not None:
+                break
+        if failure is not None:
+            os.killpg(process.pid, signal.SIGKILL)
+        returncode = process.wait()
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+    if failure is not None:
+        raise failure
+    return subprocess.CompletedProcess(
+        process.args, returncode, bytes(stdout), bytes(stderr)
+    )
 
 
 def _validate_helper_reply(completed: subprocess.CompletedProcess[bytes]) -> None:
@@ -685,7 +730,11 @@ def _validate_helper_reply(completed: subprocess.CompletedProcess[bytes]) -> Non
 
 
 def apply_migrations(connection: sqlite3.Connection) -> None:
-    """Apply packaged migrations in a fresh isolated fixed-role interpreter."""
+    """Apply packaged migrations in a fresh isolated fixed-role interpreter.
+
+    Passive audit hooks are supported. Deliberate ``sys.addaudithook`` SQLite
+    handle capture and capability theft are out of scope.
+    """
     if not isinstance(connection, sqlite3.Connection):
         raise TypeError("connection must be sqlite3.Connection")
     if not _is_factory_connection(connection):
@@ -701,11 +750,15 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
         raise MigrationError("cannot migrate inside an active caller transaction")
     _require_main_only(connection)
     _reject_user_temp_schema(connection)
-    path, timeout_ms = _connection_locator(connection)
+    path, timeout_ms, identity = _connection_locator(connection)
     migrations = load_migrations()
     _validate_applied(_applied_rows(connection), migrations)
 
-    completed = _run_migration_helper(path, timeout_ms)
+    try:
+        completed = _run_migration_helper(path, timeout_ms, identity)
+    except Exception:
+        verify_migration_prefix(connection)
+        return
     try:
         verify_migration_prefix(connection)
     except MigrationError:

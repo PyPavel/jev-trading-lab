@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import zipfile
 from pathlib import Path
 
@@ -323,25 +324,69 @@ def test_append_rejects_schema_prefix_checksum_drift(tmp_path: Path) -> None:
         connection.close()
 
 
-def test_directory_handle_close_is_idempotent_and_marks_before_close(
+def test_directory_handle_close_is_idempotent_and_retains_on_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     closed: list[int] = []
-    observed_closed = False
+    observed_open = False
     handle = db_module._DirectoryHandle(123)
 
     def close_fd(fd: int) -> None:
-        nonlocal observed_closed
-        observed_closed = handle.closed
+        nonlocal observed_open
+        observed_open = not handle.closed
         closed.append(fd)
-        raise RuntimeError("close failed after ownership ended")
+        if len(closed) == 1:
+            raise RuntimeError("close failed before ownership ended")
 
     monkeypatch.setattr(db_module.os, "close", close_fd)
     with pytest.raises(RuntimeError, match="close failed"):
         handle.close()
     handle.close()
-    assert observed_closed
-    assert closed == [123]
+    assert observed_open
+    assert closed == [123, 123]
+
+
+def test_directory_handle_close_retries_after_interruption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+    handle = db_module._DirectoryHandle(123)
+
+    def close_fd(fd: int) -> None:
+        calls.append(fd)
+        if len(calls) == 1:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(db_module.os, "close", close_fd)
+    with pytest.raises(KeyboardInterrupt):
+        handle.close()
+    assert not handle.closed
+    handle.close()
+    assert handle.closed
+    assert calls == [123, 123]
+
+
+def test_internal_writer_cleanup_preserves_original_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(db_module, "_open_private_parent", lambda _path: 123)
+
+    def fail_stat(*_args: object, **_kwargs: object) -> os.stat_result:
+        raise ValueError("original open failure")
+
+    monkeypatch.setattr(db_module.os, "stat", fail_stat)
+    monkeypatch.setattr(
+        db_module.os,
+        "close",
+        lambda _fd: (_ for _ in ()).throw(RuntimeError("cleanup interrupted")),
+    )
+    with pytest.raises(ValueError, match="original open failure"):
+        db_module._internal_connection(
+            Path("/tmp/db.sqlite3"),
+            timeout_ms=1000,
+            authorizer=lambda *_args: sqlite3.SQLITE_DENY,
+            expected_identity=(1, 2),
+        )
 
 
 def test_migration_helper_protocol_is_fixed() -> None:
@@ -360,6 +405,45 @@ def test_migration_helper_protocol_rejects_invalid_inputs() -> None:
     assert helper.main(("helper", "2", "/tmp/db.sqlite3", "1000")) == 1
     assert helper.main(("helper", "1", "relative.sqlite3", "1000")) == 1
     assert helper.main(("helper", "1", "/tmp/db.sqlite3", "0")) == 1
+    assert helper.main(("helper", "1", "/tmp/a/../db.sqlite3", "1000")) == 1
+    with pytest.raises(Exception, match="normalized"):
+        helper._arguments(("helper", "1", "/tmp/a/../db.sqlite3", "1000", "1", "2"))
+
+
+def test_migration_helper_output_is_capped_while_streaming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = (
+        sys.executable,
+        "-c",
+        "import os,time; os.write(1, b'x' * 20000); time.sleep(10)",
+    )
+    monkeypatch.setattr(migration_module, "_helper_command", lambda *_args: command)
+    started = time.monotonic()
+    with pytest.raises(Exception, match="output exceeded"):
+        migration_module._run_migration_helper(Path("/tmp/db"), 1000, (1, 2))
+    assert time.monotonic() - started < 2
+
+
+def test_migration_helper_timeout_kills_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_file = tmp_path / "grandchild.pid"
+    code = (
+        "import pathlib,subprocess,sys,time; "
+        "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
+        "pathlib.Path(sys.argv[1]).write_text(str(p.pid)); time.sleep(30)"
+    )
+    command = (sys.executable, "-c", code, str(pid_file))
+    monkeypatch.setattr(migration_module, "_helper_command", lambda *_args: command)
+    monkeypatch.setattr(migration_module, "_HELPER_TIMEOUT_SECONDS", 0.2)
+    with pytest.raises(Exception, match="timed out"):
+        migration_module._run_migration_helper(Path("/tmp/db"), 1000, (1, 2))
+    child_pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 2
+    while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not Path(f"/proc/{child_pid}").exists()
 
 
 @pytest.mark.parametrize(
@@ -386,8 +470,10 @@ def test_post_commit_reply_loss_uses_database_readback(
     connection = _connect(tmp_path / "reply-loss" / "db.sqlite3")
     real_run = migration_module._run_migration_helper
 
-    def lose_reply(path: Path, timeout_ms: int) -> subprocess.CompletedProcess[bytes]:
-        completed = real_run(path, timeout_ms)
+    def lose_reply(
+        path: Path, timeout_ms: int, identity: tuple[int, int]
+    ) -> subprocess.CompletedProcess[bytes]:
+        completed = real_run(path, timeout_ms, identity)
         assert completed.returncode == 0
         return subprocess.CompletedProcess(completed.args, 17, b"", b"lost reply")
 
@@ -400,6 +486,86 @@ def test_post_commit_reply_loss_uses_database_readback(
         )
     finally:
         connection.close()
+
+
+def test_post_commit_helper_exception_uses_database_readback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    connection = _connect(tmp_path / "helper-exception" / "db.sqlite3")
+    real_run = migration_module._run_migration_helper
+
+    def lose_outcome(
+        path: Path, timeout_ms: int, identity: tuple[int, int]
+    ) -> subprocess.CompletedProcess[bytes]:
+        completed = real_run(path, timeout_ms, identity)
+        assert completed.returncode == 0
+        raise migration_module.MigrationError("helper outcome lost")
+
+    monkeypatch.setattr(migration_module, "_run_migration_helper", lose_outcome)
+    try:
+        apply_migrations(connection)
+        assert (
+            connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0]
+            == 3
+        )
+    finally:
+        connection.close()
+
+
+def test_private_writer_rejects_database_inode_replacement(tmp_path: Path) -> None:
+    path = tmp_path / "inode" / "db.sqlite3"
+    connection = _connect(path)
+    try:
+        apply_migrations(connection)
+        replacement = path.with_suffix(".replacement")
+        replacement.write_bytes(path.read_bytes())
+        replacement.chmod(0o600)
+        os.replace(replacement, path)
+        with pytest.raises(Exception, match="inode|identity|changed"):
+            apply_migrations(connection)
+    finally:
+        connection.close()
+
+
+def test_audit_hook_capability_theft_policy_is_explicit() -> None:
+    sources = (
+        inspect.getsource(db_module.SecureConnection),
+        inspect.getsource(journal_module.AppendOnlyJournal),
+        inspect.getsource(migration_module.apply_migrations),
+    )
+    policy = "\n".join(sources).casefold()
+    assert "sys.addaudithook" in policy
+    assert "handle" in policy and "capture" in policy
+    assert "out of scope" in policy
+    assert "passive audit hooks" in policy and "supported" in policy
+
+
+def test_passive_audit_hook_observes_migration_without_changing_result(
+    tmp_path: Path,
+) -> None:
+    code = """
+import sys
+from pathlib import Path
+from jev_trading_lab.persistence.db import connect_database
+from jev_trading_lab.persistence.migrations import apply_migrations
+events = []
+sys.addaudithook(lambda event, args: events.append(event))
+path = Path(sys.argv[1])
+connection = connect_database(
+    path, busy_timeout_ms=1000, mount_resolver=lambda _: 'ext4'
+)
+apply_migrations(connection)
+assert connection.execute('SELECT count(*) FROM schema_migrations').fetchone()[0] == 3
+connection.close()
+assert events
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path / "audit" / "db.sqlite3")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_parent_database_descriptors_are_not_inheritable(tmp_path: Path) -> None:

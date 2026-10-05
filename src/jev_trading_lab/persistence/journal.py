@@ -320,7 +320,8 @@ class AppendOnlyJournal:
     object internals to steal the private writer, imports private helpers, modifies
     process memory, opens raw SQLite connections, or writes files directly is
     out of scope. This is not a sandbox or writer authentication against hostile
-    same-process code.
+    same-process code. Passive audit hooks are supported; deliberate
+    ``sys.addaudithook`` SQLite handle capture and capability theft are out of scope.
 
     Supersession is acyclic without graph traversal: each new event may reference
     only an already persisted predecessor, event primary keys are immutable, and

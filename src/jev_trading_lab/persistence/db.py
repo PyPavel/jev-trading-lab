@@ -6,6 +6,7 @@ import errno
 import os
 import sqlite3
 import stat
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -87,11 +88,12 @@ _INTERNAL_CONNECTION = object()
 class _DirectoryHandle:
     """Own one directory descriptor with idempotent, reentrancy-safe cleanup."""
 
-    __slots__ = ("_descriptor", "_lock")
+    __slots__ = ("_closing", "_descriptor", "_lock")
 
     def __init__(self, descriptor: int) -> None:
         self._descriptor: int | None = descriptor
-        self._lock = threading.Lock()
+        self._closing = False
+        self._lock = threading.RLock()
 
     @property
     def closed(self) -> bool:
@@ -107,16 +109,32 @@ class _DirectoryHandle:
     def close(self) -> None:
         with self._lock:
             descriptor = self._descriptor
-            if descriptor is None:
+            if descriptor is None or self._closing:
                 return
+            self._closing = True
+            try:
+                os.close(descriptor)
+            except BaseException:
+                self._closing = False
+                raise
             self._descriptor = None
-        os.close(descriptor)
+            self._closing = False
 
     def __del__(self) -> None:
         try:
             self.close()
         except BaseException:
             pass
+
+
+def _close_directory_handle(handle: _DirectoryHandle) -> None:
+    """Close while preserving an exception already active in the caller."""
+    active = sys.exception()
+    try:
+        handle.close()
+    except BaseException:
+        if active is None:
+            raise
 
 
 @contextmanager
@@ -153,11 +171,14 @@ class SecureConnection(sqlite3.Connection):
     after ``connect_database`` returns. Deliberate base-class descriptor dispatch,
     object-internal mutation, process-memory modification, and raw file writes are
     outside this same-process change-control boundary; this is not a sandbox.
+    Passive audit hooks are supported. Deliberate ``sys.addaudithook`` SQLite
+    handle capture and capability theft are out of scope.
     """
 
     __slots__ = (
         "_directory_handle",
         "_database_path",
+        "_database_identity",
         "_busy_timeout_ms",
         "_authorizer_sealed",
         "_factory_token",
@@ -165,6 +186,7 @@ class SecureConnection(sqlite3.Connection):
 
     _directory_handle: _DirectoryHandle
     _database_path: Path
+    _database_identity: tuple[int, int]
     _busy_timeout_ms: int
     _authorizer_sealed: bool
     _factory_token: object
@@ -234,7 +256,12 @@ class SecureConnection(sqlite3.Connection):
         return super().blobopen(*args, **kwargs)
 
     def __getattribute__(self, name: str) -> object:
-        if name in {"_factory_token", "_directory_handle", "_database_path"}:
+        if name in {
+            "_factory_token",
+            "_directory_handle",
+            "_database_path",
+            "_database_identity",
+        }:
             raise AttributeError("connection provenance is internal")
         return super().__getattribute__(name)
 
@@ -245,6 +272,7 @@ class SecureConnection(sqlite3.Connection):
             "_factory_token",
             "_directory_handle",
             "_database_path",
+            "_database_identity",
         }:
             raise AttributeError(f"{name.removeprefix('_')} is immutable")
         if name in {"row_factory", "text_factory"} and self.authorizer_sealed:
@@ -258,6 +286,7 @@ class SecureConnection(sqlite3.Connection):
             "_factory_token",
             "_directory_handle",
             "_database_path",
+            "_database_identity",
         }:
             raise AttributeError(f"{name.removeprefix('_')} is immutable")
         if name in {"row_factory", "text_factory"} and self.authorizer_sealed:
@@ -283,7 +312,7 @@ class SecureConnection(sqlite3.Connection):
             except AttributeError:
                 return
             assert isinstance(handle, _DirectoryHandle)
-            handle.close()
+            _close_directory_handle(handle)
 
     def __del__(self) -> None:
         try:
@@ -386,6 +415,7 @@ def _is_factory_connection(connection: object) -> bool:
         sealed = _secure_slot(connection, "_authorizer_sealed")
         token = _secure_slot(connection, "_factory_token")
         path = _secure_slot(connection, "_database_path")
+        identity = _secure_slot(connection, "_database_identity")
         handle = _secure_slot(connection, "_directory_handle")
     except AttributeError:
         return False
@@ -393,19 +423,33 @@ def _is_factory_connection(connection: object) -> bool:
         sealed is True
         and token is _PUBLIC_CONNECTION
         and isinstance(path, Path)
+        and isinstance(identity, tuple)
+        and len(identity) == 2
         and isinstance(handle, _DirectoryHandle)
         and not handle.closed
     )
 
 
-def _connection_locator(connection: SecureConnection) -> tuple[Path, int]:
+def _connection_locator(
+    connection: SecureConnection,
+) -> tuple[Path, int, tuple[int, int]]:
     if not _is_factory_connection(connection):
         raise DatabaseConfigurationError(
             "connection must be created and sealed by connect_database"
         )
     path = _secure_slot(connection, "_database_path")
+    identity = _secure_slot(connection, "_database_identity")
+    handle = _secure_slot(connection, "_directory_handle")
     assert isinstance(path, Path)
-    return path, connection.busy_timeout_ms
+    assert isinstance(identity, tuple)
+    assert isinstance(handle, _DirectoryHandle)
+    metadata = os.stat(path.name, dir_fd=handle.descriptor, follow_symlinks=False)
+    _validate_database_metadata(metadata, path)
+    if (metadata.st_dev, metadata.st_ino) != identity:
+        raise DatabaseSafetyError("database inode identity changed")
+    _check_directory_entries(path, handle.descriptor)
+    _check_sidecars(path, handle.descriptor)
+    return path, connection.busy_timeout_ms, identity
 
 
 def _reject_user_temp_schema(connection: SecureConnection) -> None:
@@ -429,6 +473,7 @@ def _internal_connection(
     *,
     timeout_ms: int,
     authorizer: _Authorizer,
+    expected_identity: tuple[int, int],
 ) -> sqlite3.Connection:
     """Open a fixed-role internal connection whose authorizer never changes."""
     if not path.is_absolute() or type(timeout_ms) is not int:
@@ -437,9 +482,10 @@ def _internal_connection(
     handle = _DirectoryHandle(parent)
     connection: sqlite3.Connection | None = None
     try:
-        _validate_database_metadata(
-            os.stat(path.name, dir_fd=handle.descriptor, follow_symlinks=False), path
-        )
+        metadata = os.stat(path.name, dir_fd=handle.descriptor, follow_symlinks=False)
+        _validate_database_metadata(metadata, path)
+        if (metadata.st_dev, metadata.st_ino) != expected_identity:
+            raise DatabaseSafetyError("database inode identity changed")
         _check_sidecars(path, handle.descriptor)
         connection = sqlite3.connect(
             f"/proc/self/fd/{handle.descriptor}/{path.name}",
@@ -455,6 +501,9 @@ def _internal_connection(
         connection.execute("PRAGMA trusted_schema = OFF")
         connection.set_authorizer(authorizer)
         _verify_main_database_path(connection, path)
+        metadata = os.stat(path.name, dir_fd=handle.descriptor, follow_symlinks=False)
+        if (metadata.st_dev, metadata.st_ino) != expected_identity:
+            raise DatabaseSafetyError("database inode identity changed")
         _check_directory_entries(path, handle.descriptor)
         _check_sidecars(path, handle.descriptor)
         return connection
@@ -463,15 +512,18 @@ def _internal_connection(
             connection.close()
         raise
     finally:
-        handle.close()
+        _close_directory_handle(handle)
 
 
 def _open_journal_writer(
     connection: SecureConnection, table: str
 ) -> sqlite3.Connection:
-    path, timeout = _connection_locator(connection)
+    path, timeout, identity = _connection_locator(connection)
     return _internal_connection(
-        path, timeout_ms=timeout, authorizer=_journal_authorizer(table)
+        path,
+        timeout_ms=timeout,
+        authorizer=_journal_authorizer(table),
+        expected_identity=identity,
     )
 
 
@@ -926,6 +978,7 @@ def connect_database(
                 )
             object.__setattr__(connection, "_directory_handle", parent_handle)
             object.__setattr__(connection, "_database_path", path)
+            object.__setattr__(connection, "_database_identity", file_identity)
             object.__setattr__(connection, "_factory_token", _PUBLIC_CONNECTION)
             object.__setattr__(connection, "_authorizer_sealed", False)
             _verify_sqlite_descriptors(
@@ -976,5 +1029,5 @@ def connect_database(
                 if connection is not None:
                     connection.close()
             finally:
-                parent_handle.close()
+                _close_directory_handle(parent_handle)
             raise

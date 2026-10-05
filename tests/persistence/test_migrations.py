@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from jev_trading_lab.core.time import MAX_DATETIME_US
 from jev_trading_lab.persistence import db as db_module
 from jev_trading_lab.persistence import migrations as migration_module
 from jev_trading_lab.persistence.db import (
@@ -483,143 +482,6 @@ class _TraceAbort(BaseException):
     pass
 
 
-@pytest.mark.skip(reason="parent never receives migration privilege")
-def test_apply_rejects_active_trace_before_privileged_transition(
-    tmp_path: Path,
-) -> None:
-    connection = _connect(tmp_path / "private" / "db.sqlite3")
-    sqlite3.Connection.set_authorizer(connection, None)
-    connection.execute("CREATE TABLE main.guarded(value INTEGER) STRICT")
-    connection.execute(
-        "CREATE TRIGGER main.guarded_immutable BEFORE DELETE ON guarded "
-        "BEGIN SELECT RAISE(ABORT, 'immutable'); END"
-    )
-    sqlite3.Connection.set_authorizer(connection, db_module._runtime_authorizer)
-    injected = False
-
-    def inject_after_install(frame: object, event: str, _arg: object) -> object:
-        nonlocal injected
-        if (
-            not injected
-            and event == "return"
-            and getattr(frame, "f_code", None)
-            is db_module._set_internal_authorizer.__code__
-        ):
-            connection.execute("DROP TRIGGER main.guarded_immutable")
-            connection.execute("CREATE TABLE main.trace_forged(value INTEGER) STRICT")
-            injected = True
-        return inject_after_install
-
-    sys.settrace(inject_after_install)
-    try:
-        with pytest.raises(MigrationError, match="tracing|profiling"):
-            apply_migrations(connection)
-    finally:
-        sys.settrace(None)
-    try:
-        assert not injected
-        assert tuple(
-            connection.execute(
-                "SELECT 1 FROM main.sqlite_schema "
-                "WHERE type = 'trigger' AND name = 'guarded_immutable'"
-            ).fetchone()
-        ) == (1,)
-        assert (
-            connection.execute(
-                "SELECT 1 FROM main.sqlite_schema WHERE name = 'trace_forged'"
-            ).fetchone()
-            is None
-        )
-    finally:
-        connection.close()
-
-
-@pytest.mark.skip(reason="migration authorizer transitions no longer exist")
-def test_migration_transition_restores_after_trace_baseexception(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    connection = _connect(tmp_path / "private" / "db.sqlite3")
-    raised_after_install = False
-
-    def abort_after_install(frame: object, event: str, _arg: object) -> object:
-        nonlocal raised_after_install
-        if (
-            event == "return"
-            and getattr(frame, "f_code", None)
-            is db_module._set_internal_authorizer.__code__
-        ):
-            raised_after_install = True
-            raise _TraceAbort("after migration authorizer install")
-        return abort_after_install
-
-    monkeypatch.setattr(sys, "gettrace", lambda: None)
-    sys.settrace(abort_after_install)
-    try:
-        with pytest.raises(_TraceAbort, match="after migration authorizer install"):
-            apply_migrations(connection)
-    finally:
-        sys.settrace(None)
-    try:
-        assert raised_after_install
-        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
-            connection.execute("CREATE TABLE main.stranded_privilege(value INTEGER)")
-    finally:
-        connection.close()
-
-
-@pytest.mark.skip(reason="parent hooks cannot cross isolated migration process")
-@pytest.mark.parametrize("hook", ("trace", "profile"))
-def test_apply_rejects_active_interpreter_hook_before_sql(
-    tmp_path: Path, hook: str
-) -> None:
-    connection = _connect(tmp_path / hook / "db.sqlite3")
-    callback_calls = 0
-
-    def callback(_frame: object, _event: str, _arg: object) -> object:
-        nonlocal callback_calls
-        callback_calls += 1
-        return callback
-
-    setter = sys.settrace if hook == "trace" else sys.setprofile
-    setter(callback)
-    try:
-        with pytest.raises(MigrationError, match="tracing|profiling"):
-            apply_migrations(connection)
-    finally:
-        setter(None)
-    try:
-        assert callback_calls > 0
-        assert (
-            connection.execute(
-                "SELECT 1 FROM main.sqlite_schema WHERE name = 'schema_migrations'"
-            ).fetchone()
-            is None
-        )
-    finally:
-        connection.close()
-
-
-@pytest.mark.skip(reason="all-thread hooks cannot cross isolated migration process")
-def test_apply_rejects_threading_trace_active_on_current_thread(
-    tmp_path: Path,
-) -> None:
-    if not hasattr(threading, "settrace_all_threads"):
-        pytest.skip("threading.settrace_all_threads is unavailable")
-    connection = _connect(tmp_path / "threading-trace" / "db.sqlite3")
-
-    def callback(_frame: object, _event: str, _arg: object) -> object:
-        return callback
-
-    threading.settrace_all_threads(callback)
-    try:
-        assert sys.gettrace() is callback
-        with pytest.raises(MigrationError, match="tracing|profiling"):
-            apply_migrations(connection)
-    finally:
-        threading.settrace_all_threads(None)
-        connection.close()
-
-
 def test_factory_created_sealed_connection_is_migration_ready(tmp_path: Path) -> None:
     connection = _connect(tmp_path / "private" / "db.sqlite3")
     try:
@@ -664,53 +526,6 @@ def test_public_migration_clock_cannot_run_sql_under_privilege(tmp_path: Path) -
             ).fetchone()
             is None
         )
-    finally:
-        connection.close()
-
-
-@pytest.mark.skip(reason="child timestamps are intentionally independent")
-def test_clean_database_applies_full_packaged_prefix(tmp_path: Path) -> None:
-    connection = _connect(tmp_path / "private" / "db.sqlite3")
-    try:
-        _apply_reviewed_migrations(connection, 1_700_000_000_000_000)
-        tables = {
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_schema WHERE type='table'"
-            )
-        }
-        assert tables == {
-            "schema_migrations",
-            "manifests",
-            "run_windows",
-            "runs",
-            "accounts",
-            "opportunities",
-            "observations",
-            "artifact_refs",
-            "journal_entities",
-            "journal_events",
-        }
-        assert _applied(connection) == [
-            (
-                1,
-                "001_migration_metadata.sql",
-                hashlib.sha256(SCHEMA_SQL).hexdigest(),
-                1_700_000_000_000_000,
-            ),
-            (
-                2,
-                "002_core_entities.sql",
-                hashlib.sha256(CORE_SCHEMA_SQL).hexdigest(),
-                1_700_000_000_000_000,
-            ),
-            (
-                3,
-                "003_append_only_guards.sql",
-                hashlib.sha256(JOURNAL_SCHEMA_SQL).hexdigest(),
-                1_700_000_000_000_000,
-            ),
-        ]
     finally:
         connection.close()
 
@@ -896,33 +711,6 @@ def test_failed_second_statement_rolls_back_entire_migration(
         )
         assert [row[0] for row in _applied(connection)] == [1]
         assert not connection.in_transaction
-    finally:
-        connection.close()
-
-
-@pytest.mark.skip(reason="public runtime authorizer never transitions")
-def test_failed_migration_restores_sealed_runtime_authorizer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    package, _schema = _package(
-        tmp_path / "package",
-        monkeypatch,
-        {
-            "001_migration_metadata.sql": SCHEMA_SQL,
-            "002_core_entities.sql": CORE_SCHEMA_SQL,
-            "003_append_only_guards.sql": JOURNAL_SCHEMA_SQL,
-            "004_failure.sql": b"SELECT * FROM table_that_does_not_exist;\n",
-        },
-    )
-    connection = _connect(tmp_path / "private" / "db.sqlite3")
-    try:
-        _apply_reviewed_migrations(connection, 1_000_000)
-        with pytest.raises(sqlite3.OperationalError, match="no such table"):
-            apply_fixture_migrations(
-                connection, package=package, clock=lambda: 2_000_000
-            )
-        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
-            connection.execute("CREATE TABLE escaped (id INTEGER) STRICT")
     finally:
         connection.close()
 
@@ -1465,36 +1253,6 @@ def test_empty_migration_package_fails_before_database_mutation(
         connection.close()
 
 
-@pytest.mark.skip(reason="direct public schema_migrations DML is permanently denied")
-@pytest.mark.parametrize(
-    "version,name",
-    (
-        (2, "002_a/evil.sql"),
-        (2, "002_a\\evil.sql"),
-        (2, "002_A.sql"),
-        (2, "002_.sql"),
-        (2, "002_a-b.sql"),
-        (2, "002_a.b.sql"),
-        (2, "003_ok.sql"),
-        (2, "002_bad\nname.sql"),
-    ),
-)
-def test_schema_rejects_hostile_or_mismatched_migration_names(
-    tmp_path: Path, version: int, name: str
-) -> None:
-    connection = _connect(tmp_path / "private" / "db.sqlite3")
-    try:
-        _apply_reviewed_migrations(connection, 1_000_000)
-        with pytest.raises(sqlite3.IntegrityError):
-            connection.execute(
-                "INSERT INTO main.schema_migrations "
-                "(version, name, sha256, applied_at_us) VALUES (?, ?, ?, ?)",
-                (version, name, "a" * 64, 2_000_000),
-            )
-    finally:
-        connection.close()
-
-
 def test_filesystem_resource_replacement_with_symlink_is_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1934,49 +1692,6 @@ def test_create_temp_migration_is_denied_and_rolled_back(
         reopened.close()
 
 
-@pytest.mark.skip(reason="direct public schema_migrations DML is permanently denied")
-@pytest.mark.parametrize("invalid", (-1, 2**63 - 1))
-def test_schema_rejects_invalid_applied_timestamp(tmp_path: Path, invalid: int) -> None:
-    connection = _connect(tmp_path / "private" / "db.sqlite3")
-    try:
-        _apply_reviewed_migrations(connection, 0)
-        with pytest.raises(sqlite3.IntegrityError):
-            connection.execute(
-                "INSERT INTO main.schema_migrations "
-                "(version, name, sha256, applied_at_us) VALUES (?, ?, ?, ?)",
-                (2, "002_valid.sql", "a" * 64, invalid),
-            )
-        assert _applied(connection)[0][3] == 0
-    finally:
-        connection.close()
-
-
-@pytest.mark.skip(reason="direct public schema_migrations DML is permanently denied")
-@pytest.mark.parametrize("invalid", (-1, 2**63 - 1))
-def test_reconnect_detects_corrupt_applied_timestamp(
-    tmp_path: Path, invalid: int
-) -> None:
-    database = tmp_path / "private" / "db.sqlite3"
-    connection = _connect(database)
-    try:
-        _apply_reviewed_migrations(connection, 0)
-        connection.execute("PRAGMA ignore_check_constraints = ON")
-        connection.execute(
-            "UPDATE main.schema_migrations SET applied_at_us = ? WHERE version = 1",
-            (invalid,),
-        )
-        connection.execute("PRAGMA ignore_check_constraints = OFF")
-    finally:
-        connection.close()
-
-    reopened = _connect(database)
-    try:
-        with pytest.raises(MigrationError, match="applied migration metadata"):
-            _apply_reviewed_migrations(reopened, MAX_DATETIME_US)
-    finally:
-        reopened.close()
-
-
 def test_database_parent_rejects_unexpected_entry(tmp_path: Path) -> None:
     parent = tmp_path / "private"
     parent.mkdir(mode=0o700)
@@ -2364,28 +2079,6 @@ def test_dropped_connection_releases_parent_descriptor(tmp_path: Path) -> None:
     assert parent_fds[0] not in _proc_fd_targets()
 
 
-@pytest.mark.skip(reason="replaced by shared DirectoryHandle ownership regression")
-def test_explicit_close_then_gc_does_not_double_close_reused_fd(tmp_path: Path) -> None:
-    database = tmp_path / "private" / "db.sqlite3"
-    connection = _connect(database)
-    parent_descriptor = connection._parent_descriptor  # type: ignore[attr-defined]
-    assert parent_descriptor is not None
-    connection.close()
-
-    sentinel = tmp_path / "sentinel"
-    sentinel.write_text("open", encoding="utf-8")
-    opened_descriptor = os.open(sentinel, os.O_RDONLY)
-    try:
-        sentinel_descriptor = os.dup2(opened_descriptor, parent_descriptor)
-        if opened_descriptor != sentinel_descriptor:
-            os.close(opened_descriptor)
-        del connection
-        gc.collect()
-        assert os.read(sentinel_descriptor, 4) == b"open"
-    finally:
-        os.close(parent_descriptor)
-
-
 def test_failed_connection_construction_does_not_leak_descriptors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2676,63 +2369,6 @@ def test_migration_authorizer_denies_trigger_originated_writes() -> None:
             _migration_authorizer(action, "target", None, "main", "hostile_trigger")
             == sqlite3.SQLITE_DENY
         )
-
-
-@pytest.mark.skip(
-    reason="synthetic transition helper is outside production architecture"
-)
-def test_upgrade_rejects_persistent_trigger_side_effect_on_metadata_insert(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    package_v1, _schema_v1 = _package(
-        tmp_path / "v1",
-        monkeypatch,
-        {"001_migration_metadata.sql": SCHEMA_SQL},
-    )
-    database = tmp_path / "database" / "db.sqlite3"
-    connection = _connect(database)
-    try:
-        apply_fixture_migrations(
-            connection, package=package_v1, clock=lambda: 1_000_000
-        )
-        sqlite3.Connection.set_authorizer(connection, None)
-        connection.execute("CREATE TABLE main.trigger_sink (version INTEGER)")
-        connection.execute(
-            "CREATE TRIGGER main.capture_metadata "
-            "AFTER INSERT ON schema_migrations "
-            "BEGIN INSERT INTO trigger_sink VALUES (NEW.version); END"
-        )
-        sqlite3.Connection.set_authorizer(connection, db_module._runtime_authorizer)
-
-        package_v2, _schema_v2 = _package(
-            tmp_path / "v2",
-            monkeypatch,
-            {
-                "001_migration_metadata.sql": SCHEMA_SQL,
-                "002_core_entities.sql": CORE_SCHEMA_SQL,
-            },
-        )
-        with pytest.raises(MigrationError, match="unauthorized SQL"):
-            apply_fixture_migrations(
-                connection, package=package_v2, clock=lambda: 1_000_001
-            )
-
-        assert [row[0] for row in _applied(connection)] == [1]
-        assert (
-            connection.execute("SELECT count(*) FROM main.trigger_sink").fetchone()[0]
-            == 0
-        )
-        assert (
-            connection.execute(
-                "SELECT 1 FROM main.sqlite_schema WHERE name = 'manifests'"
-            ).fetchone()
-            is None
-        )
-        assert connection.authorizer_sealed
-        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
-            connection.execute("DROP TABLE main.trigger_sink")
-    finally:
-        connection.close()
 
 
 def test_upgrade_rejects_temp_trigger_forging_journal_on_metadata_insert(
