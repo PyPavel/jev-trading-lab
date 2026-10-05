@@ -661,3 +661,77 @@ bed023031e0aaec7e4de2c3a74c5a8683011ad380a217838d970aa99c7cb29a7  .github/workfl
 Migrations `001`-`003`, `pyproject.toml`, and `uv.lock` are unchanged from `744d543`.
 The preserved `.hermes-tmp.W3Xrv5` sentinel remains untracked and byte-identical. No
 push or independent approval occurred.
+
+
+## Final acronym/digit/version remediation at `bafbee4`
+
+Status remains **PENDING INDEPENDENT RE-REVIEW**. Production commit `bafbee4`
+replaces camel-token-dependent credential matching with a bounded terminal compact-form
+classifier. Migrations `001`-`003`, `pyproject.toml`, and `uv.lock` remain unchanged.
+
+### Exact RED and delivered behavior
+
+Before production edits, the strengthened credential selection reported 25 expected
+failures and 84 passes. `OPENAIAPIKey`, `OPENAIAPIKEY`, `GPT4OAPIKey`, and attached or
+separated versions (`key2`, `keyv2`, `key_v2`, `key.v2`, repeated `v` suffixes) reached
+stored query/header/decoded JSON body bytes. The classifier also lacked an explicit
+name-cost bound.
+
+The replacement classifier NFKC-normalizes and casefolds once, emits word-token and
+compact alphanumeric forms in a bounded linear scan, strips at most eight terminal
+numeric/`v`-numeric suffixes, then recognizes only declared compact credential phrases
+at the end. Provider/acronym boundaries are unnecessary. Semantic text after a phrase
+is not redacted; exact near-misses now include `apiKeyMetadata`, `secretKeyAlgorithm`,
+`passwordResetUrl`, and `clientSecretRotationEnabled` on all three surfaces. Escaped
+JSON `OPENAI\\u0041PIKey_v2` follows the existing decoded-key path. Oversize classifier
+errors are generic and do not reflect names or values.
+
+### Fresh verification
+
+```text
+credential matrix: 129 passed, 197 deselected in 0.57s
+focused blob suite: 326 passed in 89.44s
+
+exact default full suite, sequential run 1:
+PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
+1151 passed in 110.91s; zero skips
+
+exact default full suite, sequential run 2:
+PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
+1151 passed in 111.00s; zero skips
+
+mandatory built-artifact full suite:
+JEV_REQUIRE_BUILT_ARTIFACTS=1 PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
+1151 passed in 111.59s; zero skips
+
+mandatory built-artifact policy suite: 62 passed in 2.53s
+policy preflight: Policy preflight passed.
+uv lock --check: Resolved 64 packages
+uv sync --frozen --all-groups: Checked 63 packages
+ruff check: All checks passed!
+ruff format --check: 37 files already formatted
+mypy: Success: no issues found in 18 source files
+build: wheel and sdist built successfully
+pip-audit: No known vulnerabilities found
+wheel smoke: Installed-wheel migration and controlled journal write smoke passed.
+git diff --check: exit 0
+source/test bytecode: none
+```
+
+Stable production hashes:
+
+```text
+07b5116f431d6e8953892d1b0f5507b5f212e267cdc372efc8f03492c06476c3  src/jev_trading_lab/persistence/blobs.py
+b1e3463d2f5cbe8e90f9a31386bcaa67b9e4a9cd53f235c66b1c8d0e31a43e61  tests/persistence/test_blobs.py
+374db73728ad718991bd3ed13a51f16a86110772ec93f7db86efa2186e6f37f2  scripts/policy_preflight.py
+59409d672ad8349e005b8d58d500a5823d207b0a0e9e3e21f513673865d57de9  tests/test_package_policy.py
+4355961bd90c67e75d6c235eccfbaf6a91cf957633bef757e7379bc510ed9314  .github/workflows/ci.yml
+```
+
+Migration hashes remain
+`1be6dbbcb20a6ab8efe016172d786280470fc7a450f403825e2a61e199a1cb48`,
+`9026b984313d972dec6c3db8b442e4324f2a7f02ec71bd555c0c17f8ed362c54`, and
+`d18492f31e6c0948fa87f11927f2bc4fb2a5a41ffb45c27c9e966339d5e35995`.
+The preserved `.hermes-tmp.W3Xrv5` sentinel hash remains
+`3bd946d16a26c126e038bf7d735e29352ee22a42652fc43d0e2261f4d653ccd9`.
+No push or independent approval occurred.
