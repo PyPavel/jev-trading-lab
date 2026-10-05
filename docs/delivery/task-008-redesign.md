@@ -111,6 +111,11 @@ Supported guarantee: public factory connections remain permanently restrictive t
 
 Deliberate base-class descriptor dispatch, object-internal mutation, frame inspection or private writer theft, importing private helpers, process-memory modification, raw separately opened SQLite connections, direct filesystem writes, and adversarial FD ABA outside the cooperative connection lock remain out of boundary. This is not an in-process sandbox or cryptographic writer authentication.
 
+Passive CPython audit hooks remain supported. A malicious hook installed with
+`sys.addaudithook` can deliberately capture a newly created SQLite handle before
+Python installs its fixed authorizer; that capability-theft attack is explicitly
+outside the controlled-API boundary and is not claimed to be sandboxed.
+
 ## Review state
 
 **PENDING INDEPENDENT RE-REVIEW.** This agent did not independently approve the change.
