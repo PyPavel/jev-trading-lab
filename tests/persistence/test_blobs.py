@@ -5,6 +5,10 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
+import sys
+import textwrap
+import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -140,12 +144,11 @@ def test_structured_envelope_redacts_secrets_before_hash_and_publish(
     encoded = stored.decode()
 
     assert ref.sha256 == hashlib.sha256(stored).hexdigest()
-    assert (
-        document["body"]["result"] == "preserve Bearer body-text and api_key=body-text"
-    )
-    assert document["body"]["access_token"] == "[REDACTED]"
-    assert document["body"]["nested"]["client_secret"] == "[REDACTED]"
-    assert document["body"]["nested"]["value"] == 7
+    redacted_body = json.loads(__import__("base64").b64decode(document["body_base64"]))
+    assert redacted_body["result"] == "preserve Bearer body-text and api_key=body-text"
+    assert redacted_body["access_token"] == "[REDACTED]"
+    assert redacted_body["nested"]["client_secret"] == "[REDACTED]"
+    assert redacted_body["nested"]["value"] == 7
     assert document["headers"] == {
         "Authorization": "[REDACTED]",
         "Content-Type": "application/json",
@@ -437,3 +440,478 @@ def test_blob_ref_is_frozen_and_validated(tmp_path: Path) -> None:
         ref.sha256 = "0" * 64
     with pytest.raises(ValueError):
         api.BlobRef("../bad", 1, "../bad")
+
+
+def test_fresh_directory_entries_are_fsynced_in_creation_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = _api()
+    real_fsync = os.fsync
+    events: list[str] = []
+
+    def traced_fsync(descriptor: int) -> None:
+        target = os.readlink(f"/proc/self/fd/{descriptor}")
+        events.append("file" if ".tmp-" in target else Path(target).name)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(api.os, "fsync", traced_fsync)
+    store = api.BlobStore(tmp_path / "root")
+    ref = store.publish(b"ordered")
+
+    assert events == [tmp_path.name, "root", ref.sha256[:2], "file", ref.sha256[2:4]]
+    reopened = api.BlobStore(tmp_path / "root")
+    assert reopened.read_verified(ref) == b"ordered"
+
+
+def test_preexisting_directories_are_not_reported_as_newly_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = _api()
+    first = api.BlobStore(tmp_path / "root").publish(b"same-shard")
+    real_fsync = os.fsync
+    directories: list[str] = []
+
+    def traced_fsync(descriptor: int) -> None:
+        target = os.readlink(f"/proc/self/fd/{descriptor}")
+        if ".tmp-" not in target:
+            directories.append(Path(target).name)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(api.os, "fsync", traced_fsync)
+    second = api.BlobStore(tmp_path / "root").publish(b"same-shard")
+    assert second == first
+    assert directories == [first.sha256[2:4]]
+
+
+def test_scavenger_directory_replacement_cannot_delete_outside_victim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    ref = store.publish(b"inside")
+    first = store.root / ref.sha256[:2]
+    outside = tmp_path / "outside"
+    outside_second = outside / ref.sha256[2:4]
+    outside_second.mkdir(parents=True)
+    victim = outside_second / (".tmp-" + "d" * 32)
+    victim.write_bytes(b"outside")
+    victim.chmod(0o600)
+    os.utime(victim, (1, 1))
+    replaced = False
+
+    real_open = os.open
+
+    def racing_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        nonlocal replaced
+        if path == first.name and kwargs.get("dir_fd") is not None and not replaced:
+            replaced = True
+            first.rename(first.with_name(first.name + "-old"))
+            first.symlink_to(outside, target_is_directory=True)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", racing_open)
+    with pytest.raises(_api().BlobSecurityError):
+        store.scavenge_stale_temps(older_than_seconds=1, now=100)
+    assert replaced
+    assert victim.read_bytes() == b"outside"
+
+
+def test_normalized_redaction_and_envelope_repr_hide_originals(tmp_path: Path) -> None:
+    api = _api()
+    secrets = ["auth", "proxy", "cookie", "setcookie", "api", "json-a", "json-b"]
+    body = b'{ "passWord" : "json-a", "session-token":"json-b", "safe" : 1.00 }'
+    envelope = api.ArtifactEnvelope(
+        body=body,
+        url=(
+            "https://example.test/?X-Goog-Signature=goog-secret"
+            "&sig=azure-secret&GoogleAccessId=google-id-secret"
+        ),
+        headers={
+            "Auth\uff4frization": secrets[0],
+            "Proxy_Auth": secrets[1],
+            "COOKIE": secrets[2],
+            "Set Cookie": secrets[3],
+            "xApiKey": secrets[4],
+            "Content-Type": "application/json",
+        },
+    )
+    representation = repr(envelope)
+    stored = _store(tmp_path).read_verified(_store(tmp_path).publish(envelope))
+    encoded = stored.decode()
+    for secret in secrets + ["goog-secret", "azure-secret", "google-id-secret"]:
+        assert secret not in representation
+        assert secret not in encoded
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "X-Amz-Algorithm",
+        "X-Amz-Credential",
+        "X-Amz-Date",
+        "X-Amz-Expires",
+        "X-Amz-Security-Token",
+        "X-Amz-Signature",
+        "X-Amz-SignedHeaders",
+        "X-Goog-Algorithm",
+        "X-Goog-Credential",
+        "X-Goog-Date",
+        "X-Goog-Expires",
+        "X-Goog-Security-Token",
+        "X-Goog-Signature",
+        "X-Goog-SignedHeaders",
+        "GoogleAccessId",
+        "sig",
+        "se",
+        "sv",
+        "sp",
+        "sr",
+        "st",
+        "spr",
+        "sip",
+        "si",
+        "Signature",
+        "Policy",
+        "Key-Pair-Id",
+        "token",
+        "credential",
+        "api-key",
+    ],
+)
+def test_signed_query_fields_are_redacted(tmp_path: Path, name: str) -> None:
+    api = _api()
+    envelope = api.ArtifactEnvelope(body=b"ok", url=f"https://e.test/?{name}=TOPSECRET")
+    stored = _store(tmp_path).read_verified(_store(tmp_path).publish(envelope))
+    assert b"TOPSECRET" not in stored
+
+
+def test_json_redaction_preserves_every_nonsecret_lexical_byte(tmp_path: Path) -> None:
+    api = _api()
+    body = b'{\n "safe" : "\\u0061", "nested":[{"clientSecret" : "old"}], "n":1.00\n}'
+    expected = (
+        b'{\n "safe" : "\\u0061", "nested":'
+        b'[{"clientSecret" : "[REDACTED]"}], "n":1.00\n}'
+    )
+    envelope = api.ArtifactEnvelope(
+        body=body, headers={"Content-Type": "application/problem+json"}
+    )
+    stored = _store(tmp_path).read_verified(_store(tmp_path).publish(envelope))
+    document = json.loads(stored)
+    assert __import__("base64").b64decode(document["body_base64"]) == expected
+
+
+def test_invalid_declared_json_with_secret_marker_fails_closed(tmp_path: Path) -> None:
+    api = _api()
+    secret = "DO-NOT-LEAK"
+    envelope = api.ArtifactEnvelope(
+        body=f'{{"password":"{secret}"'.encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with pytest.raises(ValueError) as caught:
+        _store(tmp_path).publish(envelope)
+    assert secret not in str(caught.value)
+
+
+def test_invalid_declared_json_with_escaped_secret_marker_fails_closed(
+    tmp_path: Path,
+) -> None:
+    api = _api()
+    secret = "ESCAPED-DO-NOT-LEAK"
+    envelope = api.ArtifactEnvelope(
+        body=f'{{"pass\\u0077ord":"{secret}"'.encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with pytest.raises(ValueError, match="declared JSON body is unsafe") as caught:
+        _store(tmp_path).publish(envelope)
+    assert secret not in str(caught.value)
+
+
+def test_invalid_declared_json_without_secret_marker_is_preserved(
+    tmp_path: Path,
+) -> None:
+    api = _api()
+    body = b'{"ordinary": incomplete'
+    envelope = api.ArtifactEnvelope(
+        body=body, headers={"Content-Type": "application/json"}
+    )
+    store = _store(tmp_path)
+    document = json.loads(store.read_verified(store.publish(envelope)))
+    assert __import__("base64").b64decode(document["body_base64"]) == body
+
+
+@pytest.mark.parametrize("error_number", [errno.ENOSYS, errno.EOPNOTSUPP])
+def test_renameat2_unavailable_is_configuration_error_without_reference_or_poison(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_number: int
+) -> None:
+    api = _api()
+    store = _store(tmp_path)
+    monkeypatch.setattr(
+        api,
+        "_rename_noreplace",
+        lambda *_args: (_ for _ in ()).throw(OSError(error_number, "x")),
+    )
+    called: list[Any] = []
+    with pytest.raises(api.BlobConfigurationError):
+        store.publish_and_reference(b"payload", called.append)
+    assert called == []
+    assert not list(store.root.rglob(".tmp-*"))
+    assert not [path for path in store.root.rglob("*") if path.is_file()]
+
+
+def test_tmpfs_root_is_rejected_and_resolver_receives_opened_root(
+    tmp_path: Path,
+) -> None:
+    api = _api()
+    seen: list[Path] = []
+    root = tmp_path / "root"
+    with pytest.raises(api.BlobSecurityError, match="unsupported filesystem"):
+        api.BlobStore(
+            root, filesystem_resolver=lambda path: seen.append(path) or "tmpfs"
+        )
+    assert len(seen) == 1
+    assert str(seen[0]).startswith("/proc/self/fd/")
+
+
+def test_root_mode_and_identity_drift_fail_closed(tmp_path: Path) -> None:
+    api = _api()
+    root = tmp_path / "root"
+    store = api.BlobStore(root)
+    root.chmod(0o755)
+    with pytest.raises(api.BlobSecurityError):
+        store.publish(b"mode drift")
+    root.chmod(0o700)
+    moved = tmp_path / "moved"
+    root.rename(moved)
+    root.mkdir(mode=0o700)
+    with pytest.raises(api.BlobSecurityError):
+        store.publish(b"identity drift")
+
+
+def test_root_symlink_swap_fails_closed_and_store_closes(tmp_path: Path) -> None:
+    api = _api()
+    root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    store = api.BlobStore(root)
+    root.rename(tmp_path / "old")
+    root.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(api.BlobSecurityError):
+        store.read_verified(api.BlobRef("0" * 64, 0, "00/00/" + "0" * 64))
+    store.close()
+    store.close()
+    with api.BlobStore(tmp_path / "other") as managed:
+        managed.publish(b"ok")
+
+
+def test_fifo_target_never_blocks(tmp_path: Path) -> None:
+    code = textwrap.dedent(
+        f"""
+        from pathlib import Path
+        from jev_trading_lab.persistence.blobs import BlobStore, BlobCorruptError
+        root = Path({str(tmp_path / "root")!r})
+        store = BlobStore(root)
+        ref = store.publish(b'fifo')
+        target = root / ref.relative_path
+        target.unlink()
+        target.parent.joinpath(ref.sha256).unlink(missing_ok=True)
+        import os
+        os.mkfifo(target, 0o600)
+        try:
+            store.read_verified(ref)
+        except BlobCorruptError:
+            raise SystemExit(0)
+        raise SystemExit(2)
+        """
+    )
+    result = subprocess.run([sys.executable, "-c", code], timeout=3, check=False)
+    assert result.returncode == 0
+
+
+def test_aggregate_bounds_reject_before_url_or_json_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = _api()
+    store = api.BlobStore(tmp_path / "root", max_bytes=256)
+    monkeypatch.setattr(api, "urlsplit", lambda _value: pytest.fail("urlsplit called"))
+    monkeypatch.setattr(api.json, "loads", lambda _value: pytest.fail("json called"))
+    with pytest.raises(ValueError):
+        store.publish(
+            api.ArtifactEnvelope(body=b"{}", url="https://e.test/" + "x" * 300)
+        )
+    with pytest.raises(ValueError):
+        store.publish(api.ArtifactEnvelope(body=b"{}", headers={"X" * 300: "v"}))
+
+
+def test_query_count_and_envelope_memory_are_bounded(tmp_path: Path) -> None:
+    api = _api()
+    store = api.BlobStore(tmp_path / "root", max_bytes=4096)
+    url = "https://e.test/?" + "&".join(f"k{i}=v" for i in range(2000))
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError):
+            store.publish(api.ArtifactEnvelope(body=b"x", url=url))
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 2_000_000
+
+
+@pytest.mark.parametrize(
+    "boundary", ["after_file_fsync", "after_rename", "after_dir_fsync"]
+)
+def test_real_process_crash_boundaries_reopen_safely(
+    tmp_path: Path, boundary: str
+) -> None:
+    root = tmp_path / boundary
+    code = textwrap.dedent(
+        f"""
+        import os
+        from jev_trading_lab.persistence.blobs import BlobStore
+        def stop(name):
+            if name == {boundary!r}: os._exit(91)
+        BlobStore({str(root)!r}, failpoint=stop).publish(b'crash-data')
+        """
+    )
+    result = subprocess.run([sys.executable, "-c", code], check=False)
+    assert result.returncode == 91
+    store = _api().BlobStore(root)
+    digest = hashlib.sha256(b"crash-data").hexdigest()
+    ref = _api().BlobRef(digest, 10, f"{digest[:2]}/{digest[2:4]}/{digest}")
+    if boundary == "after_file_fsync":
+        with pytest.raises(_api().BlobMissingError):
+            store.read_verified(ref)
+    else:
+        assert store.read_verified(ref) == b"crash-data"
+
+
+@pytest.mark.parametrize("operation", ["fsync", "rename", "unlink"])
+@pytest.mark.parametrize("error_number", [errno.ENOSPC, errno.EIO])
+def test_io_failures_leave_no_reference_or_fd_leak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str, error_number: int
+) -> None:
+    api = _api()
+    store = _store(tmp_path)
+    before = len(os.listdir("/proc/self/fd"))
+    called: list[Any] = []
+    if operation == "fsync":
+        monkeypatch.setattr(
+            api.os,
+            "fsync",
+            lambda _fd: (_ for _ in ()).throw(OSError(error_number, "safe")),
+        )
+    elif operation == "rename":
+        monkeypatch.setattr(
+            api,
+            "_rename_noreplace",
+            lambda *_a: (_ for _ in ()).throw(OSError(error_number, "safe")),
+        )
+    else:
+        monkeypatch.setattr(
+            api,
+            "_rename_noreplace",
+            lambda *_a: (_ for _ in ()).throw(FileExistsError()),
+        )
+        monkeypatch.setattr(
+            api.os,
+            "unlink",
+            lambda *_a, **_k: (_ for _ in ()).throw(OSError(error_number, "safe")),
+        )
+    with pytest.raises((OSError, api.BlobConfigurationError)) as caught:
+        store.publish_and_reference(b"failure", called.append)
+    assert "failure" not in str(caught.value)
+    assert called == []
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_root_open_and_filesystem_validation_are_descriptor_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = _api()
+    root = tmp_path / "root"
+    real_open = api.os.open
+    opens: list[tuple[Any, Any]] = []
+    resolved: list[Path] = []
+
+    def traced_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        opens.append((path, kwargs.get("dir_fd")))
+        return real_open(path, flags, *args, **kwargs)
+
+    def resolver(path: Path) -> str:
+        resolved.append(path)
+        assert str(path).startswith("/proc/self/fd/")
+        assert os.path.samestat(os.stat(path), root.stat())
+        return "ext4"
+
+    monkeypatch.setattr(api.os, "open", traced_open)
+    api.BlobStore(root, filesystem_resolver=resolver)
+    assert any(path == root.name and dir_fd is not None for path, dir_fd in opens)
+    assert len(resolved) == 1
+
+
+def test_final_envelope_bound_rejects_before_base64_encoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = _api()
+    store = api.BlobStore(tmp_path / "root", max_bytes=64)
+    monkeypatch.setattr(
+        api.base64,
+        "b64encode",
+        lambda _body: pytest.fail("base64 encoding must not run"),
+    )
+    with pytest.raises(ValueError, match="payload exceeds maximum size"):
+        store.publish(api.ArtifactEnvelope(body=b"x" * 48))
+
+
+def test_query_count_rejects_before_parse_expansion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = _api()
+    store = api.BlobStore(tmp_path / "root")
+    monkeypatch.setattr(
+        api,
+        "parse_qsl",
+        lambda *_args, **_kwargs: pytest.fail("parse_qsl must not run"),
+    )
+    query = "&".join(f"k{i}=v" for i in range(api._MAX_QUERY_FIELDS + 1))
+    with pytest.raises(ValueError, match="artifact URL is invalid"):
+        store.publish(api.ArtifactEnvelope(body=b"x", url="https://e.test/?" + query))
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["X-Amz-Custom-Future-Field", "secret", "password", "session", "cookie"],
+)
+def test_wildcard_aws_and_common_secret_query_fields_are_redacted(
+    tmp_path: Path, name: str
+) -> None:
+    api = _api()
+    store = api.BlobStore(tmp_path / "root")
+    envelope = api.ArtifactEnvelope(
+        body=b"x", url=f"https://e.test/?{name}=UNIQUE-QUERY-SECRET"
+    )
+    assert b"UNIQUE-QUERY-SECRET" not in store.read_verified(store.publish(envelope))
+
+
+def test_scavenger_rejects_weak_shard_without_fd_leak(tmp_path: Path) -> None:
+    api = _api()
+    store = api.BlobStore(tmp_path / "root")
+    ref = store.publish(b"x")
+    first = store.root / ref.sha256[:2]
+    first.chmod(0o755)
+    before = len(os.listdir("/proc/self/fd"))
+    for _ in range(3):
+        with pytest.raises(api.BlobSecurityError):
+            store.scavenge_stale_temps(older_than_seconds=0)
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_renameat2_symbol_absence_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = _api()
+    store = api.BlobStore(tmp_path / "root")
+    monkeypatch.setattr(api.ctypes, "CDLL", lambda *_args, **_kwargs: object())
+    called: list[Any] = []
+    with pytest.raises(api.BlobConfigurationError, match="renameat2"):
+        store.publish_and_reference(b"x", called.append)
+    assert called == []
+    assert not list(store.root.rglob(".tmp-*"))
