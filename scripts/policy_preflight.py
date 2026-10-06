@@ -23,6 +23,7 @@ EXPECTED_SOURCE_DIRS = frozenset(
         "src/jev_trading_lab/core",
         "src/jev_trading_lab/persistence",
         "src/jev_trading_lab/persistence/schema",
+        "src/jev_trading_lab/polymarket",
         "src/jev_trading_lab/stocks",
     }
 )
@@ -97,6 +98,12 @@ EXPECTED_SOURCE_HASHES = {
     ),
     "src/jev_trading_lab/persistence/schema/003_append_only_guards.sql": (
         "d18492f31e6c0948fa87f11927f2bc4fb2a5a41ffb45c27c9e966339d5e35995"
+    ),
+    "src/jev_trading_lab/polymarket/__init__.py": (
+        "903f189cd93f2654278167ba79f9bf7c60736e6b0a93aa08d3462fc694bd6c0e"
+    ),
+    "src/jev_trading_lab/polymarket/models.py": (
+        "b254ee262bb53cd78d4df9773baf3e170e3ad2446a017521650910a5de98024b"
     ),
     "src/jev_trading_lab/stocks/__init__.py": (
         "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"
