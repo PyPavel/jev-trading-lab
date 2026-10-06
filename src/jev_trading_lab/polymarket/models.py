@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timedelta
 from typing import Annotated, Any, Literal, Self
@@ -14,6 +15,8 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+from jev_trading_lab.core.ids import canonical_json_bytes
 
 NonEmptyStr = Annotated[str, StringConstraints(min_length=1)]
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -63,11 +66,33 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     @classmethod
-    def model_validate_json_strict(cls, raw: str | bytes | bytearray) -> Self:
-        """Validate duplicate-safe JSON without changing Pydantic globally."""
+    def model_validate_json(
+        cls,
+        json_data: str | bytes | bytearray,
+        *,
+        strict: bool | None = None,
+        extra: Literal["allow", "ignore", "forbid"] | None = None,
+        context: Any | None = None,
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> Self:
+        """Validate JSON after rejecting duplicate keys at every nesting level."""
 
-        duplicate_safe = json.dumps(load_strict_json(raw), separators=(",", ":"))
-        return cls.model_validate_json(duplicate_safe)
+        duplicate_safe = json.dumps(load_strict_json(json_data), separators=(",", ":"))
+        return super().model_validate_json(
+            duplicate_safe,
+            strict=strict,
+            extra=extra,
+            context=context,
+            by_alias=by_alias,
+            by_name=by_name,
+        )
+
+    @classmethod
+    def model_validate_json_strict(cls, raw: str | bytes | bytearray) -> Self:
+        """Compatibility alias for the standard duplicate-safe JSON API."""
+
+        return cls.model_validate_json(raw)
 
 
 class UtcModel(StrictModel):
@@ -177,7 +202,7 @@ class JevDecision(StrictModel):
 
 
 class ArmResult(StrictModel):
-    """One arm's isolated signal, paper execution, economics, and forecast."""
+    """One arm result; mark/payout are always market-YES values in micros."""
 
     arm: Literal["AI", "DETERMINISTIC"]
     signal_probability_micros: Micros | None
@@ -255,15 +280,25 @@ class ArmResult(StrictModel):
         if self.quantity == 0:
             expected_trading = 0
         else:
-            valuation = (
+            market_yes_valuation = (
                 self.payout_micros
                 if self.payout_micros is not None
                 else self.mark_micros
             )
-            if valuation is None or self.entry_vwap_micros is None:
+            if market_yes_valuation is None or self.entry_vwap_micros is None:
                 raise ValueError("filled economics require a valuation and entry VWAP")
+            held_token_valuation = (
+                market_yes_valuation
+                if self.entry_side == "YES"
+                else MICROS_PER_UNIT - market_yes_valuation
+            )
+            funded_notional = (
+                self.quantity * self.entry_vwap_micros + self.fees_microdollars
+            )
+            if funded_notional > self.initial_cash_microdollars:
+                raise ValueError("filled notional plus entry fees exceeds initial cash")
             expected_trading = (
-                self.quantity * (valuation - self.entry_vwap_micros)
+                self.quantity * (held_token_valuation - self.entry_vwap_micros)
                 - self.fees_microdollars
             )
         if self.trading_pnl_microdollars != expected_trading:
@@ -280,19 +315,26 @@ class ArmResult(StrictModel):
     def _validate_forecast(self) -> None:
         if self.forecast_probability_micros != self.signal_probability_micros:
             raise ValueError("forecast probability must equal signal probability")
+        available = self.signal_probability_micros is not None
+        if not available:
+            if self.forecast_status != "UNAVAILABLE" or self.brier_micros is not None:
+                raise ValueError("unavailable signal requires UNAVAILABLE forecast")
+            return
+        if self.forecast_status == "UNAVAILABLE":
+            raise ValueError("available signal cannot have UNAVAILABLE forecast")
         scored = self.forecast_status == "SCORED"
         if scored != (self.brier_micros is not None):
             raise ValueError("SCORED and Brier value must occur together")
         if not scored:
             return
-        if self.forecast_probability_micros is None:
-            raise ValueError("scored forecast requires a probability")
-        if self.payout_micros is not None:
-            expected_brier = _brier_micros(
-                self.forecast_probability_micros, self.payout_micros
-            )
-            if self.brier_micros != expected_brier:
-                raise ValueError("Brier value does not match probability and payout")
+        if self.payout_micros is None:
+            return
+        forecast_probability = self.forecast_probability_micros
+        if forecast_probability is None:
+            raise ValueError("available forecast requires a probability")
+        expected_brier = _brier_micros(forecast_probability, self.payout_micros)
+        if self.brier_micros != expected_brier:
+            raise ValueError("Brier value does not match probability and payout")
 
 
 class ObservationResult(UtcModel):
@@ -347,6 +389,17 @@ class ObservationResult(UtcModel):
                 or self.paired_brier_delta_micros is not None
             ):
                 raise ValueError("unresolved observation cannot carry Brier results")
+            for arm in (self.ai, self.deterministic):
+                expected_status = (
+                    "PENDING_RESOLUTION"
+                    if arm.forecast_probability_micros is not None
+                    else "UNAVAILABLE"
+                )
+                if (
+                    arm.forecast_status != expected_status
+                    or arm.brier_micros is not None
+                ):
+                    raise ValueError("unresolved arm has inconsistent forecast state")
         else:
             payout_micros = self.resolution * MICROS_PER_UNIT
             expected_baseline = _brier_micros(
@@ -355,18 +408,117 @@ class ObservationResult(UtcModel):
             if self.baseline_brier_micros != expected_baseline:
                 raise ValueError("baseline Brier value does not match resolution")
             for arm in (self.ai, self.deterministic):
-                if arm.forecast_probability_micros is None or arm.brier_micros is None:
-                    raise ValueError(
-                        "resolved observation requires both arm Brier values"
-                    )
-                if arm.brier_micros != _brier_micros(
-                    arm.forecast_probability_micros, payout_micros
+                probability = arm.forecast_probability_micros
+                if probability is None:
+                    if (
+                        arm.forecast_status != "UNAVAILABLE"
+                        or arm.brier_micros is not None
+                    ):
+                        raise ValueError("unavailable resolved arm cannot be scored")
+                    continue
+                if arm.forecast_status != "SCORED" or arm.brier_micros != _brier_micros(
+                    probability, payout_micros
                 ):
-                    raise ValueError("arm Brier value does not match resolution")
+                    raise ValueError("available resolved arm has invalid Brier state")
             ai_brier = self.ai.brier_micros
             deterministic_brier = self.deterministic.brier_micros
-            if ai_brier is None or deterministic_brier is None:
-                raise ValueError("resolved observation requires both arm Brier values")
-            if self.paired_brier_delta_micros != ai_brier - deterministic_brier:
+            expected_paired = (
+                ai_brier - deterministic_brier
+                if ai_brier is not None and deterministic_brier is not None
+                else None
+            )
+            if self.paired_brier_delta_micros != expected_paired:
                 raise ValueError("paired Brier delta must be AI minus deterministic")
         return self
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _canonical_model_sha(model: StrictModel) -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(model.model_dump(mode="json"))
+    ).hexdigest()
+
+
+def validate_feasibility_fixture(fixture: dict[str, Any]) -> None:
+    """Validate Unit 1 fixture hashes and all cross-artifact bindings."""
+
+    raw = fixture["raw"]
+    model_artifacts = fixture["model_artifacts"]
+    expected = fixture["expected"]
+    artifacts = {**raw, **model_artifacts}
+    if set(artifacts) != set(expected["artifact_sha256"]):
+        raise ValueError("fixture artifact hash manifest is incomplete")
+    for name, value in artifacts.items():
+        if _sha256_text(value) != expected["artifact_sha256"][name]:
+            raise ValueError(f"artifact hash mismatch: {name}")
+
+    gamma_hash = _sha256_text(raw["gamma_bytes"])
+    evidence = EvidencePacket.model_validate_json(
+        json.dumps(fixture["sanitized_evidence"])
+    )
+    brief = ResearchBrief.model_validate_json(json.dumps(fixture["research_brief"]))
+    observation = ObservationResult.model_validate_json(
+        json.dumps(expected["observation_result"])
+    )
+    citation_hashes = {citation.evidence_sha256 for citation in brief.cited_facts}
+    if not (
+        evidence.source_sha256
+        == brief.evidence_sha256
+        == observation.evidence_sha256
+        == gamma_hash
+        and citation_hashes == {gamma_hash}
+    ):
+        raise ValueError("Gamma hash does not match evidence bindings")
+
+    books = {
+        "precheck_book": BookSnapshot.model_validate_json(
+            json.dumps(fixture["precheck_book"])
+        ),
+        "execution_book": BookSnapshot.model_validate_json(
+            json.dumps(fixture["execution_book"])
+        ),
+    }
+    for name, book in books.items():
+        raw_name = f"{name}_bytes"
+        raw_hash = _sha256_text(raw[raw_name])
+        if book.source_sha256 != raw_hash:
+            raise ValueError(f"{name} hash does not match raw bytes")
+    if observation.execution_book_sha256 != books["execution_book"].source_sha256:
+        raise ValueError("observation execution book hash does not match raw bytes")
+
+    decision = JevDecision.model_validate(fixture["jev_decision"])
+    jev_response = load_strict_json(model_artifacts["jev_response_bytes"])
+    if (
+        not isinstance(jev_response, dict)
+        or jev_response.get("result") != fixture["jev_decision"]
+    ):
+        raise ValueError("Jev response does not match decision")
+    openai_response = load_strict_json(model_artifacts["openai_response_bytes"])
+    if (
+        not isinstance(openai_response, dict)
+        or openai_response.get("output") != fixture["research_brief"]
+    ):
+        raise ValueError("OpenAI response does not match research brief")
+    canonical_models: dict[str, StrictModel] = {
+        "evidence": evidence,
+        "precheck_book": books["precheck_book"],
+        "execution_book": books["execution_book"],
+        "research_brief": brief,
+        "jev_decision": decision,
+        "ai_arm": observation.ai,
+        "deterministic_arm": observation.deterministic,
+        "observation": observation,
+    }
+    for name, model in canonical_models.items():
+        if _canonical_model_sha(model) != expected["canonical_sha256"][name]:
+            raise ValueError(f"canonical hash mismatch: {name}")
+    if (
+        observation.research_brief_sha256
+        != expected["canonical_sha256"]["research_brief"]
+    ):
+        raise ValueError("observation research brief hash mismatch")
+    if observation.jev_decision_sha256 != expected["canonical_sha256"]["jev_decision"]:
+        raise ValueError("observation Jev decision hash mismatch")

@@ -560,3 +560,314 @@ def test_fixture_loader_rejects_duplicate_raw_json_key() -> None:
 
     with pytest.raises(ValueError, match="duplicate JSON key: schema_version"):
         polymarket_models.load_strict_json(raw)
+
+
+def _buy_no_arm(
+    *, market_yes_payout_micros: int | None, market_yes_mark_micros: int | None
+) -> dict[str, Any]:
+    quantity = 10
+    entry_vwap_micros = 400_000
+    fees_microdollars = 100_000
+    initial_cash_microdollars = 10_000_000
+    market_yes_valuation = (
+        market_yes_payout_micros
+        if market_yes_payout_micros is not None
+        else market_yes_mark_micros
+    )
+    assert market_yes_valuation is not None
+    held_no_valuation = MICROS_PER_DOLLAR - market_yes_valuation
+    trading_pnl_microdollars = (
+        quantity * (held_no_valuation - entry_vwap_micros) - fees_microdollars
+    )
+    model_cost_microdollars = 500_000
+    return {
+        "arm": "AI",
+        "signal_probability_micros": 300_000,
+        "signal_action": "BUY_NO",
+        "disposition": "FILLED",
+        "entry_side": "NO",
+        "entry_vwap_micros": entry_vwap_micros,
+        "quantity": quantity,
+        "fees_microdollars": fees_microdollars,
+        "initial_cash_microdollars": initial_cash_microdollars,
+        "final_cash_microdollars": (
+            initial_cash_microdollars + trading_pnl_microdollars
+        ),
+        "mark_micros": market_yes_mark_micros,
+        "payout_micros": market_yes_payout_micros,
+        "trading_pnl_microdollars": trading_pnl_microdollars,
+        "economic_pnl_microdollars": (
+            trading_pnl_microdollars - model_cost_microdollars
+        ),
+        "model_cost_microdollars": model_cost_microdollars,
+        "forecast_probability_micros": 300_000,
+        "forecast_status": (
+            "SCORED" if market_yes_payout_micros is not None else "PENDING_RESOLUTION"
+        ),
+        "brier_micros": (
+            (300_000 - market_yes_payout_micros) ** 2 // MICROS_PER_DOLLAR
+            if market_yes_payout_micros is not None
+            else None
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    ("market_yes_payout_micros", "expected_trading", "expected_economic"),
+    (
+        (MICROS_PER_DOLLAR, -4_100_000, -4_600_000),
+        (0, 5_900_000, 5_400_000),
+    ),
+)
+def test_buy_no_resolved_economics_use_held_token_payout(
+    market_yes_payout_micros: int,
+    expected_trading: int,
+    expected_economic: int,
+) -> None:
+    arm = ArmResult.model_validate(
+        _buy_no_arm(
+            market_yes_payout_micros=market_yes_payout_micros,
+            market_yes_mark_micros=None,
+        )
+    )
+
+    assert arm.payout_micros == market_yes_payout_micros
+    assert arm.trading_pnl_microdollars == expected_trading
+    assert arm.economic_pnl_microdollars == expected_economic
+    assert arm.final_cash_microdollars == (
+        arm.initial_cash_microdollars + expected_trading
+    )
+
+
+def test_buy_no_unresolved_economics_use_held_token_mark() -> None:
+    arm = ArmResult.model_validate(
+        _buy_no_arm(market_yes_payout_micros=None, market_yes_mark_micros=250_000)
+    )
+
+    assert arm.mark_micros == 250_000
+    assert arm.trading_pnl_microdollars == 3_400_000
+    assert arm.economic_pnl_microdollars == 2_900_000
+    assert arm.final_cash_microdollars == 13_400_000
+
+
+def _unresolved_observation(cycle: dict[str, Any]) -> dict[str, Any]:
+    observation = deepcopy(cycle["expected"]["observation_result"])
+    ai = observation["ai"]
+    mark_micros = 600_000
+    trading_pnl = (
+        ai["quantity"] * (mark_micros - ai["entry_vwap_micros"])
+        - ai["fees_microdollars"]
+    )
+    ai.update(
+        payout_micros=None,
+        mark_micros=mark_micros,
+        trading_pnl_microdollars=trading_pnl,
+        economic_pnl_microdollars=trading_pnl - ai["model_cost_microdollars"],
+        final_cash_microdollars=ai["initial_cash_microdollars"] + trading_pnl,
+        forecast_status="PENDING_RESOLUTION",
+        brier_micros=None,
+    )
+    observation["deterministic"].update(
+        forecast_status="PENDING_RESOLUTION", brier_micros=None
+    )
+    observation.update(
+        resolution=None,
+        baseline_brier_micros=None,
+        paired_trading_pnl_delta_microdollars=trading_pnl,
+        paired_economic_pnl_delta_microdollars=(
+            trading_pnl - ai["model_cost_microdollars"]
+        ),
+        paired_brier_delta_micros=None,
+    )
+    return observation
+
+
+def test_unresolved_observation_requires_pending_available_forecasts(
+    cycle: dict[str, Any],
+) -> None:
+    observation = _unresolved_observation(cycle)
+
+    assert _validate_json(ObservationResult, observation)
+
+    observation["deterministic"].update(forecast_status="SCORED", brier_micros=202_500)
+    with pytest.raises(ValidationError):
+        _validate_json(ObservationResult, observation)
+
+
+def _unavailable_ai(cycle: dict[str, Any], disposition: str) -> dict[str, Any]:
+    arm = _zero_fill_ai(cycle, disposition)
+    arm.update(
+        signal_probability_micros=None,
+        signal_action=None,
+        forecast_probability_micros=None,
+        forecast_status="UNAVAILABLE",
+        brier_micros=None,
+    )
+    return arm
+
+
+@pytest.mark.parametrize("disposition", ("INELIGIBLE", "MODEL_FAILURE", "BOOK_FAILURE"))
+def test_resolved_observation_allows_unavailable_terminal_arm(
+    cycle: dict[str, Any], disposition: str
+) -> None:
+    observation = deepcopy(cycle["expected"]["observation_result"])
+    observation["ai"] = _unavailable_ai(cycle, disposition)
+    observation.update(
+        paired_trading_pnl_delta_microdollars=0,
+        paired_economic_pnl_delta_microdollars=-500_000,
+        paired_brier_delta_micros=None,
+    )
+
+    validated = _validate_json(ObservationResult, observation)
+
+    assert validated.ai.forecast_status == "UNAVAILABLE"
+    assert validated.ai.brier_micros is None
+    assert validated.deterministic.forecast_status == "SCORED"
+    assert validated.baseline_brier_micros == 235_225
+
+
+@pytest.mark.parametrize(
+    ("disposition", "probability", "action", "status", "brier"),
+    (
+        ("ABSTAIN", 700_000, "ABSTAIN", "UNAVAILABLE", None),
+        ("NO_EDGE", 700_000, "BUY_YES", "UNAVAILABLE", None),
+        ("MODEL_FAILURE", None, None, "PENDING_RESOLUTION", None),
+        ("BOOK_FAILURE", None, None, "SCORED", 1),
+        ("INELIGIBLE", None, None, "UNAVAILABLE", 1),
+    ),
+)
+def test_terminal_forecast_table_rejects_contradictions(
+    cycle: dict[str, Any],
+    disposition: str,
+    probability: int | None,
+    action: str | None,
+    status: str,
+    brier: int | None,
+) -> None:
+    arm = _zero_fill_ai(cycle, disposition)
+    arm.update(
+        signal_probability_micros=probability,
+        signal_action=action,
+        forecast_probability_micros=probability,
+        forecast_status=status,
+        brier_micros=brier,
+    )
+
+    with pytest.raises(ValidationError):
+        ArmResult.model_validate(arm)
+
+
+def test_scored_forecast_requires_exact_observation_brier(
+    cycle: dict[str, Any],
+) -> None:
+    observation = deepcopy(cycle["expected"]["observation_result"])
+    observation["ai"]["brier_micros"] += 1
+    observation["paired_brier_delta_micros"] += 1
+
+    with pytest.raises(ValidationError):
+        ObservationResult.model_validate(observation)
+
+
+def test_standard_json_api_rejects_duplicate_jev_probability(
+    cycle: dict[str, Any],
+) -> None:
+    raw = json.dumps(cycle["jev_decision"])
+    raw = raw.replace(
+        '"p_yes_micros": 700000',
+        '"p_yes_micros": 700000, "p_yes_micros": 1',
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON key: p_yes_micros"):
+        JevDecision.model_validate_json(raw)
+
+
+def test_standard_json_api_rejects_duplicate_observation_arm(
+    cycle: dict[str, Any],
+) -> None:
+    observation = cycle["expected"]["observation_result"]
+    raw = json.dumps(observation)
+    encoded_ai = json.dumps(observation["ai"])
+    raw = raw.replace(f'"ai": {encoded_ai}', f'"ai": {encoded_ai}, "ai": {encoded_ai}')
+
+    with pytest.raises(ValueError, match="duplicate JSON key: ai"):
+        ObservationResult.model_validate_json(raw)
+
+
+def test_standard_json_api_rejects_nested_duplicate_cash(
+    cycle: dict[str, Any],
+) -> None:
+    raw = json.dumps(cycle["expected"]["observation_result"])
+    raw = raw.replace(
+        '"final_cash_microdollars": 10224000000',
+        ('"final_cash_microdollars": 10224000000, "final_cash_microdollars": 0'),
+        1,
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON key: final_cash_microdollars"):
+        ObservationResult.model_validate_json(raw)
+
+
+def test_fixture_cross_hash_bindings_validate(cycle: dict[str, Any]) -> None:
+    polymarket_models.validate_feasibility_fixture(cycle)
+
+
+def test_fixture_cross_hash_rejects_raw_mutation_with_updated_self_hash(
+    cycle: dict[str, Any],
+) -> None:
+    mutated = deepcopy(cycle)
+    mutated["raw"]["gamma_bytes"] += " "
+    mutated["expected"]["artifact_sha256"]["gamma_bytes"] = hashlib.sha256(
+        mutated["raw"]["gamma_bytes"].encode()
+    ).hexdigest()
+
+    with pytest.raises(ValueError, match="Gamma hash"):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_cross_hash_rejects_independent_canonical_literal(
+    cycle: dict[str, Any],
+) -> None:
+    mutated = deepcopy(cycle)
+    mutated["expected"]["canonical_sha256"]["jev_decision"] = "0" * 64
+
+    with pytest.raises(ValueError, match="canonical hash"):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_cross_hash_rejects_model_response_rebound_only_to_self_hash(
+    cycle: dict[str, Any],
+) -> None:
+    mutated = deepcopy(cycle)
+    response = json.loads(mutated["model_artifacts"]["jev_response_bytes"])
+    response["result"]["action"] = "BUY_NO"
+    mutated_response = json.dumps(response, separators=(",", ":"), sort_keys=True)
+    mutated["model_artifacts"]["jev_response_bytes"] = mutated_response
+    mutated["expected"]["artifact_sha256"]["jev_response_bytes"] = hashlib.sha256(
+        mutated_response.encode()
+    ).hexdigest()
+
+    with pytest.raises(ValueError, match="Jev response"):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+@pytest.mark.parametrize("available_cash", (0, 4_099_999))
+def test_filled_arm_rejects_unfunded_notional_and_fees(
+    available_cash: int,
+) -> None:
+    arm = _buy_no_arm(market_yes_payout_micros=0, market_yes_mark_micros=None)
+    arm["initial_cash_microdollars"] = available_cash
+    arm["final_cash_microdollars"] = available_cash + arm["trading_pnl_microdollars"]
+
+    with pytest.raises(ValidationError, match="notional"):
+        ArmResult.model_validate(arm)
+
+
+def test_filled_arm_accepts_exact_notional_and_fee_funding_boundary() -> None:
+    arm = _buy_no_arm(market_yes_payout_micros=0, market_yes_mark_micros=None)
+    required_cash = (
+        arm["quantity"] * arm["entry_vwap_micros"] + arm["fees_microdollars"]
+    )
+    arm["initial_cash_microdollars"] = required_cash
+    arm["final_cash_microdollars"] = required_cash + arm["trading_pnl_microdollars"]
+
+    assert ArmResult.model_validate(arm)
