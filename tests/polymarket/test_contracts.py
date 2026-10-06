@@ -314,6 +314,8 @@ def _zero_fill_ai(
         payout_micros=None,
         trading_pnl_microdollars=0,
         economic_pnl_microdollars=-model_cost,
+        forecast_status="PENDING_RESOLUTION",
+        brier_micros=None,
     )
     return arm
 
@@ -394,13 +396,11 @@ def test_filled_arm_rejects_inconsistent_contract_fields(
         {"entry_vwap_micros": 500_000},
         {"fees_microdollars": 1},
         {"final_cash_microdollars": 10_000_000_001},
-        {"mark_micros": 500_000},
-        {"payout_micros": MICROS_PER_DOLLAR},
         {"trading_pnl_microdollars": 1},
         {"economic_pnl_microdollars": 1},
     ),
 )
-def test_nonfilled_arm_rejects_entry_or_profit_fields(
+def test_nonfilled_arm_rejects_entry_or_inconsistent_economics(
     cycle: dict[str, Any], changes: dict[str, object]
 ) -> None:
     arm = {**_zero_fill_ai(cycle), **changes}
@@ -432,10 +432,10 @@ def test_disposition_has_one_allowed_signal_shape(
         signal_probability_micros=probability,
         signal_action=action,
         forecast_probability_micros=probability,
-        forecast_status="SCORED" if probability is not None else "UNAVAILABLE",
-        brier_micros=(probability - MICROS_PER_DOLLAR) ** 2 // MICROS_PER_DOLLAR
+        forecast_status="PENDING_RESOLUTION"
         if probability is not None
-        else None,
+        else "UNAVAILABLE",
+        brier_micros=None,
     )
     if disposition in {"FILLED", "PARTIAL_FILL"}:
         arm = _filled_ai(cycle)
@@ -668,7 +668,9 @@ def _unresolved_observation(cycle: dict[str, Any]) -> dict[str, Any]:
         brier_micros=None,
     )
     observation["deterministic"].update(
-        forecast_status="PENDING_RESOLUTION", brier_micros=None
+        payout_micros=None,
+        forecast_status="PENDING_RESOLUTION",
+        brier_micros=None,
     )
     observation.update(
         resolution=None,
@@ -871,3 +873,321 @@ def test_filled_arm_accepts_exact_notional_and_fee_funding_boundary() -> None:
     arm["final_cash_microdollars"] = required_cash + arm["trading_pnl_microdollars"]
 
     assert ArmResult.model_validate(arm)
+
+
+@pytest.mark.parametrize(
+    ("model_type", "raw", "mutate"),
+    (
+        (
+            BookSnapshot,
+            "precheck_book",
+            lambda value: value["bids"][0].update(quantity=2**63),
+        ),
+        (
+            BookSnapshot,
+            "precheck_book",
+            lambda value: value["bids"][0].update(quantity=2**63 + 1),
+        ),
+        (
+            ArmResult,
+            "expected.arm_results.ai",
+            lambda value: value.update(trading_pnl_microdollars=2**63),
+        ),
+        (
+            ArmResult,
+            "expected.arm_results.ai",
+            lambda value: value.update(trading_pnl_microdollars=-(2**63) - 1),
+        ),
+        (
+            ObservationResult,
+            "expected.observation_result",
+            lambda value: value.update(paired_trading_pnl_delta_microdollars=2**63),
+        ),
+        (
+            ObservationResult,
+            "expected.observation_result",
+            lambda value: value.update(
+                paired_trading_pnl_delta_microdollars=-(2**63) - 1
+            ),
+        ),
+    ),
+)
+def test_contract_integer_aliases_reject_values_outside_signed_int64(
+    cycle: dict[str, Any],
+    model_type: type[BaseModel],
+    raw: str,
+    mutate: Any,
+) -> None:
+    value: Any = deepcopy(cycle)
+    for part in raw.split("."):
+        value = value[part]
+    mutate(value)
+
+    with pytest.raises(ValidationError):
+        model_type.model_validate(value)
+
+
+def test_valid_contract_models_always_canonical_hash(cycle: dict[str, Any]) -> None:
+    models = (
+        BookSnapshot.model_validate_json(json.dumps(cycle["precheck_book"])),
+        ArmResult.model_validate_json(
+            json.dumps(cycle["expected"]["arm_results"]["ai"])
+        ),
+        ObservationResult.model_validate_json(
+            json.dumps(cycle["expected"]["observation_result"])
+        ),
+    )
+
+    for model in models:
+        assert len(_canonical_sha(model)) == 64
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"forecast_status": "PENDING_RESOLUTION", "brier_micros": None},
+        {"forecast_status": "UNAVAILABLE", "brier_micros": None},
+        {"forecast_status": "SCORED", "brier_micros": 1},
+    ),
+)
+def test_standalone_payout_arm_requires_exact_scored_forecast(
+    cycle: dict[str, Any], changes: dict[str, object]
+) -> None:
+    arm = {**_filled_ai(cycle), **changes}
+
+    with pytest.raises(ValidationError):
+        ArmResult.model_validate(arm)
+
+
+def test_standalone_marked_arm_rejects_scored_forecast(cycle: dict[str, Any]) -> None:
+    arm = _buy_no_arm(market_yes_payout_micros=None, market_yes_mark_micros=250_000)
+    arm.update(forecast_status="SCORED", brier_micros=2_500)
+
+    with pytest.raises(ValidationError):
+        ArmResult.model_validate(arm)
+
+
+@pytest.mark.parametrize("valuation", ("mark_micros", "payout_micros"))
+def test_standalone_unavailable_arm_accepts_terminal_valuation(
+    cycle: dict[str, Any], valuation: str
+) -> None:
+    arm = _unavailable_ai(cycle, "MODEL_FAILURE")
+    arm[valuation] = 1_000_000 if valuation == "payout_micros" else 500_000
+
+    validated = ArmResult.model_validate(arm)
+
+    assert validated.forecast_status == "UNAVAILABLE"
+    assert validated.brier_micros is None
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"forecast_status": "SCORED", "brier_micros": 90_000},
+        {"forecast_status": "UNAVAILABLE", "brier_micros": None},
+    ),
+)
+def test_standalone_nonfilled_available_arm_requires_pending_forecast(
+    cycle: dict[str, Any], changes: dict[str, object]
+) -> None:
+    arm = {**_zero_fill_ai(cycle), **changes}
+
+    with pytest.raises(ValidationError):
+        ArmResult.model_validate(arm)
+
+
+@pytest.mark.parametrize(
+    "section",
+    (
+        "schema_version",
+        "raw",
+        "sanitized_evidence",
+        "causal_history",
+        "precheck_book",
+        "execution_book",
+        "model_artifacts",
+        "research_brief",
+        "jev_decision",
+        "model_costs_microdollars",
+        "economics",
+        "resolution",
+        "expected",
+    ),
+)
+def test_fixture_envelope_rejects_missing_required_root_sections(
+    cycle: dict[str, Any], section: str
+) -> None:
+    mutated = deepcopy(cycle)
+    del mutated[section]
+
+    with pytest.raises((ValidationError, ValueError)):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_envelope_rejects_unknown_root_section(cycle: dict[str, Any]) -> None:
+    mutated = {**deepcopy(cycle), "unexpected": True}
+
+    with pytest.raises((ValidationError, ValueError)):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def _rehash_artifact(fixture: dict[str, Any], name: str) -> None:
+    for section in ("raw", "model_artifacts"):
+        if name in fixture[section]:
+            fixture["expected"]["artifact_sha256"][name] = hashlib.sha256(
+                fixture[section][name].encode()
+            ).hexdigest()
+            return
+    raise AssertionError(name)
+
+
+@pytest.mark.parametrize("provider", ("openai", "jev"))
+def test_fixture_rejects_detached_model_request_with_updated_self_hash(
+    cycle: dict[str, Any], provider: str
+) -> None:
+    mutated = deepcopy(cycle)
+    artifact = f"{provider}_request_bytes"
+    request = json.loads(mutated["model_artifacts"][artifact])
+    request["model"] += "-detached"
+    mutated["model_artifacts"][artifact] = json.dumps(
+        request, separators=(",", ":"), sort_keys=True
+    )
+    _rehash_artifact(mutated, artifact)
+
+    with pytest.raises((ValidationError, ValueError)):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+@pytest.mark.parametrize("provider", ("openai", "jev"))
+def test_fixture_rejects_price_leakage_in_model_request(
+    cycle: dict[str, Any], provider: str
+) -> None:
+    mutated = deepcopy(cycle)
+    artifact = f"{provider}_request_bytes"
+    request = json.loads(mutated["model_artifacts"][artifact])
+    request["bids"] = [{"price_micros": 500_000}]
+    mutated["model_artifacts"][artifact] = json.dumps(
+        request, separators=(",", ":"), sort_keys=True
+    )
+    _rehash_artifact(mutated, artifact)
+
+    with pytest.raises((ValidationError, ValueError), match="price/book|exactly"):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+@pytest.mark.parametrize("provider", ("openai", "jev"))
+def test_fixture_rejects_model_cost_detached_from_response_and_ai_arm(
+    cycle: dict[str, Any], provider: str
+) -> None:
+    mutated = deepcopy(cycle)
+    mutated["model_costs_microdollars"][provider] += 1
+
+    with pytest.raises((ValidationError, ValueError)):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_rejects_empty_causal_history(cycle: dict[str, Any]) -> None:
+    mutated = deepcopy(cycle)
+    mutated["causal_history"] = []
+
+    with pytest.raises((ValidationError, ValueError)):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_rejects_history_midpoint_outside_probability_bounds(
+    cycle: dict[str, Any],
+) -> None:
+    mutated = deepcopy(cycle)
+    mutated["causal_history"][0]["midpoint_micros"] = 1_000_001
+
+    with pytest.raises((ValidationError, ValueError)):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_rejects_noncausal_history(cycle: dict[str, Any]) -> None:
+    mutated = deepcopy(cycle)
+    mutated["causal_history"][0]["observed_at"] = mutated["sanitized_evidence"][
+        "cutoff_at"
+    ]
+
+    with pytest.raises((ValidationError, ValueError)):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+@pytest.mark.parametrize("field", ("payout", "resolved_at"))
+def test_fixture_rejects_resolution_detached_from_observation(
+    cycle: dict[str, Any], field: str
+) -> None:
+    mutated = deepcopy(cycle)
+    mutated["resolution"][field] = 0 if field == "payout" else "2026-10-04T20:00:01Z"
+
+    with pytest.raises((ValidationError, ValueError)):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_rejects_expected_arm_detached_from_observation(
+    cycle: dict[str, Any],
+) -> None:
+    mutated = deepcopy(cycle)
+    mutated["expected"]["arm_results"]["ai"]["brier_micros"] += 1
+
+    with pytest.raises((ValidationError, ValueError)):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_rejects_starting_capital_detached_from_arms(
+    cycle: dict[str, Any],
+) -> None:
+    mutated = deepcopy(cycle)
+    mutated["economics"]["starting_cash_microdollars"] += 1
+
+    with pytest.raises((ValidationError, ValueError)):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_rejects_openai_response_detached_from_research_brief(
+    cycle: dict[str, Any],
+) -> None:
+    mutated = deepcopy(cycle)
+    response = json.loads(mutated["model_artifacts"]["openai_response_bytes"])
+    response["output"]["quality"] = "LOW"
+    mutated["model_artifacts"]["openai_response_bytes"] = json.dumps(
+        response, separators=(",", ":"), sort_keys=True
+    )
+    _rehash_artifact(mutated, "openai_response_bytes")
+
+    with pytest.raises((ValidationError, ValueError), match="OpenAI response"):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_rejects_book_bytes_detached_from_normalized_snapshot(
+    cycle: dict[str, Any],
+) -> None:
+    mutated = deepcopy(cycle)
+    raw_book = json.loads(mutated["raw"]["precheck_book_bytes"])
+    raw_book["bids"][0]["size"] = "9999"
+    mutated["raw"]["precheck_book_bytes"] = json.dumps(
+        raw_book, separators=(",", ":"), sort_keys=True
+    )
+    _rehash_artifact(mutated, "precheck_book_bytes")
+    new_hash = mutated["expected"]["artifact_sha256"]["precheck_book_bytes"]
+    mutated["precheck_book"]["source_sha256"] = new_hash
+    book = BookSnapshot.model_validate_json(json.dumps(mutated["precheck_book"]))
+    mutated["expected"]["canonical_sha256"]["precheck_book"] = _canonical_sha(book)
+
+    with pytest.raises((ValidationError, ValueError)):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_integer_fields_reject_values_outside_signed_int64(
+    cycle: dict[str, Any],
+) -> None:
+    too_large = deepcopy(cycle)
+    too_large["model_costs_microdollars"]["openai"] = 2**63
+    too_small = deepcopy(cycle)
+    too_small["economics"]["starting_cash_microdollars"] = -(2**63) - 1
+
+    with pytest.raises((ValidationError, ValueError)):
+        polymarket_models.validate_feasibility_fixture(too_large)
+    with pytest.raises((ValidationError, ValueError)):
+        polymarket_models.validate_feasibility_fixture(too_small)
