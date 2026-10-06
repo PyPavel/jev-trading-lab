@@ -56,6 +56,8 @@ Build only the path below. Do not add a generic opportunity framework, stock str
 - `ArmResult`: arm, signal probability/action, disposition, entry side/VWAP/quantity/fees, initial/final cash, mark or payout, trading/economic P&L, model cost, and forecast fields.
 - `ObservationResult`: IDs/hashes/timestamps plus exactly one AI and one deterministic `ArmResult`, shared market baseline probability, resolution if known, and paired P&L/forecast deltas.
 - The fixture contains raw Gamma bytes, sanitized evidence, causal pre-cutoff history, precheck and execution books, canned OpenAI/Jev request-response bytes, actual model costs, a resolution payout, and expected canonical hashes/results. One fixture is enough.
+- Unit 1 validates the complete fixture shape and structural bindings across artifacts, hashes, market/token identity, chronology, model requests/responses, decisions, billed costs, arm capital, and resolution. Expected arm/observation records are strict, canonical provisional expected values: Unit 1 verifies their exact duplication and hashes, while Unit 2 validates how those values are derived.
+- Unit 1 does **not** derive control probability from causal history, walk books, or compute VWAP, fees, sizing, P&L, baseline probability, or Brier scores. Unit 2 is the single source of truth for those calculations and must reject fixture expected results detached from causal history, books, or frozen economics.
 
 **Tests first:**
 
@@ -63,6 +65,9 @@ Build only the path below. Do not add a generic opportunity framework, stock str
 - Adding `outcomePrices`, `bestBid`, `token_id`, `bids`, `asks`, or `midpoint` to `EvidencePacket` fails validation.
 - Prices/probabilities outside `[0, 1]`, nonpositive quantities, crossed books, malformed hashes, non-UTC timestamps, and unknown actions fail.
 - `ABSTAIN` is valid and cannot carry an entry side/quantity.
+- Structural validation rejects detached market/token identity, chronology, canonical request/response content, Jev decision, billed costs, capital, resolution, expected arm/observation duplication, or expected hashes without implementing Unit 2 arithmetic.
+
+**Boundary:** Unit 1 owns canonical shape and binding only. Passing Unit 1 means the fixture is internally linked, not that its control or economics outputs are correctly derived.
 
 **Commands:**
 
@@ -105,6 +110,7 @@ uv run mypy src
 - Both sides’ edge signs, depth-walk VWAP, threshold equality, each size cap, partial depth, rounding, and zero-quantity behavior are covered.
 - AI costs cannot reduce deterministic capital; one arm’s fill cannot reduce the other’s cash/depth accounting.
 - Fixture resolution produces exact cash, trading P&L, economic P&L, Brier values, and paired deltas.
+- Recompute fixture expected control probability and every expected arm/observation economic value from causal history, captured books, and frozen economics; reject any fixture expected value that is detached from those source inputs even when Unit 1 structural hashes and duplicated records are internally consistent.
 - Property-style parameter cases assert no negative cash, no overfill, and `filled_quantity <= captured_quantity`.
 
 **Commands:**
