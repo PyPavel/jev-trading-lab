@@ -271,6 +271,8 @@ class ArmResult(StrictModel):
             if signal != (None, None):
                 raise ValueError("failure disposition requires an unavailable signal")
             return
+        if self.disposition == "ABSTAIN" and signal == (None, "ABSTAIN"):
+            return
         if signal[0] is None or signal[1] is None:
             raise ValueError("disposition requires probability and action")
         expected_actions: dict[str, frozenset[str]] = {
@@ -348,6 +350,16 @@ class ArmResult(StrictModel):
         probability = self.forecast_probability_micros
         if probability != self.signal_probability_micros:
             raise ValueError("forecast probability must equal signal probability")
+        if (
+            self.disposition == "ABSTAIN"
+            and self.signal_action == "ABSTAIN"
+            and probability is None
+        ):
+            if self.forecast_status != "UNAVAILABLE" or self.brier_micros is not None:
+                raise ValueError(
+                    "probability-free abstain requires UNAVAILABLE forecast"
+                )
+            return
         if probability is None:
             if self.forecast_status != "UNAVAILABLE" or self.brier_micros is not None:
                 raise ValueError("unavailable signal requires UNAVAILABLE forecast")

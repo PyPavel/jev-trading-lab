@@ -55,11 +55,11 @@
         "arm": "AI",
         "brier_micros": 90000,
         "disposition": "FILLED",
-        "economic_pnl_microdollars": 223500000,
+        "economic_pnl_microdollars": 225790000,
         "entry_side": "YES",
         "entry_vwap_micros": 542000,
-        "fees_microdollars": 5000000,
-        "final_cash_microdollars": 10224000000,
+        "fees_microdollars": 2710000,
+        "final_cash_microdollars": 10226290000,
         "forecast_probability_micros": 700000,
         "forecast_status": "SCORED",
         "initial_cash_microdollars": 10000000000,
@@ -69,7 +69,7 @@
         "quantity": 500,
         "signal_action": "BUY_YES",
         "signal_probability_micros": 700000,
-        "trading_pnl_microdollars": 224000000
+        "trading_pnl_microdollars": 226290000
       },
       "deterministic": {
         "arm": "DETERMINISTIC",
@@ -102,12 +102,12 @@
       "precheck_book_bytes": "713d3fb67870aee4e040f01fa01f8ace553929786dcc1d47a1a37850b1c6dccd"
     },
     "canonical_sha256": {
-      "ai_arm": "03f46b28a583ed20c4b4dc10212802ce0aaebf80c5d2f403e54b6dcb527fad11",
+      "ai_arm": "cc55ec8ab589aa9ac52c7363a503c4931f42172c31a23cad5445b560d99df4ff",
       "deterministic_arm": "68d8105f606448712bbe958c7f6466a897e6d5b447452c830bd78a8b4e6091db",
       "evidence": "4b934973b5c17fe4155f387071693efc89af15c01f506020c4e4e4f6501abc2c",
       "execution_book": "16d84d8eea9d75e78082b10cb277072b83ee83050dc550a9ee3da60665f41731",
       "jev_decision": "2608122c13ed8da0ab5e664db4f01d3839e24bb973a0994dd0f09c778aafc259",
-      "observation": "909423b9b2ede24e6860d13c8b46563a3095d69437b3f9cc4858613af1b87ee3",
+      "observation": "0c4ee12a685a75691a8daa6556b29adbb0cffabf4d72713f1708a1b880ca333e",
       "precheck_book": "efb7e9aceabaddbd32e5a8ead57c03af7084283aef209a4d05cd218e4bf3e89e",
       "research_brief": "6b00387c3dbc8d9d01f75166c6f339b145b23fbe9c20b4dfe4162959c029d1d2"
     },
@@ -116,11 +116,11 @@
         "arm": "AI",
         "brier_micros": 90000,
         "disposition": "FILLED",
-        "economic_pnl_microdollars": 223500000,
+        "economic_pnl_microdollars": 225790000,
         "entry_side": "YES",
         "entry_vwap_micros": 542000,
-        "fees_microdollars": 5000000,
-        "final_cash_microdollars": 10224000000,
+        "fees_microdollars": 2710000,
+        "final_cash_microdollars": 10226290000,
         "forecast_probability_micros": 700000,
         "forecast_status": "SCORED",
         "initial_cash_microdollars": 10000000000,
@@ -130,7 +130,7 @@
         "quantity": 500,
         "signal_action": "BUY_YES",
         "signal_probability_micros": 700000,
-        "trading_pnl_microdollars": 224000000
+        "trading_pnl_microdollars": 226290000
       },
       "baseline_brier_micros": 235225,
       "baseline_probability_micros": 515000,
@@ -163,8 +163,8 @@
       "observed_at": "2026-11-01T20:00:00Z",
       "opportunity_id": "d56368782bb44c2446a104cde2900df658435abb45fd0754f390bfcb0e178033",
       "paired_brier_delta_micros": -112500,
-      "paired_economic_pnl_delta_microdollars": 223500000,
-      "paired_trading_pnl_delta_microdollars": 224000000,
+      "paired_economic_pnl_delta_microdollars": 225790000,
+      "paired_trading_pnl_delta_microdollars": 226290000,
       "policy_version": "polymarket-feasibility-v1",
       "research_brief_sha256": "6b00387c3dbc8d9d01f75166c6f339b145b23fbe9c20b4dfe4162959c029d1d2",
       "resolution": 1

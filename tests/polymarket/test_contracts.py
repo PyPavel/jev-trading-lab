@@ -837,8 +837,8 @@ def test_standard_json_api_rejects_nested_duplicate_cash(
 ) -> None:
     raw = json.dumps(cycle["expected"]["observation_result"])
     raw = raw.replace(
-        '"final_cash_microdollars": 10224000000',
-        ('"final_cash_microdollars": 10224000000, "final_cash_microdollars": 0'),
+        '"final_cash_microdollars": 10226290000',
+        ('"final_cash_microdollars": 10226290000, "final_cash_microdollars": 0'),
         1,
     )
 

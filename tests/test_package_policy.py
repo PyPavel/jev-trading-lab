@@ -230,8 +230,14 @@ _APPROVED_SOURCE_HASHES = {
     "src/jev_trading_lab/polymarket/__init__.py": (
         "2c8708e587ec6804d9c15736661a265c5b441cc3ce83b0b152e15f5a2fcf6739"
     ),
+    "src/jev_trading_lab/polymarket/control.py": (
+        "cadd87042c9293c2fd97d0017f532b06500d2afd23b07a9bd16c5e7bceef2b8d"
+    ),
     "src/jev_trading_lab/polymarket/models.py": (
-        "0d4c25574b2722384244afde48218e69d9d0fb0190cb1f6429616ada99573ec6"
+        "2925c2cb54de7d9d6e6486b58310dc59ee9702fa477d0e4f064d44423c539b90"
+    ),
+    "src/jev_trading_lab/polymarket/paper.py": (
+        "e90fcbabb0903ffc6b3a33098de8cefb76de62ce639a3c305a29cb44b60aec11"
     ),
     "src/jev_trading_lab/stocks/__init__.py": (
         "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"
@@ -1612,7 +1618,9 @@ def test_built_artifacts_exclude_repository_and_host_junk(tmp_path: Path) -> Non
         "jev_trading_lab/persistence/schema/002_core_entities.sql",
         "jev_trading_lab/persistence/schema/003_append_only_guards.sql",
         "jev_trading_lab/polymarket/__init__.py",
+        "jev_trading_lab/polymarket/control.py",
         "jev_trading_lab/polymarket/models.py",
+        "jev_trading_lab/polymarket/paper.py",
         "jev_trading_lab/stocks/__init__.py",
         "jev_trading_lab/stocks/calendar.py",
     }
