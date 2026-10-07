@@ -44,6 +44,43 @@ def _canonical_sha(model: BaseModel) -> str:
     ).hexdigest()
 
 
+def _identity_sha(value: object) -> str:
+    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _rehash_observation(fixture: dict[str, Any]) -> None:
+    observation = _validate_json(
+        ObservationResult, fixture["expected"]["observation_result"]
+    )
+    fixture["expected"]["canonical_sha256"]["observation"] = _canonical_sha(observation)
+
+
+def _retime_execution_book(fixture: dict[str, Any], retrieved_at: str) -> None:
+    raw_book = json.loads(fixture["raw"]["execution_book_bytes"])
+    raw_book["timestamp"] = retrieved_at
+    raw_bytes = json.dumps(raw_book, separators=(",", ":"), sort_keys=True)
+    fixture["raw"]["execution_book_bytes"] = raw_bytes
+    raw_hash = hashlib.sha256(raw_bytes.encode()).hexdigest()
+    fixture["expected"]["artifact_sha256"]["execution_book_bytes"] = raw_hash
+    fixture["execution_book"].update(
+        retrieved_at=retrieved_at,
+        source_sha256=raw_hash,
+    )
+    book = _validate_json(BookSnapshot, fixture["execution_book"])
+    fixture["expected"]["canonical_sha256"]["execution_book"] = _canonical_sha(book)
+    observation = fixture["expected"]["observation_result"]
+    observation["execution_book_sha256"] = raw_hash
+    observation["observation_id"] = _identity_sha(
+        {
+            "opportunity_id": observation["opportunity_id"],
+            "evidence_sha256": observation["evidence_sha256"],
+            "execution_book_sha256": raw_hash,
+            "policy_version": observation["policy_version"],
+        }
+    )
+    _rehash_observation(fixture)
+
+
 def test_complete_fixture_validates_and_round_trips_canonically(
     cycle: dict[str, Any],
 ) -> None:
@@ -1148,11 +1185,57 @@ def test_fixture_rejects_market_identity_detached_from_evidence(
     mutated = deepcopy(cycle)
     observation = mutated["expected"]["observation_result"]
     observation["market_id"] = "detached-market"
-    model = _validate_json(ObservationResult, observation)
-    mutated["expected"]["canonical_sha256"]["observation"] = _canonical_sha(model)
+    _rehash_observation(mutated)
 
     with pytest.raises((ValidationError, ValueError), match="market identity"):
         polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_rejects_observation_cutoff_detached_from_evidence(
+    cycle: dict[str, Any],
+) -> None:
+    mutated = deepcopy(cycle)
+    mutated["expected"]["observation_result"]["cutoff_at"] = "2026-10-03T11:59:59Z"
+    _rehash_observation(mutated)
+
+    with pytest.raises((ValidationError, ValueError), match="cutoff"):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+@pytest.mark.parametrize("identity", ("opportunity_id", "observation_id"))
+def test_fixture_rejects_detached_structural_identity(
+    cycle: dict[str, Any], identity: str
+) -> None:
+    mutated = deepcopy(cycle)
+    mutated["expected"]["observation_result"][identity] = "0" * 64
+    _rehash_observation(mutated)
+
+    with pytest.raises((ValidationError, ValueError), match=identity):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_identity_uses_documented_minimal_formulas(
+    cycle: dict[str, Any],
+) -> None:
+    observation = cycle["expected"]["observation_result"]
+    expected_opportunity_id = _identity_sha(
+        {
+            "policy_version": observation["policy_version"],
+            "market_id": observation["market_id"],
+            "cutoff_at": observation["cutoff_at"],
+        }
+    )
+    expected_observation_id = _identity_sha(
+        {
+            "opportunity_id": expected_opportunity_id,
+            "evidence_sha256": observation["evidence_sha256"],
+            "execution_book_sha256": observation["execution_book_sha256"],
+            "policy_version": observation["policy_version"],
+        }
+    )
+
+    assert observation["opportunity_id"] == expected_opportunity_id
+    assert observation["observation_id"] == expected_observation_id
 
 
 def test_fixture_rejects_execution_token_detached_from_precheck_and_gamma(
@@ -1171,10 +1254,15 @@ def test_fixture_rejects_execution_token_detached_from_precheck_and_gamma(
     mutated["expected"]["canonical_sha256"]["execution_book"] = _canonical_sha(book)
     observation = mutated["expected"]["observation_result"]
     observation["execution_book_sha256"] = raw_hash
-    observation_model = _validate_json(ObservationResult, observation)
-    mutated["expected"]["canonical_sha256"]["observation"] = _canonical_sha(
-        observation_model
+    observation["observation_id"] = _identity_sha(
+        {
+            "opportunity_id": observation["opportunity_id"],
+            "evidence_sha256": observation["evidence_sha256"],
+            "execution_book_sha256": raw_hash,
+            "policy_version": observation["policy_version"],
+        }
     )
+    _rehash_observation(mutated)
 
     with pytest.raises((ValidationError, ValueError), match="token identity"):
         polymarket_models.validate_feasibility_fixture(mutated)
@@ -1220,12 +1308,33 @@ def test_fixture_rejects_resolution_before_market_close(
     premature = "2026-10-04T20:00:00Z"
     mutated["resolution"]["resolved_at"] = premature
     mutated["expected"]["observation_result"]["observed_at"] = premature
-    observation = _validate_json(
-        ObservationResult, mutated["expected"]["observation_result"]
-    )
-    mutated["expected"]["canonical_sha256"]["observation"] = _canonical_sha(observation)
+    _rehash_observation(mutated)
 
     with pytest.raises((ValidationError, ValueError), match="market close"):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_rejects_execution_retrieved_after_resolution(
+    cycle: dict[str, Any],
+) -> None:
+    mutated = deepcopy(cycle)
+    _retime_execution_book(mutated, "2026-11-01T20:00:01Z")
+
+    with pytest.raises((ValidationError, ValueError), match="execution|resolution"):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_rejects_observation_before_execution_retrieval(
+    cycle: dict[str, Any],
+) -> None:
+    mutated = deepcopy(cycle)
+    _retime_execution_book(mutated, "2026-11-01T19:59:59Z")
+    premature = "2026-11-01T19:59:58Z"
+    mutated["resolution"]["resolved_at"] = premature
+    mutated["expected"]["observation_result"]["observed_at"] = premature
+    _rehash_observation(mutated)
+
+    with pytest.raises((ValidationError, ValueError), match="execution"):
         polymarket_models.validate_feasibility_fixture(mutated)
 
 

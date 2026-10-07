@@ -55,8 +55,9 @@ Build only the path below. Do not add a generic opportunity framework, stock str
 - `JevDecision`: `p_yes_micros` in `[0, 1_000_000]`, action in `BUY_YES|BUY_NO|ABSTAIN`, confidence micros, sufficiency micros, ambiguity micros, and concise rationale.
 - `ArmResult`: arm, signal probability/action, disposition, entry side/VWAP/quantity/fees, initial/final cash, mark or payout, trading/economic P&L, model cost, and forecast fields.
 - `ObservationResult`: IDs/hashes/timestamps plus exactly one AI and one deterministic `ArmResult`, shared market baseline probability, resolution if known, and paired P&L/forecast deltas.
+- Identity formulas are fixed and minimal: `opportunity_id` is SHA-256 of canonical JSON containing `policy_version`, `market_id`, and `cutoff_at`; `observation_id` is SHA-256 of canonical JSON containing `opportunity_id`, `evidence_sha256`, `execution_book_sha256`, and `policy_version`.
 - The fixture contains raw Gamma bytes, sanitized evidence, causal pre-cutoff history, precheck and execution books, canned OpenAI/Jev request-response bytes, actual model costs, a resolution payout, and expected canonical hashes/results. One fixture is enough.
-- Unit 1 validates the complete fixture shape and structural bindings across artifacts, hashes, market/token identity, chronology, model requests/responses, decisions, billed costs, arm capital, and resolution. Expected arm/observation records are strict, canonical provisional expected values: Unit 1 verifies their exact duplication and hashes, while Unit 2 validates how those values are derived.
+- Unit 1 validates the complete fixture shape and structural bindings across artifacts, hashes, market/token identity, chronology, model requests/responses, decisions, billed costs, arm capital, and resolution. Chronology requires `decision_frozen_at < execution_book.retrieved_at <= observation.observed_at`; a resolution requires `execution_book.retrieved_at < resolution.resolved_at`, and fixture `observed_at` equals that terminal result time. Expected arm/observation records are strict, canonical provisional expected values: Unit 1 verifies their exact duplication and hashes, while Unit 2 validates how those values are derived.
 - Unit 1 does **not** derive control probability from causal history, walk books, or compute VWAP, fees, sizing, P&L, baseline probability, or Brier scores. Unit 2 is the single source of truth for those calculations and must reject fixture expected results detached from causal history, books, or frozen economics.
 
 **Tests first:**
@@ -175,7 +176,7 @@ uv run mypy src
 - Reuse `persistence.blobs.BlobStore.publish` for exact public/model bytes. Verify returned digest and byte size before appending references.
 - Store a canonical JSON envelope per artifact: kind, SHA-256, byte size, relative blob path, source URI label, retrieval time, opportunity ID, and predecessor stage hash.
 - Append one canonical line per terminal `ObservationResult` to `<output>/results.jsonl` using `O_APPEND`, restrictive permissions, flush, and `fsync`. Refuse an existing non-regular file or symlink.
-- Observation identity is a hash of market ID, cutoff, evidence hash, execution-book hash, and policy version. Replaying the same identity verifies and returns the existing result; conflicting bytes for the same identity fail closed.
+- Observation identity uses the Unit 1 formula over opportunity ID, evidence hash, execution-book hash, and policy version. Replaying the same identity verifies and returns the existing result; conflicting bytes for the same identity fail closed.
 - A replay loader resolves every referenced blob, verifies SHA-256/size, and reconstructs contracts. Missing/corrupt artifacts stop replay.
 - Do not introduce migrations, mutable result rows, a repository abstraction, or backup machinery.
 

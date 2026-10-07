@@ -572,6 +572,41 @@ def _canonical_model_sha(model: StrictModel) -> str:
     ).hexdigest()
 
 
+def _opportunity_id(*, policy_version: str, market_id: str, cutoff_at: str) -> str:
+    """Hash canonical JSON of policy version, market ID, and UTC cutoff."""
+
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "policy_version": policy_version,
+                "market_id": market_id,
+                "cutoff_at": cutoff_at,
+            }
+        )
+    ).hexdigest()
+
+
+def _observation_id(
+    *,
+    opportunity_id: str,
+    evidence_sha256: str,
+    execution_book_sha256: str,
+    policy_version: str,
+) -> str:
+    """Hash canonical JSON of opportunity, evidence, book, and policy identity."""
+
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "opportunity_id": opportunity_id,
+                "evidence_sha256": evidence_sha256,
+                "execution_book_sha256": execution_book_sha256,
+                "policy_version": policy_version,
+            }
+        )
+    ).hexdigest()
+
+
 def _require_exact_keys(value: object, keys: set[str], label: str) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != keys:
         raise ValueError(f"{label} must contain exactly {sorted(keys)}")
@@ -716,6 +751,23 @@ def validate_feasibility_fixture(fixture: dict[str, Any]) -> None:
         observation.market_id != evidence.market_id
     ):
         raise ValueError("market identity does not match evidence")
+    if observation.cutoff_at != evidence.cutoff_at:
+        raise ValueError("observation cutoff does not match evidence cutoff")
+    expected_opportunity_id = _opportunity_id(
+        policy_version=observation.policy_version,
+        market_id=observation.market_id,
+        cutoff_at=observation.cutoff_at.isoformat().replace("+00:00", "Z"),
+    )
+    if observation.opportunity_id != expected_opportunity_id:
+        raise ValueError("opportunity_id does not match structural identity")
+    expected_observation_id = _observation_id(
+        opportunity_id=observation.opportunity_id,
+        evidence_sha256=observation.evidence_sha256,
+        execution_book_sha256=observation.execution_book_sha256,
+        policy_version=observation.policy_version,
+    )
+    if observation.observation_id != expected_observation_id:
+        raise ValueError("observation_id does not match structural identity")
     if any(book.token_id != tokens.yes_token_id for book in books.values()):
         raise ValueError("book token identity does not match normalized YES token")
     for name, book in books.items():
@@ -814,7 +866,13 @@ def validate_feasibility_fixture(fixture: dict[str, Any]) -> None:
     if arms.ai != observation.ai or arms.deterministic != observation.deterministic:
         raise ValueError("expected arm results do not match observation arms")
 
+    execution_retrieved_at = books["execution_book"].retrieved_at
+    if observation.observed_at < execution_retrieved_at:
+        raise ValueError("observation cannot precede execution book retrieval")
+
     resolution = validated.resolution
+    if resolution.resolved_at <= execution_retrieved_at:
+        raise ValueError("resolution must follow execution book retrieval")
     if (
         observation.resolution != resolution.payout
         or observation.observed_at != resolution.resolved_at
