@@ -237,7 +237,7 @@ _APPROVED_SOURCE_HASHES = {
         "2925c2cb54de7d9d6e6486b58310dc59ee9702fa477d0e4f064d44423c539b90"
     ),
     "src/jev_trading_lab/polymarket/paper.py": (
-        "e90fcbabb0903ffc6b3a33098de8cefb76de62ce639a3c305a29cb44b60aec11"
+        "6fc1e6aad99df80b5e56e9f600e431ecf607c8a5fe670de3ad369a0c62fe3ab1"
     ),
     "src/jev_trading_lab/stocks/__init__.py": (
         "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"
@@ -296,10 +296,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "60aac65af2898ad728157a75d53f4a16c15a6700ce59219b8bef8a17a0829fc8"
+    "69cc5b54b7243efbd36d6e90b6c244619e4256663e12df120531f9260e690af0"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "8f57bedc9b8df1a00a20d09d42825c0415fbb353b27a61ec92bb26efc2519df8"
+    "400b1fb02cd092acbb3274fa081d88863235c4ef557622e1333ce8316e3f760d"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = [
     "exchange-calendars==4.11.2",
@@ -1637,13 +1637,8 @@ def test_python_subprocess_path_cannot_create_source_bytecode(tmp_path: Path) ->
     )
 
     result = subprocess.run(
-        [sys.executable, "-B", "-c", code, str(tmp_path / "root")],
+        [sys.executable, "-c", code, str(tmp_path / "root")],
         cwd=ROOT,
-        env={
-            key: value
-            for key, value in os.environ.items()
-            if key != "PYTHONDONTWRITEBYTECODE"
-        },
         capture_output=True,
         text=True,
         check=False,

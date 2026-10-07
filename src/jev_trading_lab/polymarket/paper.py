@@ -10,6 +10,7 @@ from typing import Literal
 from jev_trading_lab.core.ids import canonical_json_bytes
 from jev_trading_lab.polymarket.control import control_probability
 from jev_trading_lab.polymarket.models import (
+    INT64_MAX,
     ArmResult,
     BookLevel,
     BookSnapshot,
@@ -116,12 +117,18 @@ def edge_threshold_micros(policy: Economics) -> int:
     return max(50_000, 2 * round_trip_cost + 30_000)
 
 
-def fee_microdollars(notional_microdollars: int, fee_pp_micros: int) -> int:
-    """Conservatively ceil fee probability-points times microdollar notional."""
+def fee_microdollars(quantity: int, fee_pp_micros: int) -> int:
+    """Return the per-contract probability-point fee in microdollars."""
 
-    if notional_microdollars < 0 or not 0 <= fee_pp_micros <= MICROS:
+    if (
+        type(quantity) is not int
+        or type(fee_pp_micros) is not int
+        or not 0 <= quantity <= INT64_MAX
+        or not 0 <= fee_pp_micros <= MICROS
+        or quantity > INT64_MAX // max(fee_pp_micros, 1)
+    ):
         raise ValueError("fee inputs are outside their integer domains")
-    return _ceil_div(notional_microdollars * fee_pp_micros, MICROS)
+    return quantity * fee_pp_micros
 
 
 def _volatility_cap(equity_microdollars: int, sigma_p_micros: int) -> int:
@@ -135,10 +142,10 @@ def _notional_cap(equity_microdollars: int, price_micros: int) -> int:
 
 
 def _cash_cap(cash_microdollars: int, price_micros: int, fee_pp_micros: int) -> int:
-    if price_micros == 0:
-        return cash_microdollars
-    denominator = price_micros * (MICROS + fee_pp_micros)
-    return cash_microdollars * MICROS // denominator
+    cost_per_contract = price_micros + fee_pp_micros
+    if cost_per_contract == 0:
+        return INT64_MAX
+    return cash_microdollars // cost_per_contract
 
 
 def sizing_caps(
@@ -207,20 +214,30 @@ def size_quantity(
     )
     upper = min(caps.values())
     threshold = edge_threshold_micros(policy)
-    for quantity in range(upper, 0, -1):
+
+    def passes(quantity: int) -> bool:
         quote = quote_side(book, side, quantity, liquidity="ASK")
         if quote.filled_quantity != quantity or quote.vwap_micros is None:
-            continue
+            return False
         if quantity > _notional_cap(equity, quote.vwap_micros):
-            continue
-        entry_fee = fee_microdollars(
-            quote.notional_microdollars, policy.entry_fee_pp_micros
-        )
+            return False
+        entry_fee = fee_microdollars(quantity, policy.entry_fee_pp_micros)
         if quote.notional_microdollars + entry_fee > cash:
-            continue
-        if gross_edge_micros(probability_micros, side, quote.vwap_micros) >= threshold:
-            return quantity
-    return 0
+            return False
+        return (
+            gross_edge_micros(probability_micros, side, quote.vwap_micros) >= threshold
+        )
+
+    if upper == 0 or not passes(1):
+        return 0
+    lower = 1
+    while lower < upper:
+        candidate = (lower + upper + 1) // 2
+        if passes(candidate):
+            lower = candidate
+        else:
+            upper = candidate - 1
+    return lower
 
 
 def _preferred_side(book: BookSnapshot, probability_micros: int) -> Side:
@@ -301,20 +318,16 @@ def _arm(
     entry = quote_side(book, side, quantity, liquidity="ASK")
     if entry.vwap_micros is None:
         raise ValueError("positive sized quantity requires an entry VWAP")
-    entry_fee = fee_microdollars(
-        entry.notional_microdollars, policy.entry_fee_pp_micros
-    )
+    entry_fee = fee_microdollars(quantity, policy.entry_fee_pp_micros)
     if payout is None:
         mark_quote = quote_side(book, side, quantity, liquidity="BID")
         held_valuation = mark_quote.vwap_micros or 0
         market_yes_mark = held_valuation if side == "YES" else MICROS - held_valuation
-        exit_notional = mark_quote.notional_microdollars
-        exit_fee = fee_microdollars(exit_notional, policy.exit_fee_pp_micros)
+        exit_fee = fee_microdollars(quantity, policy.exit_fee_pp_micros)
     else:
         market_yes_mark = None
         held_valuation = payout if side == "YES" else MICROS - payout
-        exit_notional = quantity * held_valuation
-        exit_fee = fee_microdollars(exit_notional, policy.exit_fee_pp_micros)
+        exit_fee = fee_microdollars(quantity, policy.exit_fee_pp_micros)
     fees = entry_fee + exit_fee
     trading_pnl = quantity * (held_valuation - entry.vwap_micros) - fees
     score = brier_micros(probability_micros, payout) if payout is not None else None

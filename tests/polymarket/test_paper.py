@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from jev_trading_lab.polymarket import paper
 from jev_trading_lab.polymarket.models import (
     BookSnapshot,
     Economics,
@@ -151,10 +152,42 @@ def test_edge_threshold_uses_cost_round_trip_floor_and_accepts_equality() -> Non
     assert gross_edge_micros(610_000, "YES", 540_000) >= edge_threshold_micros(policy)
 
 
-def test_fee_uses_conservative_ceiling_integer_arithmetic() -> None:
-    assert fee_microdollars(1, 1) == 1
-    assert fee_microdollars(3_250_000, 10_000) == 32_500
-    assert fee_microdollars(3_250_001, 10_000) == 32_501
+@pytest.mark.parametrize("entry_price_micros", (50_000, 950_000))
+def test_fee_is_per_contract_probability_point_and_price_independent(
+    entry_price_micros: int,
+) -> None:
+    quantity = 500
+    fee_pp_micros = 10_000
+    notional_microdollars = quantity * entry_price_micros
+
+    assert fee_microdollars(quantity, fee_pp_micros) == 5_000_000
+    assert fee_microdollars(quantity, fee_pp_micros) != (
+        notional_microdollars * fee_pp_micros // 1_000_000
+    )
+
+
+@pytest.mark.parametrize(
+    ("quantity", "fee_pp_micros"),
+    ((True, 10_000), (500, True), (False, 0), (0, False)),
+)
+def test_fee_rejects_bool_inputs(quantity: object, fee_pp_micros: object) -> None:
+    with pytest.raises(ValueError, match="integer domains"):
+        fee_microdollars(quantity, fee_pp_micros)  # type: ignore[arg-type]
+
+
+def test_fee_enforces_int64_result_and_input_domains() -> None:
+    int64_max = 2**63 - 1
+
+    assert fee_microdollars(int64_max, 1) == int64_max
+    for quantity, fee_pp_micros in (
+        (-1, 1),
+        (int64_max + 1, 0),
+        (int64_max, 2),
+        (1, -1),
+        (1, 1_000_001),
+    ):
+        with pytest.raises(ValueError, match="integer domains"):
+            fee_microdollars(quantity, fee_pp_micros)
 
 
 def test_sizing_caps_report_volatility_notional_depth_and_cash_limits() -> None:
@@ -163,7 +196,7 @@ def test_sizing_caps_report_volatility_notional_depth_and_cash_limits() -> None:
         "volatility": 500,
         "notional": 1_851,
         "depth": 1_000,
-        "cash": 18_335,
+        "cash": 18_181,
     }
 
 
@@ -172,10 +205,14 @@ def test_quantity_uses_smallest_frozen_cap() -> None:
     assert size_quantity(snapshot, "YES", 700_000, economics()) == 500
 
 
-def test_cash_cap_accounts_for_conservatively_rounded_fee() -> None:
+@pytest.mark.parametrize(("cash", "expected"), ((55_000_000, 100), (54_999_999, 99)))
+def test_cash_cap_uses_notional_plus_per_contract_fee_exactly(
+    cash: int, expected: int
+) -> None:
     snapshot = book(bids=[(490_000, 20_000)], asks=[(540_000, 20_000)])
-    policy = economics(cash=54_540_000)
-    assert sizing_caps(snapshot, "YES", policy)["cash"] == 100
+    policy = economics(cash=cash)
+
+    assert sizing_caps(snapshot, "YES", policy)["cash"] == expected
     assert (
         size_quantity(
             snapshot,
@@ -184,8 +221,15 @@ def test_cash_cap_accounts_for_conservatively_rounded_fee() -> None:
             policy,
             equity_microdollars=10_000_000_000,
         )
-        == 100
+        == expected
     )
+
+
+def test_threshold_equality_returns_exact_largest_quantity() -> None:
+    snapshot = book(bids=[(490_000, 20_000)], asks=[(540_000, 20_000)])
+    policy = economics(entry_fee=10_000, exit_fee=5_000, slippage=5_000)
+
+    assert size_quantity(snapshot, "YES", 610_000, policy) == 500
 
 
 def test_quantity_searches_down_when_deeper_vwap_loses_edge() -> None:
@@ -196,6 +240,36 @@ def test_quantity_searches_down_when_deeper_vwap_loses_edge() -> None:
     policy = economics(sigma=50_000, entry_fee=0, slippage=0)
 
     assert size_quantity(snapshot, "YES", 590_000, policy) == 10
+
+
+def test_huge_int64_quantity_search_has_bounded_candidate_evaluations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    int64_max = 2**63 - 1
+    snapshot = book(bids=[(490_000, int64_max)], asks=[(540_000, int64_max)])
+    policy = economics(cash=int64_max, sigma=50_000)
+    quote_calls = 0
+    original_quote_side = paper.quote_side
+
+    def counted_quote_side(*args: object, **kwargs: object) -> object:
+        nonlocal quote_calls
+        quote_calls += 1
+        return original_quote_side(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(paper, "quote_side", counted_quote_side)
+
+    assert (
+        size_quantity(
+            snapshot,
+            "YES",
+            540_000,
+            policy,
+            equity_microdollars=int64_max,
+            available_cash_microdollars=int64_max,
+        )
+        == 0
+    )
+    assert quote_calls <= 64
 
 
 def test_caps_that_floor_to_zero_produce_no_quantity() -> None:
@@ -272,9 +346,9 @@ def test_fixture_recomputes_exact_resolved_economics_and_scores(
     assert observation == fixture.expected.observation_result
     assert observation.ai.entry_vwap_micros == 542_000
     assert observation.ai.quantity == 500
-    assert observation.ai.fees_microdollars == 2_710_000
-    assert observation.ai.trading_pnl_microdollars == 226_290_000
-    assert observation.ai.economic_pnl_microdollars == 225_790_000
+    assert observation.ai.fees_microdollars == 5_000_000
+    assert observation.ai.trading_pnl_microdollars == 224_000_000
+    assert observation.ai.economic_pnl_microdollars == 223_500_000
     assert observation.ai.brier_micros == 90_000
     assert observation.deterministic.brier_micros == 202_500
     assert observation.baseline_probability_micros == 515_000
@@ -292,6 +366,32 @@ def test_unit2_validation_rejects_detached_expected_economics(
 
     with pytest.raises(ValueError, match="Unit 2 expected results mismatch"):
         validate_unit2_fixture(detached)
+
+
+@pytest.mark.parametrize("resolution", (1, None))
+def test_resolved_and_marked_fills_charge_exit_fee_per_contract(
+    resolution: int | None,
+) -> None:
+    snapshot = book(bids=[(490_000, 20_000)], asks=[(540_000, 20_000)])
+    decision = JevDecision(
+        p_yes_micros=700_000,
+        action="BUY_YES",
+        confidence_micros=800_000,
+        sufficiency_micros=800_000,
+        ambiguity_micros=200_000,
+        rationale="bounded",
+    )
+
+    result = evaluate_ai_arm(
+        snapshot,
+        decision,
+        economics(entry_fee=10_000, exit_fee=5_000, slippage=0),
+        resolution=resolution,  # type: ignore[arg-type]
+        model_cost_microdollars=0,
+    )
+
+    assert result.quantity == 500
+    assert result.fees_microdollars == 7_500_000
 
 
 def test_unresolved_fill_marks_executable_bids_and_scores_pending() -> None:
@@ -360,7 +460,7 @@ def test_property_style_sizing_never_overfills_or_creates_negative_cash(
     quantity = size_quantity(snapshot, "YES", 700_000, policy)
     fill = quote_side(snapshot, "YES", quantity, liquidity="ASK")
     funded = fill.notional_microdollars + fee_microdollars(
-        fill.notional_microdollars, policy.entry_fee_pp_micros
+        quantity, policy.entry_fee_pp_micros
     )
 
     assert 0 <= quantity <= depth
