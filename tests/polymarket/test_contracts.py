@@ -90,7 +90,7 @@ def test_fixture_preserves_exact_raw_and_model_artifact_hashes(
 def test_fixture_contains_inputs_needed_by_later_cycle(cycle: dict[str, Any]) -> None:
     assert len(cycle["causal_history"]) >= 2
     assert cycle["model_costs_microdollars"] == {"jev": 125_000, "openai": 375_000}
-    assert cycle["resolution"] == {"resolved_at": "2026-10-04T20:00:00Z", "payout": 1}
+    assert cycle["resolution"] == {"resolved_at": "2026-11-01T20:00:00Z", "payout": 1}
     assert cycle["expected"]["observation_result"]["resolution"] == 1
 
 
@@ -1129,10 +1129,146 @@ def test_fixture_rejects_expected_arm_detached_from_observation(
     cycle: dict[str, Any],
 ) -> None:
     mutated = deepcopy(cycle)
-    mutated["expected"]["arm_results"]["ai"]["brier_micros"] += 1
+    arm = mutated["expected"]["arm_results"]["deterministic"]
+    arm.update(
+        signal_probability_micros=560_000,
+        forecast_probability_micros=560_000,
+        brier_micros=193_600,
+    )
+    model = ArmResult.model_validate(arm)
+    mutated["expected"]["canonical_sha256"]["deterministic_arm"] = _canonical_sha(model)
 
-    with pytest.raises((ValidationError, ValueError)):
+    with pytest.raises((ValidationError, ValueError), match="expected arm results"):
         polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_rejects_market_identity_detached_from_evidence(
+    cycle: dict[str, Any],
+) -> None:
+    mutated = deepcopy(cycle)
+    observation = mutated["expected"]["observation_result"]
+    observation["market_id"] = "detached-market"
+    model = _validate_json(ObservationResult, observation)
+    mutated["expected"]["canonical_sha256"]["observation"] = _canonical_sha(model)
+
+    with pytest.raises((ValidationError, ValueError), match="market identity"):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_rejects_execution_token_detached_from_precheck_and_gamma(
+    cycle: dict[str, Any],
+) -> None:
+    mutated = deepcopy(cycle)
+    raw_book = json.loads(mutated["raw"]["execution_book_bytes"])
+    raw_book["asset_id"] = "detached-token"
+    mutated["raw"]["execution_book_bytes"] = json.dumps(
+        raw_book, separators=(",", ":"), sort_keys=True
+    )
+    _rehash_artifact(mutated, "execution_book_bytes")
+    raw_hash = mutated["expected"]["artifact_sha256"]["execution_book_bytes"]
+    mutated["execution_book"].update(token_id="detached-token", source_sha256=raw_hash)
+    book = _validate_json(BookSnapshot, mutated["execution_book"])
+    mutated["expected"]["canonical_sha256"]["execution_book"] = _canonical_sha(book)
+    observation = mutated["expected"]["observation_result"]
+    observation["execution_book_sha256"] = raw_hash
+    observation_model = _validate_json(ObservationResult, observation)
+    mutated["expected"]["canonical_sha256"]["observation"] = _canonical_sha(
+        observation_model
+    )
+
+    with pytest.raises((ValidationError, ValueError), match="token identity"):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_requires_normalized_yes_no_token_mapping(
+    cycle: dict[str, Any],
+) -> None:
+    assert cycle["normalized_tokens"] == {
+        "yes_token_id": "yes-token-001",
+        "no_token_id": "no-token-001",
+    }
+
+
+def test_fixture_rejects_nonincreasing_or_duplicate_causal_history(
+    cycle: dict[str, Any],
+) -> None:
+    mutated = deepcopy(cycle)
+    mutated["causal_history"][1]["observed_at"] = mutated["causal_history"][0][
+        "observed_at"
+    ]
+
+    with pytest.raises((ValidationError, ValueError), match="strictly increasing"):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_declares_model_and_decision_freeze_chronology(
+    cycle: dict[str, Any],
+) -> None:
+    assert cycle["chronology"] == {
+        "openai_request_at": "2026-10-03T12:00:01Z",
+        "openai_response_at": "2026-10-03T12:00:30Z",
+        "jev_request_at": "2026-10-03T12:00:31Z",
+        "jev_response_at": "2026-10-03T12:01:00Z",
+        "decision_frozen_at": "2026-10-03T12:01:30Z",
+    }
+
+
+def test_fixture_rejects_resolution_before_market_close(
+    cycle: dict[str, Any],
+) -> None:
+    mutated = deepcopy(cycle)
+    premature = "2026-10-04T20:00:00Z"
+    mutated["resolution"]["resolved_at"] = premature
+    mutated["expected"]["observation_result"]["observed_at"] = premature
+    observation = _validate_json(
+        ObservationResult, mutated["expected"]["observation_result"]
+    )
+    mutated["expected"]["canonical_sha256"]["observation"] = _canonical_sha(observation)
+
+    with pytest.raises((ValidationError, ValueError), match="market close"):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_rejects_ai_signal_detached_from_jev_decision(
+    cycle: dict[str, Any],
+) -> None:
+    mutated = deepcopy(cycle)
+    for arm in (
+        mutated["expected"]["arm_results"]["ai"],
+        mutated["expected"]["observation_result"]["ai"],
+    ):
+        arm.update(
+            signal_probability_micros=710_000,
+            forecast_probability_micros=710_000,
+            brier_micros=84_100,
+        )
+    observation = mutated["expected"]["observation_result"]
+    observation["paired_brier_delta_micros"] = -118_400
+    ai_model = ArmResult.model_validate(mutated["expected"]["arm_results"]["ai"])
+    observation_model = _validate_json(ObservationResult, observation)
+    mutated["expected"]["canonical_sha256"].update(
+        ai_arm=_canonical_sha(ai_model),
+        observation=_canonical_sha(observation_model),
+    )
+
+    with pytest.raises((ValidationError, ValueError), match="Jev decision"):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_rejects_resolved_observation_without_arm_payout(
+    cycle: dict[str, Any],
+) -> None:
+    observation = deepcopy(cycle["expected"]["observation_result"])
+    arm = observation["deterministic"]
+    arm.update(
+        payout_micros=None,
+        forecast_status="PENDING_RESOLUTION",
+        brier_micros=None,
+    )
+    observation["paired_brier_delta_micros"] = None
+
+    with pytest.raises(ValidationError, match="arm payout"):
+        _validate_json(ObservationResult, observation)
 
 
 def test_fixture_rejects_starting_capital_detached_from_arms(

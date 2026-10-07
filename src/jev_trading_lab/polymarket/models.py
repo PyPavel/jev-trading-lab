@@ -409,9 +409,14 @@ class ObservationResult(UtcModel):
                     if (
                         arm.forecast_status != "UNAVAILABLE"
                         or arm.brier_micros is not None
+                        or arm.payout_micros is not None
                     ):
                         raise ValueError("unavailable resolved arm cannot be scored")
                     continue
+                if arm.payout_micros != payout_micros:
+                    raise ValueError(
+                        "available resolved arm payout must match resolution"
+                    )
                 if arm.forecast_status != "SCORED" or arm.brier_micros != _brier_micros(
                     probability, payout_micros
                 ):
@@ -463,6 +468,42 @@ class ModelCosts(StrictModel):
     jev: NonNegativeInt
 
 
+class NormalizedTokens(StrictModel):
+    """Gamma YES/NO token identity after deterministic normalization."""
+
+    yes_token_id: NonEmptyStr
+    no_token_id: NonEmptyStr
+
+    @model_validator(mode="after")
+    def require_distinct_tokens(self) -> Self:
+        if self.yes_token_id == self.no_token_id:
+            raise ValueError("YES and NO token IDs must differ")
+        return self
+
+
+class FixtureChronology(UtcModel):
+    """Declared model and decision-freeze event times for Unit 1 binding."""
+
+    openai_request_at: datetime
+    openai_response_at: datetime
+    jev_request_at: datetime
+    jev_response_at: datetime
+    decision_frozen_at: datetime
+
+    @model_validator(mode="after")
+    def require_strict_stage_order(self) -> Self:
+        stages = (
+            self.openai_request_at,
+            self.openai_response_at,
+            self.jev_request_at,
+            self.jev_response_at,
+            self.decision_frozen_at,
+        )
+        if any(left >= right for left, right in zip(stages, stages[1:])):
+            raise ValueError("model chronology must be strictly increasing")
+        return self
+
+
 class Resolution(UtcModel):
     payout: Literal[0, 1]
     resolved_at: datetime
@@ -508,8 +549,10 @@ class FeasibilityFixture(StrictModel):
     raw: RawArtifacts
     sanitized_evidence: EvidencePacket
     causal_history: Annotated[list[CausalHistoryPoint], Field(min_length=1)]
+    normalized_tokens: NormalizedTokens
     precheck_book: BookSnapshot
     execution_book: BookSnapshot
+    chronology: FixtureChronology
     model_artifacts: ModelArtifacts
     research_brief: ResearchBrief
     jev_decision: JevDecision
@@ -661,11 +704,20 @@ def validate_feasibility_fixture(fixture: dict[str, Any]) -> None:
     evidence_dump = evidence.model_dump(mode="json")
     if any(evidence_dump[key] != value for key, value in gamma_evidence.items()):
         raise ValueError("sanitized evidence does not match raw Gamma record")
+    tokens = validated.normalized_tokens
+    if gamma["clobTokenIds"] != [tokens.yes_token_id, tokens.no_token_id]:
+        raise ValueError("normalized token identity does not match Gamma record")
 
     books = {
         "precheck_book": validated.precheck_book,
         "execution_book": validated.execution_book,
     }
+    if any(book.market_id != evidence.market_id for book in books.values()) or (
+        observation.market_id != evidence.market_id
+    ):
+        raise ValueError("market identity does not match evidence")
+    if any(book.token_id != tokens.yes_token_id for book in books.values()):
+        raise ValueError("book token identity does not match normalized YES token")
     for name, book in books.items():
         raw_name = f"{name}_bytes"
         raw_hash = expected_artifacts[raw_name]
@@ -768,10 +820,30 @@ def validate_feasibility_fixture(fixture: dict[str, Any]) -> None:
         or observation.observed_at != resolution.resolved_at
     ):
         raise ValueError("resolution does not match observation")
+    if resolution.resolved_at < evidence.closes_at:
+        raise ValueError("resolution cannot precede market close")
 
     cutoff = evidence.cutoff_at
-    if any(point.observed_at >= cutoff for point in validated.causal_history):
+    history_times = [point.observed_at for point in validated.causal_history]
+    if any(point_at >= cutoff for point_at in history_times):
         raise ValueError("causal history timestamps must precede cutoff")
+    if any(left >= right for left, right in zip(history_times, history_times[1:])):
+        raise ValueError("causal history timestamps must be strictly increasing")
+
+    chronology = validated.chronology
+    if chronology.openai_request_at <= cutoff:
+        raise ValueError("OpenAI request must follow cutoff")
+    if chronology.decision_frozen_at >= books["execution_book"].retrieved_at:
+        raise ValueError("decision must freeze before execution book retrieval")
+    if books["precheck_book"].retrieved_at > cutoff:
+        raise ValueError("precheck book must not follow cutoff")
+
+    decision = validated.jev_decision
+    if (
+        arms.ai.signal_probability_micros != decision.p_yes_micros
+        or arms.ai.signal_action != decision.action
+    ):
+        raise ValueError("AI arm signal does not match Jev decision")
 
     canonical_models: dict[str, StrictModel] = {
         "evidence": evidence,

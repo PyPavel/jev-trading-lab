@@ -9,6 +9,13 @@
       "observed_at": "2026-10-03T11:55:00Z"
     }
   ],
+  "chronology": {
+    "decision_frozen_at": "2026-10-03T12:01:30Z",
+    "jev_request_at": "2026-10-03T12:00:31Z",
+    "jev_response_at": "2026-10-03T12:01:00Z",
+    "openai_request_at": "2026-10-03T12:00:01Z",
+    "openai_response_at": "2026-10-03T12:00:30Z"
+  },
   "economics": {
     "entry_fee_pp_micros": 10000,
     "exit_fee_pp_micros": 0,
@@ -100,7 +107,7 @@
       "evidence": "4b934973b5c17fe4155f387071693efc89af15c01f506020c4e4e4f6501abc2c",
       "execution_book": "16d84d8eea9d75e78082b10cb277072b83ee83050dc550a9ee3da60665f41731",
       "jev_decision": "2608122c13ed8da0ab5e664db4f01d3839e24bb973a0994dd0f09c778aafc259",
-      "observation": "7881e20b100de213d1cb6fce2cf1cbf4efc6bee54cdc3686da34f0aa7b9d7177",
+      "observation": "19a11cdbdbb6681adc0e70b3c59a5eeb16a5131d092d8a8fe1e0740b49711fba",
       "precheck_book": "efb7e9aceabaddbd32e5a8ead57c03af7084283aef209a4d05cd218e4bf3e89e",
       "research_brief": "6b00387c3dbc8d9d01f75166c6f339b145b23fbe9c20b4dfe4162959c029d1d2"
     },
@@ -153,7 +160,7 @@
       "jev_decision_sha256": "2608122c13ed8da0ab5e664db4f01d3839e24bb973a0994dd0f09c778aafc259",
       "market_id": "pm-fed-oct-2026",
       "observation_id": "4444444444444444444444444444444444444444444444444444444444444444",
-      "observed_at": "2026-10-04T20:00:00Z",
+      "observed_at": "2026-11-01T20:00:00Z",
       "opportunity_id": "3333333333333333333333333333333333333333333333333333333333333333",
       "paired_brier_delta_micros": -112500,
       "paired_economic_pnl_delta_microdollars": 223500000,
@@ -180,6 +187,10 @@
   "model_costs_microdollars": {
     "jev": 125000,
     "openai": 375000
+  },
+  "normalized_tokens": {
+    "no_token_id": "no-token-001",
+    "yes_token_id": "yes-token-001"
   },
   "precheck_book": {
     "asks": [
@@ -238,7 +249,7 @@
   },
   "resolution": {
     "payout": 1,
-    "resolved_at": "2026-10-04T20:00:00Z"
+    "resolved_at": "2026-11-01T20:00:00Z"
   },
   "sanitized_evidence": {
     "category": "Economy",
