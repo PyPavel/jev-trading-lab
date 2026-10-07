@@ -193,6 +193,29 @@ class ResearchBrief(StrictModel):
         return self
 
 
+class OpenAIUsage(StrictModel):
+    """Exact token counts returned by the canned OpenAI response."""
+
+    input_tokens: NonNegativeInt
+    output_tokens: NonNegativeInt
+    total_tokens: NonNegativeInt
+
+    @model_validator(mode="after")
+    def require_exact_total(self) -> Self:
+        if self.total_tokens != self.input_tokens + self.output_tokens:
+            raise ValueError("total_tokens must equal input_tokens plus output_tokens")
+        return self
+
+
+class OpenAIResponse(StrictModel):
+    """Closed-world canned OpenAI response with billed cost metadata."""
+
+    cost_microdollars: NonNegativeInt
+    model: NonEmptyStr
+    output: ResearchBrief
+    usage: OpenAIUsage
+
+
 class JevDecision(StrictModel):
     """Bounded Jev forecast and paper action, without execution arithmetic."""
 
@@ -793,15 +816,13 @@ def validate_feasibility_fixture(fixture: dict[str, Any]) -> None:
     }:
         raise ValueError("OpenAI request does not match fixture evidence contract")
 
-    openai_response = _require_exact_keys(
-        load_strict_json(artifacts.openai_response_bytes),
-        {"cost_microdollars", "model", "output", "usage"},
-        "OpenAI response",
+    openai_response = OpenAIResponse.model_validate_json(
+        artifacts.openai_response_bytes
     )
     if (
-        openai_response["model"] != openai_request["model"]
-        or openai_response["output"] != brief.model_dump(mode="json")
-        or openai_response["cost_microdollars"]
+        openai_response.model != openai_request["model"]
+        or openai_response.output != brief
+        or openai_response.cost_microdollars
         != validated.model_costs_microdollars.openai
     ):
         raise ValueError("OpenAI response does not match brief or billed cost")

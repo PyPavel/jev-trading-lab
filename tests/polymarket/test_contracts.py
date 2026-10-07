@@ -1405,6 +1405,97 @@ def test_fixture_rejects_openai_response_detached_from_research_brief(
         polymarket_models.validate_feasibility_fixture(mutated)
 
 
+def _replace_openai_response(fixture: dict[str, Any], response: dict[str, Any]) -> None:
+    fixture["model_artifacts"]["openai_response_bytes"] = json.dumps(
+        response, separators=(",", ":"), sort_keys=True
+    )
+    _rehash_artifact(fixture, "openai_response_bytes")
+
+
+@pytest.mark.parametrize("usage", ("tokens", [], None, {}))
+def test_fixture_rejects_nonobject_or_incomplete_openai_usage_with_updated_self_hash(
+    cycle: dict[str, Any], usage: object
+) -> None:
+    mutated = deepcopy(cycle)
+    response = json.loads(mutated["model_artifacts"]["openai_response_bytes"])
+    response["usage"] = usage
+    _replace_openai_response(mutated, response)
+
+    with pytest.raises((ValidationError, ValueError)):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("input_tokens", -1),
+        ("input_tokens", True),
+        ("output_tokens", 250.0),
+        ("total_tokens", 2**63),
+        ("input_tokens", {"count": 500}),
+    ),
+)
+def test_fixture_rejects_invalid_openai_usage_counts_with_updated_self_hash(
+    cycle: dict[str, Any], field: str, value: object
+) -> None:
+    mutated = deepcopy(cycle)
+    response = json.loads(mutated["model_artifacts"]["openai_response_bytes"])
+    response["usage"]["total_tokens"] = 750
+    response["usage"][field] = value
+    _replace_openai_response(mutated, response)
+
+    with pytest.raises((ValidationError, ValueError)):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("unexpected", 1),
+        ("market", "pm-fed-oct-2026"),
+        ("token_id", "yes-token-001"),
+        ("price", 500_000),
+        ("book", {"bids": []}),
+    ),
+)
+def test_fixture_rejects_unknown_openai_usage_fields_with_updated_self_hash(
+    cycle: dict[str, Any], field: str, value: object
+) -> None:
+    mutated = deepcopy(cycle)
+    response = json.loads(mutated["model_artifacts"]["openai_response_bytes"])
+    response["usage"]["total_tokens"] = 750
+    response["usage"][field] = value
+    _replace_openai_response(mutated, response)
+
+    with pytest.raises((ValidationError, ValueError)):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+def test_fixture_rejects_inconsistent_openai_usage_total_with_updated_self_hash(
+    cycle: dict[str, Any],
+) -> None:
+    mutated = deepcopy(cycle)
+    response = json.loads(mutated["model_artifacts"]["openai_response_bytes"])
+    response["usage"]["total_tokens"] = 749
+    _replace_openai_response(mutated, response)
+
+    with pytest.raises((ValidationError, ValueError), match="total_tokens"):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+@pytest.mark.parametrize("cost", (-1, True, 375_000.0, 375_001, 2**63))
+def test_fixture_rejects_invalid_or_detached_openai_billed_cost_with_updated_self_hash(
+    cycle: dict[str, Any], cost: object
+) -> None:
+    mutated = deepcopy(cycle)
+    response = json.loads(mutated["model_artifacts"]["openai_response_bytes"])
+    response["cost_microdollars"] = cost
+    _replace_openai_response(mutated, response)
+
+    with pytest.raises((ValidationError, ValueError)):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
 def test_fixture_rejects_book_bytes_detached_from_normalized_snapshot(
     cycle: dict[str, Any],
 ) -> None:
