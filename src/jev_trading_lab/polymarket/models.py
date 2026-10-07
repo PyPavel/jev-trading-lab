@@ -227,6 +227,14 @@ class JevDecision(StrictModel):
     rationale: Annotated[str, StringConstraints(min_length=1, max_length=500)]
 
 
+class JevResponse(StrictModel):
+    """Closed-world canned Jev response with billed cost metadata."""
+
+    cost_microdollars: NonNegativeInt
+    model: Literal["jev-1-2026-09-15"]
+    result: JevDecision
+
+
 class ArmResult(StrictModel):
     """One arm result; mark/payout are always market-YES values in micros."""
 
@@ -851,22 +859,15 @@ def validate_feasibility_fixture(fixture: dict[str, Any]) -> None:
     }:
         raise ValueError("Jev request does not match fixture brief contract")
 
-    jev_response = _require_exact_keys(
-        load_strict_json(artifacts.jev_response_bytes),
-        {"cost_microdollars", "model", "result"},
-        "Jev response",
-    )
+    jev_response = JevResponse.model_validate_json(artifacts.jev_response_bytes)
     if (
-        jev_response["model"] != jev_request["model"]
-        or jev_response["result"] != validated.jev_decision.model_dump(mode="json")
-        or jev_response["cost_microdollars"] != validated.model_costs_microdollars.jev
+        jev_response.model != jev_request["model"]
+        or jev_response.result != validated.jev_decision
+        or jev_response.cost_microdollars != validated.model_costs_microdollars.jev
     ):
         raise ValueError("Jev response does not match decision or billed cost")
 
-    model_cost = (
-        validated.model_costs_microdollars.openai
-        + validated.model_costs_microdollars.jev
-    )
+    model_cost = openai_response.cost_microdollars + jev_response.cost_microdollars
     if expected.arm_results.ai.model_cost_microdollars != model_cost:
         raise ValueError("AI arm model cost does not match provider costs")
     if expected.arm_results.deterministic.model_cost_microdollars != 0:

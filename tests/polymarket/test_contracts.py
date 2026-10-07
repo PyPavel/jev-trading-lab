@@ -1412,6 +1412,137 @@ def _replace_openai_response(fixture: dict[str, Any], response: dict[str, Any]) 
     _rehash_artifact(fixture, "openai_response_bytes")
 
 
+def _replace_jev_response(fixture: dict[str, Any], response: dict[str, Any]) -> None:
+    fixture["model_artifacts"]["jev_response_bytes"] = json.dumps(
+        response, separators=(",", ":"), sort_keys=True
+    )
+    _rehash_artifact(fixture, "jev_response_bytes")
+
+
+def test_jev_response_contract_matches_fixture(cycle: dict[str, Any]) -> None:
+    response = polymarket_models.JevResponse.model_validate_json(
+        cycle["model_artifacts"]["jev_response_bytes"]
+    )
+
+    assert response.model == "jev-1-2026-09-15"
+    assert response.result == JevDecision.model_validate(cycle["jev_decision"])
+    assert response.cost_microdollars == cycle["model_costs_microdollars"]["jev"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    tuple(
+        (field, replacement)
+        for field, nominal in (
+            ("p_yes_micros", 700_000),
+            ("confidence_micros", 760_000),
+            ("sufficiency_micros", 800_000),
+            ("ambiguity_micros", 200_000),
+            ("cost_microdollars", 125_000),
+        )
+        for replacement in (
+            float(nominal),
+            True,
+            str(nominal),
+            None,
+            {"value": nominal},
+            2**63,
+        )
+    ),
+)
+def test_fixture_rejects_noninteger_jev_response_fields_with_updated_self_hash(
+    cycle: dict[str, Any], field: str, value: object
+) -> None:
+    mutated = deepcopy(cycle)
+    response = json.loads(mutated["model_artifacts"]["jev_response_bytes"])
+    target = response if field == "cost_microdollars" else response["result"]
+    target[field] = value
+    _replace_jev_response(mutated, response)
+
+    with pytest.raises((ValidationError, ValueError)):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+@pytest.mark.parametrize(
+    ("location", "field", "value"),
+    (
+        ("response", "unexpected", 1),
+        ("response", "price", 500_000),
+        ("response", "book", {"bids": []}),
+        ("response", "token_id", "yes-token-001"),
+        ("result", "unexpected", 1),
+        ("result", "price", 500_000),
+        ("result", "book", {"bids": []}),
+        ("result", "token_id", "yes-token-001"),
+    ),
+)
+def test_fixture_rejects_unknown_jev_response_fields_with_updated_self_hash(
+    cycle: dict[str, Any], location: str, field: str, value: object
+) -> None:
+    mutated = deepcopy(cycle)
+    response = json.loads(mutated["model_artifacts"]["jev_response_bytes"])
+    target = response if location == "response" else response["result"]
+    target[field] = value
+    _replace_jev_response(mutated, response)
+
+    with pytest.raises((ValidationError, ValueError)):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("model", 1),
+        ("model", "jev-1-detached"),
+        ("action", 1),
+        ("action", "HOLD"),
+        ("rationale", 1),
+        ("rationale", None),
+    ),
+)
+def test_fixture_rejects_invalid_jev_response_metadata_with_updated_self_hash(
+    cycle: dict[str, Any], field: str, value: object
+) -> None:
+    mutated = deepcopy(cycle)
+    response = json.loads(mutated["model_artifacts"]["jev_response_bytes"])
+    target = response if field == "model" else response["result"]
+    target[field] = value
+    _replace_jev_response(mutated, response)
+
+    with pytest.raises((ValidationError, ValueError)):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        (
+            "cost_microdollars",
+            '"cost_microdollars":125000,"cost_microdollars":125000',
+        ),
+        (
+            "p_yes_micros",
+            '"p_yes_micros":700000,"p_yes_micros":700000',
+        ),
+    ),
+)
+def test_fixture_jev_response_rejects_duplicate_keys_through_standard_json_api(
+    cycle: dict[str, Any], field: str, replacement: str
+) -> None:
+    mutated = deepcopy(cycle)
+    raw = mutated["model_artifacts"]["jev_response_bytes"]
+    nominal = (
+        '"cost_microdollars":125000'
+        if field == "cost_microdollars"
+        else ('"p_yes_micros":700000')
+    )
+    mutated["model_artifacts"]["jev_response_bytes"] = raw.replace(nominal, replacement)
+    _rehash_artifact(mutated, "jev_response_bytes")
+
+    with pytest.raises(ValueError, match=f"duplicate JSON key: {field}"):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
 @pytest.mark.parametrize("usage", ("tokens", [], None, {}))
 def test_fixture_rejects_nonobject_or_incomplete_openai_usage_with_updated_self_hash(
     cycle: dict[str, Any], usage: object

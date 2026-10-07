@@ -231,7 +231,7 @@ _APPROVED_SOURCE_HASHES = {
         "2c8708e587ec6804d9c15736661a265c5b441cc3ce83b0b152e15f5a2fcf6739"
     ),
     "src/jev_trading_lab/polymarket/models.py": (
-        "afdd977eaa97e7022886b654fa47b23d64ee913abcbb5f9c593cb808840fdb17"
+        "0d4c25574b2722384244afde48218e69d9d0fb0190cb1f6429616ada99573ec6"
     ),
     "src/jev_trading_lab/stocks/__init__.py": (
         "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"
@@ -290,10 +290,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "5d290f9194cdc268bd0b5416fee0633fec94d6e76c5fabad5575a2b283c93cfa"
+    "60aac65af2898ad728157a75d53f4a16c15a6700ce59219b8bef8a17a0829fc8"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "d820b8031e50979f85a3b4766549c105a10607c179121a8135ebae4554576beb"
+    "8f57bedc9b8df1a00a20d09d42825c0415fbb353b27a61ec92bb26efc2519df8"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = [
     "exchange-calendars==4.11.2",
