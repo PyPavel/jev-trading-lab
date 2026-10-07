@@ -1,14 +1,23 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import random
+from collections.abc import Callable
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from jev_trading_lab.core.ids import canonical_json_bytes
 from jev_trading_lab.polymarket import paper
 from jev_trading_lab.polymarket.models import (
+    INT64_MAX,
+    ArmResult,
     BookSnapshot,
+    CausalHistoryPoint,
     Economics,
     FeasibilityFixture,
     JevDecision,
@@ -185,6 +194,10 @@ def test_fee_enforces_int64_result_and_input_domains() -> None:
         (int64_max, 2),
         (1, -1),
         (1, 1_000_001),
+        (1.0, 1),
+        (1, 1.0),
+        ("1", 1),
+        (1, "1"),
     ):
         with pytest.raises(ValueError, match="integer domains"):
             fee_microdollars(quantity, fee_pp_micros)
@@ -466,3 +479,475 @@ def test_property_style_sizing_never_overfills_or_creates_negative_cash(
     assert 0 <= quantity <= depth
     assert fill.filled_quantity <= fill.captured_quantity
     assert funded <= cash
+
+
+def _canonical_hash(model: Any) -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(model.model_dump(mode="json"))
+    ).hexdigest()
+
+
+def test_fixture_engine_supports_unresolved_filled_arms(
+    fixture: FeasibilityFixture,
+) -> None:
+    history = [
+        CausalHistoryPoint(
+            observed_at=point.observed_at,
+            midpoint_micros=midpoint,
+        )
+        for point, midpoint in zip(fixture.causal_history, (500_000, 575_000))
+    ]
+    raw = fixture.model_dump(mode="json")
+    raw.update(
+        resolution=None,
+        causal_history=[point.model_dump(mode="json") for point in history],
+    )
+    unresolved = FeasibilityFixture.model_validate_json(json.dumps(raw))
+
+    observation = evaluate_fixture(unresolved)
+
+    assert observation.observed_at > unresolved.execution_book.retrieved_at
+    assert observation.resolution is None
+    assert observation.ai.disposition == "FILLED"
+    assert observation.deterministic.disposition == "FILLED"
+    assert observation.ai.forecast_status == "PENDING_RESOLUTION"
+    assert observation.deterministic.forecast_status == "PENDING_RESOLUTION"
+    assert observation.ai.payout_micros is None
+    assert observation.deterministic.payout_micros is None
+    assert observation.ai.brier_micros is None
+    assert observation.deterministic.brier_micros is None
+    assert observation.baseline_brier_micros is None
+    assert observation.paired_brier_delta_micros is None
+
+
+def test_unresolved_abstain_and_unavailable_forecasts_are_coherent(
+    fixture: FeasibilityFixture,
+) -> None:
+    gated = fixture.jev_decision.model_copy(update={"action": "ABSTAIN"})
+    abstain = evaluate_ai_arm(
+        fixture.execution_book,
+        gated,
+        fixture.economics,
+        resolution=None,
+        model_cost_microdollars=500_000,
+    )
+    unavailable = evaluate_ai_arm(
+        fixture.execution_book,
+        None,
+        fixture.economics,
+        resolution=None,
+        model_cost_microdollars=INT64_MAX,
+    )
+    insufficient = evaluate_control_arm(
+        fixture.model_copy(update={"causal_history": fixture.causal_history[:1]}),
+        resolution=None,
+    )
+
+    assert (abstain.forecast_status, abstain.brier_micros) == (
+        "PENDING_RESOLUTION",
+        None,
+    )
+    for result in (unavailable, insufficient):
+        assert result.forecast_status == "UNAVAILABLE"
+        assert result.brier_micros is None
+        assert result.payout_micros is None
+
+
+def test_unresolved_buy_no_mark_is_stored_as_market_yes_value() -> None:
+    snapshot = book(bids=[(390_000, 20_000)], asks=[(410_000, 20_000)])
+    decision = JevDecision(
+        p_yes_micros=200_000,
+        action="BUY_NO",
+        confidence_micros=800_000,
+        sufficiency_micros=800_000,
+        ambiguity_micros=200_000,
+        rationale="bounded",
+    )
+
+    result = evaluate_ai_arm(
+        snapshot,
+        decision,
+        economics(entry_fee=0, slippage=0),
+        resolution=None,
+        model_cost_microdollars=0,
+    )
+
+    assert result.entry_side == "NO"
+    assert result.mark_micros == 410_000
+    assert result.trading_pnl_microdollars == result.quantity * (590_000 - 610_000)
+
+
+def test_unit2_rejects_regenerated_nine_thousand_dollar_fixture(
+    fixture_dict: dict[str, object],
+) -> None:
+    mutated = deepcopy(fixture_dict)
+    mutated["economics"]["starting_cash_microdollars"] = 9_000_000_000  # type: ignore[index]
+    fixture = FeasibilityFixture.model_validate_json(json.dumps(mutated))
+    assert fixture.resolution is not None
+    resolution = fixture.resolution.payout
+    model_cost = (
+        fixture.model_costs_microdollars.openai + fixture.model_costs_microdollars.jev
+    )
+    ai = evaluate_ai_arm(
+        fixture.execution_book,
+        fixture.jev_decision,
+        fixture.economics,
+        resolution=resolution,
+        model_cost_microdollars=model_cost,
+    )
+    deterministic = evaluate_control_arm(fixture, resolution=resolution)
+    original = fixture.expected.observation_result
+    observation = original.model_copy(
+        update={
+            "ai": ai,
+            "deterministic": deterministic,
+            "paired_trading_pnl_delta_microdollars": (
+                ai.trading_pnl_microdollars - deterministic.trading_pnl_microdollars
+            ),
+            "paired_economic_pnl_delta_microdollars": (
+                ai.economic_pnl_microdollars - deterministic.economic_pnl_microdollars
+            ),
+            "paired_brier_delta_micros": (
+                ai.brier_micros - deterministic.brier_micros
+                if ai.brier_micros is not None
+                and deterministic.brier_micros is not None
+                else None
+            ),
+        }
+    )
+    expected = mutated["expected"]  # type: ignore[index]
+    expected["arm_results"] = {  # type: ignore[index]
+        "ai": ai.model_dump(mode="json"),
+        "deterministic": deterministic.model_dump(mode="json"),
+    }
+    expected["observation_result"] = observation.model_dump(mode="json")  # type: ignore[index]
+    expected["canonical_sha256"].update(  # type: ignore[index]
+        ai_arm=_canonical_hash(ai),
+        deterministic_arm=_canonical_hash(deterministic),
+        observation=_canonical_hash(observation),
+    )
+
+    with pytest.raises(ValueError, match="starting capital"):
+        validate_unit2_fixture(mutated)
+
+
+@pytest.mark.parametrize(
+    "call",
+    (
+        lambda snapshot, policy: quote_side(snapshot, "YES", True, liquidity="ASK"),
+        lambda snapshot, policy: quote_side(snapshot, "BAD", 1, liquidity="ASK"),
+        lambda snapshot, policy: quote_side(snapshot, "YES", 1, liquidity="BAD"),
+        lambda snapshot, policy: brier_micros(True, 1_000_000),
+        lambda snapshot, policy: brier_micros(500_000, 1_000_000.0),
+        lambda snapshot, policy: gross_edge_micros("500000", "YES", 400_000),
+        lambda snapshot, policy: gross_edge_micros(500_000, "BAD", 400_000),
+        lambda snapshot, policy: sizing_caps(
+            snapshot, "YES", policy, equity_microdollars=True
+        ),
+        lambda snapshot, policy: sizing_caps(
+            snapshot, "BAD", policy, available_cash_microdollars=1
+        ),
+        lambda snapshot, policy: size_quantity(snapshot, "YES", True, policy),
+        lambda snapshot, policy: size_quantity(
+            snapshot, "YES", 700_000, policy, available_cash_microdollars=1.0
+        ),
+    ),
+)
+def test_public_integer_and_side_helpers_reject_inexact_runtime_types(
+    call: Callable[[BookSnapshot, Economics], object],
+) -> None:
+    snapshot = book(bids=[(490_000, 10)], asks=[(540_000, 10)])
+
+    with pytest.raises(ValueError):
+        call(snapshot, economics())
+
+
+@pytest.mark.parametrize(
+    ("resolution", "model_cost"),
+    ((True, 0), (0, True), (1.0, 0), (1, 1.0), ("1", 0), (1, "0")),
+)
+def test_arm_evaluators_reject_inexact_resolution_and_cost_types(
+    fixture: FeasibilityFixture, resolution: object, model_cost: object
+) -> None:
+    with pytest.raises(ValueError):
+        evaluate_ai_arm(
+            fixture.execution_book,
+            fixture.jev_decision,
+            fixture.economics,
+            resolution=resolution,  # type: ignore[arg-type]
+            model_cost_microdollars=model_cost,  # type: ignore[arg-type]
+        )
+
+
+def test_extreme_model_cost_returns_terminal_no_fill_without_int64_underflow() -> None:
+    snapshot = book(
+        bids=[(0, INT64_MAX)],
+        asks=[(2, INT64_MAX)],
+    )
+    decision = JevDecision(
+        p_yes_micros=1_000_000,
+        action="BUY_YES",
+        confidence_micros=1_000_000,
+        sufficiency_micros=1_000_000,
+        ambiguity_micros=0,
+        rationale="bounded",
+    )
+
+    result = evaluate_ai_arm(
+        snapshot,
+        decision,
+        economics(cash=INT64_MAX, entry_fee=0, exit_fee=0, slippage=0, sigma=0),
+        resolution=None,
+        model_cost_microdollars=INT64_MAX,
+    )
+
+    assert result.disposition == "NO_EDGE"
+    assert result.quantity == 0
+    assert result.final_cash_microdollars == INT64_MAX
+    assert result.trading_pnl_microdollars == 0
+    assert result.economic_pnl_microdollars == -INT64_MAX
+
+
+def test_extreme_cash_returns_terminal_no_fill_when_profit_would_overflow() -> None:
+    snapshot = book(
+        bids=[(1, INT64_MAX)],
+        asks=[(2, INT64_MAX)],
+    )
+    decision = JevDecision(
+        p_yes_micros=1_000_000,
+        action="BUY_YES",
+        confidence_micros=1_000_000,
+        sufficiency_micros=1_000_000,
+        ambiguity_micros=0,
+        rationale="bounded",
+    )
+
+    result = evaluate_ai_arm(
+        snapshot,
+        decision,
+        economics(cash=INT64_MAX, entry_fee=0, exit_fee=0, slippage=0, sigma=0),
+        resolution=1,
+        model_cost_microdollars=0,
+    )
+
+    assert result.disposition == "NO_EDGE"
+    assert result.quantity == 0
+    assert result.final_cash_microdollars == INT64_MAX
+    assert result.trading_pnl_microdollars == 0
+
+
+def test_terminal_bound_preserves_largest_passing_quantity() -> None:
+    snapshot = book(
+        bids=[(1, INT64_MAX)],
+        asks=[(2, INT64_MAX)],
+    )
+    decision = JevDecision(
+        p_yes_micros=1_000_000,
+        action="BUY_YES",
+        confidence_micros=1_000_000,
+        sufficiency_micros=1_000_000,
+        ambiguity_micros=0,
+        rationale="bounded",
+    )
+
+    result = evaluate_ai_arm(
+        snapshot,
+        decision,
+        economics(
+            cash=INT64_MAX - 2_000_000,
+            entry_fee=0,
+            exit_fee=0,
+            slippage=0,
+            sigma=0,
+        ),
+        resolution=1,
+        model_cost_microdollars=0,
+    )
+
+    assert result.disposition == "FILLED"
+    assert result.quantity == 2
+    assert result.final_cash_microdollars <= INT64_MAX
+
+
+def test_extreme_contract_inputs_can_still_return_bounded_fill() -> None:
+    snapshot = book(
+        bids=[(1, INT64_MAX)],
+        asks=[(2, INT64_MAX)],
+    )
+    decision = JevDecision(
+        p_yes_micros=1_000_000,
+        action="BUY_YES",
+        confidence_micros=1_000_000,
+        sufficiency_micros=1_000_000,
+        ambiguity_micros=0,
+        rationale="bounded",
+    )
+
+    result = evaluate_ai_arm(
+        snapshot,
+        decision,
+        economics(cash=INT64_MAX - 1, entry_fee=0, exit_fee=0, slippage=0, sigma=0),
+        resolution=1,
+        model_cost_microdollars=INT64_MAX,
+    )
+
+    assert isinstance(result, ArmResult)
+    assert -(2**63) <= result.trading_pnl_microdollars <= INT64_MAX
+    assert 0 <= result.final_cash_microdollars <= INT64_MAX
+    assert -(2**63) <= result.economic_pnl_microdollars <= INT64_MAX
+
+
+def test_randomized_sizing_matches_exhaustive_small_reference() -> None:
+    rng = random.Random(20261007)
+    for _ in range(200):
+        best_bid = rng.randint(50_001, 449_999)
+        worse_bid = rng.randint(50_000, best_bid - 1)
+        best_ask = rng.randint(max(best_bid + 1, 500_000), 899_999)
+        worse_ask = rng.randint(best_ask + 1, 900_000)
+        snapshot = book(
+            bids=[
+                (best_bid, rng.randint(1, 20)),
+                (worse_bid, rng.randint(1, 20)),
+            ],
+            asks=[
+                (best_ask, rng.randint(1, 20)),
+                (worse_ask, rng.randint(1, 20)),
+            ],
+        )
+        policy = economics(
+            entry_fee=rng.randint(0, 20_000),
+            exit_fee=rng.randint(0, 20_000),
+            slippage=rng.randint(0, 20_000),
+            sigma=rng.randint(0, 200_000),
+            cash=rng.randint(1, 20_000_000),
+        )
+        probability = rng.randint(0, 1_000_000)
+        side = rng.choice(("YES", "NO"))
+        caps = sizing_caps(snapshot, side, policy)
+        expected = 0
+        for quantity in range(1, min(caps.values()) + 1):
+            entry = quote_side(snapshot, side, quantity, liquidity="ASK")
+            assert entry.vwap_micros is not None
+            funded = entry.notional_microdollars + fee_microdollars(
+                quantity, policy.entry_fee_pp_micros
+            )
+            if (
+                quantity <= caps["notional"]
+                and funded <= policy.starting_cash_microdollars
+                and gross_edge_micros(probability, side, entry.vwap_micros)
+                >= edge_threshold_micros(policy)
+            ):
+                expected = quantity
+        assert size_quantity(snapshot, side, probability, policy) == expected
+
+
+def test_randomized_terminal_bound_matches_exhaustive_contract_oracle() -> None:
+    rng = random.Random(20261008)
+    for _ in range(200):
+        best_bid = rng.randint(50_001, 449_999)
+        worse_bid = rng.randint(50_000, best_bid - 1)
+        best_ask = rng.randint(max(best_bid + 1, 500_000), 899_999)
+        worse_ask = rng.randint(best_ask + 1, 900_000)
+        snapshot = book(
+            bids=[(best_bid, rng.randint(1, 20)), (worse_bid, rng.randint(1, 20))],
+            asks=[(best_ask, rng.randint(1, 20)), (worse_ask, rng.randint(1, 20))],
+        )
+        policy = economics(
+            entry_fee=rng.randint(0, 20_000),
+            exit_fee=rng.randint(0, 20_000),
+            slippage=0,
+            sigma=50_000,
+            cash=rng.randint(1, 100_000_000),
+        )
+        side = rng.choice(("YES", "NO"))
+        payout = rng.choice((0, 1_000_000, None))
+        model_cost = rng.randint(0, INT64_MAX)
+        upper = rng.randint(1, 40)
+        expected = 0
+        for quantity in range(1, upper + 1):
+            entry = quote_side(snapshot, side, quantity, liquidity="ASK")
+            if entry.filled_quantity != quantity or entry.vwap_micros is None:
+                continue
+            mark = quote_side(snapshot, side, quantity, liquidity="BID")
+            held_valuation = (
+                (mark.vwap_micros or 0)
+                if payout is None
+                else (payout if side == "YES" else 1_000_000 - payout)
+            )
+            fees = quantity * (policy.entry_fee_pp_micros + policy.exit_fee_pp_micros)
+            funded = quantity * entry.vwap_micros + fees
+            trading = quantity * (held_valuation - entry.vwap_micros) - fees
+            final_cash = policy.starting_cash_microdollars + trading
+            economic = trading - model_cost
+            if (
+                entry.notional_microdollars <= INT64_MAX
+                and mark.notional_microdollars <= INT64_MAX
+                and fees <= INT64_MAX
+                and funded <= policy.starting_cash_microdollars
+                and -(2**63) <= trading <= INT64_MAX
+                and 0 <= final_cash <= INT64_MAX
+                and -(2**63) <= economic <= INT64_MAX
+            ):
+                expected = quantity
+        assert (
+            paper._terminal_quantity(
+                book=snapshot,
+                side=side,
+                upper=upper,
+                policy=policy,
+                payout=payout,
+                model_cost_microdollars=model_cost,
+            )
+            == expected
+        )
+
+
+def test_large_terminal_bound_finds_analytical_multi_level_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_level_quantity = 12_000
+    first_price = 100_000
+    second_price = 200_000
+    economic_loss_limit = 1_800_000_000
+    upper = 20_000
+    snapshot = book(
+        bids=[(0, upper)],
+        asks=[
+            (first_price, first_level_quantity),
+            (second_price, upper - first_level_quantity),
+        ],
+    )
+    policy = economics(
+        cash=10_000_000_000,
+        entry_fee=0,
+        exit_fee=0,
+        slippage=0,
+        sigma=0,
+    )
+    model_cost = INT64_MAX - economic_loss_limit + 1
+    expected = (
+        first_level_quantity
+        + (economic_loss_limit - first_level_quantity * first_price) // second_price
+    )
+    quote_calls = 0
+    original_quote_side = paper.quote_side
+
+    def counted_quote_side(*args: object, **kwargs: object) -> object:
+        nonlocal quote_calls
+        quote_calls += 1
+        return original_quote_side(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(paper, "quote_side", counted_quote_side)
+
+    actual = paper._terminal_quantity(
+        book=snapshot,
+        side="YES",
+        upper=upper,
+        policy=policy,
+        payout=None,
+        model_cost_microdollars=model_cost,
+    )
+
+    assert expected == 15_000
+    assert actual == expected
+    assert quote_calls < 200

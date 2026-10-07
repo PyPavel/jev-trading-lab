@@ -601,7 +601,7 @@ class FeasibilityFixture(StrictModel):
     jev_decision: JevDecision
     model_costs_microdollars: ModelCosts
     economics: Economics
-    resolution: Resolution
+    resolution: Resolution | None
     expected: FixtureExpected
 
 
@@ -901,19 +901,23 @@ def validate_feasibility_fixture(fixture: dict[str, Any]) -> None:
         raise ValueError("expected arm results do not match observation arms")
 
     execution_retrieved_at = books["execution_book"].retrieved_at
-    if observation.observed_at < execution_retrieved_at:
-        raise ValueError("observation cannot precede execution book retrieval")
+    if observation.observed_at <= execution_retrieved_at:
+        raise ValueError("observation must follow execution book retrieval")
 
     resolution = validated.resolution
-    if resolution.resolved_at <= execution_retrieved_at:
-        raise ValueError("resolution must follow execution book retrieval")
-    if (
-        observation.resolution != resolution.payout
-        or observation.observed_at != resolution.resolved_at
-    ):
-        raise ValueError("resolution does not match observation")
-    if resolution.resolved_at < evidence.closes_at:
-        raise ValueError("resolution cannot precede market close")
+    if resolution is None:
+        if observation.resolution is not None:
+            raise ValueError("unresolved fixture cannot carry observation resolution")
+    else:
+        if resolution.resolved_at <= execution_retrieved_at:
+            raise ValueError("resolution must follow execution book retrieval")
+        if (
+            observation.resolution != resolution.payout
+            or observation.observed_at != resolution.resolved_at
+        ):
+            raise ValueError("resolution does not match observation")
+        if resolution.resolved_at < evidence.closes_at:
+            raise ValueError("resolution cannot precede market close")
 
     cutoff = evidence.cutoff_at
     history_times = [point.observed_at for point in validated.causal_history]

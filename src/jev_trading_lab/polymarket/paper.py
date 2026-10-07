@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Literal
+from datetime import timedelta
+from typing import Literal, cast
 
 from jev_trading_lab.core.ids import canonical_json_bytes
 from jev_trading_lab.polymarket.control import control_probability
 from jev_trading_lab.polymarket.models import (
     INT64_MAX,
+    INT64_MIN,
     ArmResult,
     BookLevel,
     BookSnapshot,
@@ -44,7 +46,27 @@ def _ceil_div(numerator: int, denominator: int) -> int:
     return (numerator + denominator - 1) // denominator
 
 
+def _require_int(value: object, label: str, *, minimum: int, maximum: int) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError(f"{label} must be an exact integer in [{minimum}, {maximum}]")
+    return value
+
+
+def _require_side(side: object) -> Side:
+    if type(side) is not str or side not in {"YES", "NO"}:
+        raise ValueError("side must be exactly YES or NO")
+    return cast(Side, side)
+
+
+def _require_liquidity(liquidity: object) -> Liquidity:
+    if type(liquidity) is not str or liquidity not in {"ASK", "BID"}:
+        raise ValueError("liquidity must be exactly ASK or BID")
+    return cast(Liquidity, liquidity)
+
+
 def _levels(book: BookSnapshot, side: Side, liquidity: Liquidity) -> list[BookLevel]:
+    side = _require_side(side)
+    liquidity = _require_liquidity(liquidity)
     if (side, liquidity) in {("YES", "ASK"), ("NO", "BID")}:
         source = book.asks
     else:
@@ -62,8 +84,9 @@ def quote_side(
 ) -> Quote:
     """Walk best-first levels; executable-bid mark values uncovered units at zero."""
 
-    if type(quantity) is not int or quantity < 0:
-        raise ValueError("quantity must be a non-negative integer")
+    quantity = _require_int(quantity, "quantity", minimum=0, maximum=INT64_MAX)
+    side = _require_side(side)
+    liquidity = _require_liquidity(liquidity)
     levels = _levels(book, side, liquidity)
     captured = sum(level.quantity for level in levels)
     remaining = quantity
@@ -96,16 +119,27 @@ def midpoint_micros(book: BookSnapshot) -> int:
 def brier_micros(probability_micros: int, resolution_micros: int) -> int:
     """Floor squared probability error to the Unit 1 millionths contract."""
 
-    return (probability_micros - resolution_micros) ** 2 // MICROS
+    probability = _require_int(
+        probability_micros, "probability", minimum=0, maximum=MICROS
+    )
+    resolution = _require_int(
+        resolution_micros, "resolution", minimum=0, maximum=MICROS
+    )
+    return (probability - resolution) ** 2 // MICROS
 
 
 def gross_edge_micros(
     probability_micros: int, side: Side, entry_vwap_micros: int
 ) -> int:
-    held_probability = (
-        probability_micros if side == "YES" else MICROS - probability_micros
+    probability = _require_int(
+        probability_micros, "probability", minimum=0, maximum=MICROS
     )
-    return held_probability - entry_vwap_micros
+    side = _require_side(side)
+    entry_vwap = _require_int(
+        entry_vwap_micros, "entry VWAP", minimum=0, maximum=MICROS
+    )
+    held_probability = probability if side == "YES" else MICROS - probability
+    return held_probability - entry_vwap
 
 
 def edge_threshold_micros(policy: Economics) -> int:
@@ -158,18 +192,23 @@ def sizing_caps(
 ) -> dict[str, int]:
     """Return each independently floored contract cap for audit and testing."""
 
-    equity = (
+    side = _require_side(side)
+    equity = _require_int(
         policy.starting_cash_microdollars
         if equity_microdollars is None
-        else equity_microdollars
+        else equity_microdollars,
+        "equity",
+        minimum=0,
+        maximum=INT64_MAX,
     )
-    cash = (
+    cash = _require_int(
         policy.starting_cash_microdollars
         if available_cash_microdollars is None
-        else available_cash_microdollars
+        else available_cash_microdollars,
+        "available cash",
+        minimum=0,
+        maximum=INT64_MAX,
     )
-    if equity < 0 or cash < 0:
-        raise ValueError("equity and available cash must be non-negative")
     levels = _levels(book, side, "ASK")
     depth = sum(level.quantity for level in levels)
     best_price = levels[0].price_micros
@@ -195,15 +234,25 @@ def size_quantity(
 ) -> int:
     """Search integer quantity downward until edge and every frozen cap pass."""
 
-    equity = (
+    side = _require_side(side)
+    probability_micros = _require_int(
+        probability_micros, "probability", minimum=0, maximum=MICROS
+    )
+    equity = _require_int(
         policy.starting_cash_microdollars
         if equity_microdollars is None
-        else equity_microdollars
+        else equity_microdollars,
+        "equity",
+        minimum=0,
+        maximum=INT64_MAX,
     )
-    cash = (
+    cash = _require_int(
         policy.starting_cash_microdollars
         if available_cash_microdollars is None
-        else available_cash_microdollars
+        else available_cash_microdollars,
+        "available cash",
+        minimum=0,
+        maximum=INT64_MAX,
     )
     caps = sizing_caps(
         book,
@@ -240,6 +289,124 @@ def size_quantity(
     return lower
 
 
+def _terminal_quantity(
+    *,
+    book: BookSnapshot,
+    side: Side,
+    upper: int,
+    policy: Economics,
+    payout: int | None,
+    model_cost_microdollars: int,
+) -> int:
+    """Return the largest quantity whose persisted terminal integers fit int64."""
+
+    upper = min(upper, sum(level.quantity for level in _levels(book, side, "ASK")))
+    if upper == 0:
+        return 0
+    fee_per_contract = policy.entry_fee_pp_micros + policy.exit_fee_pp_micros
+
+    def values(quantity: int) -> tuple[int, int, int, int, int]:
+        entry = quote_side(book, side, quantity, liquidity="ASK")
+        if entry.vwap_micros is None:
+            raise ValueError("positive quantity requires entry VWAP")
+        if payout is None:
+            mark = quote_side(book, side, quantity, liquidity="BID")
+            held_valuation = mark.vwap_micros or 0
+            mark_notional = mark.notional_microdollars
+        else:
+            held_valuation = payout if side == "YES" else MICROS - payout
+            mark_notional = 0
+        fees = quantity * fee_per_contract
+        funded = quantity * entry.vwap_micros + fees
+        trading = quantity * (held_valuation - entry.vwap_micros) - fees
+        return entry.notional_microdollars, mark_notional, fees, funded, trading
+
+    def derived_values_fit(quantity: int) -> bool:
+        entry_notional, mark_notional, fees, funded, _ = values(quantity)
+        return (
+            entry_notional <= INT64_MAX
+            and mark_notional <= INT64_MAX
+            and fees <= INT64_MAX
+            and funded <= policy.starting_cash_microdollars
+            and funded <= INT64_MAX
+        )
+
+    if not derived_values_fit(1):
+        return 0
+    lower = 1
+    basic_upper = upper
+    while lower < basic_upper:
+        candidate = (lower + basic_upper + 1) // 2
+        if derived_values_fit(candidate):
+            lower = candidate
+        else:
+            basic_upper = candidate - 1
+    upper = lower
+
+    trading_lower = max(
+        INT64_MIN,
+        -policy.starting_cash_microdollars,
+        INT64_MIN + model_cost_microdollars,
+    )
+    trading_upper = min(
+        INT64_MAX,
+        INT64_MAX - policy.starting_cash_microdollars,
+        INT64_MAX + model_cost_microdollars,
+    )
+
+    def trading(quantity: int) -> int:
+        return values(quantity)[-1]
+
+    def terminal_values_fit(quantity: int) -> bool:
+        return trading_lower <= trading(quantity) <= trading_upper
+
+    if terminal_values_fit(upper):
+        return upper
+    if upper <= 10_000:
+        return next(
+            (
+                quantity
+                for quantity in range(upper - 1, 0, -1)
+                if terminal_values_fit(quantity)
+            ),
+            0,
+        )
+
+    # Entry VWAP is nondecreasing and executable-bid mark is nonincreasing, so
+    # terminal trading P&L is discrete-concave. Find its peak, then the largest
+    # point in the permitted interval on either monotonic branch.
+    left = 1
+    right = upper
+    while left < right:
+        candidate = (left + right) // 2
+        if trading(candidate + 1) >= trading(candidate):
+            left = candidate + 1
+        else:
+            right = candidate
+    peak = left
+
+    left = peak
+    right = upper
+    while left < right:
+        candidate = (left + right + 1) // 2
+        if trading(candidate) >= trading_lower:
+            left = candidate
+        else:
+            right = candidate - 1
+    if terminal_values_fit(left):
+        return left
+
+    left = 1
+    right = peak
+    while left < right:
+        candidate = (left + right + 1) // 2
+        if trading(candidate) <= trading_upper:
+            left = candidate
+        else:
+            right = candidate - 1
+    return left if terminal_values_fit(left) else 0
+
+
 def _preferred_side(book: BookSnapshot, probability_micros: int) -> Side:
     yes_quote = quote_side(book, "YES", 1, liquidity="ASK")
     no_quote = quote_side(book, "NO", 1, liquidity="ASK")
@@ -261,6 +428,16 @@ def _arm(
     resolution: Literal[0, 1] | None,
     model_cost_microdollars: int,
 ) -> ArmResult:
+    if resolution is not None and (
+        type(resolution) is not int or resolution not in {0, 1}
+    ):
+        raise ValueError("resolution must be exactly 0, 1, or None")
+    model_cost_microdollars = _require_int(
+        model_cost_microdollars,
+        "model cost",
+        minimum=0,
+        maximum=INT64_MAX,
+    )
     payout: Literal[0, 1_000_000] | None
     if resolution is None:
         payout = None
@@ -304,6 +481,14 @@ def _arm(
         raise ValueError("filled arm requires a directional signal")
     side: Side = "YES" if action == "BUY_YES" else "NO"
     quantity = size_quantity(book, side, probability_micros, policy)
+    quantity = _terminal_quantity(
+        book=book,
+        side=side,
+        upper=quantity,
+        policy=policy,
+        payout=payout,
+        model_cost_microdollars=model_cost_microdollars,
+    )
     if quantity == 0:
         return _arm(
             arm=arm,
@@ -432,10 +617,16 @@ def _identity_sha(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+def _require_unit2_capital(fixture: FeasibilityFixture) -> None:
+    if fixture.economics.starting_cash_microdollars != STARTING_CASH_MICRODOLLARS:
+        raise ValueError("Unit 2 starting capital must be exactly $10,000")
+
+
 def evaluate_fixture(fixture: FeasibilityFixture) -> ObservationResult:
     """Recompute the approved fixture result exclusively from frozen source inputs."""
 
-    resolution = fixture.resolution.payout
+    _require_unit2_capital(fixture)
+    resolution = fixture.resolution.payout if fixture.resolution is not None else None
     model_cost = (
         fixture.model_costs_microdollars.openai + fixture.model_costs_microdollars.jev
     )
@@ -465,14 +656,19 @@ def evaluate_fixture(fixture: FeasibilityFixture) -> ObservationResult:
         }
     )
     baseline = midpoint_micros(fixture.execution_book)
-    payout = resolution * MICROS
+    payout = resolution * MICROS if resolution is not None else None
+    observed_at = (
+        fixture.resolution.resolved_at
+        if fixture.resolution is not None
+        else fixture.execution_book.retrieved_at + timedelta(microseconds=1)
+    )
     return ObservationResult(
         observation_id=observation_id,
         opportunity_id=opportunity_id,
         market_id=evidence.market_id,
         policy_version=POLICY_VERSION,
         cutoff_at=evidence.cutoff_at,
-        observed_at=fixture.resolution.resolved_at,
+        observed_at=observed_at,
         evidence_sha256=evidence.source_sha256,
         execution_book_sha256=fixture.execution_book.source_sha256,
         research_brief_sha256=_model_sha(fixture.research_brief),
@@ -481,7 +677,9 @@ def evaluate_fixture(fixture: FeasibilityFixture) -> ObservationResult:
         deterministic=deterministic,
         baseline_probability_micros=baseline,
         resolution=resolution,
-        baseline_brier_micros=brier_micros(baseline, payout),
+        baseline_brier_micros=(
+            brier_micros(baseline, payout) if payout is not None else None
+        ),
         paired_trading_pnl_delta_microdollars=(
             ai.trading_pnl_microdollars - deterministic.trading_pnl_microdollars
         ),
@@ -501,6 +699,7 @@ def validate_unit2_fixture(raw_fixture: dict[str, object]) -> None:
 
     validate_feasibility_fixture(raw_fixture)
     fixture = FeasibilityFixture.model_validate_json(json.dumps(raw_fixture))
+    _require_unit2_capital(fixture)
     actual = evaluate_fixture(fixture)
     if (
         fixture.expected.arm_results.ai != actual.ai
