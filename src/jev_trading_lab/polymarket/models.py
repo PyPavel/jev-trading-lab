@@ -875,11 +875,33 @@ def validate_feasibility_fixture(fixture: dict[str, Any]) -> None:
         "OpenAI request",
     )
     _reject_price_keys(openai_request, "OpenAI request")
-    if openai_request != {
-        "input": f"<evidence>{canonical_evidence}</evidence>",
-        "model": "gpt-5-2026-09-30",
-        "response_format": "strict-research-brief-v1",
-    }:
+    response_format = _require_exact_keys(
+        openai_request["response_format"],
+        {"json_schema", "type"},
+        "OpenAI response format",
+    )
+    json_schema = _require_exact_keys(
+        response_format["json_schema"],
+        {"name", "schema", "strict"},
+        "OpenAI JSON schema",
+    )
+    if (
+        openai_request
+        != {
+            "input": f"<evidence>{canonical_evidence}</evidence>",
+            "model": "gpt-5-2026-09-30",
+            "response_format": {
+                "json_schema": {
+                    "name": "strict-research-brief-v1",
+                    "schema": ResearchBrief.model_json_schema(),
+                    "strict": True,
+                },
+                "type": "json_schema",
+            },
+        }
+        or response_format["type"] != "json_schema"
+        or not json_schema["strict"]
+    ):
         raise ValueError("OpenAI request does not match fixture evidence contract")
 
     openai_response = OpenAIResponse.model_validate_json(
@@ -906,7 +928,7 @@ def validate_feasibility_fixture(fixture: dict[str, Any]) -> None:
             "evidence_sufficiency",
             "ambiguity",
             "p_yes",
-            "action",
+            "action (BUY_YES|BUY_NO|ABSTAIN)",
             "confidence",
         ],
         "state": {

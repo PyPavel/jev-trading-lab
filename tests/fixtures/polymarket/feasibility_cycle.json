@@ -56,6 +56,7 @@
         "brier_micros": 90000,
         "disposition": "FILLED",
         "economic_pnl_microdollars": 223500000,
+        "entry_notional_microdollars": 271000000,
         "entry_side": "YES",
         "entry_vwap_micros": 542000,
         "fees_microdollars": 5000000,
@@ -70,7 +71,6 @@
         "signal_action": "BUY_YES",
         "signal_probability_micros": 700000,
         "trading_pnl_microdollars": 224000000,
-        "entry_notional_microdollars": 271000000,
         "valuation_notional_microdollars": 500000000
       },
       "deterministic": {
@@ -78,6 +78,7 @@
         "brier_micros": 202500,
         "disposition": "NO_EDGE",
         "economic_pnl_microdollars": 0,
+        "entry_notional_microdollars": null,
         "entry_side": null,
         "entry_vwap_micros": null,
         "fees_microdollars": 0,
@@ -92,16 +93,15 @@
         "signal_action": "BUY_YES",
         "signal_probability_micros": 550000,
         "trading_pnl_microdollars": 0,
-        "entry_notional_microdollars": null,
         "valuation_notional_microdollars": null
       }
     },
     "artifact_sha256": {
       "execution_book_bytes": "bbd889f6781e3f6c87bf4da012f3266c958bb8fb2e519273ddcf614e837637c9",
       "gamma_bytes": "ece2c0bf0810baedbf74bd09c6539452c61464abdcaea45ed36c69d10a56e88f",
-      "jev_request_bytes": "4f43b3b9312059d07abffb0084df50f6dbb07a988235cfb72de940542c68123d",
+      "jev_request_bytes": "cb1c3f7c74bdd57e1f6da409e262cebdc0ba43b04f6558506e2243d475f427c5",
       "jev_response_bytes": "8aee5ffd12b5c834922d754b2037df4d4306d1c5b007938210ea5e54475fad52",
-      "openai_request_bytes": "c3e0922058f3be9020f2c2369e919ea6eedab1e907e97bcf17657692e937d0d5",
+      "openai_request_bytes": "dfaa43cbfdf20d6bde7960ab69564291c1842162c58f2a6bd48389ba9529d6a5",
       "openai_response_bytes": "8e6fe8ee7d7cc47a524aea7249a6ab2fffc1d9646c59afa1546747f4f912cb64",
       "precheck_book_bytes": "713d3fb67870aee4e040f01fa01f8ace553929786dcc1d47a1a37850b1c6dccd"
     },
@@ -121,6 +121,7 @@
         "brier_micros": 90000,
         "disposition": "FILLED",
         "economic_pnl_microdollars": 223500000,
+        "entry_notional_microdollars": 271000000,
         "entry_side": "YES",
         "entry_vwap_micros": 542000,
         "fees_microdollars": 5000000,
@@ -135,7 +136,6 @@
         "signal_action": "BUY_YES",
         "signal_probability_micros": 700000,
         "trading_pnl_microdollars": 224000000,
-        "entry_notional_microdollars": 271000000,
         "valuation_notional_microdollars": 500000000
       },
       "baseline_brier_micros": 235225,
@@ -146,6 +146,7 @@
         "brier_micros": 202500,
         "disposition": "NO_EDGE",
         "economic_pnl_microdollars": 0,
+        "entry_notional_microdollars": null,
         "entry_side": null,
         "entry_vwap_micros": null,
         "fees_microdollars": 0,
@@ -160,7 +161,6 @@
         "signal_action": "BUY_YES",
         "signal_probability_micros": 550000,
         "trading_pnl_microdollars": 0,
-        "entry_notional_microdollars": null,
         "valuation_notional_microdollars": null
       },
       "evidence_sha256": "ece2c0bf0810baedbf74bd09c6539452c61464abdcaea45ed36c69d10a56e88f",
@@ -187,9 +187,9 @@
     "sufficiency_micros": 800000
   },
   "model_artifacts": {
-    "jev_request_bytes": "{\"model\":\"jev-1-2026-09-15\",\"questions\":[\"evidence_sufficiency\",\"ambiguity\",\"p_yes\",\"action\",\"confidence\"],\"state\":{\"brief\":{\"arguments_against\":[\"The evidence packet contains no policy guidance proving a cut.\"],\"arguments_for\":[\"A lower target range at resolution satisfies the stated YES condition.\"],\"cited_facts\":[{\"evidence_sha256\":\"ece2c0bf0810baedbf74bd09c6539452c61464abdcaea45ed36c69d10a56e88f\",\"fact\":\"The stated resolution source is the Federal Reserve decision text.\"},{\"evidence_sha256\":\"ece2c0bf0810baedbf74bd09c6539452c61464abdcaea45ed36c69d10a56e88f\",\"fact\":\"The market closes after the scheduled October meeting window.\"}],\"contradictions\":[],\"evidence_sha256\":\"ece2c0bf0810baedbf74bd09c6539452c61464abdcaea45ed36c69d10a56e88f\",\"missing_evidence\":[\"Current Federal Reserve guidance and economic releases are absent.\"],\"quality\":\"MEDIUM\"},\"evidence_sha256\":\"ece2c0bf0810baedbf74bd09c6539452c61464abdcaea45ed36c69d10a56e88f\",\"research_brief_sha256\":\"6b00387c3dbc8d9d01f75166c6f339b145b23fbe9c20b4dfe4162959c029d1d2\"}}",
+    "jev_request_bytes": "{\"model\":\"jev-1-2026-09-15\",\"questions\":[\"evidence_sufficiency\",\"ambiguity\",\"p_yes\",\"action (BUY_YES|BUY_NO|ABSTAIN)\",\"confidence\"],\"state\":{\"brief\":{\"arguments_against\":[\"The evidence packet contains no policy guidance proving a cut.\"],\"arguments_for\":[\"A lower target range at resolution satisfies the stated YES condition.\"],\"cited_facts\":[{\"evidence_sha256\":\"ece2c0bf0810baedbf74bd09c6539452c61464abdcaea45ed36c69d10a56e88f\",\"fact\":\"The stated resolution source is the Federal Reserve decision text.\"},{\"evidence_sha256\":\"ece2c0bf0810baedbf74bd09c6539452c61464abdcaea45ed36c69d10a56e88f\",\"fact\":\"The market closes after the scheduled October meeting window.\"}],\"contradictions\":[],\"evidence_sha256\":\"ece2c0bf0810baedbf74bd09c6539452c61464abdcaea45ed36c69d10a56e88f\",\"missing_evidence\":[\"Current Federal Reserve guidance and economic releases are absent.\"],\"quality\":\"MEDIUM\"},\"evidence_sha256\":\"ece2c0bf0810baedbf74bd09c6539452c61464abdcaea45ed36c69d10a56e88f\",\"research_brief_sha256\":\"6b00387c3dbc8d9d01f75166c6f339b145b23fbe9c20b4dfe4162959c029d1d2\"}}",
     "jev_response_bytes": "{\"cost_microdollars\":125000,\"model\":\"jev-1-2026-09-15\",\"result\":{\"action\":\"BUY_YES\",\"ambiguity_micros\":200000,\"confidence_micros\":760000,\"p_yes_micros\":700000,\"rationale\":\"The rules are clear, but the evidence remains incomplete.\",\"sufficiency_micros\":800000}}",
-    "openai_request_bytes": "{\"input\":\"<evidence>{\\\"category\\\":\\\"Economy\\\",\\\"closes_at\\\":\\\"2026-10-31T20:00:00Z\\\",\\\"cutoff_at\\\":\\\"2026-10-03T12:00:00Z\\\",\\\"description\\\":\\\"Resolved YES if the target range is lower after the October 2026 meeting.\\\",\\\"market_id\\\":\\\"pm-fed-oct-2026\\\",\\\"question\\\":\\\"Will the Federal Reserve cut rates by October 2026?\\\",\\\"resolution_source_text\\\":\\\"Federal Reserve press release and target-range text.\\\",\\\"retrieved_at\\\":\\\"2026-10-03T12:00:00Z\\\",\\\"rules\\\":\\\"Use the Federal Reserve decision published for the October 2026 meeting.\\\",\\\"source_sha256\\\":\\\"ece2c0bf0810baedbf74bd09c6539452c61464abdcaea45ed36c69d10a56e88f\\\",\\\"tags\\\":[\\\"Federal Reserve\\\",\\\"Interest Rates\\\"]}</evidence>\",\"model\":\"gpt-5-2026-09-30\",\"response_format\":\"strict-research-brief-v1\"}",
+    "openai_request_bytes": "{\"input\":\"<evidence>{\\\"category\\\":\\\"Economy\\\",\\\"closes_at\\\":\\\"2026-10-31T20:00:00Z\\\",\\\"cutoff_at\\\":\\\"2026-10-03T12:00:00Z\\\",\\\"description\\\":\\\"Resolved YES if the target range is lower after the October 2026 meeting.\\\",\\\"market_id\\\":\\\"pm-fed-oct-2026\\\",\\\"question\\\":\\\"Will the Federal Reserve cut rates by October 2026?\\\",\\\"resolution_source_text\\\":\\\"Federal Reserve press release and target-range text.\\\",\\\"retrieved_at\\\":\\\"2026-10-03T12:00:00Z\\\",\\\"rules\\\":\\\"Use the Federal Reserve decision published for the October 2026 meeting.\\\",\\\"source_sha256\\\":\\\"ece2c0bf0810baedbf74bd09c6539452c61464abdcaea45ed36c69d10a56e88f\\\",\\\"tags\\\":[\\\"Federal Reserve\\\",\\\"Interest Rates\\\"]}</evidence>\",\"model\":\"gpt-5-2026-09-30\",\"response_format\":{\"json_schema\":{\"name\":\"strict-research-brief-v1\",\"schema\":{\"$defs\":{\"CitedFact\":{\"additionalProperties\":false,\"description\":\"A fact tied to the exact evidence packet that supports it.\",\"properties\":{\"evidence_sha256\":{\"pattern\":\"^[0-9a-f]{64}$\",\"title\":\"Evidence Sha256\",\"type\":\"string\"},\"fact\":{\"minLength\":1,\"title\":\"Fact\",\"type\":\"string\"}},\"required\":[\"fact\",\"evidence_sha256\"],\"title\":\"CitedFact\",\"type\":\"object\"}},\"additionalProperties\":false,\"description\":\"Structured research whose citations all bind one evidence artifact.\",\"properties\":{\"arguments_against\":{\"items\":{\"minLength\":1,\"type\":\"string\"},\"title\":\"Arguments Against\",\"type\":\"array\"},\"arguments_for\":{\"items\":{\"minLength\":1,\"type\":\"string\"},\"title\":\"Arguments For\",\"type\":\"array\"},\"cited_facts\":{\"items\":{\"$ref\":\"#/$defs/CitedFact\"},\"title\":\"Cited Facts\",\"type\":\"array\"},\"contradictions\":{\"items\":{\"minLength\":1,\"type\":\"string\"},\"title\":\"Contradictions\",\"type\":\"array\"},\"evidence_sha256\":{\"pattern\":\"^[0-9a-f]{64}$\",\"title\":\"Evidence Sha256\",\"type\":\"string\"},\"missing_evidence\":{\"items\":{\"minLength\":1,\"type\":\"string\"},\"title\":\"Missing Evidence\",\"type\":\"array\"},\"quality\":{\"enum\":[\"LOW\",\"MEDIUM\",\"HIGH\"],\"title\":\"Quality\",\"type\":\"string\"}},\"required\":[\"evidence_sha256\",\"cited_facts\",\"arguments_for\",\"arguments_against\",\"contradictions\",\"missing_evidence\",\"quality\"],\"title\":\"ResearchBrief\",\"type\":\"object\"},\"strict\":true},\"type\":\"json_schema\"}}",
     "openai_response_bytes": "{\"cost_microdollars\":375000,\"model\":\"gpt-5-2026-09-30\",\"output\":{\"arguments_against\":[\"The evidence packet contains no policy guidance proving a cut.\"],\"arguments_for\":[\"A lower target range at resolution satisfies the stated YES condition.\"],\"cited_facts\":[{\"evidence_sha256\":\"ece2c0bf0810baedbf74bd09c6539452c61464abdcaea45ed36c69d10a56e88f\",\"fact\":\"The stated resolution source is the Federal Reserve decision text.\"},{\"evidence_sha256\":\"ece2c0bf0810baedbf74bd09c6539452c61464abdcaea45ed36c69d10a56e88f\",\"fact\":\"The market closes after the scheduled October meeting window.\"}],\"contradictions\":[],\"evidence_sha256\":\"ece2c0bf0810baedbf74bd09c6539452c61464abdcaea45ed36c69d10a56e88f\",\"missing_evidence\":[\"Current Federal Reserve guidance and economic releases are absent.\"],\"quality\":\"MEDIUM\"},\"usage\":{\"input_tokens\":500,\"output_tokens\":250,\"total_tokens\":750}}"
   },
   "model_costs_microdollars": {
