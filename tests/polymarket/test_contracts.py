@@ -4,7 +4,7 @@ import hashlib
 import json
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -12,6 +12,8 @@ from pydantic import BaseModel, ValidationError
 from jev_trading_lab.core.ids import canonical_json_bytes
 from jev_trading_lab.polymarket import models as polymarket_models
 from jev_trading_lab.polymarket.models import (
+    INT64_MAX,
+    INT64_MIN,
     ArmResult,
     BookSnapshot,
     EvidencePacket,
@@ -547,6 +549,129 @@ def test_observation_recomputes_paired_deltas(
 
     with pytest.raises(ValidationError):
         _validate_json(ObservationResult, observation)
+
+
+def _marked_arm(arm: str, trading_pnl: int) -> dict[str, Any]:
+    if trading_pnl >= 0:
+        entry = 0
+        mark = trading_pnl
+        fees = 0
+        initial_cash = 0
+    else:
+        assert trading_pnl == -INT64_MAX
+        entry = MICROS_PER_DOLLAR
+        mark = 0
+        fees = INT64_MAX - MICROS_PER_DOLLAR
+        initial_cash = INT64_MAX
+    return {
+        "arm": arm,
+        "signal_probability_micros": 500_000,
+        "signal_action": "BUY_YES",
+        "disposition": "FILLED",
+        "entry_side": "YES",
+        "entry_vwap_micros": entry,
+        "quantity": 1,
+        "fees_microdollars": fees,
+        "initial_cash_microdollars": initial_cash,
+        "final_cash_microdollars": initial_cash + trading_pnl,
+        "mark_micros": mark,
+        "payout_micros": None,
+        "trading_pnl_microdollars": trading_pnl,
+        "economic_pnl_microdollars": trading_pnl,
+        "model_cost_microdollars": 0,
+        "forecast_probability_micros": 500_000,
+        "forecast_status": "PENDING_RESOLUTION",
+        "brier_micros": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("ai_pnl", "deterministic_pnl", "expected"),
+    (
+        (1, -INT64_MAX, None),
+        (-INT64_MAX, 2, None),
+        (0, -INT64_MAX, INT64_MAX),
+        (-INT64_MAX, 1, INT64_MIN),
+        (2, 1, 1),
+    ),
+)
+def test_observation_paired_pnl_delta_is_exact_or_null_on_int64_overflow(
+    cycle: dict[str, Any],
+    ai_pnl: int,
+    deterministic_pnl: int,
+    expected: int | None,
+) -> None:
+    observation = deepcopy(cycle["expected"]["observation_result"])
+    observation.update(
+        ai=_marked_arm("AI", ai_pnl),
+        deterministic=_marked_arm("DETERMINISTIC", deterministic_pnl),
+        resolution=None,
+        baseline_brier_micros=None,
+        paired_trading_pnl_delta_microdollars=expected,
+        paired_economic_pnl_delta_microdollars=expected,
+        paired_brier_delta_micros=None,
+    )
+
+    validated = cast(ObservationResult, _validate_json(ObservationResult, observation))
+
+    assert validated.paired_trading_pnl_delta_microdollars == expected
+    assert validated.paired_economic_pnl_delta_microdollars == expected
+
+
+@pytest.mark.parametrize("wrong", (None, 0))
+def test_observation_rejects_noncanonical_paired_pnl_delta(
+    cycle: dict[str, Any], wrong: int | None
+) -> None:
+    observation = deepcopy(cycle["expected"]["observation_result"])
+    observation.update(
+        ai=_marked_arm("AI", 2),
+        deterministic=_marked_arm("DETERMINISTIC", 1),
+        resolution=None,
+        baseline_brier_micros=None,
+        paired_trading_pnl_delta_microdollars=wrong,
+        paired_economic_pnl_delta_microdollars=wrong,
+        paired_brier_delta_micros=None,
+    )
+
+    with pytest.raises(ValidationError, match="paired .* P&L delta"):
+        _validate_json(ObservationResult, observation)
+
+
+def test_unavailable_arm_paired_economic_overflow_is_null(
+    cycle: dict[str, Any],
+) -> None:
+    observation = deepcopy(cycle["expected"]["observation_result"])
+    ai = _marked_arm("AI", 0)
+    ai.update(
+        signal_probability_micros=None,
+        signal_action=None,
+        disposition="MODEL_FAILURE",
+        entry_side=None,
+        entry_vwap_micros=None,
+        quantity=0,
+        initial_cash_microdollars=INT64_MAX,
+        final_cash_microdollars=INT64_MAX,
+        mark_micros=None,
+        trading_pnl_microdollars=0,
+        economic_pnl_microdollars=-INT64_MAX,
+        model_cost_microdollars=INT64_MAX,
+        forecast_probability_micros=None,
+        forecast_status="UNAVAILABLE",
+    )
+    observation.update(
+        ai=ai,
+        deterministic=_marked_arm("DETERMINISTIC", 2),
+        resolution=None,
+        baseline_brier_micros=None,
+        paired_trading_pnl_delta_microdollars=-2,
+        paired_economic_pnl_delta_microdollars=None,
+        paired_brier_delta_micros=None,
+    )
+
+    validated = cast(ObservationResult, _validate_json(ObservationResult, observation))
+
+    assert validated.ai.forecast_status == "UNAVAILABLE"
+    assert validated.paired_economic_pnl_delta_microdollars is None
 
 
 def test_observation_recomputes_arm_brier(cycle: dict[str, Any]) -> None:

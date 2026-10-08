@@ -21,6 +21,7 @@ from jev_trading_lab.polymarket.models import (
     JevDecision,
     ObservationResult,
     ResearchBrief,
+    int64_delta,
     validate_feasibility_fixture,
 )
 
@@ -680,11 +681,13 @@ def evaluate_fixture(fixture: FeasibilityFixture) -> ObservationResult:
         baseline_brier_micros=(
             brier_micros(baseline, payout) if payout is not None else None
         ),
-        paired_trading_pnl_delta_microdollars=(
-            ai.trading_pnl_microdollars - deterministic.trading_pnl_microdollars
+        paired_trading_pnl_delta_microdollars=int64_delta(
+            ai.trading_pnl_microdollars,
+            deterministic.trading_pnl_microdollars,
         ),
-        paired_economic_pnl_delta_microdollars=(
-            ai.economic_pnl_microdollars - deterministic.economic_pnl_microdollars
+        paired_economic_pnl_delta_microdollars=int64_delta(
+            ai.economic_pnl_microdollars,
+            deterministic.economic_pnl_microdollars,
         ),
         paired_brier_delta_micros=(
             ai.brier_micros - deterministic.brier_micros

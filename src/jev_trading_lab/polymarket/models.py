@@ -63,6 +63,13 @@ def _brier_micros(probability_micros: int, payout_micros: int) -> int:
     return (probability_micros - payout_micros) ** 2 // MICROS_PER_UNIT
 
 
+def int64_delta(left: int, right: int) -> int | None:
+    """Return the exact signed delta, or None when it cannot persist as int64."""
+
+    delta = left - right
+    return delta if INT64_MIN <= delta <= INT64_MAX else None
+
+
 class StrictModel(BaseModel):
     """Common closed-world validation for persisted feasibility contracts."""
 
@@ -377,7 +384,7 @@ class ArmResult(StrictModel):
 
 
 class ObservationResult(UtcModel):
-    """One synchronized result containing exactly the AI and control arms."""
+    """One synchronized result; unrepresentable int64 paired P&L deltas are null."""
 
     observation_id: Sha256
     opportunity_id: Sha256
@@ -394,8 +401,8 @@ class ObservationResult(UtcModel):
     baseline_probability_micros: Micros
     resolution: Literal[0, 1] | None
     baseline_brier_micros: Micros | None
-    paired_trading_pnl_delta_microdollars: SignedInt
-    paired_economic_pnl_delta_microdollars: SignedInt
+    paired_trading_pnl_delta_microdollars: SignedInt | None
+    paired_economic_pnl_delta_microdollars: SignedInt | None
     paired_brier_delta_micros: SignedInt | None
 
     @model_validator(mode="after")
@@ -412,16 +419,24 @@ class ObservationResult(UtcModel):
                 raise ValueError("arm payout must match observation resolution")
             if arm.quantity > 0 and arm.payout_micros != expected_payout:
                 raise ValueError("filled arm payout must match observation resolution")
-        if self.paired_trading_pnl_delta_microdollars != (
-            self.ai.trading_pnl_microdollars
-            - self.deterministic.trading_pnl_microdollars
-        ):
-            raise ValueError("paired trading P&L delta must be AI minus deterministic")
-        if self.paired_economic_pnl_delta_microdollars != (
-            self.ai.economic_pnl_microdollars
-            - self.deterministic.economic_pnl_microdollars
-        ):
-            raise ValueError("paired economic P&L delta must be AI minus deterministic")
+        expected_trading_delta = int64_delta(
+            self.ai.trading_pnl_microdollars,
+            self.deterministic.trading_pnl_microdollars,
+        )
+        if self.paired_trading_pnl_delta_microdollars != expected_trading_delta:
+            raise ValueError(
+                "paired trading P&L delta must be exact AI minus deterministic, "
+                "or null on int64 overflow"
+            )
+        expected_economic_delta = int64_delta(
+            self.ai.economic_pnl_microdollars,
+            self.deterministic.economic_pnl_microdollars,
+        )
+        if self.paired_economic_pnl_delta_microdollars != expected_economic_delta:
+            raise ValueError(
+                "paired economic P&L delta must be exact AI minus deterministic, "
+                "or null on int64 overflow"
+            )
         if self.resolution is None:
             if (
                 self.baseline_brier_micros is not None

@@ -21,6 +21,7 @@ from jev_trading_lab.polymarket.models import (
     Economics,
     FeasibilityFixture,
     JevDecision,
+    ObservationResult,
     load_strict_json,
 )
 from jev_trading_lab.polymarket.paper import (
@@ -367,6 +368,35 @@ def test_fixture_recomputes_exact_resolved_economics_and_scores(
     assert observation.baseline_probability_micros == 515_000
     assert observation.baseline_brier_micros == 235_225
     assert observation.paired_brier_delta_micros == -112_500
+
+
+def test_fixture_terminalizes_paired_economic_delta_below_int64(
+    fixture: FeasibilityFixture,
+) -> None:
+    decision = fixture.jev_decision.model_copy(
+        update={"p_yes_micros": 200_000, "action": "BUY_NO"}
+    )
+    costs = fixture.model_costs_microdollars.model_copy(
+        update={"openai": INT64_MAX, "jev": 0}
+    )
+    history = [
+        point.model_copy(update={"midpoint_micros": midpoint})
+        for point, midpoint in zip(
+            fixture.causal_history, (500_000, 600_000), strict=True
+        )
+    ]
+    extreme = fixture.model_copy(
+        update={
+            "jev_decision": decision,
+            "model_costs_microdollars": costs,
+            "causal_history": history,
+        }
+    )
+
+    observation = evaluate_fixture(extreme)
+
+    assert isinstance(observation, ObservationResult)
+    assert observation.paired_economic_pnl_delta_microdollars is None
 
 
 def test_unit2_validation_rejects_detached_expected_economics(
