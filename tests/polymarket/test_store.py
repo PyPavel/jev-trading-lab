@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import multiprocessing
@@ -15,8 +16,8 @@ import pytest
 from pydantic import ValidationError
 
 from jev_trading_lab.core.ids import canonical_json_bytes
+from jev_trading_lab.polymarket.ai import AdapterFailure
 from jev_trading_lab.polymarket.models import (
-    BookSnapshot,
     EvidencePacket,
     JevDecision,
     JevResponse,
@@ -28,6 +29,7 @@ from jev_trading_lab.polymarket.models import (
 from jev_trading_lab.polymarket.store import (
     ArtifactEnvelope,
     ArtifactToFreeze,
+    FailureArtifact,
     StoreConflictError,
     StoreCorruptError,
     StoreSecurityError,
@@ -105,12 +107,6 @@ def _artifacts(
     evidence = EvidencePacket.model_validate_json(
         canonical_json_bytes(cycle["sanitized_evidence"])
     )
-    precheck = BookSnapshot.model_validate_json(
-        canonical_json_bytes(cycle["precheck_book"])
-    )
-    execution = BookSnapshot.model_validate_json(
-        canonical_json_bytes(cycle["execution_book"])
-    )
     brief = ResearchBrief.model_validate_json(
         canonical_json_bytes(cycle["research_brief"])
     )
@@ -119,7 +115,7 @@ def _artifacts(
     )
     values = (
         (
-            "gamma_raw",
+            "raw_gamma",
             cycle["raw"]["gamma_bytes"].encode(),
             "gamma_public",
             evidence.retrieved_at,
@@ -131,12 +127,6 @@ def _artifacts(
             evidence.retrieved_at,
         ),
         (
-            "precheck_book",
-            cycle["raw"]["precheck_book_bytes"].encode(),
-            "clob_public",
-            precheck.retrieved_at,
-        ),
-        (
             "openai_request",
             cycle["model_artifacts"]["openai_request_bytes"].encode(),
             "openai_request",
@@ -145,7 +135,7 @@ def _artifacts(
             ),
         ),
         (
-            "openai_response",
+            "openai_response_success",
             cycle["model_artifacts"]["openai_response_bytes"].encode(),
             "openai_response",
             datetime.fromisoformat(
@@ -169,7 +159,7 @@ def _artifacts(
             ),
         ),
         (
-            "jev_response",
+            "jev_response_success",
             cycle["model_artifacts"]["jev_response_bytes"].encode(),
             "jev_response",
             datetime.fromisoformat(
@@ -184,18 +174,6 @@ def _artifacts(
                 cycle["chronology"]["jev_response_at"].replace("Z", "+00:00")
             ),
         ),
-        (
-            "execution_book",
-            cycle["raw"]["execution_book_bytes"].encode(),
-            "clob_public",
-            execution.retrieved_at,
-        ),
-        (
-            "observation_result",
-            canonical_json_bytes(result.model_dump(mode="json")),
-            "terminal_result",
-            result.observed_at,
-        ),
     )
     artifacts: list[ArtifactToFreeze] = []
     predecessor: str | None = None
@@ -209,9 +187,144 @@ def _artifacts(
         )
         artifacts.append(artifact)
         predecessor = _stage_hash(result, artifact, predecessor)
-    assert result.research_brief_sha256 == hashlib.sha256(values[5][1]).hexdigest()
-    assert result.jev_decision_sha256 == hashlib.sha256(values[8][1]).hexdigest()
+    assert result.research_brief_sha256 == hashlib.sha256(values[4][1]).hexdigest()
+    assert result.jev_decision_sha256 == hashlib.sha256(values[7][1]).hexdigest()
     return artifacts
+
+
+def _failure_result(
+    cycle: dict[str, Any], *, openai_failed: bool, model_cost: int
+) -> ObservationResult:
+    value = deepcopy(cycle["expected"]["observation_result"])
+    value["research_brief_sha256"] = (
+        "0" * 64 if openai_failed else value["research_brief_sha256"]
+    )
+    value["jev_decision_sha256"] = "0" * 64
+    value["ai"] = {
+        "arm": "AI",
+        "signal_probability_micros": None,
+        "signal_action": None,
+        "disposition": "MODEL_FAILURE",
+        "entry_side": None,
+        "entry_vwap_micros": None,
+        "entry_notional_microdollars": None,
+        "quantity": 0,
+        "fees_microdollars": 0,
+        "initial_cash_microdollars": value["ai"]["initial_cash_microdollars"],
+        "final_cash_microdollars": value["ai"]["initial_cash_microdollars"],
+        "mark_micros": None,
+        "payout_micros": None,
+        "valuation_notional_microdollars": None,
+        "trading_pnl_microdollars": 0,
+        "economic_pnl_microdollars": -model_cost,
+        "model_cost_microdollars": model_cost,
+        "forecast_probability_micros": None,
+        "forecast_status": "UNAVAILABLE",
+        "brier_micros": None,
+    }
+    value["paired_trading_pnl_delta_microdollars"] = 0
+    value["paired_economic_pnl_delta_microdollars"] = -model_cost
+    value["paired_brier_delta_micros"] = None
+    return ObservationResult.model_validate_json(canonical_json_bytes(value))
+
+
+def _failure_metadata(
+    *, provider: str, cost: int, request_bytes: bytes, response_body: bytes
+) -> bytes:
+    failure = AdapterFailure(
+        provider=provider,  # type: ignore[arg-type]
+        code="HTTP_ERROR",
+        message=f"{provider} returned HTTP status 503",
+        request_bytes=request_bytes,
+        response_sha256=hashlib.sha256(response_body).hexdigest(),
+        response_byte_length=len(response_body),
+        retrieved_at=datetime(2026, 10, 3, 12, 0, 30, tzinfo=UTC),
+        billed_cost_microdollars=cost,
+        status_code=503,
+    )
+    return canonical_json_bytes(
+        {
+            "provider": failure.provider,
+            "code": failure.code,
+            "message": failure.message,
+            "request_sha256": hashlib.sha256(failure.request_bytes).hexdigest(),
+            "response_sha256": failure.response_sha256,
+            "response_byte_length": failure.response_byte_length,
+            "retrieved_at": failure.retrieved_at.isoformat().replace("+00:00", "Z")
+            if failure.retrieved_at is not None
+            else None,
+            "billed_cost_microdollars": failure.billed_cost_microdollars,
+            "status_code": failure.status_code,
+        }
+    )
+
+
+def _failure_artifacts(
+    cycle: dict[str, Any], *, openai_failed: bool
+) -> tuple[ObservationResult, list[ArtifactToFreeze], bytes]:
+    success = _artifacts(cycle)
+    by_kind = {item.kind: item for item in success}
+    openai_cost = cycle["model_costs_microdollars"]["openai"]
+    jev_cost = cycle["model_costs_microdollars"]["jev"]
+    response_body = b"Authorization: Basic top-secret"
+    if openai_failed:
+        result = _failure_result(cycle, openai_failed=True, model_cost=openai_cost)
+        path = ["raw_gamma", "sanitized_evidence", "openai_request"]
+        failure_kind = "openai_failure"
+        failure_cost = openai_cost
+        request = by_kind["openai_request"].payload
+        provider = "openai"
+    else:
+        result = _failure_result(
+            cycle, openai_failed=False, model_cost=openai_cost + jev_cost
+        )
+        path = [
+            "raw_gamma",
+            "sanitized_evidence",
+            "openai_request",
+            "openai_response_success",
+            "research_brief",
+            "jev_request",
+        ]
+        failure_kind = "jev_failure"
+        failure_cost = jev_cost
+        request = by_kind["jev_request"].payload
+        provider = "jev"
+    values = [
+        (
+            kind,
+            by_kind[kind].payload,
+            by_kind[kind].source_uri_label,
+            by_kind[kind].retrieved_at,
+        )
+        for kind in path
+    ]
+    values.append(
+        (
+            failure_kind,
+            _failure_metadata(
+                provider=provider,
+                cost=failure_cost,
+                request_bytes=request,
+                response_body=response_body,
+            ),
+            failure_kind,
+            datetime(2026, 10, 3, 12, 0, 30, tzinfo=UTC),
+        )
+    )
+    artifacts: list[ArtifactToFreeze] = []
+    predecessor: str | None = None
+    for kind, payload, source, retrieved_at in values:
+        artifact = ArtifactToFreeze(
+            kind=kind,
+            payload=payload,
+            source_uri_label=source,
+            retrieved_at=retrieved_at,
+            predecessor_stage_sha256=predecessor,
+        )
+        artifacts.append(artifact)
+        predecessor = _stage_hash(result, artifact, predecessor)
+    return result, artifacts, response_body
 
 
 def _retarget(
@@ -266,36 +379,136 @@ def test_publishes_exact_fixture_bytes_and_replays_verified_artifacts(
 
     assert stored == result
     assert replay.result == result
-    assert replay.artifacts["gamma_raw"] == cycle["raw"]["gamma_bytes"].encode()
+    assert replay.artifacts["raw_gamma"] == cycle["raw"]["gamma_bytes"].encode()
     assert (
-        replay.artifacts["execution_book"]
-        == cycle["raw"]["execution_book_bytes"].encode()
-    )
-    assert (
-        hashlib.sha256(replay.artifacts["gamma_raw"]).hexdigest()
+        hashlib.sha256(replay.artifacts["raw_gamma"]).hexdigest()
         == (cycle["expected"]["artifact_sha256"]["gamma_bytes"])
     )
     assert set(replay.artifacts) == {
-        "gamma_raw",
+        "raw_gamma",
         "sanitized_evidence",
-        "precheck_book",
         "openai_request",
-        "openai_response",
+        "openai_response_success",
         "research_brief",
         "jev_request",
-        "jev_response",
+        "jev_response_success",
         "jev_decision",
-        "execution_book",
-        "observation_result",
     }
     assert isinstance(replay.typed_artifacts["sanitized_evidence"], EvidencePacket)
-    assert isinstance(replay.typed_artifacts["precheck_book"], BookSnapshot)
-    assert isinstance(replay.typed_artifacts["openai_response"], OpenAIResponse)
+    assert isinstance(replay.typed_artifacts["openai_response_success"], OpenAIResponse)
     assert isinstance(replay.typed_artifacts["research_brief"], ResearchBrief)
-    assert isinstance(replay.typed_artifacts["jev_response"], JevResponse)
+    assert isinstance(replay.typed_artifacts["jev_response_success"], JevResponse)
     assert isinstance(replay.typed_artifacts["jev_decision"], JevDecision)
-    assert isinstance(replay.typed_artifacts["execution_book"], BookSnapshot)
-    assert replay.typed_artifacts["observation_result"] == result
+
+
+@pytest.mark.parametrize("openai_failed", (True, False))
+@pytest.mark.parametrize(
+    "failure_code", ("HTTP_ERROR", "MODEL_MISMATCH", "PARSE_ERROR")
+)
+def test_failure_paths_record_and_replay_sanitized_metadata(
+    tmp_path: Path,
+    cycle: dict[str, Any],
+    openai_failed: bool,
+    failure_code: str,
+) -> None:
+    output = tmp_path / "output"
+    result, artifacts, raw_failure = _failure_artifacts(
+        cycle, openai_failed=openai_failed
+    )
+    failure = artifacts[-1]
+    failure_value = json.loads(failure.payload)
+    failure_value["code"] = failure_code
+    artifacts[-1] = ArtifactToFreeze(
+        kind=failure.kind,
+        payload=canonical_json_bytes(failure_value),
+        source_uri_label=failure.source_uri_label,
+        retrieved_at=failure.retrieved_at,
+        predecessor_stage_sha256=failure.predecessor_stage_sha256,
+    )
+
+    assert record_observation(output, result, artifacts) == result
+    replay = load_observation(output, result.observation_id)
+
+    expected_kind = "openai_failure" if openai_failed else "jev_failure"
+    assert tuple(replay.artifacts) == tuple(item.kind for item in artifacts)
+    assert expected_kind in replay.typed_artifacts
+    assert isinstance(replay.typed_artifacts[expected_kind], FailureArtifact)
+    assert raw_failure not in b"".join(replay.artifacts.values())
+    assert replay.result.ai.disposition == "MODEL_FAILURE"
+    assert replay.result.ai.signal_probability_micros is None
+    assert replay.result.ai.signal_action is None
+    assert replay.result.ai.forecast_probability_micros is None
+    assert replay.result.ai.trading_pnl_microdollars == 0
+    assert (
+        replay.result.ai.economic_pnl_microdollars
+        == -replay.result.ai.model_cost_microdollars
+    )
+
+
+@pytest.mark.parametrize("openai_failed", (True, False))
+@pytest.mark.parametrize("mutation", ("missing", "extra", "cost"))
+def test_failure_path_rejects_stage_and_cost_mismatch(
+    tmp_path: Path,
+    cycle: dict[str, Any],
+    openai_failed: bool,
+    mutation: str,
+) -> None:
+    result, artifacts, _raw_failure = _failure_artifacts(
+        cycle, openai_failed=openai_failed
+    )
+    if mutation == "missing":
+        artifacts.pop(-2)
+        artifacts = _retarget(artifacts, result)
+    elif mutation == "extra":
+        artifacts.append(_artifacts(cycle)[-1])
+        artifacts = _retarget(artifacts, result)
+    else:
+        value = result.model_dump(mode="json")
+        delta = 1 if openai_failed else -(value["ai"]["model_cost_microdollars"])
+        value["ai"]["model_cost_microdollars"] += delta
+        value["ai"]["economic_pnl_microdollars"] -= delta
+        value["paired_economic_pnl_delta_microdollars"] -= delta
+        result = ObservationResult.model_validate_json(canonical_json_bytes(value))
+        artifacts = _retarget(artifacts, result)
+
+    with pytest.raises(ValueError, match="stage order|model cost|failure outcome"):
+        record_observation(tmp_path / "output", result, artifacts)
+
+
+@pytest.mark.parametrize("field", ("signal_probability_micros", "signal_action"))
+def test_success_result_must_match_frozen_jev_decision(
+    tmp_path: Path, cycle: dict[str, Any], field: str
+) -> None:
+    result = _result(cycle)
+    value = result.model_dump(mode="json")
+    value["ai"][field] = 600_000 if field == "signal_probability_micros" else "BUY_NO"
+    if field == "signal_probability_micros":
+        value["ai"]["forecast_probability_micros"] = 600_000
+        value["ai"]["brier_micros"] = 160_000
+        value["paired_brier_delta_micros"] = -42_500
+    else:
+        value["ai"].update(
+            disposition="NO_EDGE",
+            entry_side=None,
+            entry_vwap_micros=None,
+            entry_notional_microdollars=None,
+            quantity=0,
+            fees_microdollars=0,
+            final_cash_microdollars=value["ai"]["initial_cash_microdollars"],
+            valuation_notional_microdollars=None,
+            trading_pnl_microdollars=0,
+            economic_pnl_microdollars=-value["ai"]["model_cost_microdollars"],
+        )
+        value["paired_trading_pnl_delta_microdollars"] = 0
+        value["paired_economic_pnl_delta_microdollars"] = -value["ai"][
+            "model_cost_microdollars"
+        ]
+    mutated = ObservationResult.model_validate_json(canonical_json_bytes(value))
+
+    with pytest.raises(ValueError, match="Jev decision|AI signal"):
+        record_observation(
+            tmp_path / "output", mutated, _retarget(_artifacts(cycle), mutated)
+        )
 
 
 def test_journals_are_canonical_strict_and_private(
@@ -429,7 +642,7 @@ def test_incomplete_openai_response_rejects_before_journal_append(
     result = _result(cycle)
     artifacts = _artifacts(cycle)
     index = next(
-        i for i, item in enumerate(artifacts) if item.kind == "openai_response"
+        i for i, item in enumerate(artifacts) if item.kind == "openai_response_success"
     )
     response = json.loads(artifacts[index].payload)
     response["status"] = "incomplete"
@@ -635,7 +848,7 @@ def _leave_durable_artifact_orphan(
         record_observation(output, result, artifacts)
     monkeypatch.setattr(store, "_append_lines", real_append)
 
-    assert len(_journal_lines(output / "artifacts.jsonl")) == 11
+    assert len(_journal_lines(output / "artifacts.jsonl")) == len(artifacts)
     assert (output / "results.jsonl").read_bytes() == b""
 
 
@@ -648,7 +861,7 @@ def test_retry_recovers_matching_artifact_journal_after_result_append_failure(
     _leave_durable_artifact_orphan(monkeypatch, output, result, artifacts)
 
     assert record_observation(output, result, artifacts) == result
-    assert len(_journal_lines(output / "artifacts.jsonl")) == 11
+    assert len(_journal_lines(output / "artifacts.jsonl")) == len(artifacts)
     assert len(_journal_lines(output / "results.jsonl")) == 1
     assert load_observation(output, result.observation_id).result == result
 
@@ -669,7 +882,7 @@ def test_concurrent_retries_recover_artifact_orphan_once(
         )
 
     assert recovered == [result] * 8
-    assert len(_journal_lines(output / "artifacts.jsonl")) == 11
+    assert len(_journal_lines(output / "artifacts.jsonl")) == len(artifacts)
     assert len(_journal_lines(output / "results.jsonl")) == 1
 
 
@@ -691,7 +904,7 @@ def test_retry_rejects_invalid_artifact_orphan_without_mutation(
         value["source_uri_label"] = "different_public"
         lines[0] = canonical_json_bytes(value)
     elif mutation == "incomplete":
-        lines.pop()
+        lines.pop(3)
     elif mutation == "duplicate":
         lines.append(lines[-1])
     else:
@@ -743,6 +956,170 @@ def test_retry_fsyncs_existing_identical_result_after_prior_fsync_failure(
     assert record_observation(output, result, artifacts) == result
     assert any(path.endswith("results.jsonl") for path in fsynced)
     assert any(path.endswith("artifacts.jsonl") for path in fsynced)
+    artifact_index = next(
+        index for index, path in enumerate(fsynced) if path.endswith("artifacts.jsonl")
+    )
+    result_index = next(
+        index for index, path in enumerate(fsynced) if path.endswith("results.jsonl")
+    )
+    assert artifact_index < result_index
+
+
+def test_retry_fsyncs_complete_artifacts_before_result_after_artifact_fsync_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    from jev_trading_lab.polymarket import store
+
+    output = tmp_path / "output"
+    result = _result(cycle)
+    artifacts = _artifacts(cycle)
+    real_fsync = store.os.fsync
+    failed = False
+
+    def fail_artifact_fsync(descriptor: int) -> None:
+        nonlocal failed
+        target = os.readlink(f"/proc/self/fd/{descriptor}")
+        if not failed and target.endswith("artifacts.jsonl"):
+            failed = True
+            raise OSError("simulated artifact fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(store.os, "fsync", fail_artifact_fsync)
+    with pytest.raises(OSError, match="simulated"):
+        record_observation(output, result, artifacts)
+    assert len(_journal_lines(output / "artifacts.jsonl")) == len(artifacts)
+    assert (output / "results.jsonl").read_bytes() == b""
+
+    fsynced: list[str] = []
+
+    def track_fsync(descriptor: int) -> None:
+        fsynced.append(os.readlink(f"/proc/self/fd/{descriptor}"))
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(store.os, "fsync", track_fsync)
+    assert record_observation(output, result, artifacts) == result
+    journals = [
+        path for path in fsynced if path.endswith(("artifacts.jsonl", "results.jsonl"))
+    ]
+    assert journals == [
+        str(output / "artifacts.jsonl"),
+        str(output / "results.jsonl"),
+    ]
+
+
+@pytest.mark.parametrize("prefix_length", (1, 4, 7))
+def test_retry_completes_canonical_partial_artifact_prefix(
+    tmp_path: Path, cycle: dict[str, Any], prefix_length: int
+) -> None:
+    output = tmp_path / "output"
+    result = _result(cycle)
+    artifacts = _artifacts(cycle)
+    expected = [
+        ArtifactEnvelope(
+            kind=item.kind,
+            sha256=hashlib.sha256(item.payload).hexdigest(),
+            byte_size=len(item.payload),
+            storage_relpath=(
+                f"{hashlib.sha256(item.payload).hexdigest()[:2]}/"
+                f"{hashlib.sha256(item.payload).hexdigest()[2:4]}/"
+                f"{hashlib.sha256(item.payload).hexdigest()}"
+            ),
+            source_uri_label=item.source_uri_label,
+            retrieved_at=item.retrieved_at,
+            opportunity_id=result.opportunity_id,
+            observation_id=result.observation_id,
+            predecessor_stage_sha256=item.predecessor_stage_sha256,
+        )
+        for item in artifacts
+    ]
+    output.mkdir(mode=0o700)
+    journal = output / "artifacts.jsonl"
+    journal.write_bytes(
+        b"\n".join(
+            canonical_json_bytes(item.model_dump(mode="json"))
+            for item in expected[:prefix_length]
+        )
+        + b"\n"
+    )
+    journal.chmod(0o600)
+
+    assert record_observation(output, result, artifacts) == result
+    assert len(_journal_lines(journal)) == len(artifacts)
+    assert len(_journal_lines(output / "results.jsonl")) == 1
+    assert load_observation(output, result.observation_id).result == result
+
+
+@pytest.mark.parametrize("persisted_lines", (1, 4, 7))
+def test_enospc_mid_artifact_append_retry_completes_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    cycle: dict[str, Any],
+    persisted_lines: int,
+) -> None:
+    from jev_trading_lab.polymarket import store
+
+    output = tmp_path / "output"
+    result = _result(cycle)
+    artifacts = _artifacts(cycle)
+    real_write = store.os.write
+    artifact_writes = 0
+
+    def fail_mid_append(descriptor: int, data: bytes | memoryview) -> int:
+        nonlocal artifact_writes
+        target = os.readlink(f"/proc/self/fd/{descriptor}")
+        if target.endswith("artifacts.jsonl"):
+            artifact_writes += 1
+            if artifact_writes > persisted_lines:
+                raise OSError(errno.ENOSPC, "simulated full disk")
+        return real_write(descriptor, data)
+
+    monkeypatch.setattr(store.os, "write", fail_mid_append)
+    with pytest.raises(OSError) as caught:
+        record_observation(output, result, artifacts)
+    assert caught.value.errno == errno.ENOSPC
+    assert len(_journal_lines(output / "artifacts.jsonl")) == persisted_lines
+    assert (output / "results.jsonl").read_bytes() == b""
+
+    monkeypatch.setattr(store.os, "write", real_write)
+    assert record_observation(output, result, artifacts) == result
+    assert len(_journal_lines(output / "artifacts.jsonl")) == len(artifacts)
+    assert len(_journal_lines(output / "results.jsonl")) == 1
+
+
+def test_concurrent_retries_converge_from_partial_artifact_prefix(
+    tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    output = tmp_path / "output"
+    result = _result(cycle)
+    artifacts = _artifacts(cycle)
+    output.mkdir(mode=0o700)
+    first = artifacts[0]
+    digest = hashlib.sha256(first.payload).hexdigest()
+    envelope = ArtifactEnvelope(
+        kind=first.kind,
+        sha256=digest,
+        byte_size=len(first.payload),
+        storage_relpath=f"{digest[:2]}/{digest[2:4]}/{digest}",
+        source_uri_label=first.source_uri_label,
+        retrieved_at=first.retrieved_at,
+        opportunity_id=result.opportunity_id,
+        observation_id=result.observation_id,
+        predecessor_stage_sha256=None,
+    )
+    journal = output / "artifacts.jsonl"
+    journal.write_bytes(canonical_json_bytes(envelope.model_dump(mode="json")) + b"\n")
+    journal.chmod(0o600)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        recovered = list(
+            pool.map(
+                lambda _index: record_observation(output, result, artifacts), range(8)
+            )
+        )
+
+    assert recovered == [result] * 8
+    assert len(_journal_lines(journal)) == len(artifacts)
+    assert len(_journal_lines(output / "results.jsonl")) == 1
 
 
 def test_threads_append_distinct_results_and_same_identity_converges(
@@ -837,6 +1214,40 @@ def test_secret_artifact_rejects_before_durable_append(
     assert not (output / "results.jsonl").exists()
 
 
+@pytest.mark.parametrize(
+    "secret",
+    (
+        b'{"Authorization":"Basic top-secret"}',
+        b'{"Cookie":"session=top-secret"}',
+        b'{"x-api-key":"top-secret"}',
+        b'{"\\u0041uthorization":"Basic top-secret"}',
+        '{"Ａｕｔｈｏｒｉｚａｔｉｏｎ":"Basic top-secret"}'.encode(),
+    ),
+)
+def test_semantic_json_secret_fields_reject_without_leaking(
+    tmp_path: Path, cycle: dict[str, Any], secret: bytes
+) -> None:
+    output = tmp_path / "output"
+    result = _result(cycle)
+    artifacts = _artifacts(cycle)
+    index = next(i for i, item in enumerate(artifacts) if item.kind == "openai_request")
+    item = artifacts[index]
+    artifacts[index] = ArtifactToFreeze(
+        kind=item.kind,
+        payload=secret,
+        source_uri_label=item.source_uri_label,
+        retrieved_at=item.retrieved_at,
+        predecessor_stage_sha256=item.predecessor_stage_sha256,
+    )
+
+    with pytest.raises(StoreSecurityError) as caught:
+        record_observation(output, result, artifacts)
+
+    assert "top-secret" not in repr(caught.value)
+    assert not (output / "artifacts.jsonl").exists()
+    assert not (output / "results.jsonl").exists()
+
+
 def test_configured_fixture_secret_rejects_without_leaking(
     tmp_path: Path, cycle: dict[str, Any]
 ) -> None:
@@ -880,41 +1291,26 @@ def test_same_opportunity_distinct_observations_coexist(
     output = tmp_path / "output"
     first = _result(cycle)
     value = first.model_dump(mode="json")
-    execution_payload = cycle["raw"]["execution_book_bytes"].encode() + b" "
-    execution_hash = hashlib.sha256(execution_payload).hexdigest()
-    value["execution_book_sha256"] = execution_hash
+    value["execution_book_sha256"] = "0" * 64
     value["observation_id"] = hashlib.sha256(
         canonical_json_bytes(
             {
                 "opportunity_id": first.opportunity_id,
                 "evidence_sha256": first.evidence_sha256,
-                "execution_book_sha256": execution_hash,
+                "execution_book_sha256": value["execution_book_sha256"],
                 "policy_version": first.policy_version,
             }
         )
     ).hexdigest()
     second = ObservationResult.model_validate_json(canonical_json_bytes(value))
-    second_artifacts = _artifacts(cycle, second)
-    execution_index = next(
-        i for i, item in enumerate(second_artifacts) if item.kind == "execution_book"
-    )
-    item = second_artifacts[execution_index]
-    second_artifacts[execution_index] = ArtifactToFreeze(
-        kind=item.kind,
-        payload=execution_payload,
-        source_uri_label=item.source_uri_label,
-        retrieved_at=item.retrieved_at,
-        predecessor_stage_sha256=item.predecessor_stage_sha256,
-    )
-    second_artifacts = _retarget(second_artifacts, second)
 
     record_observation(output, first, _artifacts(cycle))
-    record_observation(output, second, second_artifacts)
+    record_observation(output, second, _retarget(_artifacts(cycle), second))
 
     assert load_observation(output, first.observation_id).result == first
     assert load_observation(output, second.observation_id).result == second
     assert len(_journal_lines(output / "results.jsonl")) == 2
-    assert len(_journal_lines(output / "artifacts.jsonl")) == 22
+    assert len(_journal_lines(output / "artifacts.jsonl")) == 16
 
 
 def test_envelope_and_input_validation_is_strict(cycle: dict[str, Any]) -> None:
