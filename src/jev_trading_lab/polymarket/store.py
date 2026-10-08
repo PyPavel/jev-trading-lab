@@ -81,9 +81,17 @@ class ArtifactKind(StrEnum):
     JEV_SUCCESS_METADATA = "jev_success_metadata"
     JEV_FAILURE = "jev_failure"
     JEV_DECISION = "jev_decision"
+    DECISION_FROZEN = "decision_frozen"
 
 
-_SUCCESS_PATH = (
+class DecisionFrozenArtifact(UtcModel):
+    """Canonical barrier proving the model decision preceded book economics."""
+
+    jev_decision_sha256: Sha256
+    frozen_at: datetime
+
+
+_LEGACY_SUCCESS_PATH = (
     ArtifactKind.RAW_GAMMA,
     ArtifactKind.SANITIZED_EVIDENCE,
     ArtifactKind.OPENAI_REQUEST,
@@ -95,6 +103,7 @@ _SUCCESS_PATH = (
     ArtifactKind.JEV_SUCCESS_METADATA,
     ArtifactKind.JEV_DECISION,
 )
+_SUCCESS_PATH = (*_LEGACY_SUCCESS_PATH, ArtifactKind.DECISION_FROZEN)
 _OPENAI_FAILURE_PATH = (
     ArtifactKind.RAW_GAMMA,
     ArtifactKind.SANITIZED_EVIDENCE,
@@ -205,6 +214,17 @@ def _stage_path(kinds: tuple[str, ...]) -> tuple[ArtifactKind, ...]:
         if kinds == tuple(kind.value for kind in path):
             return path
     raise ValueError("artifact stage order must match one reviewed path")
+
+
+def _stage_path_prefix(kinds: tuple[str, ...]) -> tuple[ArtifactKind, ...]:
+    matches = [
+        path
+        for path in _STAGE_PATHS
+        if kinds == tuple(kind.value for kind in path[: len(kinds)])
+    ]
+    if not matches:
+        raise ValueError("artifact stages must form one reviewed path prefix")
+    return matches[0]
 
 
 def _stage_path_for_result(
@@ -390,7 +410,7 @@ def _validate_success_terminal(
     *,
     fail: Callable[[str], None],
 ) -> None:
-    if path != _SUCCESS_PATH:
+    if path not in {_SUCCESS_PATH, _LEGACY_SUCCESS_PATH}:
         return
     if result.ai.model_cost_microdollars != _expected_model_cost(path, typed):
         fail("terminal AI model cost does not match provider success metadata")
@@ -748,6 +768,8 @@ def _reconstruct_orphan(kind: ArtifactKind, payload: bytes) -> TypedArtifact:
         return ResearchBrief.model_validate_json(payload)
     if kind is ArtifactKind.JEV_DECISION:
         return JevDecision.model_validate_json(payload)
+    if kind is ArtifactKind.DECISION_FROZEN:
+        return DecisionFrozenArtifact.model_validate_json(payload)
     if kind is ArtifactKind.OPENAI_RESPONSE_SUCCESS:
         response = OpenAIResponse.model_validate_json(payload)
         if (
@@ -936,6 +958,27 @@ def _validate_reconstructed_path(
         ):
             fail("terminal AI signal does not match frozen Jev decision")
 
+    frozen = typed.get(ArtifactKind.DECISION_FROZEN)
+    if frozen is not None:
+        if not isinstance(frozen, DecisionFrozenArtifact):
+            fail("decision frozen artifact type is invalid")
+        elif not isinstance(decision, JevDecision):
+            fail("decision frozen artifact requires a Jev decision")
+        else:
+            decision_envelope = envelope_by_kind.get(ArtifactKind.JEV_DECISION)
+            if (
+                decision_envelope is None
+                or frozen.jev_decision_sha256 != decision_envelope.sha256
+            ):
+                fail("decision frozen artifact does not bind the Jev decision")
+            frozen_envelope = envelope_by_kind.get(ArtifactKind.DECISION_FROZEN)
+            if (
+                frozen_envelope is None
+                or frozen.frozen_at != frozen_envelope.retrieved_at
+                or frozen.frozen_at < envelopes[-2].retrieved_at
+            ):
+                fail("decision frozen timestamp is inconsistent")
+
     success_metadata_complete = all(
         kind in typed
         for kind in (
@@ -948,7 +991,7 @@ def _validate_reconstructed_path(
             _expected_model_cost(_SUCCESS_PATH, typed)
         except ValueError as error:
             fail(str(error))
-    if len(envelopes) == len(_SUCCESS_PATH) and result is not None:
+    if path in {_SUCCESS_PATH, _LEGACY_SUCCESS_PATH} and result is not None:
         _validate_success_terminal(result, path, typed, fail=fail)
 
 
@@ -1147,6 +1190,95 @@ def _verify_replay_locked(
         artifacts=artifacts,
         typed_artifacts=typed,
     )
+
+
+def freeze_observation_artifacts(
+    output_dir: str | os.PathLike[str],
+    result: ObservationResult,
+    artifact_refs: Iterable[ArtifactToFreeze],
+    *,
+    forbidden_secret_values: tuple[bytes, ...] = (),
+) -> tuple[ArtifactEnvelope, ...]:
+    """Publish and journal a validated success-path prefix without its result."""
+
+    if type(result) is not ObservationResult:
+        raise TypeError("result must be an ObservationResult")
+    verified_result, _result_line = _verified_result(result)
+    artifacts = list(artifact_refs)
+    path = _stage_path_prefix(tuple(item.kind for item in artifacts))
+    if path != _SUCCESS_PATH:
+        raise ValueError("only the success path supports staged freezing")
+    envelopes: list[ArtifactEnvelope] = []
+    typed: dict[str, TypedArtifact] = {}
+    predecessor: str | None = None
+    for artifact, kind in zip(artifacts, path, strict=False):
+        _screen_payload(artifact.payload, forbidden_secret_values, strict_json=True)
+        payload_hash = hashlib.sha256(artifact.payload).hexdigest()
+        envelope = ArtifactEnvelope(
+            kind=kind.value,
+            sha256=payload_hash,
+            byte_size=len(artifact.payload),
+            storage_relpath=f"{payload_hash[:2]}/{payload_hash[2:4]}/{payload_hash}",
+            source_uri_label=artifact.source_uri_label,
+            retrieved_at=artifact.retrieved_at,
+            opportunity_id=verified_result.opportunity_id,
+            observation_id=verified_result.observation_id,
+            predecessor_stage_sha256=artifact.predecessor_stage_sha256,
+        )
+        if envelope.predecessor_stage_sha256 != predecessor:
+            raise ValueError("artifact predecessor chain is invalid")
+        typed[kind.value] = _reconstruct(kind, artifact.payload, verified_result)
+        envelopes.append(envelope)
+        predecessor = _canonical_stage_hash(envelope)
+    _validate_reconstructed_path(None, typed, path, envelopes, corruption=False)
+    envelope_lines = [
+        canonical_json_bytes(envelope.model_dump(mode="json")) for envelope in envelopes
+    ]
+    output = Path(output_dir)
+    root_fd = _open_output(output)
+    try:
+        with BlobStore(output.absolute() / "blobs") as store:
+            results_fd = _open_journal(root_fd, "results.jsonl")
+            try:
+                _lock(results_fd, fcntl.LOCK_EX)
+                existing_results = _parse_results(
+                    _read_journal(results_fd, label="result journal")
+                )
+                artifacts_fd = _open_journal(root_fd, "artifacts.jsonl")
+                try:
+                    _lock(artifacts_fd, fcntl.LOCK_EX)
+                    existing_envelopes = _parse_envelopes(
+                        _read_journal(artifacts_fd, label="artifact journal")
+                    )
+                    _validate_journals_locked(
+                        store,
+                        existing_results,
+                        existing_envelopes,
+                        forbidden_secret_values,
+                    )
+                    _publish(store, artifacts, envelopes)
+                    prior = [
+                        item
+                        for item in existing_envelopes
+                        if item.observation_id == verified_result.observation_id
+                    ]
+                    common = min(len(prior), len(envelopes))
+                    if prior[:common] != envelopes[:common]:
+                        raise StoreConflictError(
+                            "artifact stage identity already has different bytes"
+                        )
+                    missing = envelope_lines[len(prior) :]
+                    if missing:
+                        _append_lines(artifacts_fd, missing, label="artifact journal")
+                    else:
+                        os.fsync(artifacts_fd)
+                    return tuple(envelopes)
+                finally:
+                    os.close(artifacts_fd)
+            finally:
+                os.close(results_fd)
+    finally:
+        os.close(root_fd)
 
 
 def record_observation(

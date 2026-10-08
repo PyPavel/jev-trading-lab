@@ -214,6 +214,19 @@ def _artifacts(
                 cycle["chronology"]["jev_response_at"].replace("Z", "+00:00")
             ),
         ),
+        (
+            "decision_frozen",
+            canonical_json_bytes(
+                {
+                    "jev_decision_sha256": result.jev_decision_sha256,
+                    "frozen_at": cycle["chronology"]["decision_frozen_at"],
+                }
+            ),
+            "decision_frozen",
+            datetime.fromisoformat(
+                cycle["chronology"]["decision_frozen_at"].replace("Z", "+00:00")
+            ),
+        ),
     )
     artifacts: list[ArtifactToFreeze] = []
     predecessor: str | None = None
@@ -486,6 +499,7 @@ def test_publishes_exact_fixture_bytes_and_replays_verified_artifacts(
         "jev_response_success",
         "jev_success_metadata",
         "jev_decision",
+        "decision_frozen",
     }
     assert isinstance(replay.typed_artifacts["sanitized_evidence"], EvidencePacket)
     assert isinstance(replay.typed_artifacts["openai_response_success"], OpenAIResponse)
@@ -1584,7 +1598,7 @@ def test_valid_complete_success_orphan_allows_unrelated_then_recovers(
         == unrelated
     )
     assert record_observation(output, orphan, orphan_artifacts) == orphan
-    assert len(_journal_lines(output / "artifacts.jsonl")) == 20
+    assert len(_journal_lines(output / "artifacts.jsonl")) == 22
     assert len(_journal_lines(output / "results.jsonl")) == 2
 
 
@@ -2209,7 +2223,7 @@ def test_same_opportunity_distinct_observations_coexist(
     assert load_observation(output, first.observation_id).result == first
     assert load_observation(output, second.observation_id).result == second
     assert len(_journal_lines(output / "results.jsonl")) == 2
-    assert len(_journal_lines(output / "artifacts.jsonl")) == 20
+    assert len(_journal_lines(output / "artifacts.jsonl")) == 22
 
 
 def test_envelope_and_input_validation_is_strict(cycle: dict[str, Any]) -> None:

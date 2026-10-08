@@ -174,7 +174,7 @@ _APPROVED_SOURCE_HASHES = {
         "583ff05fc923ac30ef5cd0e9c44271e53746a65e312f53f112ec1b49e827647b"
     ),
     "src/jev_trading_lab/cli.py": (
-        "e1018e68f8902660a347c842866c321a42bad08d3f332cdf7f32bf0029cc84d9"
+        "d00730b9fcad3dc28ac7a1b3412456b89261378896e4a763f69f5bcad6cfe4bd"
     ),
     "src/jev_trading_lab/core/ids.py": (
         "0e73742a406e112f269e7b8d5fd205c448eb4fbf49541cab3c669bf7b4dc0dd4"
@@ -242,8 +242,11 @@ _APPROVED_SOURCE_HASHES = {
     "src/jev_trading_lab/polymarket/paper.py": (
         "a8d3754b325a1da673fb0ce30a81bf92931550d68002b5c3b5fef7b64d2b4b00"
     ),
+    "src/jev_trading_lab/polymarket/pipeline.py": (
+        "0105dbd62e34fc6331e2932fa5ba64e7553a13e4228c6ca0dbe5bd39a59f715d"
+    ),
     "src/jev_trading_lab/polymarket/store.py": (
-        "47100ecc7e79fb754d18d040fbac0dd5a8e33cc43bf59516e4d8b6d3f9a69b2c"
+        "46677424e22d63bb11129db86f9e4821a4827c4d029f634db1205e6727bb7854"
     ),
     "src/jev_trading_lab/stocks/__init__.py": (
         "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"
@@ -302,10 +305,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "f919773841a7b3bd0ad9b068064882292fecceffe3614d8b6f565c612bd1c109"
+    "034b3b03c1b8d20306a6cc6c3604bd54a53d083cf9f95d41a30b83875385b1be"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "282f9da1dac8a7bbf7a107abbdc907cc55b7185ae1ce67308f5ca1549f4aad0a"
+    "3808b2d6af6c59d45f64a710036e2cfd86a71e38e6166690d584564b41b02d95"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = [
     "exchange-calendars==4.11.2",
@@ -1628,6 +1631,7 @@ def test_built_artifacts_exclude_repository_and_host_junk(tmp_path: Path) -> Non
         "jev_trading_lab/polymarket/control.py",
         "jev_trading_lab/polymarket/models.py",
         "jev_trading_lab/polymarket/paper.py",
+        "jev_trading_lab/polymarket/pipeline.py",
         "jev_trading_lab/polymarket/store.py",
         "jev_trading_lab/stocks/__init__.py",
         "jev_trading_lab/stocks/calendar.py",
