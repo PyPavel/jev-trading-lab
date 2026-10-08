@@ -3,31 +3,84 @@
 from __future__ import annotations
 
 import hashlib
+import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Literal, Protocol
+from typing import Final, Literal, Protocol
 
 from pydantic import ValidationError
 
 from jev_trading_lab.core.ids import canonical_json_bytes
 from jev_trading_lab.polymarket.models import (
+    INT64_MAX,
     EvidencePacket,
     JevDecision,
     JevResponse,
     OpenAIResponse,
     ResearchBrief,
+    jev_response_decision,
     load_strict_json,
+    openai_response_brief,
 )
 
+OPENAI_MODEL_ID: Final = "gpt-5-2026-09-30"
+JEV_MODEL_ID: Final = "jev-1.13.0"
 _OPENAI_DELIMITERS = ("<evidence>", "</evidence>")
-_JEV_QUESTIONS = (
-    "evidence_sufficiency",
-    "ambiguity",
-    "p_yes",
-    "action (BUY_YES|BUY_NO|ABSTAIN)",
-    "confidence",
-)
+_SCORE_CRITERIA = ["No", "Yes"]
+_JEV_QUESTIONS: Final[dict[str, object]] = {
+    "evidence_sufficient": {
+        "type": "noul",
+        "instructions": (
+            "Is the supplied research brief sufficient to estimate the event outcome "
+            "without any market data?"
+        ),
+        "criteria": {
+            "true": "The brief supports an outcome estimate.",
+            "false": "Material evidence needed for an estimate is absent.",
+        },
+    },
+    "materially_ambiguous": {
+        "type": "noul",
+        "instructions": (
+            "Are the event rules or supplied evidence materially ambiguous about the "
+            "outcome definition?"
+        ),
+        "criteria": {
+            "true": "Ambiguity could change the resolved outcome.",
+            "false": "The outcome definition is sufficiently clear.",
+        },
+    },
+    "p_yes": {
+        "type": "score",
+        "instructions": (
+            "Estimate the probability that the event resolves YES using only the state."
+        ),
+        "criteria": _SCORE_CRITERIA,
+    },
+    "action": {
+        "type": "choice",
+        "instructions": (
+            "Select the research action justified by the state, without considering "
+            "any market price or order book."
+        ),
+        "criteria": {
+            "BUY_YES": "Evidence favors YES strongly enough to permit a YES signal.",
+            "BUY_NO": "Evidence favors NO strongly enough to permit a NO signal.",
+            "ABSTAIN": (
+                "Evidence is insufficient, ambiguous, or lacks a justified side."
+            ),
+        },
+    },
+    "confidence": {
+        "type": "score",
+        "instructions": (
+            "Estimate confidence that the selected action is supported by the "
+            "supplied state."
+        ),
+        "criteria": _SCORE_CRITERIA,
+    },
+}
 _FORBIDDEN_NAMES = frozenset(
     {
         "ask",
@@ -38,22 +91,25 @@ _FORBIDDEN_NAMES = frozenset(
         "bids",
         "book",
         "booksnapshot",
+        "impliedprobability",
+        "marketprice",
         "midpoint",
         "outcomeprices",
         "price",
         "prices",
         "token",
         "tokenid",
+        "yesprice",
     }
 )
 type FailureCode = Literal[
+    "INPUT_ERROR",
     "PROVIDER_ERROR",
     "TIMEOUT",
     "HTTP_ERROR",
     "PARSE_ERROR",
     "MODEL_MISMATCH",
     "CITATION_ERROR",
-    "COST_MISMATCH",
 ]
 
 
@@ -109,17 +165,34 @@ type JevResult = JevSuccess | AdapterFailure
 
 
 def _normalized_name(name: str) -> str:
-    return "".join(character for character in name.lower() if character.isalnum())
+    return "".join(
+        character
+        for character in unicodedata.normalize("NFKC", name).casefold()
+        if character.isalnum()
+    )
 
 
 def _is_forbidden_name(value: str) -> bool:
     normalized = _normalized_name(value)
     return normalized in _FORBIDDEN_NAMES or normalized.startswith(
-        ("ask", "bid", "book", "midpoint", "outcomeprices", "price", "token")
+        (
+            "ask",
+            "bid",
+            "book",
+            "impliedprobability",
+            "marketprice",
+            "midpoint",
+            "outcomeprices",
+            "price",
+            "token",
+            "yesprice",
+        )
     )
 
 
 def _reject_forbidden_names(value: object, *, label: str) -> None:
+    """Scan structured field names and JSON embedded in otherwise-prose strings."""
+
     if isinstance(value, Mapping):
         forbidden = {str(key) for key in value if _is_forbidden_name(str(key))}
         if forbidden:
@@ -129,8 +202,30 @@ def _reject_forbidden_names(value: object, *, label: str) -> None:
     elif isinstance(value, list | tuple):
         for nested in value:
             _reject_forbidden_names(nested, label=label)
-    elif isinstance(value, str) and _is_forbidden_name(value):
-        raise ValueError(f"{label} contains forbidden value: {value}")
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                decoded = load_strict_json(stripped)
+            except (TypeError, ValueError):
+                return
+            _reject_forbidden_names(decoded, label=label)
+
+
+def _reject_delimiters(value: object) -> None:
+    if isinstance(value, Mapping):
+        for nested in value.values():
+            _reject_delimiters(nested)
+    elif isinstance(value, list | tuple):
+        for nested in value:
+            _reject_delimiters(nested)
+    elif isinstance(value, str) and any(token in value for token in _OPENAI_DELIMITERS):
+        raise ValueError("OpenAI evidence contains a reserved delimiter")
+
+
+def _require_model(model: object, approved: str, provider: str) -> None:
+    if type(model) is not str or model != approved:
+        raise ValueError(f"{provider} model must be the approved pinned ID {approved}")
 
 
 def _strict_research_schema() -> dict[str, object]:
@@ -140,28 +235,29 @@ def _strict_research_schema() -> dict[str, object]:
 
 
 def build_openai_request(evidence: EvidencePacket, model: str) -> bytes:
-    """Build one canonical, tool-free request from an EvidencePacket only."""
+    """Build one canonical, tool-free Responses API request from evidence only."""
 
     if not isinstance(evidence, EvidencePacket):
         raise TypeError("OpenAI request requires an EvidencePacket")
-    if type(model) is not str or not model:
-        raise ValueError("OpenAI model must be a non-empty immutable snapshot ID")
+    _require_model(model, OPENAI_MODEL_ID, "OpenAI")
     evidence_value = evidence.model_dump(mode="json")
     _reject_forbidden_names(evidence_value, label="OpenAI evidence")
-    evidence_bytes = canonical_json_bytes(evidence_value)
+    _reject_delimiters(evidence_value)
     evidence_input = (
-        _OPENAI_DELIMITERS[0] + evidence_bytes.decode() + _OPENAI_DELIMITERS[1]
+        _OPENAI_DELIMITERS[0]
+        + canonical_json_bytes(evidence_value).decode()
+        + _OPENAI_DELIMITERS[1]
     )
     request = {
         "input": evidence_input,
         "model": model,
-        "response_format": {
-            "json_schema": {
+        "text": {
+            "format": {
+                "type": "json_schema",
                 "name": "strict-research-brief-v1",
                 "schema": _strict_research_schema(),
                 "strict": True,
-            },
-            "type": "json_schema",
+            }
         },
     }
     _reject_forbidden_names(request, label="OpenAI request")
@@ -171,50 +267,52 @@ def build_openai_request(evidence: EvidencePacket, model: str) -> bytes:
 def build_jev_request(
     brief: ResearchBrief, evidence: EvidencePacket, model: str
 ) -> bytes:
-    """Build canonical Jev state from a frozen brief and safe evidence identity."""
+    """Build canonical System One state and independently answerable questions."""
 
     if not isinstance(brief, ResearchBrief):
         raise TypeError("Jev request requires a ResearchBrief")
     if not isinstance(evidence, EvidencePacket):
         raise TypeError("Jev request requires an EvidencePacket, not a BookSnapshot")
-    if type(model) is not str or not model:
-        raise ValueError("Jev model must be a non-empty immutable snapshot ID")
+    _require_model(model, JEV_MODEL_ID, "Jev")
     if brief.evidence_sha256 != evidence.source_sha256:
         raise ValueError("research brief must bind the supplied evidence SHA-256")
     brief_value = brief.model_dump(mode="json")
-    brief_sha256 = hashlib.sha256(canonical_json_bytes(brief_value)).hexdigest()
     request = {
         "model": model,
-        "questions": list(_JEV_QUESTIONS),
+        "questions": _JEV_QUESTIONS,
         "state": {
             "brief": brief_value,
             "evidence_sha256": evidence.source_sha256,
-            "research_brief_sha256": brief_sha256,
+            "research_brief_sha256": hashlib.sha256(
+                canonical_json_bytes(brief_value)
+            ).hexdigest(),
         },
     }
     _reject_forbidden_names(request, label="Jev request")
     return canonical_json_bytes(request)
 
 
-def _transport_failure(
+def _failure(
     *,
     provider: Literal["openai", "jev"],
     code: FailureCode,
     message: str,
     request_bytes: bytes,
-    response: TransportResponse | None = None,
+    retrieved_at: datetime | None = None,
+    billed_cost_microdollars: int = 0,
+    status_code: int | None = None,
 ) -> AdapterFailure:
+    """Return safe metadata without retaining failed bodies or headers."""
+
     return AdapterFailure(
         provider=provider,
         code=code,
         message=message,
         request_bytes=request_bytes,
-        response_bytes=b"" if response is None else response.raw_bytes,
-        retrieved_at=None if response is None else response.retrieved_at,
-        billed_cost_microdollars=(
-            0 if response is None else response.billed_cost_microdollars
-        ),
-        status_code=None if response is None else response.status_code,
+        response_bytes=b"",
+        retrieved_at=retrieved_at,
+        billed_cost_microdollars=billed_cost_microdollars,
+        status_code=status_code,
     )
 
 
@@ -225,45 +323,52 @@ def _send_once(
 ) -> TransportResponse | AdapterFailure:
     try:
         response = transport(request_bytes)
+        status_code = response.status_code
+        headers = response.headers
+        raw_bytes = response.raw_bytes
+        retrieved_at = response.retrieved_at
+        billed_cost = response.billed_cost_microdollars
+        valid_retrieval = (
+            isinstance(retrieved_at, datetime)
+            and retrieved_at.tzinfo is not None
+            and retrieved_at.utcoffset() == timedelta(0)
+        )
+        valid_headers = isinstance(headers, Mapping) and all(
+            type(key) is str and type(value) is str for key, value in headers.items()
+        )
+        if (
+            type(status_code) is not int
+            or not (100 <= status_code <= 599)
+            or type(raw_bytes) is not bytes
+            or type(billed_cost) is not int
+            or not (0 <= billed_cost <= INT64_MAX)
+            or not valid_retrieval
+            or not valid_headers
+        ):
+            raise ValueError("invalid transport metadata")
     except TimeoutError:
-        return _transport_failure(
+        return _failure(
             provider=provider,
             code="TIMEOUT",
             message=f"{provider} transport timed out",
             request_bytes=request_bytes,
         )
     except Exception:
-        return _transport_failure(
+        return _failure(
             provider=provider,
             code="PROVIDER_ERROR",
-            message=f"{provider} transport failed",
+            message=f"{provider} transport returned invalid data",
             request_bytes=request_bytes,
         )
-    valid_retrieval = (
-        isinstance(response.retrieved_at, datetime)
-        and response.retrieved_at.tzinfo is not None
-        and response.retrieved_at.utcoffset() == timedelta(0)
-    )
-    if (
-        type(response.status_code) is not int
-        or not isinstance(response.raw_bytes, bytes)
-        or type(response.billed_cost_microdollars) is not int
-        or response.billed_cost_microdollars < 0
-        or not valid_retrieval
-    ):
-        return _transport_failure(
-            provider=provider,
-            code="PROVIDER_ERROR",
-            message=f"{provider} transport returned invalid metadata",
-            request_bytes=request_bytes,
-        )
-    if response.status_code < 200 or response.status_code >= 300:
-        return _transport_failure(
+    if status_code < 200 or status_code >= 300:
+        return _failure(
             provider=provider,
             code="HTTP_ERROR",
-            message=f"{provider} returned HTTP status {response.status_code}",
+            message=f"{provider} returned HTTP status {status_code}",
             request_bytes=request_bytes,
-            response=response,
+            retrieved_at=retrieved_at,
+            billed_cost_microdollars=billed_cost,
+            status_code=status_code,
         )
     return response
 
@@ -276,22 +381,43 @@ def _decoded_response(
     try:
         decoded = load_strict_json(response.raw_bytes)
     except (TypeError, ValueError):
-        return _transport_failure(
+        return _failure(
             provider=provider,
             code="PARSE_ERROR",
             message=f"{provider} response is not strict JSON",
             request_bytes=request_bytes,
-            response=response,
+            retrieved_at=response.retrieved_at,
+            billed_cost_microdollars=response.billed_cost_microdollars,
+            status_code=response.status_code,
         )
     if not isinstance(decoded, Mapping):
-        return _transport_failure(
+        return _failure(
             provider=provider,
             code="PARSE_ERROR",
             message=f"{provider} response must be a JSON object",
             request_bytes=request_bytes,
-            response=response,
+            retrieved_at=response.retrieved_at,
+            billed_cost_microdollars=response.billed_cost_microdollars,
+            status_code=response.status_code,
         )
     return decoded
+
+
+def _parse_failure(
+    provider: Literal["openai", "jev"],
+    request_bytes: bytes,
+    response: TransportResponse,
+    message: str,
+) -> AdapterFailure:
+    return _failure(
+        provider=provider,
+        code="PARSE_ERROR",
+        message=message,
+        request_bytes=request_bytes,
+        retrieved_at=response.retrieved_at,
+        billed_cost_microdollars=response.billed_cost_microdollars,
+        status_code=response.status_code,
+    )
 
 
 def call_openai(
@@ -301,70 +427,75 @@ def call_openai(
 ) -> OpenAIResult:
     """Perform exactly one OpenAI call and return a typed success or failure."""
 
-    request_bytes = build_openai_request(evidence, model)
+    try:
+        request_bytes = build_openai_request(evidence, model)
+    except (TypeError, ValueError):
+        return _failure(
+            provider="openai",
+            code="INPUT_ERROR",
+            message="openai request input is invalid",
+            request_bytes=b"",
+        )
     sent = _send_once("openai", request_bytes, transport)
     if isinstance(sent, AdapterFailure):
         return sent
     decoded = _decoded_response("openai", request_bytes, sent)
     if isinstance(decoded, AdapterFailure):
         return decoded
-    if decoded.get("model") != model:
-        return _transport_failure(
+    if decoded.get("model") != OPENAI_MODEL_ID:
+        return _failure(
             provider="openai",
             code="MODEL_MISMATCH",
-            message="openai response model does not match requested snapshot",
+            message="openai response model does not match the approved snapshot",
             request_bytes=request_bytes,
-            response=sent,
+            retrieved_at=sent.retrieved_at,
+            billed_cost_microdollars=sent.billed_cost_microdollars,
+            status_code=sent.status_code,
         )
-    raw_output = decoded.get("output")
-    citation_hashes: list[object] = []
-    if isinstance(raw_output, Mapping):
-        citations = raw_output.get("cited_facts")
-        if isinstance(citations, list):
-            citation_hashes = [
+    try:
+        envelope = OpenAIResponse.model_validate(decoded)
+        raw_brief = load_strict_json(envelope.output[0].content[0].text)
+    except (ValidationError, TypeError, ValueError):
+        return _parse_failure(
+            "openai",
+            request_bytes,
+            sent,
+            "openai response violates the strict envelope",
+        )
+    if isinstance(raw_brief, Mapping):
+        citations = raw_brief.get("cited_facts")
+        citation_hashes = (
+            [
                 citation.get("evidence_sha256")
                 for citation in citations
-                if isinstance(citation, Mapping) and "evidence_sha256" in citation
+                if isinstance(citation, Mapping)
             ]
-        if raw_output.get("evidence_sha256") not in {
-            None,
-            evidence.source_sha256,
-        } or any(value != evidence.source_sha256 for value in citation_hashes):
-            return _transport_failure(
+            if isinstance(citations, list)
+            else []
+        )
+        if raw_brief.get("evidence_sha256") != evidence.source_sha256 or any(
+            value != evidence.source_sha256 for value in citation_hashes
+        ):
+            return _failure(
                 provider="openai",
                 code="CITATION_ERROR",
                 message="openai brief does not cite the supplied evidence",
                 request_bytes=request_bytes,
-                response=sent,
+                retrieved_at=sent.retrieved_at,
+                billed_cost_microdollars=sent.billed_cost_microdollars,
+                status_code=sent.status_code,
             )
     try:
-        envelope = OpenAIResponse.model_validate(decoded)
-    except ValidationError:
-        return _transport_failure(
-            provider="openai",
-            code="PARSE_ERROR",
-            message="openai response violates the strict envelope",
-            request_bytes=request_bytes,
-            response=sent,
-        )
-    if envelope.output.evidence_sha256 != evidence.source_sha256:
-        return _transport_failure(
-            provider="openai",
-            code="CITATION_ERROR",
-            message="openai brief does not cite the supplied evidence",
-            request_bytes=request_bytes,
-            response=sent,
-        )
-    if envelope.cost_microdollars != sent.billed_cost_microdollars:
-        return _transport_failure(
-            provider="openai",
-            code="COST_MISMATCH",
-            message="openai billed cost does not match the strict envelope",
-            request_bytes=request_bytes,
-            response=sent,
+        brief = openai_response_brief(envelope)
+    except (ValidationError, TypeError, ValueError):
+        return _parse_failure(
+            "openai",
+            request_bytes,
+            sent,
+            "openai output_text violates the research schema",
         )
     return OpenAISuccess(
-        brief=envelope.output,
+        brief=brief,
         request_bytes=request_bytes,
         response_bytes=sent.raw_bytes,
         retrieved_at=sent.retrieved_at,
@@ -380,41 +511,40 @@ def call_jev(
 ) -> JevResult:
     """Perform exactly one Jev call and return a typed success or failure."""
 
-    request_bytes = build_jev_request(brief, evidence, model)
+    try:
+        request_bytes = build_jev_request(brief, evidence, model)
+    except (TypeError, ValueError):
+        return _failure(
+            provider="jev",
+            code="INPUT_ERROR",
+            message="jev request input is invalid",
+            request_bytes=b"",
+        )
     sent = _send_once("jev", request_bytes, transport)
     if isinstance(sent, AdapterFailure):
         return sent
     decoded = _decoded_response("jev", request_bytes, sent)
     if isinstance(decoded, AdapterFailure):
         return decoded
-    if decoded.get("model") != model:
-        return _transport_failure(
+    if decoded.get("model") != JEV_MODEL_ID:
+        return _failure(
             provider="jev",
             code="MODEL_MISMATCH",
-            message="jev response model does not match requested snapshot",
+            message="jev response model does not match the approved snapshot",
             request_bytes=request_bytes,
-            response=sent,
+            retrieved_at=sent.retrieved_at,
+            billed_cost_microdollars=sent.billed_cost_microdollars,
+            status_code=sent.status_code,
         )
     try:
         envelope = JevResponse.model_validate(decoded)
-    except ValidationError:
-        return _transport_failure(
-            provider="jev",
-            code="PARSE_ERROR",
-            message="jev response violates the strict envelope",
-            request_bytes=request_bytes,
-            response=sent,
-        )
-    if envelope.cost_microdollars != sent.billed_cost_microdollars:
-        return _transport_failure(
-            provider="jev",
-            code="COST_MISMATCH",
-            message="jev billed cost does not match the strict envelope",
-            request_bytes=request_bytes,
-            response=sent,
+        decision = jev_response_decision(envelope)
+    except (ValidationError, TypeError, ValueError):
+        return _parse_failure(
+            "jev", request_bytes, sent, "jev response violates the strict envelope"
         )
     return JevSuccess(
-        decision=envelope.result,
+        decision=decision,
         request_bytes=request_bytes,
         response_bytes=sent.raw_bytes,
         retrieved_at=sent.retrieved_at,

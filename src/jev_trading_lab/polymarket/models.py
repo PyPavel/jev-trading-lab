@@ -13,6 +13,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
+    ValidationError,
     field_validator,
     model_validator,
 )
@@ -200,11 +201,25 @@ class ResearchBrief(StrictModel):
         return self
 
 
+class OpenAIInputTokenDetails(StrictModel):
+    """Raw Responses API input-token detail counts."""
+
+    cached_tokens: NonNegativeInt
+
+
+class OpenAIOutputTokenDetails(StrictModel):
+    """Raw Responses API output-token detail counts."""
+
+    reasoning_tokens: NonNegativeInt
+
+
 class OpenAIUsage(StrictModel):
-    """Exact token counts returned by the canned OpenAI response."""
+    """Exact token counts from a raw OpenAI Responses API envelope."""
 
     input_tokens: NonNegativeInt
+    input_tokens_details: OpenAIInputTokenDetails
     output_tokens: NonNegativeInt
+    output_tokens_details: OpenAIOutputTokenDetails
     total_tokens: NonNegativeInt
 
     @model_validator(mode="after")
@@ -214,12 +229,37 @@ class OpenAIUsage(StrictModel):
         return self
 
 
-class OpenAIResponse(StrictModel):
-    """Closed-world canned OpenAI response with billed cost metadata."""
+class OpenAIOutputText(StrictModel):
+    """One completed raw Responses API output_text content part."""
 
-    cost_microdollars: NonNegativeInt
-    model: NonEmptyStr
-    output: ResearchBrief
+    type: Literal["output_text"]
+    text: NonEmptyStr
+    annotations: list[object]
+    logprobs: list[object]
+
+    @model_validator(mode="after")
+    def reject_unapproved_metadata(self) -> Self:
+        if self.annotations or self.logprobs:
+            raise ValueError("output_text annotations and logprobs are not approved")
+        return self
+
+
+class OpenAIOutputMessage(StrictModel):
+    """The sole completed assistant message accepted from Responses API."""
+
+    type: Literal["message"]
+    id: NonEmptyStr
+    status: Literal["completed"]
+    role: Literal["assistant"]
+    content: Annotated[list[OpenAIOutputText], Field(min_length=1, max_length=1)]
+
+
+class OpenAIResponse(StrictModel):
+    """Closed-world raw OpenAI Responses API envelope used by the fixture."""
+
+    model: Literal["gpt-5-2026-09-30"]
+    status: Literal["completed"]
+    output: Annotated[list[OpenAIOutputMessage], Field(min_length=1, max_length=1)]
     usage: OpenAIUsage
 
 
@@ -234,12 +274,102 @@ class JevDecision(StrictModel):
     rationale: Annotated[str, StringConstraints(min_length=1, max_length=500)]
 
 
-class JevResponse(StrictModel):
-    """Closed-world canned Jev response with billed cost metadata."""
+Probability = Annotated[float, Field(strict=True, ge=0.0, le=1.0, allow_inf_nan=False)]
 
-    cost_microdollars: NonNegativeInt
-    model: Literal["jev-1-2026-09-15"]
-    result: JevDecision
+
+class JevNoulAnswer(StrictModel):
+    type: Literal["noul"]
+    noul: Probability
+
+
+class JevScoreAnswer(StrictModel):
+    type: Literal["score"]
+    score: Probability
+    legend: dict[str, str]
+    probabilities: dict[str, Probability]
+    confidence: Probability
+
+    @model_validator(mode="after")
+    def require_binary_probability_rubric(self) -> Self:
+        if self.legend != {"0": "No", "1": "Yes"}:
+            raise ValueError("score legend must match the approved binary rubric")
+        if (
+            set(self.probabilities) != {"0", "1"}
+            or not abs(sum(self.probabilities.values()) - 1.0) <= 1e-9
+        ):
+            raise ValueError("score probabilities must cover the rubric and sum to one")
+        return self
+
+
+class JevChoiceAnswer(StrictModel):
+    type: Literal["choice"]
+    choice: Action
+    probabilities: dict[str, Probability]
+    confidence: Probability
+
+    @model_validator(mode="after")
+    def require_action_distribution(self) -> Self:
+        if (
+            set(self.probabilities) != {"BUY_YES", "BUY_NO", "ABSTAIN"}
+            or not abs(sum(self.probabilities.values()) - 1.0) <= 1e-9
+        ):
+            raise ValueError(
+                "action probabilities must cover all choices and sum to one"
+            )
+        return self
+
+
+class JevAnswers(StrictModel):
+    evidence_sufficient: JevNoulAnswer
+    materially_ambiguous: JevNoulAnswer
+    p_yes: JevScoreAnswer
+    action: JevChoiceAnswer
+    confidence: JevScoreAnswer
+
+
+class JevUsage(StrictModel):
+    input_tokens: NonNegativeInt
+    output_tokens: NonNegativeInt
+
+
+class JevResponse(StrictModel):
+    """Closed-world raw TypeSafe System One response envelope."""
+
+    model: Literal["jev-1.13.0"]
+    answers: JevAnswers
+    usage: JevUsage
+
+
+JEV_RATIONALE = "Derived from Jev typed answers; no free-form rationale provided."
+
+
+def jev_response_decision(response: JevResponse) -> JevDecision:
+    """Map exact typed answers to the persisted bounded decision."""
+
+    from decimal import ROUND_HALF_UP
+
+    def micros(value: float) -> int:
+        return int(
+            (Decimal(str(value)) * MICROS_PER_UNIT).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+        )
+
+    answers = response.answers
+    return JevDecision(
+        p_yes_micros=micros(answers.p_yes.score),
+        action=answers.action.choice,
+        confidence_micros=micros(answers.confidence.score),
+        sufficiency_micros=micros(answers.evidence_sufficient.noul),
+        ambiguity_micros=micros(answers.materially_ambiguous.noul),
+        rationale=JEV_RATIONALE,
+    )
+
+
+def openai_response_brief(response: OpenAIResponse) -> ResearchBrief:
+    """Parse the sole completed raw output_text as a strict research brief."""
+
+    return ResearchBrief.model_validate_json(response.output[0].content[0].text)
 
 
 class ArmResult(StrictModel):
@@ -868,86 +998,51 @@ def validate_feasibility_fixture(fixture: dict[str, Any]) -> None:
     if observation.execution_book_sha256 != expected_artifacts["execution_book_bytes"]:
         raise ValueError("observation execution book hash does not match raw bytes")
 
-    canonical_evidence = canonical_json_bytes(evidence.model_dump(mode="json")).decode()
-    openai_request = _require_exact_keys(
-        load_strict_json(artifacts.openai_request_bytes),
-        {"input", "model", "response_format"},
-        "OpenAI request",
+    from jev_trading_lab.polymarket.ai import (
+        JEV_MODEL_ID,
+        OPENAI_MODEL_ID,
+        build_jev_request,
+        build_openai_request,
     )
+
+    expected_openai_request = load_strict_json(
+        build_openai_request(evidence, OPENAI_MODEL_ID)
+    )
+    openai_request = load_strict_json(artifacts.openai_request_bytes)
     _reject_price_keys(openai_request, "OpenAI request")
-    response_format = _require_exact_keys(
-        openai_request["response_format"],
-        {"json_schema", "type"},
-        "OpenAI response format",
-    )
-    json_schema = _require_exact_keys(
-        response_format["json_schema"],
-        {"name", "schema", "strict"},
-        "OpenAI JSON schema",
-    )
-    if (
-        openai_request
-        != {
-            "input": f"<evidence>{canonical_evidence}</evidence>",
-            "model": "gpt-5-2026-09-30",
-            "response_format": {
-                "json_schema": {
-                    "name": "strict-research-brief-v1",
-                    "schema": ResearchBrief.model_json_schema(),
-                    "strict": True,
-                },
-                "type": "json_schema",
-            },
-        }
-        or response_format["type"] != "json_schema"
-        or not json_schema["strict"]
-    ):
+    if openai_request != expected_openai_request:
         raise ValueError("OpenAI request does not match fixture evidence contract")
 
     openai_response = OpenAIResponse.model_validate_json(
         artifacts.openai_response_bytes
     )
-    if (
-        openai_response.model != openai_request["model"]
-        or openai_response.output != brief
-        or openai_response.cost_microdollars
-        != validated.model_costs_microdollars.openai
-    ):
-        raise ValueError("OpenAI response does not match brief or billed cost")
+    try:
+        response_brief = openai_response_brief(openai_response)
+    except (ValidationError, ValueError) as error:
+        raise ValueError("OpenAI response output_text is invalid") from error
+    if openai_response.model != openai_request["model"] or response_brief != brief:
+        raise ValueError("OpenAI response does not match brief")
 
     brief_hash = _canonical_model_sha(brief)
-    jev_request = _require_exact_keys(
-        load_strict_json(artifacts.jev_request_bytes),
-        {"model", "questions", "state"},
-        "Jev request",
+    expected_jev_request = load_strict_json(
+        build_jev_request(brief, evidence, JEV_MODEL_ID)
     )
+    jev_request = load_strict_json(artifacts.jev_request_bytes)
     _reject_price_keys(jev_request, "Jev request")
-    if jev_request != {
-        "model": "jev-1-2026-09-15",
-        "questions": [
-            "evidence_sufficiency",
-            "ambiguity",
-            "p_yes",
-            "action (BUY_YES|BUY_NO|ABSTAIN)",
-            "confidence",
-        ],
-        "state": {
-            "brief": brief.model_dump(mode="json"),
-            "evidence_sha256": evidence.source_sha256,
-            "research_brief_sha256": brief_hash,
-        },
-    }:
+    if jev_request != expected_jev_request:
         raise ValueError("Jev request does not match fixture brief contract")
 
     jev_response = JevResponse.model_validate_json(artifacts.jev_response_bytes)
     if (
         jev_response.model != jev_request["model"]
-        or jev_response.result != validated.jev_decision
-        or jev_response.cost_microdollars != validated.model_costs_microdollars.jev
+        or jev_response_decision(jev_response) != validated.jev_decision
     ):
-        raise ValueError("Jev response does not match decision or billed cost")
+        raise ValueError("Jev response does not match decision")
 
-    model_cost = openai_response.cost_microdollars + jev_response.cost_microdollars
+    model_cost = (
+        validated.model_costs_microdollars.openai
+        + validated.model_costs_microdollars.jev
+    )
     if expected.arm_results.ai.model_cost_microdollars != model_cost:
         raise ValueError("AI arm model cost does not match provider costs")
     if expected.arm_results.deterministic.model_cost_microdollars != 0:

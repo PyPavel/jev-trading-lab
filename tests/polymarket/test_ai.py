@@ -10,6 +10,8 @@ import pytest
 
 from jev_trading_lab.core.ids import canonical_json_bytes
 from jev_trading_lab.polymarket.ai import (
+    JEV_MODEL_ID,
+    OPENAI_MODEL_ID,
     AdapterFailure,
     JevSuccess,
     OpenAISuccess,
@@ -27,9 +29,8 @@ from jev_trading_lab.polymarket.models import (
 )
 
 FIXTURE_PATH = Path(__file__).parents[1] / "fixtures/polymarket/feasibility_cycle.json"
-OPENAI_MODEL = "gpt-5-2026-09-30"
-JEV_MODEL = "jev-1-2026-09-15"
 CREDENTIAL_SENTINEL = "unit3-secret-never-persist"
+INT64_MAX = 2**63 - 1
 FORBIDDEN_NAMES = {
     "ask",
     "asks",
@@ -39,12 +40,15 @@ FORBIDDEN_NAMES = {
     "bids",
     "book",
     "booksnapshot",
+    "impliedprobability",
+    "marketprice",
     "midpoint",
     "outcomeprices",
     "price",
     "prices",
     "token",
     "tokenid",
+    "yesprice",
 }
 
 
@@ -69,6 +73,9 @@ def brief(cycle: dict[str, Any]) -> ResearchBrief:
     )
 
 
+_DEFAULT_RESPONSE = object()
+
+
 class FixtureTransport:
     def __init__(
         self,
@@ -77,23 +84,34 @@ class FixtureTransport:
         status_code: int = 200,
         billed_cost_microdollars: int = 0,
         error: BaseException | None = None,
+        headers: object = None,
+        response: object = _DEFAULT_RESPONSE,
     ) -> None:
         self.body = body
         self.status_code = status_code
         self.billed_cost_microdollars = billed_cost_microdollars
         self.error = error
+        self.headers = (
+            {
+                "content-type": "application/json",
+                "authorization": f"Bearer {CREDENTIAL_SENTINEL}",
+                "set-cookie": f"session={CREDENTIAL_SENTINEL}",
+            }
+            if headers is None
+            else headers
+        )
+        self.response = response
         self.calls: list[bytes] = []
 
     def __call__(self, request_bytes: bytes) -> TransportResponse:
         self.calls.append(request_bytes)
         if self.error is not None:
             raise self.error
+        if self.response is not _DEFAULT_RESPONSE:
+            return self.response  # type: ignore[return-value]
         return TransportResponse(
             status_code=self.status_code,
-            headers={
-                "content-type": "application/json",
-                "authorization": f"Bearer {CREDENTIAL_SENTINEL}",
-            },
+            headers=self.headers,  # type: ignore[arg-type]
             raw_bytes=self.body,
             retrieved_at=datetime(2026, 10, 3, 12, 0, 30, tzinfo=UTC),
             billed_cost_microdollars=self.billed_cost_microdollars,
@@ -101,46 +119,90 @@ class FixtureTransport:
 
 
 def _normalized_name(name: str) -> str:
-    return "".join(character for character in name.lower() if character.isalnum())
+    import unicodedata
+
+    return "".join(
+        character
+        for character in unicodedata.normalize("NFKC", name).casefold()
+        if character.isalnum()
+    )
 
 
 def _assert_no_forbidden_names(value: object) -> None:
     if isinstance(value, dict):
-        assert not ({_normalized_name(key) for key in value} & FORBIDDEN_NAMES)
+        assert not ({_normalized_name(str(key)) for key in value} & FORBIDDEN_NAMES)
         for nested in value.values():
             _assert_no_forbidden_names(nested)
     elif isinstance(value, list):
         for nested in value:
             _assert_no_forbidden_names(nested)
+    elif isinstance(value, str) and value.strip().startswith(("{", "[")):
+        try:
+            decoded = load_strict_json(value)
+        except ValueError:
+            return
+        _assert_no_forbidden_names(decoded)
 
 
-def _replace_json(raw: str, mutate: Any) -> bytes:
+def _replace_json(raw: str | bytes, mutate: Any) -> bytes:
     value = json.loads(raw)
     mutate(value)
-    return canonical_json_bytes(value)
+    return json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
 
 
-def test_openai_request_is_canonical_strict_schema_without_tools_or_prices(
+def _openai_body(cycle: dict[str, Any]) -> dict[str, Any]:
+    value = json.loads(cycle["model_artifacts"]["openai_response_bytes"])
+    assert isinstance(value, dict)
+    return value
+
+
+def _jev_body(cycle: dict[str, Any]) -> dict[str, Any]:
+    value = json.loads(cycle["model_artifacts"]["jev_response_bytes"])
+    assert isinstance(value, dict)
+    return value
+
+
+def _openai_text(response: dict[str, Any]) -> dict[str, Any]:
+    value = json.loads(response["output"][0]["content"][0]["text"])
+    assert isinstance(value, dict)
+    return value
+
+
+def _set_openai_text(response: dict[str, Any], value: object) -> None:
+    response["output"][0]["content"][0]["text"] = canonical_json_bytes(value).decode()
+
+
+def _call(
+    provider: str,
+    cycle: dict[str, Any],
+    evidence: EvidencePacket,
+    brief: ResearchBrief,
+    transport: Any,
+) -> OpenAISuccess | JevSuccess | AdapterFailure:
+    if provider == "openai":
+        return call_openai(evidence, OPENAI_MODEL_ID, transport)
+    return call_jev(brief, evidence, JEV_MODEL_ID, transport)
+
+
+def test_openai_request_uses_responses_text_format_and_frozen_input(
     cycle: dict[str, Any], evidence: EvidencePacket
 ) -> None:
-    request_bytes = build_openai_request(evidence, OPENAI_MODEL)
+    request_bytes = build_openai_request(evidence, OPENAI_MODEL_ID)
     request = load_strict_json(request_bytes)
 
     assert request_bytes == canonical_json_bytes(request)
-    assert set(request) == {"input", "model", "response_format"}
+    assert set(request) == {"input", "model", "text"}
     assert "tools" not in request
-    assert request["model"] == OPENAI_MODEL
+    assert "response_format" not in request
+    assert request["model"] == OPENAI_MODEL_ID
     assert request["input"] == (
         "<evidence>"
         + canonical_json_bytes(evidence.model_dump(mode="json")).decode()
         + "</evidence>"
     )
-    assert request["response_format"]["type"] == "json_schema"
-    assert request["response_format"]["json_schema"]["strict"] is True
-    assert (
-        request["response_format"]["json_schema"]["schema"]["additionalProperties"]
-        is False
-    )
+    assert request["text"]["format"]["type"] == "json_schema"
+    assert request["text"]["format"]["strict"] is True
+    assert request["text"]["format"]["schema"]["additionalProperties"] is False
     _assert_no_forbidden_names(request)
     assert request_bytes == cycle["model_artifacts"]["openai_request_bytes"].encode()
     assert (
@@ -149,59 +211,107 @@ def test_openai_request_is_canonical_strict_schema_without_tools_or_prices(
     )
 
 
-def test_openai_canned_response_maps_to_expected_brief_in_one_call(
+def test_openai_raw_responses_fixture_maps_one_output_text_to_brief(
     cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief
 ) -> None:
     response_bytes = cycle["model_artifacts"]["openai_response_bytes"].encode()
-    transport = FixtureTransport(
-        response_bytes,
-        billed_cost_microdollars=cycle["model_costs_microdollars"]["openai"],
-    )
+    transport = FixtureTransport(response_bytes, billed_cost_microdollars=375_000)
 
-    result = call_openai(evidence, OPENAI_MODEL, transport)
+    result = call_openai(evidence, OPENAI_MODEL_ID, transport)
 
     assert isinstance(result, OpenAISuccess)
     assert result.brief == brief
-    assert (
-        result.request_bytes
-        == cycle["model_artifacts"]["openai_request_bytes"].encode()
-    )
     assert result.response_bytes == response_bytes
-    assert (
-        hashlib.sha256(result.response_bytes).hexdigest()
-        == cycle["expected"]["artifact_sha256"]["openai_response_bytes"]
-    )
     assert result.billed_cost_microdollars == 375_000
     assert transport.calls == [result.request_bytes]
     assert CREDENTIAL_SENTINEL not in repr(result)
 
 
-def test_jev_request_is_exact_price_free_state_and_matches_fixture(
+def test_jev_request_uses_typed_question_map_and_exact_pinned_model(
     cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief
 ) -> None:
-    request_bytes = build_jev_request(brief, evidence, JEV_MODEL)
+    request_bytes = build_jev_request(brief, evidence, JEV_MODEL_ID)
     request = load_strict_json(request_bytes)
 
     assert request_bytes == canonical_json_bytes(request)
-    assert set(request) == {"model", "state", "questions"}
-    assert set(request["state"]) == {
-        "brief",
-        "evidence_sha256",
-        "research_brief_sha256",
-    }
-    assert request["questions"] == [
-        "evidence_sufficiency",
-        "ambiguity",
+    assert set(request) == {"model", "questions", "state"}
+    assert request["model"] == "jev-1.13.0"
+    assert set(request["questions"]) == {
+        "evidence_sufficient",
+        "materially_ambiguous",
         "p_yes",
-        "action (BUY_YES|BUY_NO|ABSTAIN)",
+        "action",
         "confidence",
-    ]
+    }
+    assert request["questions"]["evidence_sufficient"]["type"] == "noul"
+    assert request["questions"]["materially_ambiguous"]["type"] == "noul"
+    assert request["questions"]["p_yes"]["type"] == "score"
+    assert request["questions"]["confidence"]["type"] == "score"
+    assert request["questions"]["action"]["type"] == "choice"
+    assert set(request["questions"]["action"]["criteria"]) == {
+        "BUY_YES",
+        "BUY_NO",
+        "ABSTAIN",
+    }
+    assert all(question["instructions"] for question in request["questions"].values())
     _assert_no_forbidden_names(request)
     assert request_bytes == cycle["model_artifacts"]["jev_request_bytes"].encode()
-    assert (
-        hashlib.sha256(request_bytes).hexdigest()
-        == cycle["expected"]["artifact_sha256"]["jev_request_bytes"]
+
+
+def test_jev_raw_systemone_fixture_maps_answers_to_expected_decision(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief
+) -> None:
+    response_bytes = cycle["model_artifacts"]["jev_response_bytes"].encode()
+    transport = FixtureTransport(response_bytes, billed_cost_microdollars=125_000)
+
+    result = call_jev(brief, evidence, JEV_MODEL_ID, transport)
+
+    assert isinstance(result, JevSuccess)
+    assert result.decision.model_dump(mode="json") == cycle["jev_decision"]
+    assert result.response_bytes == response_bytes
+    assert result.billed_cost_microdollars == 125_000
+    assert transport.calls == [result.request_bytes]
+    assert CREDENTIAL_SENTINEL not in repr(result)
+
+
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    (
+        ("openai", "gpt-5-latest"),
+        ("openai", "gpt-5-preview"),
+        ("openai", "gpt-5-2026-09-29"),
+        ("jev", "jev-latest"),
+        ("jev", "jev-preview"),
+        ("jev", "jev-1.12.0"),
+    ),
+)
+def test_unapproved_or_moving_model_is_input_failure_before_transport(
+    provider: str,
+    model: str,
+    evidence: EvidencePacket,
+    brief: ResearchBrief,
+) -> None:
+    transport = FixtureTransport(b"never sent")
+
+    result = (
+        call_openai(evidence, model, transport)
+        if provider == "openai"
+        else call_jev(brief, evidence, model, transport)
     )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "INPUT_ERROR"
+    assert result.request_bytes == b""
+    assert transport.calls == []
+
+
+def test_direct_builders_reject_unapproved_models(
+    evidence: EvidencePacket, brief: ResearchBrief
+) -> None:
+    with pytest.raises(ValueError, match="approved pinned"):
+        build_openai_request(evidence, "gpt-5-latest")
+    with pytest.raises(ValueError, match="approved pinned"):
+        build_jev_request(brief, evidence, "jev-preview")
 
 
 def test_jev_request_rejects_book_snapshot_at_runtime(
@@ -212,38 +322,67 @@ def test_jev_request_rejects_book_snapshot_at_runtime(
     )
 
     with pytest.raises(TypeError, match="EvidencePacket"):
-        build_jev_request(brief, book, JEV_MODEL)  # type: ignore[arg-type]
+        build_jev_request(brief, book, JEV_MODEL_ID)  # type: ignore[arg-type]
+
+    transport = FixtureTransport(b"never sent")
+    result = call_jev(brief, book, JEV_MODEL_ID, transport)  # type: ignore[arg-type]
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "INPUT_ERROR"
+    assert transport.calls == []
 
 
-def test_jev_canned_response_maps_to_expected_decision_in_one_call(
-    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Ordinary price discussion is allowed in prose.",
+        "A token can be an ordinary word, as can bid and ask.",
+    ),
+)
+def test_prose_words_are_not_treated_as_structured_leakage(
+    evidence: EvidencePacket, text: str
 ) -> None:
-    response_bytes = cycle["model_artifacts"]["jev_response_bytes"].encode()
-    transport = FixtureTransport(
-        response_bytes,
-        billed_cost_microdollars=cycle["model_costs_microdollars"]["jev"],
-    )
+    safe = evidence.model_copy(update={"description": text})
+    build_openai_request(safe, OPENAI_MODEL_ID)
 
-    result = call_jev(brief, evidence, JEV_MODEL, transport)
 
-    assert isinstance(result, JevSuccess)
-    assert result.decision.model_dump(mode="json") == cycle["jev_decision"]
-    assert (
-        result.request_bytes == cycle["model_artifacts"]["jev_request_bytes"].encode()
-    )
-    assert result.response_bytes == response_bytes
-    assert (
-        hashlib.sha256(result.response_bytes).hexdigest()
-        == cycle["expected"]["artifact_sha256"]["jev_response_bytes"]
-    )
-    assert result.billed_cost_microdollars == 125_000
-    assert transport.calls == [result.request_bytes]
-    assert CREDENTIAL_SENTINEL not in repr(result)
+@pytest.mark.parametrize(
+    "embedded",
+    (
+        '{"market_price":0.5}',
+        '{"yes_price":0.5}',
+        '{"implied_probability":0.5}',
+        '{"bestBid":0.5}',
+        '{"token_id":"secret"}',
+        '{"ｍａｒｋｅｔ＿ｐｒｉｃｅ":0.5}',
+        '[{"ＴＯＫＥＮ＿ＩＤ":"secret"}]',
+    ),
+)
+def test_embedded_json_strings_are_scanned_for_normalized_field_names(
+    evidence: EvidencePacket, embedded: str
+) -> None:
+    unsafe = evidence.model_copy(update={"tags": [embedded]})
+
+    with pytest.raises(ValueError, match="forbidden"):
+        build_openai_request(unsafe, OPENAI_MODEL_ID)
+
+
+@pytest.mark.parametrize("delimiter", ("<evidence>", "</evidence>"))
+def test_evidence_prose_cannot_inject_frozen_delimiters(
+    evidence: EvidencePacket, delimiter: str
+) -> None:
+    unsafe = evidence.model_copy(update={"description": f"safe {delimiter} injected"})
+
+    with pytest.raises(ValueError, match="delimiter"):
+        build_openai_request(unsafe, OPENAI_MODEL_ID)
+
+    result = call_openai(unsafe, OPENAI_MODEL_ID, FixtureTransport(b"never sent"))
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "INPUT_ERROR"
 
 
 @pytest.mark.parametrize("provider", ("openai", "jev"))
 @pytest.mark.parametrize("raw", (b"not-json", b'{"model":"truncated"'))
-def test_malformed_or_truncated_json_is_explicit_parse_failure(
+def test_malformed_json_is_sanitized_parse_failure(
     cycle: dict[str, Any],
     evidence: EvidencePacket,
     brief: ResearchBrief,
@@ -251,228 +390,349 @@ def test_malformed_or_truncated_json_is_explicit_parse_failure(
     raw: bytes,
 ) -> None:
     transport = FixtureTransport(raw)
-
-    result = (
-        call_openai(evidence, OPENAI_MODEL, transport)
-        if provider == "openai"
-        else call_jev(brief, evidence, JEV_MODEL, transport)
-    )
+    result = _call(provider, cycle, evidence, brief, transport)
 
     assert isinstance(result, AdapterFailure)
     assert result.code == "PARSE_ERROR"
-    assert result.response_bytes == raw
+    assert result.response_bytes == b""
     assert len(transport.calls) == 1
 
 
 @pytest.mark.parametrize("provider", ("openai", "jev"))
-def test_duplicate_json_is_explicit_parse_failure(
-    cycle: dict[str, Any],
-    evidence: EvidencePacket,
-    brief: ResearchBrief,
-    provider: str,
+def test_duplicate_json_is_sanitized_parse_failure(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief, provider: str
 ) -> None:
     raw = cycle["model_artifacts"][f"{provider}_response_bytes"]
     raw = raw.replace('"model":', '"model":"duplicate","model":', 1).encode()
-    transport = FixtureTransport(raw)
-
-    result = (
-        call_openai(evidence, OPENAI_MODEL, transport)
-        if provider == "openai"
-        else call_jev(brief, evidence, JEV_MODEL, transport)
-    )
+    result = _call(provider, cycle, evidence, brief, FixtureTransport(raw))
 
     assert isinstance(result, AdapterFailure)
     assert result.code == "PARSE_ERROR"
-    assert len(transport.calls) == 1
+    assert result.response_bytes == b""
 
 
 @pytest.mark.parametrize("provider", ("openai", "jev"))
-def test_response_extra_keys_are_explicit_parse_failures(
-    cycle: dict[str, Any],
-    evidence: EvidencePacket,
-    brief: ResearchBrief,
-    provider: str,
+def test_unknown_response_fields_are_parse_failures(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief, provider: str
 ) -> None:
     raw = _replace_json(
         cycle["model_artifacts"][f"{provider}_response_bytes"],
         lambda value: value.update(unexpected=True),
     )
-    transport = FixtureTransport(raw)
-
-    result = (
-        call_openai(evidence, OPENAI_MODEL, transport)
-        if provider == "openai"
-        else call_jev(brief, evidence, JEV_MODEL, transport)
-    )
+    result = _call(provider, cycle, evidence, brief, FixtureTransport(raw))
 
     assert isinstance(result, AdapterFailure)
     assert result.code == "PARSE_ERROR"
 
 
 @pytest.mark.parametrize("provider", ("openai", "jev"))
-def test_wrong_model_is_explicit_model_failure(
-    cycle: dict[str, Any],
-    evidence: EvidencePacket,
-    brief: ResearchBrief,
-    provider: str,
+def test_wrong_response_model_is_explicit_model_failure(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief, provider: str
 ) -> None:
     raw = _replace_json(
         cycle["model_artifacts"][f"{provider}_response_bytes"],
         lambda value: value.update(model="wrong-model"),
     )
-    transport = FixtureTransport(raw)
-
-    result = (
-        call_openai(evidence, OPENAI_MODEL, transport)
-        if provider == "openai"
-        else call_jev(brief, evidence, JEV_MODEL, transport)
-    )
+    result = _call(provider, cycle, evidence, brief, FixtureTransport(raw))
 
     assert isinstance(result, AdapterFailure)
     assert result.code == "MODEL_MISMATCH"
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda r: r.update(status="incomplete"),
+        lambda r: r["output"].append(r["output"][0].copy()),
+        lambda r: r["output"].append({"type": "function_call", "name": "tool"}),
+        lambda r: r["output"][0].update(status="in_progress"),
+        lambda r: r["output"][0]["content"].clear(),
+        lambda r: r["output"][0]["content"].append(
+            {"type": "refusal", "refusal": "no"}
+        ),
+        lambda r: r["output"][0]["content"].append(r["output"][0]["content"][0].copy()),
+        lambda r: r["output"][0]["content"][0]["annotations"].append(
+            {"type": "url_citation"}
+        ),
+        lambda r: r["output"][0]["content"][0]["logprobs"].append({"token": "x"}),
+    ),
+)
+def test_openai_rejects_noncompleted_refusal_tool_or_nonunique_output_text(
+    cycle: dict[str, Any], evidence: EvidencePacket, mutate: Any
+) -> None:
+    response = _openai_body(cycle)
+    mutate(response)
+    result = call_openai(
+        evidence,
+        OPENAI_MODEL_ID,
+        FixtureTransport(
+            canonical_json_bytes(response), billed_cost_microdollars=375_000
+        ),
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "PARSE_ERROR"
+
+
+def test_openai_mismatched_individual_citation_is_citation_failure(
+    cycle: dict[str, Any], evidence: EvidencePacket
+) -> None:
+    response = _openai_body(cycle)
+    output = _openai_text(response)
+    output["cited_facts"][0]["evidence_sha256"] = "0" * 64
+    _set_openai_text(response, output)
+
+    result = call_openai(
+        evidence,
+        OPENAI_MODEL_ID,
+        FixtureTransport(
+            canonical_json_bytes(response), billed_cost_microdollars=375_000
+        ),
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "CITATION_ERROR"
+
+
 def test_openai_invalid_citation_is_explicit_failure(
     cycle: dict[str, Any], evidence: EvidencePacket
 ) -> None:
-    raw = _replace_json(
-        cycle["model_artifacts"]["openai_response_bytes"],
-        lambda value: value["output"].update(evidence_sha256="0" * 64),
-    )
-    value = json.loads(raw)
-    for citation in value["output"]["cited_facts"]:
+    response = _openai_body(cycle)
+    output = _openai_text(response)
+    output["evidence_sha256"] = "0" * 64
+    for citation in output["cited_facts"]:
         citation["evidence_sha256"] = "0" * 64
-    transport = FixtureTransport(
-        canonical_json_bytes(value), billed_cost_microdollars=375_000
-    )
+    _set_openai_text(response, output)
 
-    result = call_openai(evidence, OPENAI_MODEL, transport)
+    result = call_openai(
+        evidence,
+        OPENAI_MODEL_ID,
+        FixtureTransport(
+            canonical_json_bytes(response), billed_cost_microdollars=375_000
+        ),
+    )
 
     assert isinstance(result, AdapterFailure)
     assert result.code == "CITATION_ERROR"
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
+    ("answer_id", "field", "value"),
     (
-        ("p_yes_micros", 1_000_001),
-        ("confidence_micros", -1),
-        ("sufficiency_micros", 1_000_001),
-        ("ambiguity_micros", -1),
-        ("action", "HOLD"),
+        ("evidence_sufficient", "noul", 1.1),
+        ("materially_ambiguous", "noul", -0.1),
+        ("p_yes", "score", float("nan")),
+        ("p_yes", "score", 1.1),
+        ("confidence", "score", -0.1),
+        ("action", "choice", "HOLD"),
+        ("action", "confidence", 1.1),
     ),
 )
-def test_jev_range_and_action_failures_are_explicit(
+def test_jev_answer_bounds_and_action_are_strict(
     cycle: dict[str, Any],
     evidence: EvidencePacket,
     brief: ResearchBrief,
+    answer_id: str,
     field: str,
     value: object,
 ) -> None:
-    raw = _replace_json(
-        cycle["model_artifacts"]["jev_response_bytes"],
-        lambda response: response["result"].update({field: value}),
+    response = _jev_body(cycle)
+    response["answers"][answer_id][field] = value
+    raw = json.dumps(response, allow_nan=True, separators=(",", ":")).encode()
+    result = call_jev(
+        brief,
+        evidence,
+        JEV_MODEL_ID,
+        FixtureTransport(raw, billed_cost_microdollars=125_000),
     )
-    transport = FixtureTransport(raw, billed_cost_microdollars=125_000)
-
-    result = call_jev(brief, evidence, JEV_MODEL, transport)
 
     assert isinstance(result, AdapterFailure)
     assert result.code == "PARSE_ERROR"
 
 
-def test_jev_action_question_cannot_omit_abstain(
-    evidence: EvidencePacket, brief: ResearchBrief
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda r: r["answers"].pop("confidence"),
+        lambda r: r["answers"].update(extra={"type": "noul", "noul": 0.5}),
+        lambda r: r["answers"]["action"]["probabilities"].pop("ABSTAIN"),
+        lambda r: r["answers"]["action"]["probabilities"].update(HOLD=0.0),
+        lambda r: r["answers"]["action"]["probabilities"].update(
+            BUY_YES=0.5, BUY_NO=0.5, ABSTAIN=0.5
+        ),
+        lambda r: r["answers"]["p_yes"]["legend"].update({"1": "detached rubric"}),
+        lambda r: r["answers"]["p_yes"].update(type="noul"),
+        lambda r: r["usage"].update(input_tokens=True),
+        lambda r: r["usage"].update(output_tokens=-1),
+        lambda r: r["usage"].update(extra=1),
+    ),
+)
+def test_jev_requires_exact_answer_ids_types_distributions_rubrics_and_usage(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief, mutate: Any
 ) -> None:
-    request = load_strict_json(build_jev_request(brief, evidence, JEV_MODEL))
+    response = _jev_body(cycle)
+    mutate(response)
+    result = call_jev(
+        brief,
+        evidence,
+        JEV_MODEL_ID,
+        FixtureTransport(
+            json.dumps(response, separators=(",", ":"), sort_keys=True).encode(),
+            billed_cost_microdollars=125_000,
+        ),
+    )
 
-    assert "ABSTAIN" in request["questions"][3]
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "PARSE_ERROR"
 
 
 @pytest.mark.parametrize("provider", ("openai", "jev"))
-def test_http_failure_is_explicit_and_called_once(
-    cycle: dict[str, Any],
-    evidence: EvidencePacket,
-    brief: ResearchBrief,
-    provider: str,
+def test_non_2xx_body_and_headers_never_enter_failure(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief, provider: str
 ) -> None:
-    transport = FixtureTransport(b'{"error":"unavailable"}', status_code=503)
-
-    result = (
-        call_openai(evidence, OPENAI_MODEL, transport)
-        if provider == "openai"
-        else call_jev(brief, evidence, JEV_MODEL, transport)
+    secret_body = (
+        f'{{"error":"Bearer {CREDENTIAL_SENTINEL}; '
+        f'Cookie: session={CREDENTIAL_SENTINEL}; api_key={CREDENTIAL_SENTINEL}"}}'
+    ).encode()
+    result = _call(
+        provider,
+        cycle,
+        evidence,
+        brief,
+        FixtureTransport(secret_body, status_code=503, billed_cost_microdollars=7),
     )
 
     assert isinstance(result, AdapterFailure)
     assert result.code == "HTTP_ERROR"
     assert result.status_code == 503
-    assert len(transport.calls) == 1
+    assert result.response_bytes == b""
+    assert result.billed_cost_microdollars == 7
+    assert CREDENTIAL_SENTINEL not in repr(result)
+    assert CREDENTIAL_SENTINEL not in result.message
 
 
 @pytest.mark.parametrize("provider", ("openai", "jev"))
-def test_timeout_is_explicit_called_once_and_sanitized(
-    evidence: EvidencePacket, brief: ResearchBrief, provider: str
+def test_timeout_is_one_call_and_sanitized(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief, provider: str
 ) -> None:
     transport = FixtureTransport(
         b"", error=TimeoutError(f"timeout with {CREDENTIAL_SENTINEL}")
     )
-
-    result = (
-        call_openai(evidence, OPENAI_MODEL, transport)
-        if provider == "openai"
-        else call_jev(brief, evidence, JEV_MODEL, transport)
-    )
+    result = _call(provider, cycle, evidence, brief, transport)
 
     assert isinstance(result, AdapterFailure)
     assert result.code == "TIMEOUT"
     assert result.response_bytes == b""
     assert len(transport.calls) == 1
     assert CREDENTIAL_SENTINEL not in repr(result)
-    assert CREDENTIAL_SENTINEL not in result.message
 
 
+@pytest.mark.parametrize(
+    "malformed",
+    (
+        None,
+        object(),
+        {"status_code": 200},
+        TransportResponse(
+            status_code=True,
+            headers={},
+            raw_bytes=b"{}",
+            retrieved_at=datetime(2026, 10, 3, tzinfo=UTC),
+            billed_cost_microdollars=0,
+        ),
+        TransportResponse(
+            status_code=200,
+            headers=[],  # type: ignore[arg-type]
+            raw_bytes=b"{}",
+            retrieved_at=datetime(2026, 10, 3, tzinfo=UTC),
+            billed_cost_microdollars=0,
+        ),
+        TransportResponse(
+            status_code=200,
+            headers={"x": 1},  # type: ignore[dict-item]
+            raw_bytes=b"{}",
+            retrieved_at=datetime(2026, 10, 3, tzinfo=UTC),
+            billed_cost_microdollars=0,
+        ),
+        TransportResponse(
+            status_code=200,
+            headers={},
+            raw_bytes=bytearray(b"{}"),  # type: ignore[arg-type]
+            retrieved_at=datetime(2026, 10, 3, tzinfo=UTC),
+            billed_cost_microdollars=0,
+        ),
+        TransportResponse(
+            status_code=200,
+            headers={},
+            raw_bytes=b"{}",
+            retrieved_at=datetime(2026, 10, 3),
+            billed_cost_microdollars=0,
+        ),
+        TransportResponse(
+            status_code=200,
+            headers={},
+            raw_bytes=b"{}",
+            retrieved_at=datetime(2026, 10, 3, tzinfo=UTC),
+            billed_cost_microdollars=INT64_MAX + 1,
+        ),
+    ),
+)
 @pytest.mark.parametrize("provider", ("openai", "jev"))
-def test_billed_cost_must_match_strict_provider_envelope(
+def test_malformed_transport_objects_become_provider_failure(
     cycle: dict[str, Any],
     evidence: EvidencePacket,
     brief: ResearchBrief,
     provider: str,
+    malformed: object,
+) -> None:
+    result = _call(
+        provider,
+        cycle,
+        evidence,
+        brief,
+        FixtureTransport(b"", response=malformed),
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "PROVIDER_ERROR"
+    assert result.response_bytes == b""
+    assert result.billed_cost_microdollars == 0
+
+
+@pytest.mark.parametrize("provider", ("openai", "jev"))
+def test_transport_cost_is_authoritative_exact_int64(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief, provider: str
 ) -> None:
     raw = cycle["model_artifacts"][f"{provider}_response_bytes"].encode()
-    transport = FixtureTransport(raw, billed_cost_microdollars=1)
-
-    result = (
-        call_openai(evidence, OPENAI_MODEL, transport)
-        if provider == "openai"
-        else call_jev(brief, evidence, JEV_MODEL, transport)
+    result = _call(
+        provider,
+        cycle,
+        evidence,
+        brief,
+        FixtureTransport(raw, billed_cost_microdollars=INT64_MAX),
     )
 
-    assert isinstance(result, AdapterFailure)
-    assert result.code == "COST_MISMATCH"
-    assert result.billed_cost_microdollars == 1
-    assert len(transport.calls) == 1
+    assert isinstance(result, OpenAISuccess | JevSuccess)
+    assert result.billed_cost_microdollars == INT64_MAX
 
 
-def test_openai_rejects_forbidden_schema_name_used_as_nested_value(
-    evidence: EvidencePacket,
+def test_score_to_micros_uses_deterministic_half_up_rounding(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief
 ) -> None:
-    unsafe = evidence.model_copy(update={"tags": ["token_id"]})
-
-    with pytest.raises(ValueError, match="forbidden"):
-        build_openai_request(unsafe, OPENAI_MODEL)
-
-
-def test_openai_mismatched_individual_citation_is_citation_failure(
-    cycle: dict[str, Any], evidence: EvidencePacket
-) -> None:
-    value = json.loads(cycle["model_artifacts"]["openai_response_bytes"])
-    value["output"]["cited_facts"][0]["evidence_sha256"] = "0" * 64
-    transport = FixtureTransport(
-        canonical_json_bytes(value), billed_cost_microdollars=375_000
+    response = _jev_body(cycle)
+    response["answers"]["p_yes"]["score"] = 0.7000005
+    response["answers"]["p_yes"]["probabilities"] = {
+        "0": 0.2999995,
+        "1": 0.7000005,
+    }
+    result = call_jev(
+        brief,
+        evidence,
+        JEV_MODEL_ID,
+        FixtureTransport(
+            json.dumps(response, separators=(",", ":"), sort_keys=True).encode()
+        ),
     )
 
-    result = call_openai(evidence, OPENAI_MODEL, transport)
-
-    assert isinstance(result, AdapterFailure)
-    assert result.code == "CITATION_ERROR"
+    assert isinstance(result, JevSuccess)
+    assert result.decision.p_yes_micros == 700_001
