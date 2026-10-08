@@ -292,15 +292,53 @@ class OpenAITextConfig(StrictModel):
     verbosity: Literal["low", "medium", "high"] | None = None
 
 
-class OpenAIResponse(StrictModel):
-    """Reviewed closed-world OpenAI Responses API envelope.
+class OpenAIAccessPrograms(StrictModel):
+    cyber: Literal["standard", "daybreak_blue", "daybreak_red"]
 
-    ``access_programs`` is required but restricted to null because this experiment
-    requests no programmatic or tool capability.
-    """
+
+class OpenAIPromptCacheDiagnosticsCacheMiss(StrictModel):
+    cache_missed_tokens: NonNegativeInt
+    reason: Literal[
+        "model_changed",
+        "prompt_cache_key_changed",
+        "tools_changed",
+        "text_format_changed",
+        "reasoning_effort_changed",
+        "verbosity_changed",
+        "context_compacted",
+        "input_changed",
+        "service_tier_changed",
+    ]
+    type: Literal["cache_miss"]
+    comparison_reusable_tokens: NonNegativeInt | None = None
+
+
+class OpenAIPromptCacheDiagnosticsCacheHit(StrictModel):
+    type: Literal["cache_hit"]
+
+
+class OpenAIPromptCacheDiagnosticsComparisonResponseNotFound(StrictModel):
+    type: Literal["comparison_response_not_found"]
+
+
+class OpenAIPromptCacheDiagnosticsUnavailable(StrictModel):
+    type: Literal["unavailable"]
+
+
+OpenAIPromptCacheDiagnostics = Annotated[
+    OpenAIPromptCacheDiagnosticsCacheMiss
+    | OpenAIPromptCacheDiagnosticsCacheHit
+    | OpenAIPromptCacheDiagnosticsComparisonResponseNotFound
+    | OpenAIPromptCacheDiagnosticsUnavailable,
+    Field(discriminator="type"),
+]
+
+
+class OpenAIResponse(StrictModel):
+    """Reviewed closed-world OpenAI Responses API envelope."""
 
     id: NonEmptyStr
-    access_programs: None
+    access_programs: OpenAIAccessPrograms | None = None
     object: Literal["response"]
     created_at: UnixNumber
     model: Literal["gpt-5-2025-08-07"]
@@ -317,12 +355,14 @@ class OpenAIResponse(StrictModel):
     moderation: None = None
     output_text: str | None = None
     prompt: None = None
+    prompt_cache_diagnostics: OpenAIPromptCacheDiagnostics | None = None
     prompt_cache_key: str | None = None
     prompt_cache_options: None = None
     prompt_cache_retention: Literal["in_memory", "24h"] | None = None
     safety_identifier: Annotated[str, StringConstraints(max_length=64)] | None = None
     service_tier: (
-        Literal["auto", "default", "fast", "flex", "priority", "scale"] | None
+        Literal["auto", "default", "fast", "flex", "priority", "scale", "ultrafast"]
+        | None
     ) = None
     top_logprobs: Annotated[int, Field(strict=True, ge=0, le=20)] | None = None
     user: str | None = None

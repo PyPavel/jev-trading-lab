@@ -874,6 +874,7 @@ def _openai_optional_fields(cycle: dict[str, Any]) -> dict[str, object]:
         "output_text": _official_message(response)["content"][0]["text"],
         "previous_response_id": None,
         "prompt": None,
+        "prompt_cache_diagnostics": None,
         "prompt_cache_key": None,
         "prompt_cache_options": None,
         "prompt_cache_retention": "in_memory",
@@ -1127,6 +1128,7 @@ def test_openai_uses_official_pinned_gpt5_snapshot_and_rejects_old_id(
         "output_text",
         "previous_response_id",
         "prompt",
+        "prompt_cache_diagnostics",
         "prompt_cache_key",
         "prompt_cache_options",
         "prompt_cache_retention",
@@ -1173,20 +1175,275 @@ def test_openai_accepts_current_official_response_fields_together_without_store(
     assert result.brief == brief
 
 
-def test_openai_requires_access_programs_and_allows_only_null(
+@pytest.mark.parametrize(
+    "access_programs",
+    (
+        None,
+        {"cyber": "standard"},
+        {"cyber": "daybreak_blue"},
+        {"cyber": "daybreak_red"},
+    ),
+)
+def test_openai_accepts_current_access_programs_variants(
+    cycle: dict[str, Any],
+    evidence: EvidencePacket,
+    brief: ResearchBrief,
+    access_programs: object,
+) -> None:
+    response = _official_openai_response(cycle)
+    response["access_programs"] = access_programs
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, OpenAISuccess)
+    assert result.brief == brief
+
+
+def test_openai_access_programs_is_optional_in_current_official_schema(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief
+) -> None:
+    response = _official_openai_response(cycle)
+    response.pop("access_programs")
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, OpenAISuccess)
+    assert result.brief == brief
+
+
+@pytest.mark.parametrize(
+    "access_programs",
+    (
+        {},
+        {"cyber": "unofficial"},
+        {"cyber": "standard", "extra": True},
+        "standard",
+    ),
+)
+def test_openai_rejects_invalid_access_programs(
+    cycle: dict[str, Any], evidence: EvidencePacket, access_programs: object
+) -> None:
+    response = _official_openai_response(cycle)
+    response["access_programs"] = access_programs
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "PARSE_ERROR"
+
+
+_PROMPT_CACHE_MISS_REASONS = (
+    "model_changed",
+    "prompt_cache_key_changed",
+    "tools_changed",
+    "text_format_changed",
+    "reasoning_effort_changed",
+    "verbosity_changed",
+    "context_compacted",
+    "input_changed",
+    "service_tier_changed",
+)
+
+
+@pytest.mark.parametrize(
+    "diagnostics",
+    (
+        None,
+        {"type": "cache_hit"},
+        {"type": "comparison_response_not_found"},
+        {"type": "unavailable"},
+        *(
+            {"type": "cache_miss", "cache_missed_tokens": 0, "reason": reason}
+            for reason in _PROMPT_CACHE_MISS_REASONS
+        ),
+        {
+            "type": "cache_miss",
+            "cache_missed_tokens": INT64_MAX,
+            "reason": "input_changed",
+            "comparison_reusable_tokens": None,
+        },
+        {
+            "type": "cache_miss",
+            "cache_missed_tokens": 1,
+            "reason": "input_changed",
+            "comparison_reusable_tokens": INT64_MAX,
+        },
+    ),
+)
+def test_openai_accepts_current_prompt_cache_diagnostics_as_audit_metadata(
+    cycle: dict[str, Any],
+    evidence: EvidencePacket,
+    brief: ResearchBrief,
+    diagnostics: object,
+) -> None:
+    response = _official_openai_response(cycle)
+    response["prompt_cache_diagnostics"] = diagnostics
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, OpenAISuccess)
+    assert result.brief == brief
+
+
+def test_openai_prompt_cache_diagnostics_is_optional(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief
+) -> None:
+    response = _official_openai_response(cycle)
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, OpenAISuccess)
+    assert result.brief == brief
+
+
+@pytest.mark.parametrize(
+    "diagnostics",
+    (
+        {"type": "cache_hit", "extra": True},
+        {"type": "unknown"},
+        {"type": "cache_miss"},
+        {"type": "cache_miss", "cache_missed_tokens": True, "reason": "input_changed"},
+        {"type": "cache_miss", "cache_missed_tokens": -1, "reason": "input_changed"},
+        {
+            "type": "cache_miss",
+            "cache_missed_tokens": INT64_MAX + 1,
+            "reason": "input_changed",
+        },
+        {
+            "type": "cache_miss",
+            "cache_missed_tokens": 0,
+            "reason": "unknown",
+        },
+        {
+            "type": "cache_miss",
+            "cache_missed_tokens": 0,
+            "reason": "input_changed",
+            "comparison_reusable_tokens": -1,
+        },
+        {
+            "type": "cache_miss",
+            "cache_missed_tokens": 0,
+            "reason": "input_changed",
+            "comparison_reusable_tokens": INT64_MAX + 1,
+        },
+    ),
+)
+def test_openai_rejects_invalid_prompt_cache_diagnostics(
+    cycle: dict[str, Any], evidence: EvidencePacket, diagnostics: object
+) -> None:
+    response = _official_openai_response(cycle)
+    response["prompt_cache_diagnostics"] = diagnostics
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "PARSE_ERROR"
+
+
+def test_openai_response_covers_all_current_official_generated_fields() -> None:
+    official_fields = {
+        "id",
+        "access_programs",
+        "created_at",
+        "error",
+        "incomplete_details",
+        "instructions",
+        "metadata",
+        "model",
+        "object",
+        "output",
+        "parallel_tool_calls",
+        "temperature",
+        "tool_choice",
+        "tools",
+        "top_p",
+        "background",
+        "completed_at",
+        "conversation",
+        "max_output_tokens",
+        "max_tool_calls",
+        "moderation",
+        "previous_response_id",
+        "prompt",
+        "prompt_cache_diagnostics",
+        "prompt_cache_key",
+        "prompt_cache_options",
+        "prompt_cache_retention",
+        "reasoning",
+        "safety_identifier",
+        "service_tier",
+        "status",
+        "text",
+        "top_logprobs",
+        "truncation",
+        "usage",
+        "user",
+    }
+
+    assert official_fields <= OpenAIResponse.model_fields.keys()
+
+
+def test_openai_current_optional_envelope_fields_default_to_none() -> None:
+    required = {
+        "id",
+        "object",
+        "created_at",
+        "model",
+        "status",
+        "output",
+        "parallel_tool_calls",
+        "tool_choice",
+        "tools",
+        "usage",
+    }
+
+    for name, field in OpenAIResponse.model_fields.items():
+        if name not in required:
+            assert not field.is_required(), name
+            assert field.default is None, name
+
+
+def test_openai_semantically_scans_access_programs_for_credential_reflection(
     cycle: dict[str, Any], evidence: EvidencePacket
 ) -> None:
-    missing = _official_openai_response(cycle)
-    missing.pop("access_programs")
-    enabled = _official_openai_response(cycle)
-    enabled["access_programs"] = {"cyber": "standard"}
+    response = _official_openai_response(cycle)
+    response["access_programs"] = {"cyber": "opaque-reflected-secret"}
+    body = _wire_json(response).replace(b"secret", b"\\u0073ecret")
 
-    for response in (missing, enabled):
-        result = call_openai(
-            evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
-        )
-        assert isinstance(result, AdapterFailure)
-        assert result.code == "PARSE_ERROR"
+    result = call_openai(
+        evidence,
+        OPENAI_MODEL_ID,
+        FixtureTransport(body, sensitive_values=(b"opaque-reflected-secret",)),
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "CREDENTIAL_REFLECTION"
+
+
+def test_openai_accepts_current_ultrafast_service_tier(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief
+) -> None:
+    response = _official_openai_response(cycle)
+    response["service_tier"] = "ultrafast"
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, OpenAISuccess)
+    assert result.brief == brief
 
 
 def test_openai_output_text_must_equal_sole_strict_research_brief(
