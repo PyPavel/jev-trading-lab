@@ -859,7 +859,6 @@ def _official_openai_response(cycle: dict[str, Any]) -> dict[str, Any]:
 
 
 def _openai_optional_fields(cycle: dict[str, Any]) -> dict[str, object]:
-    response = _openai_body(cycle)
     return {
         "background": False,
         "completed_at": 1_780_488_031,
@@ -871,7 +870,6 @@ def _openai_optional_fields(cycle: dict[str, Any]) -> dict[str, object]:
         "max_tool_calls": None,
         "metadata": {},
         "moderation": None,
-        "output_text": _official_message(response)["content"][0]["text"],
         "previous_response_id": None,
         "prompt": None,
         "prompt_cache_diagnostics": None,
@@ -881,7 +879,6 @@ def _openai_optional_fields(cycle: dict[str, Any]) -> dict[str, object]:
         "reasoning": None,
         "safety_identifier": None,
         "service_tier": "fast",
-        "store": None,
         "temperature": None,
         "text": None,
         "top_logprobs": None,
@@ -895,13 +892,18 @@ def _official_message(response: dict[str, Any]) -> dict[str, Any]:
     return next(item for item in response["output"] if item["type"] == "message")
 
 
-def test_openai_accepts_official_completed_envelope_with_reasoning_and_absent_metadata(
+def test_openai_accepts_exact_official_completed_envelope_with_reasoning_content(
     cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief
 ) -> None:
     response = _official_openai_response(cycle)
-    content = _official_message(response)["content"][0]
-    content.pop("annotations")
-    content.pop("logprobs")
+    _official_message(response)["phase"] = "final_answer"
+    response["output"][0].update(
+        content=[
+            {"type": "reasoning_text", "text": "Never derive the brief from this."}
+        ],
+        encrypted_content="opaque-reasoning-payload",
+        status="incomplete",
+    )
 
     result = call_openai(
         evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
@@ -909,6 +911,67 @@ def test_openai_accepts_official_completed_envelope_with_reasoning_and_absent_me
 
     assert isinstance(result, OpenAISuccess)
     assert result.brief == brief
+
+
+@pytest.mark.parametrize("field", ("status", "usage"))
+def test_openai_optional_wire_status_and_usage_validate_but_call_requires_them(
+    cycle: dict[str, Any], evidence: EvidencePacket, field: str
+) -> None:
+    response = _official_openai_response(cycle)
+    response.pop(field)
+
+    envelope = OpenAIResponse.model_validate(response)
+    assert getattr(envelope, field) is None
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "PARSE_ERROR"
+
+
+def test_openai_rejects_missing_required_output_text_annotations(
+    cycle: dict[str, Any], evidence: EvidencePacket
+) -> None:
+    response = _official_openai_response(cycle)
+    _official_message(response)["content"][0].pop("annotations")
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "PARSE_ERROR"
+
+
+def test_openai_rejects_missing_required_cache_write_tokens(
+    cycle: dict[str, Any], evidence: EvidencePacket
+) -> None:
+    response = _official_openai_response(cycle)
+    response["usage"]["input_tokens_details"].pop("cache_write_tokens")
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "PARSE_ERROR"
+
+
+@pytest.mark.parametrize("synthetic", ("store", "output_text"))
+def test_openai_rejects_synthetic_sdk_only_response_fields(
+    cycle: dict[str, Any], evidence: EvidencePacket, synthetic: str
+) -> None:
+    response = _official_openai_response(cycle)
+    response[synthetic] = None
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "PARSE_ERROR"
 
 
 @pytest.mark.parametrize(
@@ -1125,7 +1188,6 @@ def test_openai_uses_official_pinned_gpt5_snapshot_and_rejects_old_id(
         "max_tool_calls",
         "metadata",
         "moderation",
-        "output_text",
         "previous_response_id",
         "prompt",
         "prompt_cache_diagnostics",
@@ -1135,7 +1197,6 @@ def test_openai_uses_official_pinned_gpt5_snapshot_and_rejects_old_id(
         "reasoning",
         "safety_identifier",
         "service_tier",
-        "store",
         "temperature",
         "text",
         "top_logprobs",
@@ -1160,12 +1221,11 @@ def test_openai_accepts_each_current_optional_response_field(
     assert isinstance(result, OpenAISuccess)
 
 
-def test_openai_accepts_current_official_response_fields_together_without_store(
+def test_openai_accepts_current_official_response_fields_together(
     cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief
 ) -> None:
     response = _official_openai_response(cycle)
     response.update(_openai_optional_fields(cycle))
-    response.pop("store")
 
     result = call_openai(
         evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
@@ -1392,7 +1452,7 @@ def test_openai_response_covers_all_current_official_generated_fields() -> None:
         "user",
     }
 
-    assert official_fields <= OpenAIResponse.model_fields.keys()
+    assert official_fields == OpenAIResponse.model_fields.keys()
 
 
 def test_openai_current_optional_envelope_fields_default_to_none() -> None:
@@ -1401,12 +1461,10 @@ def test_openai_current_optional_envelope_fields_default_to_none() -> None:
         "object",
         "created_at",
         "model",
-        "status",
         "output",
         "parallel_tool_calls",
         "tool_choice",
         "tools",
-        "usage",
     }
 
     for name, field in OpenAIResponse.model_fields.items():
@@ -1446,19 +1504,19 @@ def test_openai_accepts_current_ultrafast_service_tier(
     assert result.brief == brief
 
 
-def test_openai_output_text_must_equal_sole_strict_research_brief(
-    cycle: dict[str, Any], evidence: EvidencePacket
+@pytest.mark.parametrize("phase", (None, "commentary", "final_answer"))
+def test_openai_accepts_official_message_phase_variants(
+    cycle: dict[str, Any], evidence: EvidencePacket, phase: str | None
 ) -> None:
-    for value in ("{}", "mismatched"):
-        response = _official_openai_response(cycle)
-        response["output_text"] = value
+    response = _official_openai_response(cycle)
+    if phase is not None:
+        _official_message(response)["phase"] = phase
 
-        result = call_openai(
-            evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
-        )
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
 
-        assert isinstance(result, AdapterFailure)
-        assert result.code == "PARSE_ERROR"
+    assert isinstance(result, OpenAISuccess)
 
 
 @pytest.mark.parametrize(
@@ -1620,6 +1678,25 @@ def test_unicode_escaped_sensitive_value_in_reasoning_summary_is_rejected(
     response = _official_openai_response(cycle)
     response["output"][0]["summary"] = [
         {"type": "summary_text", "text": "opaque-reflected-secret"}
+    ]
+    body = _wire_json(response).replace(b"secret", b"\\u0073ecret")
+
+    result = call_openai(
+        evidence,
+        OPENAI_MODEL_ID,
+        FixtureTransport(body, sensitive_values=(b"opaque-reflected-secret",)),
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "CREDENTIAL_REFLECTION"
+
+
+def test_unicode_escaped_sensitive_value_in_reasoning_content_is_rejected(
+    cycle: dict[str, Any], evidence: EvidencePacket
+) -> None:
+    response = _official_openai_response(cycle)
+    response["output"][0]["content"] = [
+        {"type": "reasoning_text", "text": "opaque-reflected-secret"}
     ]
     body = _wire_json(response).replace(b"secret", b"\\u0073ecret")
 

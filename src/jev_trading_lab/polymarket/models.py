@@ -208,8 +208,8 @@ class ResearchBrief(StrictModel):
 class OpenAIInputTokenDetails(StrictModel):
     """Raw Responses API input-token detail counts."""
 
+    cache_write_tokens: NonNegativeInt
     cached_tokens: NonNegativeInt
-    cache_write_tokens: NonNegativeInt | None = None
 
 
 class OpenAIOutputTokenDetails(StrictModel):
@@ -237,9 +237,9 @@ class OpenAIUsage(StrictModel):
 class OpenAIOutputText(StrictModel):
     """One completed raw Responses API output_text content part."""
 
-    type: Literal["output_text"]
+    annotations: list[object]
     text: NonEmptyStr
-    annotations: list[object] | None = None
+    type: Literal["output_text"]
     logprobs: list[object] | None = None
 
     @model_validator(mode="after")
@@ -257,10 +257,16 @@ class OpenAIOutputMessage(StrictModel):
     status: Literal["completed"]
     role: Literal["assistant"]
     content: Annotated[list[OpenAIOutputText], Field(min_length=1, max_length=1)]
+    phase: Literal["commentary", "final_answer"] | None = None
 
 
 class OpenAIReasoningSummary(StrictModel):
     type: Literal["summary_text"]
+    text: Annotated[str, StringConstraints(max_length=20_000)]
+
+
+class OpenAIReasoningContent(StrictModel):
+    type: Literal["reasoning_text"]
     text: Annotated[str, StringConstraints(max_length=20_000)]
 
 
@@ -269,9 +275,10 @@ class OpenAIReasoningItem(StrictModel):
 
     type: Literal["reasoning"]
     id: NonEmptyStr
-    status: Literal["completed"] | None = None
     summary: Annotated[list[OpenAIReasoningSummary], Field(max_length=16)]
+    content: Annotated[list[OpenAIReasoningContent], Field(max_length=16)] | None = None
     encrypted_content: str | None = None
+    status: Literal["in_progress", "completed", "incomplete"] | None = None
 
 
 class OpenAIReasoningConfig(StrictModel):
@@ -342,7 +349,12 @@ class OpenAIResponse(StrictModel):
     object: Literal["response"]
     created_at: UnixNumber
     model: Literal["gpt-5-2025-08-07"]
-    status: Literal["completed"]
+    status: (
+        Literal[
+            "completed", "failed", "in_progress", "cancelled", "queued", "incomplete"
+        ]
+        | None
+    ) = None
     error: None = None
     incomplete_details: None = None
     instructions: None = None
@@ -353,7 +365,6 @@ class OpenAIResponse(StrictModel):
     max_tool_calls: NonNegativeInt | None = None
     metadata: dict[str, str] | None = None
     moderation: None = None
-    output_text: str | None = None
     prompt: None = None
     prompt_cache_diagnostics: OpenAIPromptCacheDiagnostics | None = None
     prompt_cache_key: str | None = None
@@ -373,14 +384,13 @@ class OpenAIResponse(StrictModel):
     parallel_tool_calls: bool
     previous_response_id: str | None = None
     reasoning: OpenAIReasoningConfig | None = None
-    store: bool | None = None
     temperature: Annotated[float, Field(strict=True, ge=0.0, le=2.0)] | None = None
     top_p: Annotated[float, Field(strict=True, ge=0.0, le=1.0)] | None = None
     text: OpenAITextConfig | None = None
     tool_choice: Literal["auto", "none"]
     tools: Annotated[list[Any], Field(max_length=0)]
     truncation: Literal["auto", "disabled"] | None = None
-    usage: OpenAIUsage
+    usage: OpenAIUsage | None = None
 
     @model_validator(mode="after")
     def require_one_completed_message(self) -> Self:
@@ -391,11 +401,6 @@ class OpenAIResponse(StrictModel):
             raise ValueError(
                 "response must contain exactly one completed assistant message"
             )
-        message_text = messages[0].content[0].text
-        if self.output_text is not None:
-            if self.output_text != message_text:
-                raise ValueError("output_text must equal the sole message output_text")
-            ResearchBrief.model_validate_json(self.output_text)
         metadata = self.metadata or {}
         if len(metadata) > 16 or any(
             len(key) > 64 or len(value) > 512 for key, value in metadata.items()
@@ -1207,8 +1212,15 @@ def validate_feasibility_fixture(fixture: dict[str, Any]) -> None:
         response_brief = openai_response_brief(openai_response)
     except (ValidationError, ValueError) as error:
         raise ValueError("OpenAI response output_text is invalid") from error
-    if openai_response.model != openai_request["model"] or response_brief != brief:
-        raise ValueError("OpenAI response does not match brief")
+    if (
+        openai_response.status != "completed"
+        or openai_response.usage is None
+        or openai_response.error is not None
+        or openai_response.incomplete_details is not None
+        or openai_response.model != openai_request["model"]
+        or response_brief != brief
+    ):
+        raise ValueError("OpenAI response does not match completed brief")
 
     brief_hash = _canonical_model_sha(brief)
     expected_jev_request = load_strict_json(

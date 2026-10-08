@@ -567,6 +567,13 @@ def call_openai(
         )
     try:
         envelope = OpenAIResponse.model_validate(decoded)
+        if (
+            envelope.status != "completed"
+            or envelope.usage is None
+            or envelope.error is not None
+            or envelope.incomplete_details is not None
+        ):
+            raise ValueError("OpenAI response is not a completed success")
         raw_brief = load_strict_json(envelope.message().content[0].text)
     except (ValidationError, TypeError, ValueError):
         return _parse_failure(
