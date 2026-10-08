@@ -251,12 +251,14 @@ class ArmResult(StrictModel):
     disposition: Disposition
     entry_side: Literal["YES", "NO"] | None
     entry_vwap_micros: Micros | None
+    entry_notional_microdollars: NonNegativeInt | None
     quantity: NonNegativeInt
     fees_microdollars: NonNegativeInt
     initial_cash_microdollars: NonNegativeInt
     final_cash_microdollars: NonNegativeInt
     mark_micros: Micros | None
     payout_micros: Literal[0, 1_000_000] | None
+    valuation_notional_microdollars: NonNegativeInt | None
     trading_pnl_microdollars: SignedInt
     economic_pnl_microdollars: SignedInt
     model_cost_microdollars: NonNegativeInt
@@ -301,6 +303,12 @@ class ArmResult(StrictModel):
             raise ValueError("fill disposition and entry side must occur together")
         if filled != (self.entry_vwap_micros is not None):
             raise ValueError("fill disposition and entry VWAP must occur together")
+        if filled != (self.entry_notional_microdollars is not None):
+            raise ValueError("fill disposition and entry notional must occur together")
+        if filled != (self.valuation_notional_microdollars is not None):
+            raise ValueError(
+                "fill disposition and valuation notional must occur together"
+            )
         if not filled:
             if self.fees_microdollars != 0:
                 raise ValueError("an arm without an entry cannot have execution fees")
@@ -321,25 +329,48 @@ class ArmResult(StrictModel):
         if self.quantity == 0:
             expected_trading = 0
         else:
+            if (
+                self.entry_vwap_micros is None
+                or self.entry_notional_microdollars is None
+                or self.valuation_notional_microdollars is None
+            ):
+                raise ValueError("filled economics require exact notionals")
+            if (
+                self.entry_vwap_micros
+                != (self.entry_notional_microdollars + self.quantity - 1)
+                // self.quantity
+            ):
+                raise ValueError(
+                    "entry VWAP must be the ceiling of exact entry notional"
+                )
             market_yes_valuation = (
                 self.payout_micros
                 if self.payout_micros is not None
                 else self.mark_micros
             )
-            if market_yes_valuation is None or self.entry_vwap_micros is None:
-                raise ValueError("filled economics require a valuation and entry VWAP")
+            if market_yes_valuation is None:
+                raise ValueError("filled economics require a valuation")
             held_token_valuation = (
                 market_yes_valuation
                 if self.entry_side == "YES"
                 else MICROS_PER_UNIT - market_yes_valuation
             )
-            funded_notional = (
-                self.quantity * self.entry_vwap_micros + self.fees_microdollars
-            )
+            if self.payout_micros is not None:
+                if self.valuation_notional_microdollars != (
+                    self.quantity * held_token_valuation
+                ):
+                    raise ValueError("payout notional does not match terminal payout")
+            elif (
+                self.valuation_notional_microdollars // self.quantity
+                != held_token_valuation
+            ):
+                raise ValueError("mark must floor exact valuation notional")
+            funded_notional = self.entry_notional_microdollars + self.fees_microdollars
             if funded_notional > self.initial_cash_microdollars:
                 raise ValueError("filled notional plus entry fees exceeds initial cash")
             expected_trading = (
-                self.quantity * (held_token_valuation - self.entry_vwap_micros)
+                self.valuation_notional_microdollars
+                - self.entry_notional_microdollars
                 - self.fees_microdollars
             )
         if self.trading_pnl_microdollars != expected_trading:

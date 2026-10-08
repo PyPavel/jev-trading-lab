@@ -871,6 +871,71 @@ def test_randomized_sizing_matches_exhaustive_small_reference() -> None:
         assert size_quantity(snapshot, side, probability, policy) == expected
 
 
+def test_terminal_bound_uses_exact_notional_for_rounding_counterexample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upper = 95_506
+    snapshot = book(
+        bids=[(1, upper)],
+        asks=[(104_144, 30_413), (949_094, upper - 30_413)],
+    )
+    policy = economics(
+        cash=INT64_MAX - 29_284_403_580,
+        entry_fee=4_839,
+        exit_fee=0,
+        slippage=0,
+        sigma=0,
+    )
+    decision = JevDecision(
+        p_yes_micros=1_000_000,
+        action="BUY_YES",
+        confidence_micros=1_000_000,
+        sufficiency_micros=1_000_000,
+        ambiguity_micros=0,
+        rationale="bounded",
+    )
+    quote_calls = 0
+    original_quote_side = paper.quote_side
+
+    def counted_quote_side(*args: object, **kwargs: object) -> object:
+        nonlocal quote_calls
+        quote_calls += 1
+        return original_quote_side(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(paper, "size_quantity", lambda *args, **kwargs: upper)
+    monkeypatch.setattr(paper, "quote_side", counted_quote_side)
+
+    result = evaluate_ai_arm(
+        snapshot,
+        decision,
+        policy,
+        resolution=1,
+        model_cost_microdollars=0,
+    )
+
+    rounded_island = quote_side(snapshot, "YES", 77_865, liquidity="ASK")
+    assert rounded_island.vwap_micros is not None
+    assert (
+        policy.starting_cash_microdollars
+        + 77_865 * (1_000_000 - rounded_island.vwap_micros - 4_839)
+        == INT64_MAX
+    )
+    assert result.quantity == 77_863
+    assert result.quantity != 77_865
+    assert result.entry_notional_microdollars == 48_201_841_772
+    assert result.trading_pnl_microdollars == 29_284_379_171
+    assert result.final_cash_microdollars == 9_223_372_036_854_751_398
+    next_entry = quote_side(snapshot, "YES", result.quantity + 1, liquidity="ASK")
+    assert (
+        policy.starting_cash_microdollars
+        + (result.quantity + 1) * 1_000_000
+        - next_entry.notional_microdollars
+        - (result.quantity + 1) * policy.entry_fee_pp_micros
+        > INT64_MAX
+    )
+    assert quote_calls <= 5
+
+
 def test_randomized_terminal_bound_matches_exhaustive_contract_oracle() -> None:
     rng = random.Random(20261008)
     for _ in range(200):
@@ -899,14 +964,14 @@ def test_randomized_terminal_bound_matches_exhaustive_contract_oracle() -> None:
             if entry.filled_quantity != quantity or entry.vwap_micros is None:
                 continue
             mark = quote_side(snapshot, side, quantity, liquidity="BID")
-            held_valuation = (
-                (mark.vwap_micros or 0)
+            valuation_notional = (
+                mark.notional_microdollars
                 if payout is None
-                else (payout if side == "YES" else 1_000_000 - payout)
+                else quantity * (payout if side == "YES" else 1_000_000 - payout)
             )
             fees = quantity * (policy.entry_fee_pp_micros + policy.exit_fee_pp_micros)
-            funded = quantity * entry.vwap_micros + fees
-            trading = quantity * (held_valuation - entry.vwap_micros) - fees
+            funded = entry.notional_microdollars + fees
+            trading = valuation_notional - entry.notional_microdollars - fees
             final_cash = policy.starting_cash_microdollars + trading
             economic = trading - model_cost
             if (
@@ -917,6 +982,62 @@ def test_randomized_terminal_bound_matches_exhaustive_contract_oracle() -> None:
                 and -(2**63) <= trading <= INT64_MAX
                 and 0 <= final_cash <= INT64_MAX
                 and -(2**63) <= economic <= INT64_MAX
+            ):
+                expected = quantity
+        assert (
+            paper._terminal_quantity(
+                book=snapshot,
+                side=side,
+                upper=upper,
+                policy=policy,
+                payout=payout,
+                model_cost_microdollars=model_cost,
+            )
+            == expected
+        )
+
+
+def test_randomized_terminal_bound_matches_exhaustive_int64_extremes() -> None:
+    rng = random.Random(20261009)
+    for _ in range(200):
+        upper = rng.randint(1, 50)
+        best_bid = rng.randint(0, 400_000)
+        best_ask = rng.randint(max(best_bid + 1, 500_000), 900_000)
+        snapshot = book(
+            bids=[(best_bid, upper)],
+            asks=[(best_ask, upper)],
+        )
+        policy = economics(
+            entry_fee=rng.randint(0, 1_000_000),
+            exit_fee=rng.randint(0, 1_000_000),
+            slippage=0,
+            sigma=0,
+            cash=rng.choice((rng.randint(0, 10_000_000), INT64_MAX)),
+        )
+        side = rng.choice(("YES", "NO"))
+        payout = rng.choice((0, 1_000_000, None))
+        model_cost = rng.choice((0, rng.randint(0, 10_000_000), INT64_MAX))
+        expected = 0
+        for quantity in range(1, upper + 1):
+            entry = quote_side(snapshot, side, quantity, liquidity="ASK")
+            mark = quote_side(snapshot, side, quantity, liquidity="BID")
+            valuation_notional = (
+                mark.notional_microdollars
+                if payout is None
+                else quantity * (payout if side == "YES" else 1_000_000 - payout)
+            )
+            fees = quantity * (policy.entry_fee_pp_micros + policy.exit_fee_pp_micros)
+            trading = valuation_notional - entry.notional_microdollars - fees
+            if (
+                entry.filled_quantity == quantity
+                and entry.notional_microdollars <= INT64_MAX
+                and valuation_notional <= INT64_MAX
+                and fees <= INT64_MAX
+                and entry.notional_microdollars + fees
+                <= policy.starting_cash_microdollars
+                and -(2**63) <= trading <= INT64_MAX
+                and 0 <= policy.starting_cash_microdollars + trading <= INT64_MAX
+                and -(2**63) <= trading - model_cost <= INT64_MAX
             ):
                 expected = quantity
         assert (

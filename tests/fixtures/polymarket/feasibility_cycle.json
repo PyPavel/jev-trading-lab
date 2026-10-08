@@ -69,7 +69,9 @@
         "quantity": 500,
         "signal_action": "BUY_YES",
         "signal_probability_micros": 700000,
-        "trading_pnl_microdollars": 224000000
+        "trading_pnl_microdollars": 224000000,
+        "entry_notional_microdollars": 271000000,
+        "valuation_notional_microdollars": 500000000
       },
       "deterministic": {
         "arm": "DETERMINISTIC",
@@ -89,7 +91,9 @@
         "quantity": 0,
         "signal_action": "BUY_YES",
         "signal_probability_micros": 550000,
-        "trading_pnl_microdollars": 0
+        "trading_pnl_microdollars": 0,
+        "entry_notional_microdollars": null,
+        "valuation_notional_microdollars": null
       }
     },
     "artifact_sha256": {
@@ -102,12 +106,12 @@
       "precheck_book_bytes": "713d3fb67870aee4e040f01fa01f8ace553929786dcc1d47a1a37850b1c6dccd"
     },
     "canonical_sha256": {
-      "ai_arm": "03f46b28a583ed20c4b4dc10212802ce0aaebf80c5d2f403e54b6dcb527fad11",
-      "deterministic_arm": "68d8105f606448712bbe958c7f6466a897e6d5b447452c830bd78a8b4e6091db",
+      "ai_arm": "adb93cf076afc26d7d5c82bd4fa5f267ff9eb49b28886f4149fc40cdecc380f3",
+      "deterministic_arm": "7483fd86e0442c534f7c534281d9ad0056bd6b38cbaec84660dc4333c5738fa2",
       "evidence": "4b934973b5c17fe4155f387071693efc89af15c01f506020c4e4e4f6501abc2c",
       "execution_book": "16d84d8eea9d75e78082b10cb277072b83ee83050dc550a9ee3da60665f41731",
       "jev_decision": "2608122c13ed8da0ab5e664db4f01d3839e24bb973a0994dd0f09c778aafc259",
-      "observation": "909423b9b2ede24e6860d13c8b46563a3095d69437b3f9cc4858613af1b87ee3",
+      "observation": "b3a45535d6dec2e14a745aad6ddc19dd02f6c1836064cf825f720bd21b9401cf",
       "precheck_book": "efb7e9aceabaddbd32e5a8ead57c03af7084283aef209a4d05cd218e4bf3e89e",
       "research_brief": "6b00387c3dbc8d9d01f75166c6f339b145b23fbe9c20b4dfe4162959c029d1d2"
     },
@@ -130,7 +134,9 @@
         "quantity": 500,
         "signal_action": "BUY_YES",
         "signal_probability_micros": 700000,
-        "trading_pnl_microdollars": 224000000
+        "trading_pnl_microdollars": 224000000,
+        "entry_notional_microdollars": 271000000,
+        "valuation_notional_microdollars": 500000000
       },
       "baseline_brier_micros": 235225,
       "baseline_probability_micros": 515000,
@@ -153,7 +159,9 @@
         "quantity": 0,
         "signal_action": "BUY_YES",
         "signal_probability_micros": 550000,
-        "trading_pnl_microdollars": 0
+        "trading_pnl_microdollars": 0,
+        "entry_notional_microdollars": null,
+        "valuation_notional_microdollars": null
       },
       "evidence_sha256": "ece2c0bf0810baedbf74bd09c6539452c61464abdcaea45ed36c69d10a56e88f",
       "execution_book_sha256": "bbd889f6781e3f6c87bf4da012f3266c958bb8fb2e519273ddcf614e837637c9",

@@ -53,7 +53,7 @@ Build only the path below. Do not add a generic opportunity framework, stock str
 - `BookSnapshot`: market/token IDs, retrieval time, source SHA-256, and integer-microprice/integer-quantity bid/ask levels in deterministic order.
 - `ResearchBrief`: cited facts, arguments for/against, contradictions, missing evidence, and quality flag. Every citation names the evidence SHA-256.
 - `JevDecision`: `p_yes_micros` in `[0, 1_000_000]`, action in `BUY_YES|BUY_NO|ABSTAIN`, confidence micros, sufficiency micros, ambiguity micros, and concise rationale.
-- `ArmResult`: arm, signal probability/action, disposition, entry side/VWAP/quantity/fees, initial/final cash, mark or payout, trading/economic P&L, model cost, and forecast fields.
+- `ArmResult`: arm, signal probability/action, disposition, entry side/VWAP/exact notional/quantity/fees, initial/final cash, mark or payout and exact valuation notional, trading/economic P&L, model cost, and forecast fields.
 - `ObservationResult`: IDs/hashes/timestamps plus exactly one AI and one deterministic `ArmResult`, shared market baseline probability, resolution if known, and paired P&L/forecast deltas. Paired P&L deltas persist the exact AI-minus-deterministic signed int64 value, or `null` when that exact difference is outside signed int64; they are never clamped.
 - Identity formulas are fixed and minimal: `opportunity_id` is SHA-256 of canonical JSON containing `policy_version`, `market_id`, and `cutoff_at`; `observation_id` is SHA-256 of canonical JSON containing `opportunity_id`, `evidence_sha256`, `execution_book_sha256`, and `policy_version`.
 - The fixture contains raw Gamma bytes, sanitized evidence, causal pre-cutoff history, precheck and execution books, canned OpenAI/Jev request-response bytes, actual model costs, a resolution payout, and expected canonical hashes/results. One fixture is enough.
@@ -102,7 +102,7 @@ uv run mypy src
 - Search positive integer quantity downward from the minimum of: `floor(0.005 * equity / max(sigma_p, 0.05))`, `floor(0.10 * equity / side_vwap)`, `floor(0.05 * displayed_side_depth)`, and available arm cash. If no quantity passes edge after VWAP/costs, disposition is `NO_EDGE`.
 - Fill only captured ask levels in order. Never exceed captured quantity; cancel remainder. Use exact integer/fixed-point arithmetic from `core.values`, with one explicit rounding direction per conversion.
 - Give AI and deterministic arms separate `$10,000` starting capital. Charge OpenAI/Jev costs only to AI; charge no synthetic model cost to control. Report trading P&L separately from economic P&L.
-- At resolution, `P&L = q * (payout - entry_vwap) - entry_fees - exit_fees`; on unresolved observations, conservatively mark from executable bid depth and mark excess quantity at zero.
+- Entry VWAP remains the upward-rounded reporting/edge value, but funding and P&L use the exact captured entry notional persisted on `ArmResult`. At resolution, `P&L = q * payout - entry_notional - entry_fees - exit_fees`; on unresolved observations, exact executable-bid notional values captured depth and excess quantity at zero.
 - Forecast baseline is the shared execution-book midpoint. If payout is known, calculate AI/control/baseline Brier and paired deltas; otherwise emit `null` scores with `PENDING_RESOLUTION`.
 
 **Tests first:**

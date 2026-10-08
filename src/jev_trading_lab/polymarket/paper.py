@@ -44,7 +44,7 @@ class Quote:
 
 
 def _ceil_div(numerator: int, denominator: int) -> int:
-    return (numerator + denominator - 1) // denominator
+    return -(-numerator // denominator)
 
 
 def _require_int(value: object, label: str, *, minimum: int, maximum: int) -> int:
@@ -290,6 +290,49 @@ def size_quantity(
     return lower
 
 
+def _notional_segments(
+    levels: list[BookLevel], upper: int
+) -> list[tuple[int, int, int, int]]:
+    """Return inclusive quantity ranges with affine exact book notional."""
+
+    segments: list[tuple[int, int, int, int]] = []
+    cumulative_quantity = 0
+    cumulative_notional = 0
+    for level in levels:
+        if cumulative_quantity == upper:
+            break
+        end = min(upper, cumulative_quantity + level.quantity)
+        intercept = cumulative_notional - level.price_micros * cumulative_quantity
+        segments.append((cumulative_quantity + 1, end, level.price_micros, intercept))
+        cumulative_notional += (end - cumulative_quantity) * level.price_micros
+        cumulative_quantity = end
+    if cumulative_quantity < upper:
+        segments.append((cumulative_quantity + 1, upper, 0, cumulative_notional))
+    return segments
+
+
+def _constrain_affine(
+    lower: int,
+    upper: int,
+    *,
+    slope: int,
+    intercept: int,
+    minimum: int,
+    maximum: int,
+) -> tuple[int, int] | None:
+    """Intersect an integer interval with minimum <= slope*q+intercept <= maximum."""
+
+    if slope > 0:
+        lower = max(lower, _ceil_div(minimum - intercept, slope))
+        upper = min(upper, (maximum - intercept) // slope)
+    elif slope < 0:
+        lower = max(lower, _ceil_div(maximum - intercept, slope))
+        upper = min(upper, (minimum - intercept) // slope)
+    elif not minimum <= intercept <= maximum:
+        return None
+    return (lower, upper) if lower <= upper else None
+
+
 def _terminal_quantity(
     *,
     book: BookSnapshot,
@@ -299,51 +342,19 @@ def _terminal_quantity(
     payout: int | None,
     model_cost_microdollars: int,
 ) -> int:
-    """Return the largest quantity whose persisted terminal integers fit int64."""
+    """Return the largest quantity whose exact terminal integers fit int64."""
 
-    upper = min(upper, sum(level.quantity for level in _levels(book, side, "ASK")))
+    entry_levels = _levels(book, side, "ASK")
+    upper = min(upper, sum(level.quantity for level in entry_levels))
     if upper == 0:
         return 0
     fee_per_contract = policy.entry_fee_pp_micros + policy.exit_fee_pp_micros
-
-    def values(quantity: int) -> tuple[int, int, int, int, int]:
-        entry = quote_side(book, side, quantity, liquidity="ASK")
-        if entry.vwap_micros is None:
-            raise ValueError("positive quantity requires entry VWAP")
-        if payout is None:
-            mark = quote_side(book, side, quantity, liquidity="BID")
-            held_valuation = mark.vwap_micros or 0
-            mark_notional = mark.notional_microdollars
-        else:
-            held_valuation = payout if side == "YES" else MICROS - payout
-            mark_notional = 0
-        fees = quantity * fee_per_contract
-        funded = quantity * entry.vwap_micros + fees
-        trading = quantity * (held_valuation - entry.vwap_micros) - fees
-        return entry.notional_microdollars, mark_notional, fees, funded, trading
-
-    def derived_values_fit(quantity: int) -> bool:
-        entry_notional, mark_notional, fees, funded, _ = values(quantity)
-        return (
-            entry_notional <= INT64_MAX
-            and mark_notional <= INT64_MAX
-            and fees <= INT64_MAX
-            and funded <= policy.starting_cash_microdollars
-            and funded <= INT64_MAX
-        )
-
-    if not derived_values_fit(1):
-        return 0
-    lower = 1
-    basic_upper = upper
-    while lower < basic_upper:
-        candidate = (lower + basic_upper + 1) // 2
-        if derived_values_fit(candidate):
-            lower = candidate
-        else:
-            basic_upper = candidate - 1
-    upper = lower
-
+    entry_segments = _notional_segments(entry_levels, upper)
+    if payout is None:
+        valuation_segments = _notional_segments(_levels(book, side, "BID"), upper)
+    else:
+        held_payout = payout if side == "YES" else MICROS - payout
+        valuation_segments = [(1, upper, held_payout, 0)]
     trading_lower = max(
         INT64_MIN,
         -policy.starting_cash_microdollars,
@@ -354,58 +365,56 @@ def _terminal_quantity(
         INT64_MAX - policy.starting_cash_microdollars,
         INT64_MAX + model_cost_microdollars,
     )
-
-    def trading(quantity: int) -> int:
-        return values(quantity)[-1]
-
-    def terminal_values_fit(quantity: int) -> bool:
-        return trading_lower <= trading(quantity) <= trading_upper
-
-    if terminal_values_fit(upper):
-        return upper
-    if upper <= 10_000:
-        return next(
-            (
-                quantity
-                for quantity in range(upper - 1, 0, -1)
-                if terminal_values_fit(quantity)
-            ),
-            0,
+    largest = 0
+    entry_index = 0
+    valuation_index = 0
+    while entry_index < len(entry_segments) and valuation_index < len(
+        valuation_segments
+    ):
+        entry_start, entry_end, entry_slope, entry_intercept = entry_segments[
+            entry_index
+        ]
+        valuation_start, valuation_end, valuation_slope, valuation_intercept = (
+            valuation_segments[valuation_index]
         )
-
-    # Entry VWAP is nondecreasing and executable-bid mark is nonincreasing, so
-    # terminal trading P&L is discrete-concave. Find its peak, then the largest
-    # point in the permitted interval on either monotonic branch.
-    left = 1
-    right = upper
-    while left < right:
-        candidate = (left + right) // 2
-        if trading(candidate + 1) >= trading(candidate):
-            left = candidate + 1
-        else:
-            right = candidate
-    peak = left
-
-    left = peak
-    right = upper
-    while left < right:
-        candidate = (left + right + 1) // 2
-        if trading(candidate) >= trading_lower:
-            left = candidate
-        else:
-            right = candidate - 1
-    if terminal_values_fit(left):
-        return left
-
-    left = 1
-    right = peak
-    while left < right:
-        candidate = (left + right + 1) // 2
-        if trading(candidate) <= trading_upper:
-            left = candidate
-        else:
-            right = candidate - 1
-    return left if terminal_values_fit(left) else 0
+        interval: tuple[int, int] | None = (
+            max(entry_start, valuation_start),
+            min(entry_end, valuation_end),
+        )
+        constraints = (
+            (entry_slope, entry_intercept, 0, INT64_MAX),
+            (valuation_slope, valuation_intercept, 0, INT64_MAX),
+            (fee_per_contract, 0, 0, INT64_MAX),
+            (
+                entry_slope + fee_per_contract,
+                entry_intercept,
+                0,
+                policy.starting_cash_microdollars,
+            ),
+            (
+                valuation_slope - entry_slope - fee_per_contract,
+                valuation_intercept - entry_intercept,
+                trading_lower,
+                trading_upper,
+            ),
+        )
+        for slope, intercept, minimum, maximum in constraints:
+            if interval is None:
+                break
+            interval = _constrain_affine(
+                *interval,
+                slope=slope,
+                intercept=intercept,
+                minimum=minimum,
+                maximum=maximum,
+            )
+        if interval is not None:
+            largest = max(largest, interval[1])
+        if entry_end == min(entry_end, valuation_end):
+            entry_index += 1
+        if valuation_end == min(entry_end, valuation_end):
+            valuation_index += 1
+    return largest
 
 
 def _preferred_side(book: BookSnapshot, probability_micros: int) -> Side:
@@ -464,12 +473,14 @@ def _arm(
             disposition=disposition,
             entry_side=None,
             entry_vwap_micros=None,
+            entry_notional_microdollars=None,
             quantity=0,
             fees_microdollars=0,
             initial_cash_microdollars=policy.starting_cash_microdollars,
             final_cash_microdollars=policy.starting_cash_microdollars,
             mark_micros=None,
             payout_micros=payout if probability_micros is not None else None,
+            valuation_notional_microdollars=None,
             trading_pnl_microdollars=0,
             economic_pnl_microdollars=-model_cost_microdollars,
             model_cost_microdollars=model_cost_microdollars,
@@ -508,14 +519,16 @@ def _arm(
     if payout is None:
         mark_quote = quote_side(book, side, quantity, liquidity="BID")
         held_valuation = mark_quote.vwap_micros or 0
+        valuation_notional = mark_quote.notional_microdollars
         market_yes_mark = held_valuation if side == "YES" else MICROS - held_valuation
         exit_fee = fee_microdollars(quantity, policy.exit_fee_pp_micros)
     else:
         market_yes_mark = None
         held_valuation = payout if side == "YES" else MICROS - payout
+        valuation_notional = quantity * held_valuation
         exit_fee = fee_microdollars(quantity, policy.exit_fee_pp_micros)
     fees = entry_fee + exit_fee
-    trading_pnl = quantity * (held_valuation - entry.vwap_micros) - fees
+    trading_pnl = valuation_notional - entry.notional_microdollars - fees
     score = brier_micros(probability_micros, payout) if payout is not None else None
     return ArmResult(
         arm=arm,
@@ -524,12 +537,14 @@ def _arm(
         disposition="FILLED",
         entry_side=side,
         entry_vwap_micros=entry.vwap_micros,
+        entry_notional_microdollars=entry.notional_microdollars,
         quantity=quantity,
         fees_microdollars=fees,
         initial_cash_microdollars=policy.starting_cash_microdollars,
         final_cash_microdollars=policy.starting_cash_microdollars + trading_pnl,
         mark_micros=market_yes_mark,
         payout_micros=payout,
+        valuation_notional_microdollars=valuation_notional,
         trading_pnl_microdollars=trading_pnl,
         economic_pnl_microdollars=trading_pnl - model_cost_microdollars,
         model_cost_microdollars=model_cost_microdollars,
