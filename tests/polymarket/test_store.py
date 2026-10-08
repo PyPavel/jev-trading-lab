@@ -33,6 +33,7 @@ from jev_trading_lab.polymarket.store import (
     StoreConflictError,
     StoreCorruptError,
     StoreSecurityError,
+    failure_artifact_from_adapter,
     load_observation,
     record_observation,
 )
@@ -242,21 +243,8 @@ def _failure_metadata(
         billed_cost_microdollars=cost,
         status_code=503,
     )
-    return canonical_json_bytes(
-        {
-            "provider": failure.provider,
-            "code": failure.code,
-            "message": failure.message,
-            "request_sha256": hashlib.sha256(failure.request_bytes).hexdigest(),
-            "response_sha256": failure.response_sha256,
-            "response_byte_length": failure.response_byte_length,
-            "retrieved_at": failure.retrieved_at.isoformat().replace("+00:00", "Z")
-            if failure.retrieved_at is not None
-            else None,
-            "billed_cost_microdollars": failure.billed_cost_microdollars,
-            "status_code": failure.status_code,
-        }
-    )
+    artifact = failure_artifact_from_adapter(failure)
+    return canonical_json_bytes(artifact.model_dump(mode="json"))
 
 
 def _failure_artifacts(
@@ -418,6 +406,15 @@ def test_failure_paths_record_and_replay_sanitized_metadata(
     failure = artifacts[-1]
     failure_value = json.loads(failure.payload)
     failure_value["code"] = failure_code
+    provider = failure_value["provider"]
+    if failure_code == "MODEL_MISMATCH":
+        failure_value["message"] = (
+            f"{provider} response model does not match the approved snapshot"
+        )
+        failure_value["status_code"] = 200
+    elif failure_code == "PARSE_ERROR":
+        failure_value["message"] = f"{provider} response is not strict JSON"
+        failure_value["status_code"] = 200
     artifacts[-1] = ArtifactToFreeze(
         kind=failure.kind,
         payload=canonical_json_bytes(failure_value),
@@ -443,6 +440,113 @@ def test_failure_paths_record_and_replay_sanitized_metadata(
         replay.result.ai.economic_pnl_microdollars
         == -replay.result.ai.model_cost_microdollars
     )
+
+
+_FAILURE_VARIANTS = (
+    "INPUT_ERROR",
+    "PROVIDER_ERROR",
+    "TIMEOUT",
+    "HTTP_ERROR",
+    "PARSE_ERROR",
+    "MODEL_MISMATCH",
+    "CREDENTIAL_REFLECTION",
+)
+
+
+@pytest.mark.parametrize("openai_failed", (True, False))
+@pytest.mark.parametrize("failure_code", _FAILURE_VARIANTS)
+def test_each_adapter_failure_variant_roundtrips_canonical_metadata(
+    tmp_path: Path,
+    cycle: dict[str, Any],
+    openai_failed: bool,
+    failure_code: str,
+) -> None:
+    result, artifacts, _raw_failure = _failure_artifacts(
+        cycle, openai_failed=openai_failed
+    )
+    value = json.loads(artifacts[-1].payload)
+    provider = value["provider"]
+    value["code"] = failure_code
+    if failure_code in {"INPUT_ERROR", "PROVIDER_ERROR", "TIMEOUT"}:
+        messages = {
+            "INPUT_ERROR": f"{provider} request input is invalid",
+            "PROVIDER_ERROR": f"{provider} transport returned invalid data",
+            "TIMEOUT": f"{provider} transport timed out",
+        }
+        value.update(
+            message=messages[failure_code],
+            response_sha256=None,
+            response_byte_length=0,
+            retrieved_at=None,
+            billed_cost_microdollars=0,
+            status_code=None,
+        )
+        prior_cost = 0 if openai_failed else cycle["model_costs_microdollars"]["openai"]
+        result = _failure_result(
+            cycle, openai_failed=openai_failed, model_cost=prior_cost
+        )
+    elif failure_code == "HTTP_ERROR":
+        value["message"] = f"{provider} returned HTTP status 503"
+    elif failure_code == "PARSE_ERROR":
+        value.update(message=f"{provider} response is not strict JSON", status_code=200)
+    elif failure_code == "MODEL_MISMATCH":
+        value.update(
+            message=f"{provider} response model does not match the approved snapshot",
+            status_code=200,
+        )
+    else:
+        value["message"] = f"{provider} response contained credential-like data"
+    item = artifacts[-1]
+    artifacts[-1] = ArtifactToFreeze(
+        kind=item.kind,
+        payload=canonical_json_bytes(value),
+        source_uri_label=item.source_uri_label,
+        retrieved_at=item.retrieved_at,
+        predecessor_stage_sha256=item.predecessor_stage_sha256,
+    )
+    artifacts = _retarget(artifacts, result)
+    output = tmp_path / f"{provider}-{failure_code.lower()}"
+
+    assert record_observation(output, result, artifacts) == result
+    replay = load_observation(output, result.observation_id)
+
+    failure = replay.typed_artifacts[artifacts[-1].kind]
+    assert isinstance(failure, FailureArtifact)
+    assert failure.code == failure_code
+    assert failure.message == value["message"]
+
+
+@pytest.mark.parametrize(
+    "mutation", ("request_hash", "message", "response_consistency", "http_status")
+)
+def test_forged_failure_provenance_rejects_before_journal_write(
+    tmp_path: Path, cycle: dict[str, Any], mutation: str
+) -> None:
+    output = tmp_path / "output"
+    result, artifacts, _raw_failure = _failure_artifacts(cycle, openai_failed=True)
+    value = json.loads(artifacts[-1].payload)
+    if mutation == "request_hash":
+        value["request_sha256"] = "0" * 64
+    elif mutation == "message":
+        value["message"] = "openai attacker supplied diagnostic"
+    elif mutation == "response_consistency":
+        value["response_sha256"] = None
+    else:
+        value["status_code"] = 200
+    item = artifacts[-1]
+    artifacts[-1] = ArtifactToFreeze(
+        kind=item.kind,
+        payload=canonical_json_bytes(value),
+        source_uri_label=item.source_uri_label,
+        retrieved_at=item.retrieved_at,
+        predecessor_stage_sha256=item.predecessor_stage_sha256,
+    )
+
+    with pytest.raises(ValueError, match="failure|request|response|status"):
+        record_observation(output, result, artifacts)
+
+    assert not (output / "artifacts.jsonl").exists()
+    assert not (output / "results.jsonl").exists()
 
 
 @pytest.mark.parametrize("openai_failed", (True, False))
@@ -922,6 +1026,58 @@ def test_retry_rejects_invalid_artifact_orphan_without_mutation(
     assert (output / "results.jsonl").read_bytes() == b""
 
 
+def _corrupt_second_stage_predecessor(output: Path) -> None:
+    journal = output / "artifacts.jsonl"
+    lines = _journal_lines(journal)
+    value = json.loads(lines[1])
+    value["predecessor_stage_sha256"] = "0" * 64
+    lines[1] = canonical_json_bytes(value)
+    journal.write_bytes(b"\n".join(lines) + b"\n")
+    journal.chmod(0o600)
+
+
+def test_corrupt_orphan_a_blocks_unrelated_observation_b_without_mutation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    output = tmp_path / "output"
+    orphan = _result(cycle, "orphan-a")
+    _leave_durable_artifact_orphan(
+        monkeypatch, output, orphan, _retarget(_artifacts(cycle), orphan)
+    )
+    _corrupt_second_stage_predecessor(output)
+    before = (
+        (output / "artifacts.jsonl").read_bytes(),
+        (output / "results.jsonl").read_bytes(),
+    )
+    unrelated = _result(cycle, "unrelated-b")
+
+    with pytest.raises(StoreCorruptError, match="predecessor"):
+        record_observation(output, unrelated, _retarget(_artifacts(cycle), unrelated))
+
+    assert (output / "artifacts.jsonl").read_bytes() == before[0]
+    assert (output / "results.jsonl").read_bytes() == before[1]
+
+
+def test_corrupt_completed_a_blocks_unrelated_observation_b_without_mutation(
+    tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    output = tmp_path / "output"
+    completed = _result(cycle, "completed-a")
+    record_observation(output, completed, _retarget(_artifacts(cycle), completed))
+    _corrupt_second_stage_predecessor(output)
+    before = (
+        (output / "artifacts.jsonl").read_bytes(),
+        (output / "results.jsonl").read_bytes(),
+    )
+    unrelated = _result(cycle, "unrelated-b")
+
+    with pytest.raises(StoreCorruptError, match="predecessor"):
+        record_observation(output, unrelated, _retarget(_artifacts(cycle), unrelated))
+
+    assert (output / "artifacts.jsonl").read_bytes() == before[0]
+    assert (output / "results.jsonl").read_bytes() == before[1]
+
+
 def test_retry_fsyncs_existing_identical_result_after_prior_fsync_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cycle: dict[str, Any]
 ) -> None:
@@ -1271,6 +1427,77 @@ def test_configured_fixture_secret_rejects_without_leaking(
         )
 
     assert sentinel not in repr(caught.value).encode()
+    assert not (output / "artifacts.jsonl").exists()
+    assert not (output / "results.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    "gamma_payload,sentinel",
+    (
+        (b'{"\\u0041uthorization":"Basic top-secret"}', None),
+        (b'{"auth_token":"top-secret"}', None),
+        (b'{"Cookie":"session=top-secret"}', None),
+        (b'{"api-key":"top-secret"}', None),
+        (b'{"description":"\\u0053ECRET-SENTINEL"}', b"secret-sentinel"),
+    ),
+)
+def test_raw_gamma_semantic_secrets_reject_before_publish_without_leaking(
+    tmp_path: Path,
+    cycle: dict[str, Any],
+    gamma_payload: bytes,
+    sentinel: bytes | None,
+) -> None:
+    output = tmp_path / "output"
+    result = _result(cycle)
+    artifacts = _artifacts(cycle)
+    first = artifacts[0]
+    artifacts[0] = ArtifactToFreeze(
+        kind=first.kind,
+        payload=gamma_payload,
+        source_uri_label=first.source_uri_label,
+        retrieved_at=first.retrieved_at,
+        predecessor_stage_sha256=None,
+    )
+    artifacts = _retarget(artifacts, result)
+
+    with pytest.raises(StoreSecurityError) as caught:
+        record_observation(
+            output,
+            result,
+            artifacts,
+            forbidden_secret_values=(sentinel,) if sentinel is not None else (),
+        )
+
+    assert "top-secret" not in repr(caught.value)
+    assert "secret-sentinel" not in repr(caught.value).casefold()
+    assert not (output / "blobs").exists()
+    assert not (output / "artifacts.jsonl").exists()
+    assert not (output / "results.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    "gamma_payload", (b"not json", b'{"id":1,"id":2}', b'["not", "an", "object"]')
+)
+def test_raw_gamma_requires_strict_json_object_before_publish(
+    tmp_path: Path, cycle: dict[str, Any], gamma_payload: bytes
+) -> None:
+    output = tmp_path / "output"
+    result = _result(cycle)
+    artifacts = _artifacts(cycle)
+    first = artifacts[0]
+    artifacts[0] = ArtifactToFreeze(
+        kind=first.kind,
+        payload=gamma_payload,
+        source_uri_label=first.source_uri_label,
+        retrieved_at=first.retrieved_at,
+        predecessor_stage_sha256=None,
+    )
+    artifacts = _retarget(artifacts, result)
+
+    with pytest.raises((ValueError, StoreSecurityError), match="Gamma|JSON|structured"):
+        record_observation(output, result, artifacts)
+
+    assert not (output / "blobs").exists()
     assert not (output / "artifacts.jsonl").exists()
     assert not (output / "results.jsonl").exists()
 

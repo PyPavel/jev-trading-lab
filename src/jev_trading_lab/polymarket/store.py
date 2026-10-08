@@ -23,8 +23,10 @@ from jev_trading_lab.persistence.blobs import BlobError, BlobRef, BlobStore
 from jev_trading_lab.polymarket.ai import (
     JEV_MODEL_ID,
     OPENAI_MODEL_ID,
+    AdapterFailure,
     build_jev_request,
     build_openai_request,
+    is_canonical_failure_message,
 )
 from jev_trading_lab.polymarket.models import (
     INT64_MAX,
@@ -60,6 +62,7 @@ _CREDENTIAL_KEYS = frozenset(
         "apikey",
         "openaiapikey",
         "typesafeapikey",
+        "authtoken",
     }
 )
 
@@ -136,9 +139,46 @@ class FailureArtifact(UtcModel):
     status_code: Annotated[int, Field(strict=True, ge=100, le=599)] | None
 
     @model_validator(mode="after")
-    def require_provider_message(self) -> Self:
-        if not self.message.startswith(f"{self.provider} "):
-            raise ValueError("failure message must be canonical provider metadata")
+    def require_canonical_metadata(self) -> Self:
+        if not is_canonical_failure_message(
+            self.provider, self.code, self.message, self.status_code
+        ):
+            raise ValueError("failure message is not canonical adapter metadata")
+        has_response = self.response_sha256 is not None
+        if has_response != (self.response_byte_length > 0):
+            raise ValueError("failure response hash and length are inconsistent")
+        if self.code == "HTTP_ERROR":
+            if (
+                self.status_code is None
+                or 200 <= self.status_code < 300
+                or not has_response
+                or self.retrieved_at is None
+            ):
+                raise ValueError("HTTP failure metadata is inconsistent")
+        elif self.code in {
+            "PARSE_ERROR",
+            "MODEL_MISMATCH",
+            "CITATION_ERROR",
+        }:
+            if (
+                self.status_code is None
+                or not 200 <= self.status_code < 300
+                or not has_response
+                or self.retrieved_at is None
+            ):
+                raise ValueError("post-response failure metadata is inconsistent")
+        elif self.code == "CREDENTIAL_REFLECTION" and (
+            self.status_code is None or not has_response or self.retrieved_at is None
+        ):
+            raise ValueError("credential-reflection metadata is inconsistent")
+        elif self.code in {"INPUT_ERROR", "PROVIDER_ERROR", "TIMEOUT"}:
+            if (
+                self.status_code is not None
+                or has_response
+                or self.retrieved_at is not None
+                or self.billed_cost_microdollars != 0
+            ):
+                raise ValueError("pre-response failure contains response metadata")
         return self
 
 
@@ -196,6 +236,24 @@ def _contains_credentials(value: object, sentinels: tuple[str, ...]) -> bool:
     return False
 
 
+def failure_artifact_from_adapter(failure: AdapterFailure) -> FailureArtifact:
+    """Convert only typed adapter metadata; failed response bodies stay discarded."""
+
+    if type(failure) is not AdapterFailure:
+        raise TypeError("failure must be an AdapterFailure")
+    return FailureArtifact(
+        provider=failure.provider,
+        code=failure.code,
+        message=failure.message,
+        request_sha256=hashlib.sha256(failure.request_bytes).hexdigest(),
+        response_sha256=failure.response_sha256,
+        response_byte_length=failure.response_byte_length,
+        retrieved_at=failure.retrieved_at,
+        billed_cost_microdollars=failure.billed_cost_microdollars,
+        status_code=failure.status_code,
+    )
+
+
 def _failure_artifact(
     payload: bytes, provider: Literal["openai", "jev"]
 ) -> FailureArtifact:
@@ -203,6 +261,32 @@ def _failure_artifact(
     if failure.provider != provider:
         raise ValueError("failure artifact provider does not match stage")
     return failure
+
+
+def _validate_failure_provenance(
+    path: tuple[ArtifactKind, ...],
+    typed: dict[str, TypedArtifact],
+    *,
+    fail: Callable[[str], None],
+) -> None:
+    if path == _OPENAI_FAILURE_PATH:
+        failure_kind = ArtifactKind.OPENAI_FAILURE
+        request_kind = ArtifactKind.OPENAI_REQUEST
+        label = "OpenAI"
+    elif path == _JEV_FAILURE_PATH:
+        failure_kind = ArtifactKind.JEV_FAILURE
+        request_kind = ArtifactKind.JEV_REQUEST
+        label = "Jev"
+    else:
+        return
+    failure = typed[failure_kind]
+    request = typed[request_kind]
+    assert isinstance(failure, FailureArtifact)
+    if (
+        failure.request_sha256
+        != hashlib.sha256(canonical_json_bytes(request)).hexdigest()
+    ):
+        fail(f"{label} failure request hash does not match frozen request")
 
 
 def _expected_model_cost(
@@ -567,45 +651,49 @@ def _canonical_stage_hash(envelope: ArtifactEnvelope) -> str:
     ).hexdigest()
 
 
+def _reconstruct_orphan(kind: ArtifactKind, payload: bytes) -> TypedArtifact:
+    if kind is ArtifactKind.RAW_GAMMA:
+        value = load_strict_json(payload)
+        if not isinstance(value, Mapping):
+            raise ValueError("Gamma artifact must be a JSON object")
+        return value
+    if kind is ArtifactKind.SANITIZED_EVIDENCE:
+        return EvidencePacket.model_validate_json(payload)
+    if kind is ArtifactKind.RESEARCH_BRIEF:
+        return ResearchBrief.model_validate_json(payload)
+    if kind is ArtifactKind.JEV_DECISION:
+        return JevDecision.model_validate_json(payload)
+    if kind is ArtifactKind.OPENAI_RESPONSE_SUCCESS:
+        response = OpenAIResponse.model_validate_json(payload)
+        if (
+            response.status != "completed"
+            or response.usage is None
+            or response.error is not None
+            or response.incomplete_details is not None
+        ):
+            raise ValueError("OpenAI response is not a completed success")
+        return response
+    if kind is ArtifactKind.JEV_RESPONSE_SUCCESS:
+        return JevResponse.model_validate_json(payload)
+    if kind is ArtifactKind.OPENAI_FAILURE:
+        return _failure_artifact(payload, "openai")
+    if kind is ArtifactKind.JEV_FAILURE:
+        return _failure_artifact(payload, "jev")
+    value = load_strict_json(payload)
+    if not isinstance(value, Mapping):
+        raise ValueError("request artifact must be a JSON object")
+    return value
+
+
 def _reconstruct(
     kind: ArtifactKind, payload: bytes, result: ObservationResult
 ) -> TypedArtifact:
+    del result
     try:
-        if kind is ArtifactKind.RAW_GAMMA:
-            value = load_strict_json(payload)
-            if not isinstance(value, Mapping):
-                raise ValueError("Gamma artifact must be a JSON object")
-            return value
-        if kind is ArtifactKind.SANITIZED_EVIDENCE:
-            return EvidencePacket.model_validate_json(payload)
-        if kind is ArtifactKind.RESEARCH_BRIEF:
-            return ResearchBrief.model_validate_json(payload)
-        if kind is ArtifactKind.JEV_DECISION:
-            return JevDecision.model_validate_json(payload)
-        if kind is ArtifactKind.OPENAI_RESPONSE_SUCCESS:
-            response = OpenAIResponse.model_validate_json(payload)
-            if (
-                response.status != "completed"
-                or response.usage is None
-                or response.error is not None
-                or response.incomplete_details is not None
-            ):
-                raise ValueError("OpenAI response is not a completed success")
-            return response
-        if kind is ArtifactKind.JEV_RESPONSE_SUCCESS:
-            return JevResponse.model_validate_json(payload)
-        if kind is ArtifactKind.OPENAI_FAILURE:
-            return _failure_artifact(payload, "openai")
-        if kind is ArtifactKind.JEV_FAILURE:
-            return _failure_artifact(payload, "jev")
-        value = load_strict_json(payload)
-        if not isinstance(value, Mapping):
-            raise ValueError("request artifact must be a JSON object")
-        return value
+        return _reconstruct_orphan(kind, payload)
     except (TypeError, ValueError) as error:
-        raise ValueError(
-            f"{kind.value} artifact violates its strict contract"
-        ) from error
+        label = "Gamma" if kind is ArtifactKind.RAW_GAMMA else kind.value
+        raise ValueError(f"{label} artifact violates its strict contract") from error
 
 
 def _validate_reconstructed(
@@ -635,6 +723,7 @@ def _validate_reconstructed(
     ):
         fail("OpenAI request does not match evidence")
     if path == _OPENAI_FAILURE_PATH:
+        _validate_failure_provenance(path, typed, fail=fail)
         _validate_failure_terminal(result, path, typed, fail=fail)
         return
     brief = typed[ArtifactKind.RESEARCH_BRIEF]
@@ -654,6 +743,7 @@ def _validate_reconstructed(
     ):
         fail("Jev request does not match evidence and brief")
     if path == _JEV_FAILURE_PATH:
+        _validate_failure_provenance(path, typed, fail=fail)
         _validate_failure_terminal(result, path, typed, fail=fail)
         return
     decision = typed[ArtifactKind.JEV_DECISION]
@@ -696,7 +786,7 @@ def _prepare(
         _screen_payload(
             artifact.payload,
             forbidden_secret_values,
-            strict_json=kind is not ArtifactKind.RAW_GAMMA,
+            strict_json=True,
         )
         payload_hash = hashlib.sha256(artifact.payload).hexdigest()
         envelope = ArtifactEnvelope(
@@ -745,6 +835,91 @@ def _publish(
     return frozen
 
 
+def _validate_journals_locked(
+    store: BlobStore,
+    results: dict[str, tuple[ObservationResult, bytes]],
+    envelopes: list[ArtifactEnvelope],
+    forbidden_secret_values: tuple[bytes, ...] = (),
+) -> dict[str, ObservationReplay]:
+    grouped: dict[str, list[ArtifactEnvelope]] = {}
+    for envelope in envelopes:
+        grouped.setdefault(envelope.observation_id, []).append(envelope)
+
+    replays: dict[str, ObservationReplay] = {}
+    for observation_id, selected in grouped.items():
+        kinds = tuple(item.kind for item in selected)
+        matching_paths = [
+            path
+            for path in _STAGE_PATHS
+            if kinds == tuple(kind.value for kind in path[: len(kinds)])
+        ]
+        if not matching_paths:
+            raise StoreCorruptError(
+                "artifact stages do not form a reviewed path prefix"
+            )
+        opportunity_id = selected[0].opportunity_id
+        predecessor: str | None = None
+        for envelope in selected:
+            if (
+                envelope.observation_id != observation_id
+                or envelope.opportunity_id != opportunity_id
+            ):
+                raise StoreCorruptError(
+                    "artifact envelope observation references mismatch"
+                )
+            if envelope.predecessor_stage_sha256 != predecessor:
+                raise StoreCorruptError("artifact predecessor chain is invalid")
+            try:
+                store.read_verified(envelope.blob_ref())
+            except BlobError as error:
+                raise StoreCorruptError(
+                    "artifact blob is missing or corrupt"
+                ) from error
+            predecessor = _canonical_stage_hash(envelope)
+
+        found = results.get(observation_id)
+        if found is not None:
+            result = found[0]
+            if result.opportunity_id != opportunity_id:
+                raise StoreCorruptError(
+                    "artifact envelope observation references mismatch"
+                )
+            replays[observation_id] = _verify_replay_locked(
+                store, result, selected, forbidden_secret_values
+            )
+            continue
+
+        typed: dict[str, TypedArtifact] = {}
+        for envelope, kind in zip(selected, matching_paths[0], strict=False):
+            try:
+                payload = store.read_verified(envelope.blob_ref())
+                _screen_payload(payload, forbidden_secret_values, strict_json=True)
+                typed[kind.value] = _reconstruct_orphan(kind, payload)
+            except StoreSecurityError:
+                raise
+            except (BlobError, TypeError, ValueError) as error:
+                raise StoreCorruptError(
+                    "artifact blob is missing or corrupt"
+                ) from error
+        failure_paths = [
+            path
+            for path in matching_paths
+            if len(selected) == len(path)
+            and path in {_OPENAI_FAILURE_PATH, _JEV_FAILURE_PATH}
+        ]
+        if failure_paths:
+
+            def fail(message: str) -> None:
+                raise StoreCorruptError(message)
+
+            _validate_failure_provenance(failure_paths[0], typed, fail=fail)
+
+    missing = results.keys() - grouped.keys()
+    if missing:
+        raise StoreCorruptError("terminal result has an incomplete artifact path")
+    return replays
+
+
 def _verify_replay_locked(
     store: BlobStore,
     result: ObservationResult,
@@ -775,7 +950,7 @@ def _verify_replay_locked(
             _screen_payload(
                 payload,
                 forbidden_secret_values,
-                strict_json=kind is not ArtifactKind.RAW_GAMMA,
+                strict_json=True,
             )
             typed[kind.value] = _reconstruct(kind, payload, result)
         except StoreSecurityError:
@@ -831,6 +1006,12 @@ def record_observation(
                     _lock(artifacts_fd, fcntl.LOCK_EX)
                     existing_envelopes = _parse_envelopes(
                         _read_journal(artifacts_fd, label="artifact journal")
+                    )
+                    _validate_journals_locked(
+                        store,
+                        existing_results,
+                        existing_envelopes,
+                        forbidden_secret_values,
                     )
                     prior_artifacts = [
                         item
@@ -911,9 +1092,10 @@ def load_observation(
                     envelopes = _parse_envelopes(
                         _read_journal(artifacts_fd, label="artifact journal")
                     )
-                    return _verify_replay_locked(
-                        store, found[0], envelopes, forbidden_secret_values
+                    replays = _validate_journals_locked(
+                        store, results, envelopes, forbidden_secret_values
                     )
+                    return replays[observation_id]
                 finally:
                     os.close(artifacts_fd)
             finally:

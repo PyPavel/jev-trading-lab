@@ -176,6 +176,45 @@ type OpenAIResult = OpenAISuccess | AdapterFailure
 type JevResult = JevSuccess | AdapterFailure
 
 
+def is_canonical_failure_message(
+    provider: Literal["openai", "jev"],
+    code: FailureCode,
+    message: str,
+    status_code: int | None,
+) -> bool:
+    """Return whether metadata matches one sanitized adapter diagnostic."""
+
+    fixed: dict[FailureCode, set[str]] = {
+        "INPUT_ERROR": {f"{provider} request input is invalid"},
+        "PROVIDER_ERROR": {f"{provider} transport returned invalid data"},
+        "TIMEOUT": {f"{provider} transport timed out"},
+        "HTTP_ERROR": {
+            f"{provider} returned HTTP status {status_code}"
+            if status_code is not None
+            else ""
+        },
+        "PARSE_ERROR": {
+            f"{provider} response is not strict JSON",
+            f"{provider} response must be a JSON object",
+            f"{provider} response violates the strict envelope",
+        },
+        "MODEL_MISMATCH": {
+            f"{provider} response model does not match the approved snapshot"
+        },
+        "CITATION_ERROR": {
+            "openai brief does not cite the supplied evidence"
+            if provider == "openai"
+            else ""
+        },
+        "CREDENTIAL_REFLECTION": {
+            f"{provider} response contained credential-like data"
+        },
+    }
+    if provider == "openai" and code == "PARSE_ERROR":
+        fixed[code].add("openai output_text violates the research schema")
+    return message in fixed[code]
+
+
 def _normalized_name(name: str) -> str:
     return "".join(
         character
