@@ -205,17 +205,20 @@ def _is_forbidden_name(value: str) -> bool:
 def _embedded_json_values(text: str, *, label: str) -> list[object]:
     if len(text.encode("utf-8")) > _MAX_PROSE_SCAN_BYTES:
         raise ValueError(f"{label} prose exceeds embedded JSON scan limit")
+    normalized = unicodedata.normalize("NFKC", text)
+    if len(normalized.encode("utf-8")) > _MAX_PROSE_SCAN_BYTES:
+        raise ValueError(f"{label} prose exceeds embedded JSON scan limit")
     decoder = json.JSONDecoder(object_pairs_hook=lambda pairs: dict(pairs))
     decoded_values: list[object] = []
     candidates = 0
-    for index, character in enumerate(text):
+    for index, character in enumerate(normalized):
         if character not in "{[":
             continue
         candidates += 1
         if candidates > _MAX_JSON_CANDIDATES:
             raise ValueError(f"{label} exceeds embedded JSON candidate scan limit")
         try:
-            decoded, _ = decoder.raw_decode(text, index)
+            decoded, _ = decoder.raw_decode(normalized, index)
         except (TypeError, ValueError):
             continue
         decoded_values.append(decoded)
@@ -246,7 +249,9 @@ def _reject_delimiters(value: object) -> None:
     elif isinstance(value, list | tuple):
         for nested in value:
             _reject_delimiters(nested)
-    elif isinstance(value, str) and any(token in value for token in _OPENAI_DELIMITERS):
+    elif isinstance(value, str) and any(
+        token in unicodedata.normalize("NFKC", value) for token in _OPENAI_DELIMITERS
+    ):
         raise ValueError("OpenAI evidence contains a reserved delimiter")
 
 

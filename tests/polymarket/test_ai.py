@@ -25,6 +25,7 @@ from jev_trading_lab.polymarket.ai import (
 from jev_trading_lab.polymarket.models import (
     BookSnapshot,
     EvidencePacket,
+    OpenAIResponse,
     ResearchBrief,
     load_strict_json,
 )
@@ -186,6 +187,28 @@ def _set_openai_text(response: dict[str, Any], value: object) -> None:
     ).decode()
 
 
+def _choice_confidence(probabilities: dict[str, float]) -> float:
+    count = len(probabilities)
+    return max(0.0, min(1.0, (count * max(probabilities.values()) - 1) / (count - 1)))
+
+
+def _score_confidence(probabilities: dict[str, float]) -> float:
+    ordered = [probabilities[str(index)] for index in range(len(probabilities))]
+    maximum = max(ordered)
+    winners = [
+        index for index, probability in enumerate(ordered) if probability == maximum
+    ]
+    assert len(winners) == 1
+    mode = winners[0]
+    spread = sum(
+        probability * abs(index - mode) for index, probability in enumerate(ordered)
+    )
+    even_spread = sum(
+        abs(index - (len(ordered) - 1) / 2) for index in range(len(ordered))
+    ) / len(ordered)
+    return max(0.0, min(1.0, 1 - spread / even_spread))
+
+
 def _call(
     provider: str,
     cycle: dict[str, Any],
@@ -276,16 +299,49 @@ def test_jev_raw_systemone_fixture_maps_answers_to_expected_decision(
     cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief
 ) -> None:
     response_bytes = cycle["model_artifacts"]["jev_response_bytes"].encode()
+    response = _jev_body(cycle)
     transport = FixtureTransport(response_bytes, billed_cost_microdollars=125_000)
 
     result = call_jev(brief, evidence, JEV_MODEL_ID, transport)
 
     assert isinstance(result, JevSuccess)
     assert result.decision.model_dump(mode="json") == cycle["jev_decision"]
+    assert result.decision.confidence_micros == round(
+        _choice_confidence(response["answers"]["action"]["probabilities"]) * 1_000_000
+    )
     assert result.response_bytes == response_bytes
     assert result.billed_cost_microdollars == 125_000
     assert transport.calls == [result.request_bytes]
     assert CREDENTIAL_SENTINEL not in repr(result)
+
+
+def test_jev_fixture_confidences_use_official_provider_formulas(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief
+) -> None:
+    response = _jev_body(cycle)
+    answers = response["answers"]
+
+    assert answers["action"]["confidence"] == pytest.approx(
+        _choice_confidence(answers["action"]["probabilities"])
+    )
+    for answer_id in ("p_yes", "confidence"):
+        answer = answers[answer_id]
+        assert answer["confidence"] == pytest.approx(
+            _score_confidence(answer["probabilities"])
+        )
+
+    for answer_id in ("action", "p_yes", "confidence"):
+        for mutated_confidence in (0.0, 0.123):
+            mutated = _jev_body(cycle)
+            mutated["answers"][answer_id]["confidence"] = mutated_confidence
+            result = call_jev(
+                brief,
+                evidence,
+                JEV_MODEL_ID,
+                FixtureTransport(_wire_json(mutated)),
+            )
+            assert isinstance(result, AdapterFailure)
+            assert result.code == "PARSE_ERROR"
 
 
 @pytest.mark.parametrize(
@@ -380,7 +436,10 @@ def test_embedded_json_strings_are_scanned_for_normalized_field_names(
         build_openai_request(unsafe, OPENAI_MODEL_ID)
 
 
-@pytest.mark.parametrize("delimiter", ("<evidence>", "</evidence>"))
+@pytest.mark.parametrize(
+    "delimiter",
+    ("<evidence>", "</evidence>", "＜ｅｖｉｄｅｎｃｅ＞", "＜／ｅｖｉｄｅｎｃｅ＞"),
+)
 def test_evidence_prose_cannot_inject_frozen_delimiters(
     evidence: EvidencePacket, delimiter: str
 ) -> None:
@@ -392,6 +451,32 @@ def test_evidence_prose_cannot_inject_frozen_delimiters(
     result = call_openai(unsafe, OPENAI_MODEL_ID, FixtureTransport(b"never sent"))
     assert isinstance(result, AdapterFailure)
     assert result.code == "INPUT_ERROR"
+
+
+@pytest.mark.parametrize(
+    "embedded",
+    (
+        'prefix ｛"price":0.5｝ suffix',
+        'prefix ｛"ＰＲＩＣＥ":0.5｝ suffix',
+        'prefix ［｛"safe":｛"MarketPrice":0.5｝｝］ suffix',
+        'prefix ｛"safe":"x","Ｔｏｋｅｎ＿Ｉｄ":"secret"｝ suffix',
+    ),
+)
+def test_nfkc_json_delimiters_and_field_aliases_cannot_bypass_leakage_scan(
+    evidence: EvidencePacket, embedded: str
+) -> None:
+    unsafe = evidence.model_copy(update={"description": embedded})
+
+    with pytest.raises(ValueError, match="forbidden"):
+        build_openai_request(unsafe, OPENAI_MODEL_ID)
+
+
+def test_ordinary_unicode_prose_remains_accepted(evidence: EvidencePacket) -> None:
+    safe = evidence.model_copy(
+        update={"description": "政策讨论： café, Δ概率，以及日本語の説明。"}
+    )
+
+    build_openai_request(safe, OPENAI_MODEL_ID)
 
 
 @pytest.mark.parametrize("provider", ("openai", "jev"))
@@ -740,6 +825,9 @@ def test_score_to_micros_uses_deterministic_half_up_rounding(
         "0": 0.2999995,
         "1": 0.7000005,
     }
+    response["answers"]["p_yes"]["confidence"] = _score_confidence(
+        response["answers"]["p_yes"]["probabilities"]
+    )
     result = call_jev(
         brief,
         evidence,
@@ -872,6 +960,12 @@ def test_embedded_json_scanner_is_explicitly_bounded(evidence: EvidencePacket) -
         lambda r: r["answers"]["action"].update(
             choice="BUY_YES",
             probabilities={"BUY_YES": 0.4, "BUY_NO": 0.4, "ABSTAIN": 0.2},
+        ),
+        lambda r: r["answers"]["p_yes"].update(
+            score=0.5, probabilities={"0": 0.5, "1": 0.5}, confidence=0.0
+        ),
+        lambda r: r["answers"]["confidence"].update(
+            score=0.5, probabilities={"0": 0.5, "1": 0.5}, confidence=0.0
         ),
     ),
 )
@@ -1045,6 +1139,43 @@ def test_openai_accepts_all_documented_optional_response_fields_together(
     )
 
     assert isinstance(result, OpenAISuccess)
+
+
+@pytest.mark.parametrize("value", (0, 1_780_488_030, 0.0, 1_780_488_030.0))
+@pytest.mark.parametrize("field", ("created_at", "completed_at"))
+def test_openai_timestamps_accept_and_preserve_nonnegative_unix_numbers(
+    cycle: dict[str, Any], evidence: EvidencePacket, field: str, value: int | float
+) -> None:
+    response = _official_openai_response(cycle)
+    response[field] = value
+
+    envelope = OpenAIResponse.model_validate(response)
+    assert getattr(envelope, field) == value
+    assert type(getattr(envelope, field)) is type(value)
+    result = call_openai(
+        evidence,
+        OPENAI_MODEL_ID,
+        FixtureTransport(_wire_json(response)),
+    )
+    assert isinstance(result, OpenAISuccess)
+
+
+@pytest.mark.parametrize(
+    "value",
+    (True, "1780488030", -1, float("nan"), float("inf"), float("-inf"), 1e309),
+)
+@pytest.mark.parametrize("field", ("created_at", "completed_at"))
+def test_openai_timestamps_reject_nonfinite_negative_or_nonnumeric_values(
+    cycle: dict[str, Any], evidence: EvidencePacket, field: str, value: object
+) -> None:
+    response = _official_openai_response(cycle)
+    response[field] = value
+    body = json.dumps(response, allow_nan=True, separators=(",", ":")).encode()
+
+    result = call_openai(evidence, OPENAI_MODEL_ID, FixtureTransport(body))
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "PARSE_ERROR"
 
 
 @pytest.mark.parametrize(

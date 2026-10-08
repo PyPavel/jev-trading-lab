@@ -26,6 +26,10 @@ INT64_MIN = -(2**63)
 INT64_MAX = 2**63 - 1
 Micros = Annotated[int, Field(strict=True, ge=0, le=1_000_000)]
 NonNegativeInt = Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)]
+UnixNumber = (
+    Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)]
+    | Annotated[float, Field(strict=True, ge=0, le=INT64_MAX, allow_inf_nan=False)]
+)
 PositiveInt = Annotated[int, Field(strict=True, ge=1, le=INT64_MAX)]
 SignedInt = Annotated[int, Field(strict=True, ge=INT64_MIN, le=INT64_MAX)]
 Action = Literal["BUY_YES", "BUY_NO", "ABSTAIN"]
@@ -299,14 +303,14 @@ class OpenAIResponse(StrictModel):
 
     id: NonEmptyStr
     object: Literal["response"]
-    created_at: Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)]
+    created_at: UnixNumber
     model: Literal["gpt-5-2025-08-07"]
     status: Literal["completed"]
     error: None
     incomplete_details: None
     instructions: str | None
     background: bool | None = None
-    completed_at: NonNegativeInt | None = None
+    completed_at: UnixNumber | None = None
     conversation: OpenAIConversation | None = None
     max_output_tokens: NonNegativeInt | None
     max_tool_calls: NonNegativeInt | None = None
@@ -367,6 +371,10 @@ class JevDecision(StrictModel):
 Probability = Annotated[float, Field(strict=True, ge=0.0, le=1.0, allow_inf_nan=False)]
 
 
+def _clamp_probability(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
 class JevNoulAnswer(StrictModel):
     type: Literal["noul"]
     noul: Probability
@@ -391,6 +399,23 @@ class JevScoreAnswer(StrictModel):
         expected = self.probabilities["1"]
         if abs(self.score - expected) > 1e-6:
             raise ValueError("score must equal the binary distribution expected value")
+        ordered = [self.probabilities[str(index)] for index in range(2)]
+        maximum = max(ordered)
+        winners = [
+            index for index, probability in enumerate(ordered) if probability == maximum
+        ]
+        if len(winners) != 1:
+            raise ValueError("score confidence requires a unique distribution maximum")
+        mode = winners[0]
+        spread = sum(
+            probability * abs(index - mode) for index, probability in enumerate(ordered)
+        )
+        even_spread = sum(abs(index - 0.5) for index in range(2)) / 2
+        expected_confidence = _clamp_probability(1 - spread / even_spread)
+        if abs(self.confidence - expected_confidence) > 1e-9:
+            raise ValueError(
+                "score confidence must match the official distribution formula"
+            )
         return self
 
 
@@ -413,6 +438,12 @@ class JevChoiceAnswer(StrictModel):
         winners = [key for key, value in self.probabilities.items() if value == maximum]
         if len(winners) != 1 or self.choice != winners[0]:
             raise ValueError("action choice must be the unique distribution maximum")
+        count = len(self.probabilities)
+        expected_confidence = _clamp_probability((count * maximum - 1) / (count - 1))
+        if abs(self.confidence - expected_confidence) > 1e-9:
+            raise ValueError(
+                "choice confidence must match the official distribution formula"
+            )
         return self
 
 
@@ -456,7 +487,9 @@ def jev_response_decision(response: JevResponse) -> JevDecision:
     return JevDecision(
         p_yes_micros=micros(answers.p_yes.score),
         action=answers.action.choice,
-        confidence_micros=micros(answers.confidence.score),
+        # Action confidence controls whether the selected action is trustworthy;
+        # the separately named score remains setup-confidence diagnostic output.
+        confidence_micros=micros(answers.action.confidence),
         sufficiency_micros=micros(answers.evidence_sufficient.noul),
         ambiguity_micros=micros(answers.materially_ambiguous.noul),
         rationale=JEV_RATIONALE,
