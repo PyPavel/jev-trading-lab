@@ -8,9 +8,11 @@ import hashlib
 import os
 import re
 import stat
-from collections.abc import Iterable
+import unicodedata
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Self
 
@@ -18,24 +20,64 @@ from pydantic import Field, StringConstraints, field_validator, model_validator
 
 from jev_trading_lab.core.ids import canonical_json_bytes
 from jev_trading_lab.persistence.blobs import BlobError, BlobRef, BlobStore
+from jev_trading_lab.polymarket.ai import (
+    JEV_MODEL_ID,
+    OPENAI_MODEL_ID,
+    build_jev_request,
+    build_openai_request,
+)
 from jev_trading_lab.polymarket.models import (
     INT64_MAX,
+    BookSnapshot,
+    EvidencePacket,
+    JevDecision,
+    JevResponse,
     ObservationResult,
+    OpenAIResponse,
+    ResearchBrief,
     Sha256,
+    StrictModel,
     UtcModel,
+    _raw_book_snapshot,
+    jev_response_decision,
+    load_strict_json,
+    openai_response_brief,
 )
 
 _LABEL_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _MAX_LINE_BYTES = 1024 * 1024
 _MAX_JOURNAL_BYTES = 64 * 1024 * 1024
-_REQUIRED_HASH_KINDS = {
-    "evidence": "evidence_sha256",
-    "execution_book": "execution_book_sha256",
-    "research_brief": "research_brief_sha256",
-    "jev_decision": "jev_decision_sha256",
+_SECRET_PATTERN = re.compile(
+    r"(?i)(?:openai_api_key|typesafe_api_key|bearer\s+\S{4,}|"
+    r"(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|"
+    r"api[-_]?key)\s*[:=]\s*\S{4,})"
+)
+
+
+class ArtifactKind(StrEnum):
+    GAMMA_RAW = "gamma_raw"
+    SANITIZED_EVIDENCE = "sanitized_evidence"
+    PRECHECK_BOOK = "precheck_book"
+    OPENAI_REQUEST = "openai_request"
+    OPENAI_RESPONSE = "openai_response"
+    RESEARCH_BRIEF = "research_brief"
+    JEV_REQUEST = "jev_request"
+    JEV_RESPONSE = "jev_response"
+    JEV_DECISION = "jev_decision"
+    EXECUTION_BOOK = "execution_book"
+    OBSERVATION_RESULT = "observation_result"
+
+
+_STAGE_ORDER = tuple(ArtifactKind)
+_RESULT_HASH_KINDS = {
+    ArtifactKind.GAMMA_RAW: "evidence_sha256",
+    ArtifactKind.EXECUTION_BOOK: "execution_book_sha256",
+    ArtifactKind.RESEARCH_BRIEF: "research_brief_sha256",
+    ArtifactKind.JEV_DECISION: "jev_decision_sha256",
 }
 Label = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
 ByteSize = Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)]
+TypedArtifact = StrictModel | Mapping[str, object] | None
 
 
 class StoreError(Exception):
@@ -64,6 +106,7 @@ class ArtifactEnvelope(UtcModel):
     source_uri_label: Label
     retrieved_at: datetime
     opportunity_id: Sha256
+    observation_id: Sha256
     predecessor_stage_sha256: Sha256 | None
 
     @field_validator("retrieved_at", mode="after")
@@ -122,6 +165,7 @@ class ObservationReplay:
     result: ObservationResult
     envelopes: dict[str, ArtifactEnvelope]
     artifacts: dict[str, bytes]
+    typed_artifacts: dict[str, TypedArtifact]
 
 
 def _open_output(output_dir: Path) -> int:
@@ -259,7 +303,13 @@ def _parse_envelopes(lines: Iterable[bytes]) -> list[ArtifactEnvelope]:
             ) from error
         if line != canonical_json_bytes(envelope.model_dump(mode="json")):
             raise StoreCorruptError("artifact journal contains noncanonical JSON")
-        identity = (envelope.opportunity_id, envelope.kind)
+        try:
+            ArtifactKind(envelope.kind)
+        except ValueError as error:
+            raise StoreCorruptError(
+                "artifact journal contains an unknown stage"
+            ) from error
+        identity = (envelope.observation_id, envelope.kind)
         if identity in identities:
             raise StoreCorruptError(
                 "artifact journal contains duplicate stage identities"
@@ -304,48 +354,206 @@ def _verified_result(result: ObservationResult) -> tuple[ObservationResult, byte
     return verified, canonical
 
 
-def _freeze(
-    store: BlobStore,
+def _screen_payload(payload: bytes, forbidden_secret_values: tuple[bytes, ...]) -> None:
+    try:
+        text = unicodedata.normalize("NFKC", payload.decode("utf-8")).casefold()
+    except UnicodeDecodeError:
+        text = ""
+    if _SECRET_PATTERN.search(text):
+        raise StoreSecurityError("artifact contains credential-like data")
+    for value in forbidden_secret_values:
+        if type(value) is not bytes or not value:
+            raise ValueError("forbidden secret values must be nonempty bytes")
+        try:
+            sentinel = unicodedata.normalize("NFKC", value.decode("utf-8")).casefold()
+        except UnicodeDecodeError:
+            if value in payload:
+                raise StoreSecurityError("artifact contains a forbidden secret value")
+        else:
+            if sentinel in text:
+                raise StoreSecurityError("artifact contains a forbidden secret value")
+
+
+def _canonical_stage_hash(envelope: ArtifactEnvelope) -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(envelope.model_dump(mode="json"))
+    ).hexdigest()
+
+
+def _book_from_raw(payload: bytes) -> BookSnapshot:
+    value = load_strict_json(payload)
+    if not isinstance(value, Mapping):
+        raise ValueError("book artifact must be a JSON object")
+    raw_hash = hashlib.sha256(payload).hexdigest()
+    return _raw_book_snapshot(payload.decode("utf-8"), raw_hash)
+
+
+def _reconstruct(
+    kind: ArtifactKind, payload: bytes, result: ObservationResult
+) -> TypedArtifact:
+    try:
+        if kind is ArtifactKind.GAMMA_RAW:
+            value = load_strict_json(payload)
+            if not isinstance(value, Mapping):
+                raise ValueError("Gamma artifact must be a JSON object")
+            return value
+        if kind is ArtifactKind.SANITIZED_EVIDENCE:
+            return EvidencePacket.model_validate_json(payload)
+        if kind in {ArtifactKind.PRECHECK_BOOK, ArtifactKind.EXECUTION_BOOK}:
+            return _book_from_raw(payload)
+        if kind is ArtifactKind.RESEARCH_BRIEF:
+            return ResearchBrief.model_validate_json(payload)
+        if kind is ArtifactKind.JEV_DECISION:
+            return JevDecision.model_validate_json(payload)
+        if kind is ArtifactKind.OPENAI_RESPONSE:
+            response = OpenAIResponse.model_validate_json(payload)
+            if (
+                response.status != "completed"
+                or response.usage is None
+                or response.error is not None
+                or response.incomplete_details is not None
+            ):
+                raise ValueError("OpenAI response is not a completed success")
+            return response
+        if kind is ArtifactKind.JEV_RESPONSE:
+            return JevResponse.model_validate_json(payload)
+        if kind is ArtifactKind.OBSERVATION_RESULT:
+            return ObservationResult.model_validate_json(payload)
+        value = load_strict_json(payload)
+        if not isinstance(value, Mapping):
+            raise ValueError("request artifact must be a JSON object")
+        return value
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"{kind.value} artifact violates its strict contract"
+        ) from error
+
+
+def _validate_reconstructed(
+    result: ObservationResult, typed: dict[str, TypedArtifact], *, corruption: bool
+) -> None:
+    def fail(message: str) -> None:
+        if corruption:
+            raise StoreCorruptError(message)
+        raise ValueError(message)
+
+    evidence = typed[ArtifactKind.SANITIZED_EVIDENCE]
+    precheck = typed[ArtifactKind.PRECHECK_BOOK]
+    execution = typed[ArtifactKind.EXECUTION_BOOK]
+    brief = typed[ArtifactKind.RESEARCH_BRIEF]
+    decision = typed[ArtifactKind.JEV_DECISION]
+    openai_response = typed[ArtifactKind.OPENAI_RESPONSE]
+    jev_response = typed[ArtifactKind.JEV_RESPONSE]
+    terminal = typed[ArtifactKind.OBSERVATION_RESULT]
+    if not isinstance(evidence, EvidencePacket):
+        fail("sanitized evidence artifact type is invalid")
+    if not isinstance(precheck, BookSnapshot) or not isinstance(
+        execution, BookSnapshot
+    ):
+        fail("book artifact type is invalid")
+    if not isinstance(brief, ResearchBrief) or not isinstance(decision, JevDecision):
+        fail("validated model artifact type is invalid")
+    if not isinstance(openai_response, OpenAIResponse) or not isinstance(
+        jev_response, JevResponse
+    ):
+        fail("provider response artifact type is invalid")
+    assert isinstance(evidence, EvidencePacket)
+    assert isinstance(precheck, BookSnapshot)
+    assert isinstance(execution, BookSnapshot)
+    assert isinstance(brief, ResearchBrief)
+    assert isinstance(decision, JevDecision)
+    assert isinstance(openai_response, OpenAIResponse)
+    assert isinstance(jev_response, JevResponse)
+    if terminal != result:
+        fail("terminal result artifact does not match journal result")
+    if (
+        evidence.market_id != result.market_id
+        or evidence.source_sha256 != result.evidence_sha256
+    ):
+        fail("sanitized evidence does not match observation")
+    if any(book.market_id != result.market_id for book in (precheck, execution)):
+        fail("book market does not match observation")
+    if execution.source_sha256 != result.execution_book_sha256:
+        fail("execution book does not match observation hash")
+    if brief.evidence_sha256 != result.evidence_sha256:
+        fail("research brief does not match observation evidence")
+    if jev_response_decision(jev_response) != decision:
+        fail("Jev response does not match decision")
+    if openai_response_brief(openai_response) != brief:
+        fail("OpenAI response does not match research brief")
+    openai_request = typed[ArtifactKind.OPENAI_REQUEST]
+    jev_request = typed[ArtifactKind.JEV_REQUEST]
+    if openai_request != load_strict_json(
+        build_openai_request(evidence, OPENAI_MODEL_ID)
+    ):
+        fail("OpenAI request does not match evidence")
+    if jev_request != load_strict_json(
+        build_jev_request(brief, evidence, JEV_MODEL_ID)
+    ):
+        fail("Jev request does not match evidence and brief")
+
+
+def _prepare(
     result: ObservationResult,
     artifact_refs: Iterable[ArtifactToFreeze],
-) -> list[tuple[ArtifactEnvelope, bytes]]:
-    frozen: list[tuple[ArtifactEnvelope, bytes]] = []
-    kinds: set[str] = set()
-    for artifact in artifact_refs:
-        if type(artifact) is not ArtifactToFreeze:
-            raise TypeError("artifact references must be ArtifactToFreeze values")
-        if artifact.kind in kinds:
-            raise ValueError("artifact kinds must be unique per observation")
-        kinds.add(artifact.kind)
-        ref = store.publish(artifact.payload)
-        verified = store.read_verified(ref)
-        expected_hash = hashlib.sha256(artifact.payload).hexdigest()
-        if (
-            verified != artifact.payload
-            or ref.sha256 != expected_hash
-            or ref.byte_length != len(artifact.payload)
-        ):
-            raise StoreCorruptError("published artifact failed exact verification")
+    forbidden_secret_values: tuple[bytes, ...],
+) -> tuple[list[ArtifactToFreeze], list[ArtifactEnvelope], dict[str, TypedArtifact]]:
+    artifacts = list(artifact_refs)
+    if any(type(item) is not ArtifactToFreeze for item in artifacts):
+        raise TypeError("artifact references must be ArtifactToFreeze values")
+    kinds = tuple(item.kind for item in artifacts)
+    expected = tuple(kind.value for kind in _STAGE_ORDER)
+    if kinds != expected:
+        raise ValueError(
+            "artifact stage order must match the complete reviewed registry"
+        )
+    envelopes: list[ArtifactEnvelope] = []
+    typed: dict[str, TypedArtifact] = {}
+    predecessor: str | None = None
+    for artifact, kind in zip(artifacts, _STAGE_ORDER, strict=True):
+        _screen_payload(artifact.payload, forbidden_secret_values)
+        payload_hash = hashlib.sha256(artifact.payload).hexdigest()
         envelope = ArtifactEnvelope(
-            kind=artifact.kind,
-            sha256=ref.sha256,
-            byte_size=ref.byte_length,
-            storage_relpath=ref.relative_path,
+            kind=kind.value,
+            sha256=payload_hash,
+            byte_size=len(artifact.payload),
+            storage_relpath=f"{payload_hash[:2]}/{payload_hash[2:4]}/{payload_hash}",
             source_uri_label=artifact.source_uri_label,
             retrieved_at=artifact.retrieved_at,
             opportunity_id=result.opportunity_id,
+            observation_id=result.observation_id,
             predecessor_stage_sha256=artifact.predecessor_stage_sha256,
         )
+        if envelope.predecessor_stage_sha256 != predecessor:
+            raise ValueError("artifact predecessor chain is invalid")
+        typed[kind.value] = _reconstruct(kind, artifact.payload, result)
+        envelopes.append(envelope)
+        predecessor = _canonical_stage_hash(envelope)
+    for kind, field in _RESULT_HASH_KINDS.items():
+        envelope = envelopes[_STAGE_ORDER.index(kind)]
+        if envelope.sha256 != getattr(result, field):
+            raise ValueError(f"{kind.value} artifact does not match observation hash")
+    _validate_reconstructed(result, typed, corruption=False)
+    return artifacts, envelopes, typed
+
+
+def _publish(
+    store: BlobStore,
+    artifacts: list[ArtifactToFreeze],
+    envelopes: list[ArtifactEnvelope],
+) -> list[tuple[ArtifactEnvelope, bytes]]:
+    frozen: list[tuple[ArtifactEnvelope, bytes]] = []
+    for artifact, envelope in zip(artifacts, envelopes, strict=True):
+        ref = store.publish(artifact.payload)
+        verified = store.read_verified(ref)
+        if (
+            verified != artifact.payload
+            or ref.sha256 != envelope.sha256
+            or ref.byte_length != envelope.byte_size
+            or ref.relative_path != envelope.storage_relpath
+        ):
+            raise StoreCorruptError("published artifact failed exact verification")
         frozen.append((envelope, verified))
-    missing = set(_REQUIRED_HASH_KINDS) - kinds
-    if missing:
-        raise ValueError(f"required artifact kinds are missing: {sorted(missing)}")
-    for envelope, _payload in frozen:
-        field = _REQUIRED_HASH_KINDS.get(envelope.kind)
-        if field is not None and envelope.sha256 != getattr(result, field):
-            raise ValueError(
-                f"{envelope.kind} artifact does not match observation hash"
-            )
     return frozen
 
 
@@ -353,47 +561,75 @@ def _verify_replay_locked(
     store: BlobStore,
     result: ObservationResult,
     envelopes: list[ArtifactEnvelope],
+    forbidden_secret_values: tuple[bytes, ...] = (),
 ) -> ObservationReplay:
     selected = [
-        item for item in envelopes if item.opportunity_id == result.opportunity_id
+        item for item in envelopes if item.observation_id == result.observation_id
     ]
+    if tuple(item.kind for item in selected) != tuple(
+        kind.value for kind in _STAGE_ORDER
+    ):
+        raise StoreCorruptError("artifact stage order is incomplete or invalid")
     by_kind = {item.kind: item for item in selected}
-    missing = set(_REQUIRED_HASH_KINDS) - set(by_kind)
-    if missing:
-        raise StoreCorruptError(
-            f"required artifact envelopes are missing: {sorted(missing)}"
-        )
     artifacts: dict[str, bytes] = {}
+    typed: dict[str, TypedArtifact] = {}
     predecessor: str | None = None
-    for envelope in selected:
+    for envelope, kind in zip(selected, _STAGE_ORDER, strict=True):
+        if (
+            envelope.opportunity_id != result.opportunity_id
+            or envelope.observation_id != result.observation_id
+        ):
+            raise StoreCorruptError("artifact envelope observation references mismatch")
         if envelope.predecessor_stage_sha256 != predecessor:
             raise StoreCorruptError("artifact predecessor chain is invalid")
-        field = _REQUIRED_HASH_KINDS.get(envelope.kind)
+        field = _RESULT_HASH_KINDS.get(kind)
         if field is not None and envelope.sha256 != getattr(result, field):
             raise StoreCorruptError("artifact envelope does not match observation hash")
         try:
-            artifacts[envelope.kind] = store.read_verified(envelope.blob_ref())
-        except (BlobError, ValueError) as error:
+            payload = store.read_verified(envelope.blob_ref())
+            _screen_payload(payload, forbidden_secret_values)
+            typed[kind.value] = _reconstruct(kind, payload, result)
+        except StoreSecurityError:
+            raise
+        except (BlobError, TypeError, ValueError) as error:
             raise StoreCorruptError("artifact blob is missing or corrupt") from error
-        predecessor = envelope.sha256
-    return ObservationReplay(result=result, envelopes=by_kind, artifacts=artifacts)
+        artifacts[kind.value] = payload
+        predecessor = _canonical_stage_hash(envelope)
+    _validate_reconstructed(result, typed, corruption=True)
+    return ObservationReplay(
+        result=result,
+        envelopes=by_kind,
+        artifacts=artifacts,
+        typed_artifacts=typed,
+    )
 
 
 def record_observation(
     output_dir: str | os.PathLike[str],
     result: ObservationResult,
     artifact_refs: Iterable[ArtifactToFreeze],
+    *,
+    forbidden_secret_values: tuple[bytes, ...] = (),
 ) -> ObservationResult:
-    """Publish and verify every blob, then durably append stages and terminal result."""
+    """Validate all stages, publish blobs, then append envelopes and terminal result."""
 
     if type(result) is not ObservationResult:
         raise TypeError("result must be an ObservationResult")
     verified_result, result_line = _verified_result(result)
+    _screen_payload(result_line, forbidden_secret_values)
+    artifacts, envelopes, _typed = _prepare(
+        verified_result, artifact_refs, forbidden_secret_values
+    )
+    envelope_lines = [
+        canonical_json_bytes(envelope.model_dump(mode="json")) for envelope in envelopes
+    ]
+    for line in envelope_lines:
+        _screen_payload(line, forbidden_secret_values)
     output = Path(output_dir)
     root_fd = _open_output(output)
     try:
         with BlobStore(output.absolute() / "blobs") as store:
-            frozen = _freeze(store, verified_result, artifact_refs)
+            _publish(store, artifacts, envelopes)
             results_fd = _open_journal(root_fd, "results.jsonl")
             try:
                 _lock(results_fd, fcntl.LOCK_EX)
@@ -407,43 +643,46 @@ def record_observation(
                     existing_envelopes = _parse_envelopes(
                         _read_journal(artifacts_fd, label="artifact journal")
                     )
+                    prior_artifacts = [
+                        item
+                        for item in existing_envelopes
+                        if item.observation_id == verified_result.observation_id
+                    ]
                     if existing is not None:
                         if existing[1] != result_line:
                             raise StoreConflictError(
                                 "observation identity already has different "
                                 "canonical bytes"
                             )
-                        prior_artifacts = [
-                            item
-                            for item in existing_envelopes
-                            if item.opportunity_id == verified_result.opportunity_id
-                        ]
-                        if prior_artifacts != [item for item, _payload in frozen]:
+                        if prior_artifacts != envelopes:
                             raise StoreConflictError(
                                 "observation identity already has a different "
                                 "artifact set"
                             )
-                        _verify_replay_locked(store, existing[0], existing_envelopes)
-                        return existing[0]
-                    current = {
-                        (item.opportunity_id, item.kind): item
-                        for item in existing_envelopes
-                    }
-                    append: list[bytes] = []
-                    for envelope, _payload in frozen:
-                        identity = (envelope.opportunity_id, envelope.kind)
-                        prior = current.get(identity)
-                        if prior is not None:
-                            if prior != envelope:
-                                raise StoreConflictError(
-                                    "artifact stage identity already has different "
-                                    "bytes"
-                                )
-                            continue
-                        append.append(
-                            canonical_json_bytes(envelope.model_dump(mode="json"))
+                        _verify_replay_locked(
+                            store,
+                            existing[0],
+                            existing_envelopes,
+                            forbidden_secret_values,
                         )
-                    _append_lines(artifacts_fd, append, label="artifact journal")
+                        os.fsync(artifacts_fd)
+                        os.fsync(results_fd)
+                        return existing[0]
+                    if prior_artifacts and prior_artifacts != envelopes:
+                        raise StoreConflictError(
+                            "artifact stage identity already has different bytes"
+                        )
+                    if prior_artifacts:
+                        _verify_replay_locked(
+                            store,
+                            verified_result,
+                            existing_envelopes,
+                            forbidden_secret_values,
+                        )
+                    else:
+                        _append_lines(
+                            artifacts_fd, envelope_lines, label="artifact journal"
+                        )
                     _append_lines(results_fd, [result_line], label="result journal")
                     return verified_result
                 finally:
@@ -455,7 +694,10 @@ def record_observation(
 
 
 def load_observation(
-    output_dir: str | os.PathLike[str], observation_id: str
+    output_dir: str | os.PathLike[str],
+    observation_id: str,
+    *,
+    forbidden_secret_values: tuple[bytes, ...] = (),
 ) -> ObservationReplay:
     """Replay one observation only from strict journals and verified exact blobs."""
 
@@ -483,7 +725,9 @@ def load_observation(
                     envelopes = _parse_envelopes(
                         _read_journal(artifacts_fd, label="artifact journal")
                     )
-                    return _verify_replay_locked(store, found[0], envelopes)
+                    return _verify_replay_locked(
+                        store, found[0], envelopes, forbidden_secret_values
+                    )
                 finally:
                     os.close(artifacts_fd)
             finally:
