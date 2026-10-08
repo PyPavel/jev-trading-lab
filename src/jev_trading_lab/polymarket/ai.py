@@ -262,15 +262,19 @@ def _contains_credentials(value: object, sensitive_values: tuple[bytes, ...]) ->
         except UnicodeDecodeError:
             continue
 
-    def contains(nested: object) -> bool:
+    def contains(nested: object, *, mapping_key: bool = False) -> bool:
         if isinstance(nested, Mapping):
-            return any(contains(item) for item in nested.values())
+            return any(
+                type(key) is str and contains(key, mapping_key=True) for key in nested
+            ) or any(contains(item) for item in nested.values())
         if isinstance(nested, list | tuple):
             return any(contains(item) for item in nested)
         if isinstance(nested, str):
             semantic = _semantic_bytes(nested)
-            if bool(_SECRET_PATTERN.search(semantic)) or any(
-                sentinel in semantic for sentinel in normalized_sentinels
+            if (
+                bool(_SECRET_PATTERN.search(semantic))
+                or (mapping_key and bool(_SECRET_PATTERN.search(semantic + b": safe")))
+                or any(sentinel in semantic for sentinel in normalized_sentinels)
             ):
                 return True
             return any(

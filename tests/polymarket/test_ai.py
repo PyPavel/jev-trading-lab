@@ -16,6 +16,7 @@ from jev_trading_lab.polymarket.ai import (
     JevSuccess,
     OpenAISuccess,
     TransportResponse,
+    _contains_credentials,
     build_jev_request,
     build_openai_request,
     call_jev,
@@ -1181,6 +1182,131 @@ def test_semantically_decoded_generic_credential_pattern_is_rejected(
 
     assert isinstance(result, AdapterFailure)
     assert result.code == "CREDENTIAL_REFLECTION"
+
+
+def test_semantic_credential_scanner_checks_string_mapping_keys_only() -> None:
+    sentinel = b"opaque-reflected-secret"
+
+    assert _contains_credentials({"opaque-reflected-secret": "safe"}, (sentinel,))
+    assert not _contains_credentials({1: "safe", "ordinary-metadata": "safe"}, ())
+    assert _contains_credentials({1: "Bearer reflected-secret"}, ())
+
+
+def test_openai_rejects_unicode_escaped_sensitive_metadata_key(
+    cycle: dict[str, Any], evidence: EvidencePacket
+) -> None:
+    response = _official_openai_response(cycle)
+    response["metadata"] = {"opaque-reflected-secret": "safe"}
+    body = _wire_json(response).replace(b"secret", b"\\u0073ecret")
+
+    result = call_openai(
+        evidence,
+        OPENAI_MODEL_ID,
+        FixtureTransport(body, sensitive_values=(b"opaque-reflected-secret",)),
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "CREDENTIAL_REFLECTION"
+    assert not hasattr(result, "response_bytes")
+    assert result.response_sha256 == hashlib.sha256(body).hexdigest()
+    assert result.response_byte_length == len(body)
+    assert "opaque-reflected-secret" not in repr(result)
+
+
+def test_openai_rejects_sensitive_mapping_key_in_reasoning_output_json(
+    cycle: dict[str, Any], evidence: EvidencePacket
+) -> None:
+    response = _official_openai_response(cycle)
+    response["output"][0]["summary"] = [
+        {
+            "type": "summary_text",
+            "text": '{"opaque-reflected-secret":"safe"}',
+        }
+    ]
+    body = _wire_json(response).replace(b"secret", b"\\\\u0073ecret")
+
+    result = call_openai(
+        evidence,
+        OPENAI_MODEL_ID,
+        FixtureTransport(body, sensitive_values=(b"opaque-reflected-secret",)),
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "CREDENTIAL_REFLECTION"
+    assert result.response_sha256 == hashlib.sha256(body).hexdigest()
+    assert result.response_byte_length == len(body)
+    assert "opaque-reflected-secret" not in repr(result)
+
+
+def test_openai_rejects_sensitive_mapping_key_in_embedded_output_json(
+    cycle: dict[str, Any], evidence: EvidencePacket
+) -> None:
+    response = _official_openai_response(cycle)
+    output = _openai_text(response)
+    output["opaque-reflected-secret"] = "safe"
+    _set_openai_text(response, output)
+    body = _wire_json(response).replace(b"secret", b"\\\\u0073ecret")
+
+    result = call_openai(
+        evidence,
+        OPENAI_MODEL_ID,
+        FixtureTransport(body, sensitive_values=(b"opaque-reflected-secret",)),
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "CREDENTIAL_REFLECTION"
+    assert result.response_sha256 == hashlib.sha256(body).hexdigest()
+    assert result.response_byte_length == len(body)
+    assert "opaque-reflected-secret" not in repr(result)
+
+
+def test_jev_rejects_sensitive_mapping_key_in_nested_answer_map(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief
+) -> None:
+    response = _jev_body(cycle)
+    response["answers"]["p_yes"]["legend"]["opaque-reflected-secret"] = "safe"
+    body = _wire_json(response).replace(b"secret", b"\\u0073ecret")
+
+    result = call_jev(
+        brief,
+        evidence,
+        JEV_MODEL_ID,
+        FixtureTransport(body, sensitive_values=(b"opaque-reflected-secret",)),
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "CREDENTIAL_REFLECTION"
+    assert result.response_sha256 == hashlib.sha256(body).hexdigest()
+    assert result.response_byte_length == len(body)
+    assert "opaque-reflected-secret" not in repr(result)
+
+
+@pytest.mark.parametrize("key", ("authorization", "api_key", "cookie", "set-cookie"))
+def test_openai_rejects_generic_credential_pattern_metadata_keys(
+    cycle: dict[str, Any], evidence: EvidencePacket, key: str
+) -> None:
+    response = _official_openai_response(cycle)
+    response["metadata"] = {key: "safe"}
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "CREDENTIAL_REFLECTION"
+
+
+def test_openai_accepts_harmless_normal_metadata_key(
+    cycle: dict[str, Any], evidence: EvidencePacket
+) -> None:
+    response = _official_openai_response(cycle)
+    response["metadata"] = {"ordinary-metadata": "safe"}
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, OpenAISuccess)
 
 
 def test_custom_zero_offset_tzinfo_cannot_reach_result_metadata_or_repr(
