@@ -141,7 +141,9 @@ uv run mypy src
 - Validate returned model ID and structured output before constructing `ResearchBrief`. Unknown fields, invalid citations, non-JSON, truncation, version mismatch, or provider error become typed failure results, not exceptions that lose the observation.
 - Jev request is exactly `{model,state,questions}`. `state` contains the frozen brief and safe evidence metadata only. Questions elicit evidence sufficiency, ambiguity, `p_yes`, action including `ABSTAIN`, and confidence.
 - Validate returned model ID, every bound, and action. No fallback model, retry model, OpenRouter route, or tool use.
-- Preserve canonical request/response bytes and provider cost for publication by the caller.
+- Preserve canonical request bytes and provider cost for publication by the caller. Request bytes remain deterministic, canonical, and price-free.
+- Preserve raw bytes only for successful, fully validated provider responses after screening the body for reflected secret patterns. Non-2xx, malformed, model-mismatch, citation, envelope, and other failure bodies may reflect provider or proxy credentials and must never be persisted raw.
+- `AdapterFailure` preserves only the response SHA-256, byte length, HTTP status, retrieval time, billed cost, and a fixed sanitized message. Unit 4 may publish only this sanitized failure metadata, never a raw failure body.
 
 **Tests first:**
 
