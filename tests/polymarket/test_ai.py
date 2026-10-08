@@ -480,6 +480,29 @@ def test_ordinary_unicode_prose_remains_accepted(evidence: EvidencePacket) -> No
 
 
 @pytest.mark.parametrize("provider", ("openai", "jev"))
+@pytest.mark.parametrize("status_code", (200, 500))
+def test_empty_response_retains_canonical_empty_body_hash(
+    cycle: dict[str, Any],
+    evidence: EvidencePacket,
+    brief: ResearchBrief,
+    provider: str,
+    status_code: int,
+) -> None:
+    result = _call(
+        provider,
+        cycle,
+        evidence,
+        brief,
+        FixtureTransport(b"", status_code=status_code),
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == ("PARSE_ERROR" if status_code == 200 else "HTTP_ERROR")
+    assert result.response_sha256 == hashlib.sha256(b"").hexdigest()
+    assert result.response_byte_length == 0
+
+
+@pytest.mark.parametrize("provider", ("openai", "jev"))
 @pytest.mark.parametrize("raw", (b"not-json", b'{"model":"truncated"'))
 def test_malformed_json_is_sanitized_parse_failure(
     cycle: dict[str, Any],

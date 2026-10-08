@@ -26,6 +26,7 @@ from jev_trading_lab.polymarket.ai import (
     AdapterFailure,
     build_jev_request,
     build_openai_request,
+    has_canonical_failure_response,
     is_canonical_failure_message,
 )
 from jev_trading_lab.polymarket.models import (
@@ -145,7 +146,9 @@ class FailureArtifact(UtcModel):
         ):
             raise ValueError("failure message is not canonical adapter metadata")
         has_response = self.response_sha256 is not None
-        if has_response != (self.response_byte_length > 0):
+        if not has_canonical_failure_response(
+            self.response_sha256, self.response_byte_length
+        ):
             raise ValueError("failure response hash and length are inconsistent")
         if self.code == "HTTP_ERROR":
             if (
@@ -289,6 +292,24 @@ def _validate_failure_provenance(
         fail(f"{label} failure request hash does not match frozen request")
 
 
+def _openai_success_cost(response: OpenAIResponse) -> int:
+    """Price the approved GPT-5 snapshot from its exact frozen usage counters."""
+
+    usage = response.usage
+    if usage is None:
+        raise ValueError("OpenAI success response has no usage")
+    cached_tokens = usage.input_tokens_details.cached_tokens
+    if cached_tokens > usage.input_tokens:
+        raise ValueError("OpenAI cached input tokens exceed total input tokens")
+    # gpt-5-2025-08-07: $1.25/M input, $0.125/M cached, $10/M output.
+    eighth_microdollars = (
+        (usage.input_tokens - cached_tokens) * 10
+        + cached_tokens
+        + usage.output_tokens * 80
+    )
+    return (eighth_microdollars + 7) // 8
+
+
 def _expected_model_cost(
     path: tuple[ArtifactKind, ...], typed: dict[str, TypedArtifact]
 ) -> int:
@@ -297,9 +318,11 @@ def _expected_model_cost(
         assert isinstance(failure, FailureArtifact)
         return failure.billed_cost_microdollars
     if path == _JEV_FAILURE_PATH:
+        openai_response = typed[ArtifactKind.OPENAI_RESPONSE_SUCCESS]
         failure = typed[ArtifactKind.JEV_FAILURE]
+        assert isinstance(openai_response, OpenAIResponse)
         assert isinstance(failure, FailureArtifact)
-        return failure.billed_cost_microdollars
+        return _openai_success_cost(openai_response) + failure.billed_cost_microdollars
     return 0
 
 
@@ -311,19 +334,9 @@ def _validate_failure_terminal(
     fail: Callable[[str], None],
 ) -> None:
     ai = result.ai
-    if path == _OPENAI_FAILURE_PATH:
-        expected = _expected_model_cost(path, typed)
-    elif path == _JEV_FAILURE_PATH:
-        jev_failure = typed[ArtifactKind.JEV_FAILURE]
-        assert isinstance(jev_failure, FailureArtifact)
-        expected = jev_failure.billed_cost_microdollars
-        # A Jev request proves OpenAI completed; its cost is already in the result.
-        if ai.model_cost_microdollars < expected:
-            fail("terminal model cost is below Jev failure cost")
-            return
-        expected = ai.model_cost_microdollars
-    else:
+    if path not in {_OPENAI_FAILURE_PATH, _JEV_FAILURE_PATH}:
         return
+    expected = _expected_model_cost(path, typed)
     if (
         ai.disposition != "MODEL_FAILURE"
         or ai.signal_probability_micros is not None
@@ -993,7 +1006,6 @@ def record_observation(
     root_fd = _open_output(output)
     try:
         with BlobStore(output.absolute() / "blobs") as store:
-            _publish(store, artifacts, envelopes)
             results_fd = _open_journal(root_fd, "results.jsonl")
             try:
                 _lock(results_fd, fcntl.LOCK_EX)
@@ -1013,6 +1025,7 @@ def record_observation(
                         existing_envelopes,
                         forbidden_secret_values,
                     )
+                    _publish(store, artifacts, envelopes)
                     prior_artifacts = [
                         item
                         for item in existing_envelopes

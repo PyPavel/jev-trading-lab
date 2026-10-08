@@ -159,6 +159,24 @@ class JevSuccess:
     billed_cost_microdollars: int
 
 
+EMPTY_RESPONSE_SHA256: Final = hashlib.sha256(b"").hexdigest()
+
+
+def has_canonical_failure_response(
+    response_sha256: str | None, response_byte_length: int
+) -> bool:
+    """Bind a response digest to absent, empty, or nonempty response bytes."""
+
+    has_response = response_sha256 is not None
+    empty_response = response_sha256 == EMPTY_RESPONSE_SHA256
+    return (
+        type(response_byte_length) is int
+        and response_byte_length >= 0
+        and (has_response or response_byte_length == 0)
+        and (empty_response == (has_response and response_byte_length == 0))
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class AdapterFailure:
     provider: Literal["openai", "jev"]
@@ -170,6 +188,12 @@ class AdapterFailure:
     retrieved_at: datetime | None
     billed_cost_microdollars: int
     status_code: int | None
+
+    def __post_init__(self) -> None:
+        if not has_canonical_failure_response(
+            self.response_sha256, self.response_byte_length
+        ):
+            raise ValueError("failure response hash and length are inconsistent")
 
 
 type OpenAIResult = OpenAISuccess | AdapterFailure
