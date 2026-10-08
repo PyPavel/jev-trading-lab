@@ -1531,8 +1531,12 @@ def test_fixture_rejects_starting_capital_detached_from_arms(
         polymarket_models.validate_feasibility_fixture(mutated)
 
 
+def _openai_fixture_message(response: dict[str, Any]) -> dict[str, Any]:
+    return next(item for item in response["output"] if item["type"] == "message")
+
+
 def _openai_fixture_output(response: dict[str, Any]) -> dict[str, Any]:
-    output = json.loads(response["output"][0]["content"][0]["text"])
+    output = json.loads(_openai_fixture_message(response)["content"][0]["text"])
     assert isinstance(output, dict)
     return output
 
@@ -1540,7 +1544,7 @@ def _openai_fixture_output(response: dict[str, Any]) -> dict[str, Any]:
 def _set_openai_fixture_output(
     response: dict[str, Any], output: dict[str, Any]
 ) -> None:
-    response["output"][0]["content"][0]["text"] = json.dumps(
+    _openai_fixture_message(response)["content"][0]["text"] = json.dumps(
         output, separators=(",", ":"), sort_keys=True
     )
 

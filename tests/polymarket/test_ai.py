@@ -86,6 +86,7 @@ class FixtureTransport:
         error: BaseException | None = None,
         headers: object = None,
         response: object = _DEFAULT_RESPONSE,
+        sensitive_values: tuple[bytes, ...] = (),
     ) -> None:
         self.body = body
         self.status_code = status_code
@@ -101,6 +102,7 @@ class FixtureTransport:
             else headers
         )
         self.response = response
+        self.sensitive_values = sensitive_values
         self.calls: list[bytes] = []
 
     def __call__(self, request_bytes: bytes) -> TransportResponse:
@@ -115,6 +117,7 @@ class FixtureTransport:
             raw_bytes=self.body,
             retrieved_at=datetime(2026, 10, 3, 12, 0, 30, tzinfo=UTC),
             billed_cost_microdollars=self.billed_cost_microdollars,
+            sensitive_values=self.sensitive_values,
         )
 
 
@@ -144,10 +147,14 @@ def _assert_no_forbidden_names(value: object) -> None:
         _assert_no_forbidden_names(decoded)
 
 
+def _wire_json(value: object) -> bytes:
+    return json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+
+
 def _replace_json(raw: str | bytes, mutate: Any) -> bytes:
     value = json.loads(raw)
     mutate(value)
-    return json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+    return _wire_json(value)
 
 
 def _openai_body(cycle: dict[str, Any]) -> dict[str, Any]:
@@ -162,14 +169,20 @@ def _jev_body(cycle: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
+def _openai_message(response: dict[str, Any]) -> dict[str, Any]:
+    return next(item for item in response["output"] if item["type"] == "message")
+
+
 def _openai_text(response: dict[str, Any]) -> dict[str, Any]:
-    value = json.loads(response["output"][0]["content"][0]["text"])
+    value = json.loads(_openai_message(response)["content"][0]["text"])
     assert isinstance(value, dict)
     return value
 
 
 def _set_openai_text(response: dict[str, Any], value: object) -> None:
-    response["output"][0]["content"][0]["text"] = canonical_json_bytes(value).decode()
+    _openai_message(response)["content"][0]["text"] = canonical_json_bytes(
+        value
+    ).decode()
 
 
 def _call(
@@ -394,7 +407,8 @@ def test_malformed_json_is_sanitized_parse_failure(
 
     assert isinstance(result, AdapterFailure)
     assert result.code == "PARSE_ERROR"
-    assert result.response_bytes == b""
+    assert result.response_sha256 == hashlib.sha256(raw).hexdigest()
+    assert result.response_byte_length == len(raw)
     assert len(transport.calls) == 1
 
 
@@ -408,7 +422,8 @@ def test_duplicate_json_is_sanitized_parse_failure(
 
     assert isinstance(result, AdapterFailure)
     assert result.code == "PARSE_ERROR"
-    assert result.response_bytes == b""
+    assert result.response_sha256 == hashlib.sha256(raw).hexdigest()
+    assert result.response_byte_length == len(raw)
 
 
 @pytest.mark.parametrize("provider", ("openai", "jev"))
@@ -443,18 +458,20 @@ def test_wrong_response_model_is_explicit_model_failure(
     "mutate",
     (
         lambda r: r.update(status="incomplete"),
-        lambda r: r["output"].append(r["output"][0].copy()),
+        lambda r: r["output"].append(_openai_message(r).copy()),
         lambda r: r["output"].append({"type": "function_call", "name": "tool"}),
-        lambda r: r["output"][0].update(status="in_progress"),
-        lambda r: r["output"][0]["content"].clear(),
-        lambda r: r["output"][0]["content"].append(
+        lambda r: _openai_message(r).update(status="in_progress"),
+        lambda r: _openai_message(r)["content"].clear(),
+        lambda r: _openai_message(r)["content"].append(
             {"type": "refusal", "refusal": "no"}
         ),
-        lambda r: r["output"][0]["content"].append(r["output"][0]["content"][0].copy()),
-        lambda r: r["output"][0]["content"][0]["annotations"].append(
+        lambda r: _openai_message(r)["content"].append(
+            _openai_message(r)["content"][0].copy()
+        ),
+        lambda r: _openai_message(r)["content"][0]["annotations"].append(
             {"type": "url_citation"}
         ),
-        lambda r: r["output"][0]["content"][0]["logprobs"].append({"token": "x"}),
+        lambda r: _openai_message(r)["content"][0]["logprobs"].append({"token": "x"}),
     ),
 )
 def test_openai_rejects_noncompleted_refusal_tool_or_nonunique_output_text(
@@ -465,9 +482,7 @@ def test_openai_rejects_noncompleted_refusal_tool_or_nonunique_output_text(
     result = call_openai(
         evidence,
         OPENAI_MODEL_ID,
-        FixtureTransport(
-            canonical_json_bytes(response), billed_cost_microdollars=375_000
-        ),
+        FixtureTransport(_wire_json(response), billed_cost_microdollars=375_000),
     )
 
     assert isinstance(result, AdapterFailure)
@@ -485,9 +500,7 @@ def test_openai_mismatched_individual_citation_is_citation_failure(
     result = call_openai(
         evidence,
         OPENAI_MODEL_ID,
-        FixtureTransport(
-            canonical_json_bytes(response), billed_cost_microdollars=375_000
-        ),
+        FixtureTransport(_wire_json(response), billed_cost_microdollars=375_000),
     )
 
     assert isinstance(result, AdapterFailure)
@@ -507,9 +520,7 @@ def test_openai_invalid_citation_is_explicit_failure(
     result = call_openai(
         evidence,
         OPENAI_MODEL_ID,
-        FixtureTransport(
-            canonical_json_bytes(response), billed_cost_microdollars=375_000
-        ),
+        FixtureTransport(_wire_json(response), billed_cost_microdollars=375_000),
     )
 
     assert isinstance(result, AdapterFailure)
@@ -603,9 +614,10 @@ def test_non_2xx_body_and_headers_never_enter_failure(
     )
 
     assert isinstance(result, AdapterFailure)
-    assert result.code == "HTTP_ERROR"
+    assert result.code == "CREDENTIAL_REFLECTION"
     assert result.status_code == 503
-    assert result.response_bytes == b""
+    assert result.response_sha256 == hashlib.sha256(secret_body).hexdigest()
+    assert result.response_byte_length == len(secret_body)
     assert result.billed_cost_microdollars == 7
     assert CREDENTIAL_SENTINEL not in repr(result)
     assert CREDENTIAL_SENTINEL not in result.message
@@ -622,7 +634,8 @@ def test_timeout_is_one_call_and_sanitized(
 
     assert isinstance(result, AdapterFailure)
     assert result.code == "TIMEOUT"
-    assert result.response_bytes == b""
+    assert result.response_sha256 is None
+    assert result.response_byte_length == 0
     assert len(transport.calls) == 1
     assert CREDENTIAL_SENTINEL not in repr(result)
 
@@ -695,7 +708,8 @@ def test_malformed_transport_objects_become_provider_failure(
 
     assert isinstance(result, AdapterFailure)
     assert result.code == "PROVIDER_ERROR"
-    assert result.response_bytes == b""
+    assert result.response_sha256 is None
+    assert result.response_byte_length == 0
     assert result.billed_cost_microdollars == 0
 
 
@@ -736,3 +750,265 @@ def test_score_to_micros_uses_deterministic_half_up_rounding(
 
     assert isinstance(result, JevSuccess)
     assert result.decision.p_yes_micros == 700_001
+
+
+def _official_openai_response(cycle: dict[str, Any]) -> dict[str, Any]:
+    response = _openai_body(cycle)
+    response.update(
+        {
+            "id": "resp_fixture_openai_001",
+            "object": "response",
+            "created_at": 1_780_488_030,
+            "error": None,
+            "incomplete_details": None,
+            "instructions": None,
+            "max_output_tokens": None,
+            "metadata": {},
+            "parallel_tool_calls": True,
+            "previous_response_id": None,
+            "reasoning": {"effort": "medium", "summary": None},
+            "store": True,
+            "temperature": 1.0,
+            "text": {"format": {"type": "json_schema"}, "verbosity": "medium"},
+            "tool_choice": "auto",
+            "tools": [],
+            "top_p": 1.0,
+            "truncation": "disabled",
+        }
+    )
+    response["output"].insert(
+        0,
+        {
+            "id": "rs_fixture_openai_001",
+            "type": "reasoning",
+            "summary": [],
+            "status": "completed",
+        },
+    )
+    return response
+
+
+def _official_message(response: dict[str, Any]) -> dict[str, Any]:
+    return next(item for item in response["output"] if item["type"] == "message")
+
+
+def test_openai_accepts_official_completed_envelope_with_reasoning_and_absent_metadata(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief
+) -> None:
+    response = _official_openai_response(cycle)
+    content = _official_message(response)["content"][0]
+    content.pop("annotations")
+    content.pop("logprobs")
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, OpenAISuccess)
+    assert result.brief == brief
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda r: r.update(created_at=True),
+        lambda r: r.update(object="chat.completion"),
+        lambda r: r.update(error={"message": "failed"}),
+        lambda r: r.update(incomplete_details={"reason": "max_output_tokens"}),
+        lambda r: r["output"].append(
+            {"type": "function_call", "id": "call_1", "name": "x"}
+        ),
+        lambda r: _official_message(r)["content"].append(
+            {"type": "refusal", "refusal": "no"}
+        ),
+    ),
+)
+def test_openai_official_envelope_rejects_invalid_or_unapproved_outputs(
+    cycle: dict[str, Any], evidence: EvidencePacket, mutate: Any
+) -> None:
+    response = _official_openai_response(cycle)
+    mutate(response)
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "PARSE_ERROR"
+
+
+@pytest.mark.parametrize(
+    "embedded",
+    (
+        'prefix {"market_price":0.5} suffix',
+        'prefix [{"nested":{"ＴＯＫＥＮ＿ＩＤ":"secret"}}] suffix',
+        '{"safe":"prefix {\\"bestBid\\":0.5} suffix"}',
+        'safe [1,{"outer":{"yes_price":0.5}}] trailing',
+    ),
+)
+def test_embedded_json_is_found_at_any_offset_and_recursively_scanned(
+    evidence: EvidencePacket, embedded: str
+) -> None:
+    unsafe = evidence.model_copy(update={"description": embedded})
+
+    with pytest.raises(ValueError, match="forbidden"):
+        build_openai_request(unsafe, OPENAI_MODEL_ID)
+
+
+def test_embedded_json_scanner_is_explicitly_bounded(evidence: EvidencePacket) -> None:
+    unsafe = evidence.model_copy(update={"description": "x" * 20_001})
+
+    with pytest.raises(ValueError, match="scan limit"):
+        build_openai_request(unsafe, OPENAI_MODEL_ID)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda r: r["answers"]["p_yes"].update(score=0.2),
+        lambda r: r["answers"]["confidence"].update(score=0.2),
+        lambda r: r["answers"]["action"].update(choice="BUY_NO"),
+        lambda r: r["answers"]["action"].update(
+            choice="BUY_YES",
+            probabilities={"BUY_YES": 0.4, "BUY_NO": 0.4, "ABSTAIN": 0.2},
+        ),
+    ),
+)
+def test_jev_rejects_contradictory_scores_choices_and_ties(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief, mutate: Any
+) -> None:
+    response = _jev_body(cycle)
+    mutate(response)
+
+    result = call_jev(
+        brief,
+        evidence,
+        JEV_MODEL_ID,
+        FixtureTransport(_wire_json(response)),
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "PARSE_ERROR"
+
+
+@pytest.mark.parametrize("provider", ("openai", "jev"))
+@pytest.mark.parametrize(
+    ("body", "sensitive_values"),
+    (
+        (b'{"error":"Bearer reflected-secret"}', ()),
+        (b'{"error":"opaque-reflected-secret"}', (b"opaque-reflected-secret",)),
+    ),
+)
+def test_credential_reflection_discards_2xx_body_and_preserves_digest_metadata(
+    cycle: dict[str, Any],
+    evidence: EvidencePacket,
+    brief: ResearchBrief,
+    provider: str,
+    body: bytes,
+    sensitive_values: tuple[bytes, ...],
+) -> None:
+    result = _call(
+        provider,
+        cycle,
+        evidence,
+        brief,
+        FixtureTransport(
+            body,
+            billed_cost_microdollars=11,
+            sensitive_values=sensitive_values,
+        ),
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "CREDENTIAL_REFLECTION"
+    assert result.response_sha256 == hashlib.sha256(body).hexdigest()
+    assert result.response_byte_length == len(body)
+    assert result.status_code == 200
+    assert result.billed_cost_microdollars == 11
+    assert body.decode() not in repr(result)
+
+
+@pytest.mark.parametrize("provider", ("openai", "jev"))
+def test_all_response_failures_preserve_only_hash_and_length(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief, provider: str
+) -> None:
+    body = b"not-json-secret-body"
+    result = _call(provider, cycle, evidence, brief, FixtureTransport(body))
+
+    assert isinstance(result, AdapterFailure)
+    assert not hasattr(result, "response_bytes")
+    assert result.response_sha256 == hashlib.sha256(body).hexdigest()
+    assert result.response_byte_length == len(body)
+    assert body.decode() not in repr(result)
+    assert body.decode() not in result.message
+
+
+def test_success_repr_hides_request_and_response_bytes(
+    cycle: dict[str, Any], evidence: EvidencePacket
+) -> None:
+    response = _wire_json(_official_openai_response(cycle))
+    result = call_openai(evidence, OPENAI_MODEL_ID, FixtureTransport(response))
+
+    assert isinstance(result, OpenAISuccess)
+    assert result.request_bytes not in repr(result).encode()
+    assert response not in repr(result).encode()
+    assert result.response_bytes == response
+
+
+@pytest.mark.parametrize(
+    "sensitive_values",
+    ((b"",), (b"x" * 257,), tuple(b"x" for _ in range(17))),
+)
+def test_invalid_sensitive_value_metadata_is_provider_error(
+    cycle: dict[str, Any],
+    evidence: EvidencePacket,
+    sensitive_values: tuple[bytes, ...],
+) -> None:
+    response = _wire_json(_official_openai_response(cycle))
+    result = call_openai(
+        evidence,
+        OPENAI_MODEL_ID,
+        FixtureTransport(response, sensitive_values=sensitive_values),
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "PROVIDER_ERROR"
+    assert result.response_sha256 is None
+    assert result.response_byte_length == 0
+
+
+def test_transport_property_failure_is_provider_error(evidence: EvidencePacket) -> None:
+    class BrokenResponse:
+        @property
+        def status_code(self) -> int:
+            raise RuntimeError("credential-bearing property failure")
+
+    result = call_openai(
+        evidence,
+        OPENAI_MODEL_ID,
+        FixtureTransport(b"", response=BrokenResponse()),
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "PROVIDER_ERROR"
+    assert result.request_bytes
+    assert result.response_sha256 is None
+
+
+def test_call_catches_unexpected_builder_exception_as_input_error(
+    evidence: EvidencePacket, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken_builder(evidence: EvidencePacket, model: str) -> bytes:
+        raise RuntimeError("do not expose builder internals")
+
+    monkeypatch.setattr(
+        "jev_trading_lab.polymarket.ai.build_openai_request", broken_builder
+    )
+    transport = FixtureTransport(b"never sent")
+
+    result = call_openai(evidence, OPENAI_MODEL_ID, transport)
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "INPUT_ERROR"
+    assert result.request_bytes == b""
+    assert transport.calls == []

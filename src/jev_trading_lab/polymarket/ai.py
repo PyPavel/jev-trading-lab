@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 import unicodedata
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Final, Literal, Protocol
 
@@ -27,6 +29,13 @@ from jev_trading_lab.polymarket.models import (
 OPENAI_MODEL_ID: Final = "gpt-5-2026-09-30"
 JEV_MODEL_ID: Final = "jev-1.13.0"
 _OPENAI_DELIMITERS = ("<evidence>", "</evidence>")
+_MAX_PROSE_SCAN_BYTES = 20_000
+_MAX_JSON_CANDIDATES = 128
+_MAX_SENSITIVE_VALUES = 16
+_MAX_SENSITIVE_VALUE_BYTES = 256
+_SECRET_PATTERN = re.compile(
+    rb"(?i)(?:bearer\s+[!#$%&'*+.^_`|~0-9a-z-]{4,}|basic\s+[a-z0-9+/=]{4,}|(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|api[-_]?key)\s*[:=]\s*[^\s,;]{4,})"
+)
 _SCORE_CRITERIA = ["No", "Yes"]
 _JEV_QUESTIONS: Final[dict[str, object]] = {
     "evidence_sufficient": {
@@ -110,18 +119,20 @@ type FailureCode = Literal[
     "PARSE_ERROR",
     "MODEL_MISMATCH",
     "CITATION_ERROR",
+    "CREDENTIAL_REFLECTION",
 ]
 
 
 @dataclass(frozen=True, slots=True)
 class TransportResponse:
-    """One provider reply; callers discard headers after boundary validation."""
+    """One provider reply; callers discard headers and sensitive sentinels."""
 
     status_code: int
-    headers: Mapping[str, str]
-    raw_bytes: bytes
+    headers: Mapping[str, str] = field(repr=False)
+    raw_bytes: bytes = field(repr=False)
     retrieved_at: datetime
     billed_cost_microdollars: int
+    sensitive_values: tuple[bytes, ...] = field(default=(), repr=False)
 
 
 class Transport(Protocol):
@@ -133,8 +144,8 @@ class Transport(Protocol):
 @dataclass(frozen=True, slots=True)
 class OpenAISuccess:
     brief: ResearchBrief
-    request_bytes: bytes
-    response_bytes: bytes
+    request_bytes: bytes = field(repr=False)
+    response_bytes: bytes = field(repr=False)
     retrieved_at: datetime
     billed_cost_microdollars: int
 
@@ -142,8 +153,8 @@ class OpenAISuccess:
 @dataclass(frozen=True, slots=True)
 class JevSuccess:
     decision: JevDecision
-    request_bytes: bytes
-    response_bytes: bytes
+    request_bytes: bytes = field(repr=False)
+    response_bytes: bytes = field(repr=False)
     retrieved_at: datetime
     billed_cost_microdollars: int
 
@@ -153,8 +164,9 @@ class AdapterFailure:
     provider: Literal["openai", "jev"]
     code: FailureCode
     message: str
-    request_bytes: bytes
-    response_bytes: bytes
+    request_bytes: bytes = field(repr=False)
+    response_sha256: str | None
+    response_byte_length: int
     retrieved_at: datetime | None
     billed_cost_microdollars: int
     status_code: int | None
@@ -190,8 +202,28 @@ def _is_forbidden_name(value: str) -> bool:
     )
 
 
+def _embedded_json_values(text: str, *, label: str) -> list[object]:
+    if len(text.encode("utf-8")) > _MAX_PROSE_SCAN_BYTES:
+        raise ValueError(f"{label} prose exceeds embedded JSON scan limit")
+    decoder = json.JSONDecoder(object_pairs_hook=lambda pairs: dict(pairs))
+    decoded_values: list[object] = []
+    candidates = 0
+    for index, character in enumerate(text):
+        if character not in "{[":
+            continue
+        candidates += 1
+        if candidates > _MAX_JSON_CANDIDATES:
+            raise ValueError(f"{label} exceeds embedded JSON candidate scan limit")
+        try:
+            decoded, _ = decoder.raw_decode(text, index)
+        except (TypeError, ValueError):
+            continue
+        decoded_values.append(decoded)
+    return decoded_values
+
+
 def _reject_forbidden_names(value: object, *, label: str) -> None:
-    """Scan structured field names and JSON embedded in otherwise-prose strings."""
+    """Scan structured names and bounded JSON embedded anywhere in prose."""
 
     if isinstance(value, Mapping):
         forbidden = {str(key) for key in value if _is_forbidden_name(str(key))}
@@ -203,12 +235,7 @@ def _reject_forbidden_names(value: object, *, label: str) -> None:
         for nested in value:
             _reject_forbidden_names(nested, label=label)
     elif isinstance(value, str):
-        stripped = value.strip()
-        if stripped.startswith(("{", "[")):
-            try:
-                decoded = load_strict_json(stripped)
-            except (TypeError, ValueError):
-                return
+        for decoded in _embedded_json_values(value, label=label):
             _reject_forbidden_names(decoded, label=label)
 
 
@@ -298,6 +325,7 @@ def _failure(
     code: FailureCode,
     message: str,
     request_bytes: bytes,
+    response_body: bytes | None = None,
     retrieved_at: datetime | None = None,
     billed_cost_microdollars: int = 0,
     status_code: int | None = None,
@@ -309,7 +337,12 @@ def _failure(
         code=code,
         message=message,
         request_bytes=request_bytes,
-        response_bytes=b"",
+        response_sha256=(
+            hashlib.sha256(response_body).hexdigest()
+            if response_body is not None
+            else None
+        ),
+        response_byte_length=len(response_body) if response_body is not None else 0,
         retrieved_at=retrieved_at,
         billed_cost_microdollars=billed_cost_microdollars,
         status_code=status_code,
@@ -328,6 +361,7 @@ def _send_once(
         raw_bytes = response.raw_bytes
         retrieved_at = response.retrieved_at
         billed_cost = response.billed_cost_microdollars
+        sensitive_values = response.sensitive_values
         valid_retrieval = (
             isinstance(retrieved_at, datetime)
             and retrieved_at.tzinfo is not None
@@ -335,6 +369,14 @@ def _send_once(
         )
         valid_headers = isinstance(headers, Mapping) and all(
             type(key) is str and type(value) is str for key, value in headers.items()
+        )
+        valid_sensitive = (
+            type(sensitive_values) is tuple
+            and len(sensitive_values) <= _MAX_SENSITIVE_VALUES
+            and all(
+                type(value) is bytes and 0 < len(value) <= _MAX_SENSITIVE_VALUE_BYTES
+                for value in sensitive_values
+            )
         )
         if (
             type(status_code) is not int
@@ -344,6 +386,7 @@ def _send_once(
             or not (0 <= billed_cost <= INT64_MAX)
             or not valid_retrieval
             or not valid_headers
+            or not valid_sensitive
         ):
             raise ValueError("invalid transport metadata")
     except TimeoutError:
@@ -360,12 +403,26 @@ def _send_once(
             message=f"{provider} transport returned invalid data",
             request_bytes=request_bytes,
         )
+    if _SECRET_PATTERN.search(raw_bytes) or any(
+        sentinel in raw_bytes for sentinel in sensitive_values
+    ):
+        return _failure(
+            provider=provider,
+            code="CREDENTIAL_REFLECTION",
+            message=f"{provider} response contained credential-like data",
+            request_bytes=request_bytes,
+            response_body=raw_bytes,
+            retrieved_at=retrieved_at,
+            billed_cost_microdollars=billed_cost,
+            status_code=status_code,
+        )
     if status_code < 200 or status_code >= 300:
         return _failure(
             provider=provider,
             code="HTTP_ERROR",
             message=f"{provider} returned HTTP status {status_code}",
             request_bytes=request_bytes,
+            response_body=raw_bytes,
             retrieved_at=retrieved_at,
             billed_cost_microdollars=billed_cost,
             status_code=status_code,
@@ -386,6 +443,7 @@ def _decoded_response(
             code="PARSE_ERROR",
             message=f"{provider} response is not strict JSON",
             request_bytes=request_bytes,
+            response_body=response.raw_bytes,
             retrieved_at=response.retrieved_at,
             billed_cost_microdollars=response.billed_cost_microdollars,
             status_code=response.status_code,
@@ -396,6 +454,7 @@ def _decoded_response(
             code="PARSE_ERROR",
             message=f"{provider} response must be a JSON object",
             request_bytes=request_bytes,
+            response_body=response.raw_bytes,
             retrieved_at=response.retrieved_at,
             billed_cost_microdollars=response.billed_cost_microdollars,
             status_code=response.status_code,
@@ -414,6 +473,7 @@ def _parse_failure(
         code="PARSE_ERROR",
         message=message,
         request_bytes=request_bytes,
+        response_body=response.raw_bytes,
         retrieved_at=response.retrieved_at,
         billed_cost_microdollars=response.billed_cost_microdollars,
         status_code=response.status_code,
@@ -429,7 +489,7 @@ def call_openai(
 
     try:
         request_bytes = build_openai_request(evidence, model)
-    except (TypeError, ValueError):
+    except Exception:
         return _failure(
             provider="openai",
             code="INPUT_ERROR",
@@ -448,13 +508,14 @@ def call_openai(
             code="MODEL_MISMATCH",
             message="openai response model does not match the approved snapshot",
             request_bytes=request_bytes,
+            response_body=sent.raw_bytes,
             retrieved_at=sent.retrieved_at,
             billed_cost_microdollars=sent.billed_cost_microdollars,
             status_code=sent.status_code,
         )
     try:
         envelope = OpenAIResponse.model_validate(decoded)
-        raw_brief = load_strict_json(envelope.output[0].content[0].text)
+        raw_brief = load_strict_json(envelope.message().content[0].text)
     except (ValidationError, TypeError, ValueError):
         return _parse_failure(
             "openai",
@@ -481,6 +542,7 @@ def call_openai(
                 code="CITATION_ERROR",
                 message="openai brief does not cite the supplied evidence",
                 request_bytes=request_bytes,
+                response_body=sent.raw_bytes,
                 retrieved_at=sent.retrieved_at,
                 billed_cost_microdollars=sent.billed_cost_microdollars,
                 status_code=sent.status_code,
@@ -513,7 +575,7 @@ def call_jev(
 
     try:
         request_bytes = build_jev_request(brief, evidence, model)
-    except (TypeError, ValueError):
+    except Exception:
         return _failure(
             provider="jev",
             code="INPUT_ERROR",
@@ -532,6 +594,7 @@ def call_jev(
             code="MODEL_MISMATCH",
             message="jev response model does not match the approved snapshot",
             request_bytes=request_bytes,
+            response_body=sent.raw_bytes,
             retrieved_at=sent.retrieved_at,
             billed_cost_microdollars=sent.billed_cost_microdollars,
             status_code=sent.status_code,

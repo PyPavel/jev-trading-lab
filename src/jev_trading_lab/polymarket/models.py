@@ -234,8 +234,8 @@ class OpenAIOutputText(StrictModel):
 
     type: Literal["output_text"]
     text: NonEmptyStr
-    annotations: list[object]
-    logprobs: list[object]
+    annotations: list[object] | None = None
+    logprobs: list[object] | None = None
 
     @model_validator(mode="after")
     def reject_unapproved_metadata(self) -> Self:
@@ -254,13 +254,87 @@ class OpenAIOutputMessage(StrictModel):
     content: Annotated[list[OpenAIOutputText], Field(min_length=1, max_length=1)]
 
 
-class OpenAIResponse(StrictModel):
-    """Closed-world raw OpenAI Responses API envelope used by the fixture."""
+class OpenAIReasoningSummary(StrictModel):
+    type: Literal["summary_text"]
+    text: Annotated[str, StringConstraints(max_length=20_000)]
 
+
+class OpenAIReasoningItem(StrictModel):
+    """Approved non-message output item; its text never feeds the brief."""
+
+    type: Literal["reasoning"]
+    id: NonEmptyStr
+    status: Literal["completed"] | None = None
+    summary: Annotated[list[OpenAIReasoningSummary], Field(max_length=16)]
+    encrypted_content: str | None = None
+
+
+class OpenAIReasoningConfig(StrictModel):
+    effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"] | None = None
+    summary: Literal["auto", "concise", "detailed"] | None = None
+
+
+class OpenAITextFormat(StrictModel):
+    type: Literal["text", "json_object", "json_schema"]
+    name: str | None = None
+    description: str | None = None
+    schema_: dict[str, object] | None = Field(default=None, alias="schema")
+    strict: bool | None = None
+
+
+class OpenAITextConfig(StrictModel):
+    format: OpenAITextFormat
+    verbosity: Literal["low", "medium", "high"] | None = None
+
+
+class OpenAIResponse(StrictModel):
+    """Reviewed closed-world OpenAI Responses API envelope."""
+
+    id: NonEmptyStr
+    object: Literal["response"]
+    created_at: Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)]
     model: Literal["gpt-5-2026-09-30"]
     status: Literal["completed"]
-    output: Annotated[list[OpenAIOutputMessage], Field(min_length=1, max_length=1)]
+    error: None
+    incomplete_details: None
+    instructions: str | None
+    max_output_tokens: NonNegativeInt | None
+    metadata: dict[str, str]
+    output: Annotated[
+        list[OpenAIOutputMessage | OpenAIReasoningItem],
+        Field(min_length=1, max_length=32),
+    ]
+    parallel_tool_calls: bool
+    previous_response_id: str | None
+    reasoning: OpenAIReasoningConfig | None
+    store: bool
+    temperature: Annotated[float, Field(strict=True, ge=0.0, le=2.0)] | None = None
+    top_p: Annotated[float, Field(strict=True, ge=0.0, le=1.0)] | None = None
+    text: OpenAITextConfig
+    tool_choice: Literal["auto", "none"] | None = None
+    tools: Annotated[list[Any], Field(max_length=0)] | None = None
+    truncation: Literal["auto", "disabled"]
     usage: OpenAIUsage
+
+    @model_validator(mode="after")
+    def require_one_completed_message(self) -> Self:
+        messages = [
+            item for item in self.output if isinstance(item, OpenAIOutputMessage)
+        ]
+        if len(messages) != 1:
+            raise ValueError(
+                "response must contain exactly one completed assistant message"
+            )
+        if len(self.metadata) > 16 or any(
+            len(key) > 64 or len(value) > 512 for key, value in self.metadata.items()
+        ):
+            raise ValueError("response metadata exceeds reviewed bounds")
+        return self
+
+    def message(self) -> OpenAIOutputMessage:
+        return next(
+            item for item in self.output if isinstance(item, OpenAIOutputMessage)
+        )
 
 
 class JevDecision(StrictModel):
@@ -298,6 +372,9 @@ class JevScoreAnswer(StrictModel):
             or not abs(sum(self.probabilities.values()) - 1.0) <= 1e-9
         ):
             raise ValueError("score probabilities must cover the rubric and sum to one")
+        expected = self.probabilities["1"]
+        if abs(self.score - expected) > 1e-6:
+            raise ValueError("score must equal the binary distribution expected value")
         return self
 
 
@@ -316,6 +393,10 @@ class JevChoiceAnswer(StrictModel):
             raise ValueError(
                 "action probabilities must cover all choices and sum to one"
             )
+        maximum = max(self.probabilities.values())
+        winners = [key for key, value in self.probabilities.items() if value == maximum]
+        if len(winners) != 1 or self.choice != winners[0]:
+            raise ValueError("action choice must be the unique distribution maximum")
         return self
 
 
@@ -369,7 +450,7 @@ def jev_response_decision(response: JevResponse) -> JevDecision:
 def openai_response_brief(response: OpenAIResponse) -> ResearchBrief:
     """Parse the sole completed raw output_text as a strict research brief."""
 
-    return ResearchBrief.model_validate_json(response.output[0].content[0].text)
+    return ResearchBrief.model_validate_json(response.message().content[0].text)
 
 
 class ArmResult(StrictModel):
@@ -1013,9 +1094,14 @@ def validate_feasibility_fixture(fixture: dict[str, Any]) -> None:
     if openai_request != expected_openai_request:
         raise ValueError("OpenAI request does not match fixture evidence contract")
 
-    openai_response = OpenAIResponse.model_validate_json(
-        artifacts.openai_response_bytes
-    )
+    try:
+        openai_response = OpenAIResponse.model_validate_json(
+            artifacts.openai_response_bytes
+        )
+    except ValidationError:
+        raise
+    except ValueError as error:
+        raise ValueError("OpenAI response output_text is invalid") from error
     try:
         response_brief = openai_response_brief(openai_response)
     except (ValidationError, ValueError) as error:
@@ -1032,10 +1118,18 @@ def validate_feasibility_fixture(fixture: dict[str, Any]) -> None:
     if jev_request != expected_jev_request:
         raise ValueError("Jev request does not match fixture brief contract")
 
-    jev_response = JevResponse.model_validate_json(artifacts.jev_response_bytes)
+    try:
+        jev_response = JevResponse.model_validate_json(artifacts.jev_response_bytes)
+    except ValidationError as error:
+        if "duplicate JSON key:" in str(error):
+            raise ValueError(str(error)) from error
+        raise ValueError("Jev response is invalid") from error
+    except ValueError:
+        raise
+    response_decision = jev_response_decision(jev_response)
     if (
         jev_response.model != jev_request["model"]
-        or jev_response_decision(jev_response) != validated.jev_decision
+        or response_decision != validated.jev_decision
     ):
         raise ValueError("Jev response does not match decision")
 
