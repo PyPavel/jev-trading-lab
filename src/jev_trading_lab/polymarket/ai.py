@@ -8,7 +8,7 @@ import re
 import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime
 from typing import Final, Literal, Protocol
 
 from pydantic import ValidationError
@@ -26,7 +26,7 @@ from jev_trading_lab.polymarket.models import (
     openai_response_brief,
 )
 
-OPENAI_MODEL_ID: Final = "gpt-5-2026-09-30"
+OPENAI_MODEL_ID: Final = "gpt-5-2025-08-07"
 JEV_MODEL_ID: Final = "jev-1.13.0"
 _OPENAI_DELIMITERS = ("<evidence>", "</evidence>")
 _MAX_PROSE_SCAN_BYTES = 20_000
@@ -250,6 +250,38 @@ def _reject_delimiters(value: object) -> None:
         raise ValueError("OpenAI evidence contains a reserved delimiter")
 
 
+def _semantic_bytes(value: str) -> bytes:
+    return unicodedata.normalize("NFKC", value).encode("utf-8")
+
+
+def _contains_credentials(value: object, sensitive_values: tuple[bytes, ...]) -> bool:
+    normalized_sentinels: list[bytes] = []
+    for sentinel in sensitive_values:
+        try:
+            normalized_sentinels.append(_semantic_bytes(sentinel.decode("utf-8")))
+        except UnicodeDecodeError:
+            continue
+
+    def contains(nested: object) -> bool:
+        if isinstance(nested, Mapping):
+            return any(contains(item) for item in nested.values())
+        if isinstance(nested, list | tuple):
+            return any(contains(item) for item in nested)
+        if isinstance(nested, str):
+            semantic = _semantic_bytes(nested)
+            if bool(_SECRET_PATTERN.search(semantic)) or any(
+                sentinel in semantic for sentinel in normalized_sentinels
+            ):
+                return True
+            return any(
+                contains(decoded)
+                for decoded in _embedded_json_values(nested, label="response")
+            )
+        return False
+
+    return contains(value)
+
+
 def _require_model(model: object, approved: str, provider: str) -> None:
     if type(model) is not str or model != approved:
         raise ValueError(f"{provider} model must be the approved pinned ID {approved}")
@@ -362,11 +394,7 @@ def _send_once(
         retrieved_at = response.retrieved_at
         billed_cost = response.billed_cost_microdollars
         sensitive_values = response.sensitive_values
-        valid_retrieval = (
-            isinstance(retrieved_at, datetime)
-            and retrieved_at.tzinfo is not None
-            and retrieved_at.utcoffset() == timedelta(0)
-        )
+        valid_retrieval = type(retrieved_at) is datetime and retrieved_at.tzinfo is UTC
         valid_headers = isinstance(headers, Mapping) and all(
             type(key) is str and type(value) is str for key, value in headers.items()
         )
@@ -453,6 +481,21 @@ def _decoded_response(
             provider=provider,
             code="PARSE_ERROR",
             message=f"{provider} response must be a JSON object",
+            request_bytes=request_bytes,
+            response_body=response.raw_bytes,
+            retrieved_at=response.retrieved_at,
+            billed_cost_microdollars=response.billed_cost_microdollars,
+            status_code=response.status_code,
+        )
+    try:
+        reflected = _contains_credentials(decoded, response.sensitive_values)
+    except (TypeError, ValueError):
+        reflected = True
+    if reflected:
+        return _failure(
+            provider=provider,
+            code="CREDENTIAL_REFLECTION",
+            message=f"{provider} response contained credential-like data",
             request_bytes=request_bytes,
             response_body=response.raw_bytes,
             retrieved_at=response.retrieved_at,

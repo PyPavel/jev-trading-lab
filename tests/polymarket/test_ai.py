@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Any
 
@@ -993,6 +993,244 @@ def test_transport_property_failure_is_provider_error(evidence: EvidencePacket) 
     assert result.code == "PROVIDER_ERROR"
     assert result.request_bytes
     assert result.response_sha256 is None
+
+
+def test_openai_uses_official_pinned_gpt5_snapshot_and_rejects_old_id(
+    evidence: EvidencePacket,
+) -> None:
+    assert OPENAI_MODEL_ID == "gpt-5-2025-08-07"
+    with pytest.raises(ValueError, match="approved pinned"):
+        build_openai_request(evidence, "gpt-5-2026-09-30")
+
+
+_OPENAI_OPTIONAL_FIELDS: dict[str, object] = {
+    "background": False,
+    "completed_at": 1_780_488_031,
+    "conversation": {"id": "conv_fixture_openai_001"},
+    "max_tool_calls": 0,
+    "prompt_cache_key": "cache-fixture",
+    "safety_identifier": "safe-user-fixture",
+    "service_tier": "default",
+    "top_logprobs": 0,
+    "user": "legacy-user-fixture",
+}
+
+
+@pytest.mark.parametrize(("field", "value"), tuple(_OPENAI_OPTIONAL_FIELDS.items()))
+def test_openai_accepts_each_documented_optional_response_field(
+    cycle: dict[str, Any],
+    evidence: EvidencePacket,
+    field: str,
+    value: object,
+) -> None:
+    response = _official_openai_response(cycle)
+    response[field] = value
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, OpenAISuccess)
+
+
+def test_openai_accepts_all_documented_optional_response_fields_together(
+    cycle: dict[str, Any], evidence: EvidencePacket
+) -> None:
+    response = _official_openai_response(cycle)
+    response.update(_OPENAI_OPTIONAL_FIELDS)
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, OpenAISuccess)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("background", 1),
+        ("completed_at", True),
+        ("conversation", {"id": "conv", "extra": True}),
+        ("max_tool_calls", -1),
+        ("prompt_cache_key", 1),
+        ("safety_identifier", "x" * 65),
+        ("service_tier", "unofficial"),
+        ("top_logprobs", 21),
+        ("user", 1),
+    ),
+)
+def test_openai_rejects_invalid_documented_optional_response_field_types(
+    cycle: dict[str, Any],
+    evidence: EvidencePacket,
+    field: str,
+    value: object,
+) -> None:
+    response = _official_openai_response(cycle)
+    response[field] = value
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "PARSE_ERROR"
+
+
+def test_openai_accepts_cache_write_tokens_as_strict_nonnegative_int64(
+    cycle: dict[str, Any], evidence: EvidencePacket
+) -> None:
+    for value in (0, INT64_MAX):
+        response = _official_openai_response(cycle)
+        response["usage"]["input_tokens_details"]["cache_write_tokens"] = value
+        result = call_openai(
+            evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+        )
+        assert isinstance(result, OpenAISuccess)
+
+
+@pytest.mark.parametrize("value", (True, -1, INT64_MAX + 1, "1"))
+def test_openai_rejects_invalid_cache_write_tokens(
+    cycle: dict[str, Any], evidence: EvidencePacket, value: object
+) -> None:
+    response = _official_openai_response(cycle)
+    response["usage"]["input_tokens_details"]["cache_write_tokens"] = value
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "PARSE_ERROR"
+
+
+@pytest.mark.parametrize("provider", ("openai", "jev"))
+def test_unicode_escaped_sensitive_value_is_semantically_rejected(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief, provider: str
+) -> None:
+    response = (
+        _official_openai_response(cycle) if provider == "openai" else _jev_body(cycle)
+    )
+    if provider == "openai":
+        response["prompt_cache_key"] = "opaque-reflected-secret"
+    else:
+        response["answers"]["action"]["choice"] = "opaque-reflected-secret"
+    body = _wire_json(response).replace(b"secret", b"\\u0073ecret")
+
+    result = _call(
+        provider,
+        cycle,
+        evidence,
+        brief,
+        FixtureTransport(body, sensitive_values=(b"opaque-reflected-secret",)),
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "CREDENTIAL_REFLECTION"
+    assert result.response_sha256 == hashlib.sha256(body).hexdigest()
+    assert result.response_byte_length == len(body)
+    assert "opaque-reflected-secret" not in repr(result)
+
+
+def test_unicode_escaped_sensitive_value_in_reasoning_summary_is_rejected(
+    cycle: dict[str, Any], evidence: EvidencePacket
+) -> None:
+    response = _official_openai_response(cycle)
+    response["output"][0]["summary"] = [
+        {"type": "summary_text", "text": "opaque-reflected-secret"}
+    ]
+    body = _wire_json(response).replace(b"secret", b"\\u0073ecret")
+
+    result = call_openai(
+        evidence,
+        OPENAI_MODEL_ID,
+        FixtureTransport(body, sensitive_values=(b"opaque-reflected-secret",)),
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "CREDENTIAL_REFLECTION"
+
+
+def test_unicode_escaped_sensitive_value_in_decoded_output_text_is_rejected(
+    cycle: dict[str, Any], evidence: EvidencePacket
+) -> None:
+    response = _official_openai_response(cycle)
+    output = _openai_text(response)
+    output["arguments_for"][0] = "opaque-reflected-secret"
+    _set_openai_text(response, output)
+    body = _wire_json(response).replace(b"secret", b"\\\\u0073ecret")
+
+    result = call_openai(
+        evidence,
+        OPENAI_MODEL_ID,
+        FixtureTransport(body, sensitive_values=(b"opaque-reflected-secret",)),
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "CREDENTIAL_REFLECTION"
+
+
+def test_semantically_decoded_generic_credential_pattern_is_rejected(
+    cycle: dict[str, Any], evidence: EvidencePacket
+) -> None:
+    response = _official_openai_response(cycle)
+    response["prompt_cache_key"] = "Bearer reflected-secret"
+    body = _wire_json(response).replace(b"Bearer", b"B\\u0065arer")
+
+    result = call_openai(evidence, OPENAI_MODEL_ID, FixtureTransport(body))
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "CREDENTIAL_REFLECTION"
+
+
+def test_custom_zero_offset_tzinfo_cannot_reach_result_metadata_or_repr(
+    cycle: dict[str, Any], evidence: EvidencePacket
+) -> None:
+    sentinel = "custom-tz-secret-never-retain"
+
+    class SecretZeroOffset(tzinfo):
+        def utcoffset(self, dt: datetime | None) -> timedelta:
+            return timedelta(0)
+
+        def dst(self, dt: datetime | None) -> timedelta:
+            return timedelta(0)
+
+        def tzname(self, dt: datetime | None) -> str:
+            return sentinel
+
+        def __repr__(self) -> str:
+            return sentinel
+
+    response = TransportResponse(
+        status_code=200,
+        headers={},
+        raw_bytes=_wire_json(_official_openai_response(cycle)),
+        retrieved_at=datetime(2026, 10, 3, tzinfo=SecretZeroOffset()),
+        billed_cost_microdollars=0,
+    )
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(b"", response=response)
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "PROVIDER_ERROR"
+    assert result.retrieved_at is None
+    assert sentinel not in repr(result)
+
+
+def test_transport_timestamp_is_exact_builtin_utc_datetime(
+    cycle: dict[str, Any], evidence: EvidencePacket
+) -> None:
+    result = call_openai(
+        evidence,
+        OPENAI_MODEL_ID,
+        FixtureTransport(_wire_json(_official_openai_response(cycle))),
+    )
+
+    assert isinstance(result, OpenAISuccess)
+    assert type(result.retrieved_at) is datetime
+    assert result.retrieved_at.tzinfo is UTC
 
 
 def test_call_catches_unexpected_builder_exception_as_input_error(

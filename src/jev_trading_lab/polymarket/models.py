@@ -205,6 +205,13 @@ class OpenAIInputTokenDetails(StrictModel):
     """Raw Responses API input-token detail counts."""
 
     cached_tokens: NonNegativeInt
+    cache_write_tokens: NonNegativeInt | None = None
+
+
+class OpenAIConversation(StrictModel):
+    """Conversation associated with an official Responses API envelope."""
+
+    id: NonEmptyStr
 
 
 class OpenAIOutputTokenDetails(StrictModel):
@@ -293,13 +300,22 @@ class OpenAIResponse(StrictModel):
     id: NonEmptyStr
     object: Literal["response"]
     created_at: Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)]
-    model: Literal["gpt-5-2026-09-30"]
+    model: Literal["gpt-5-2025-08-07"]
     status: Literal["completed"]
     error: None
     incomplete_details: None
     instructions: str | None
+    background: bool | None = None
+    completed_at: NonNegativeInt | None = None
+    conversation: OpenAIConversation | None = None
     max_output_tokens: NonNegativeInt | None
+    max_tool_calls: NonNegativeInt | None = None
     metadata: dict[str, str]
+    prompt_cache_key: str | None = None
+    safety_identifier: Annotated[str, StringConstraints(max_length=64)] | None = None
+    service_tier: Literal["auto", "default", "flex", "priority", "scale"] | None = None
+    top_logprobs: Annotated[int, Field(strict=True, ge=0, le=20)] | None = None
+    user: str | None = None
     output: Annotated[
         list[OpenAIOutputMessage | OpenAIReasoningItem],
         Field(min_length=1, max_length=32),

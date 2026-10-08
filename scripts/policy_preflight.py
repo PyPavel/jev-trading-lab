@@ -103,13 +103,13 @@ EXPECTED_SOURCE_HASHES = {
         "2c8708e587ec6804d9c15736661a265c5b441cc3ce83b0b152e15f5a2fcf6739"
     ),
     "src/jev_trading_lab/polymarket/ai.py": (
-        "fddd7d8c2d8c15d877a6692a8244987c55fc9b923a1013e6bcc7396806974b65"
+        "74059ff4ee87ce47f0b046fc2229f21213d9842e0135d418f6275b21f0d7aadb"
     ),
     "src/jev_trading_lab/polymarket/control.py": (
         "cadd87042c9293c2fd97d0017f532b06500d2afd23b07a9bd16c5e7bceef2b8d"
     ),
     "src/jev_trading_lab/polymarket/models.py": (
-        "94e46e908b37d9619bc4624539944bbdca9aca5cf5c8c415bc4addf871da8d2b"
+        "2265d655258b61aef89a7fd8c4e3c52fee25f02742993a9f3b02d6a52a4639ac"
     ),
     "src/jev_trading_lab/polymarket/paper.py": (
         "a8d3754b325a1da673fb0ce30a81bf92931550d68002b5c3b5fef7b64d2b4b00"
