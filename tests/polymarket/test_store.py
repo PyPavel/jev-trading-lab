@@ -1,0 +1,510 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import multiprocessing
+import os
+import stat
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import pytest
+from pydantic import ValidationError
+
+from jev_trading_lab.core.ids import canonical_json_bytes
+from jev_trading_lab.polymarket.models import (
+    JevDecision,
+    ObservationResult,
+    ResearchBrief,
+    load_strict_json,
+)
+from jev_trading_lab.polymarket.store import (
+    ArtifactEnvelope,
+    ArtifactToFreeze,
+    StoreConflictError,
+    StoreCorruptError,
+    StoreSecurityError,
+    load_observation,
+    record_observation,
+)
+
+FIXTURE_PATH = Path(__file__).parents[1] / "fixtures/polymarket/feasibility_cycle.json"
+
+
+@pytest.fixture(autouse=True)
+def _local_test_filesystem(monkeypatch: pytest.MonkeyPatch) -> None:
+    from jev_trading_lab.polymarket import store
+
+    defaults = dict(store.BlobStore.__init__.__kwdefaults__ or {})
+    defaults["filesystem_resolver"] = lambda _path: "ext4"
+    monkeypatch.setattr(store.BlobStore.__init__, "__kwdefaults__", defaults)
+
+
+@pytest.fixture
+def cycle() -> dict[str, Any]:
+    value = load_strict_json(FIXTURE_PATH.read_bytes())
+    assert isinstance(value, dict)
+    return value
+
+
+def _result(cycle: dict[str, Any], suffix: str = "") -> ObservationResult:
+    value = deepcopy(cycle["expected"]["observation_result"])
+    if suffix:
+        value["policy_version"] += f"-{suffix}"
+        value["opportunity_id"] = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "policy_version": value["policy_version"],
+                    "market_id": value["market_id"],
+                    "cutoff_at": value["cutoff_at"],
+                }
+            )
+        ).hexdigest()
+        value["observation_id"] = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "opportunity_id": value["opportunity_id"],
+                    "evidence_sha256": value["evidence_sha256"],
+                    "execution_book_sha256": value["execution_book_sha256"],
+                    "policy_version": value["policy_version"],
+                }
+            )
+        ).hexdigest()
+    return ObservationResult.model_validate_json(json.dumps(value))
+
+
+def _artifacts(cycle: dict[str, Any]) -> list[ArtifactToFreeze]:
+    result = _result(cycle)
+    brief = ResearchBrief.model_validate_json(json.dumps(cycle["research_brief"]))
+    decision = JevDecision.model_validate_json(json.dumps(cycle["jev_decision"]))
+    values = (
+        (
+            "evidence",
+            cycle["raw"]["gamma_bytes"].encode(),
+            "gamma_public",
+            datetime(2026, 10, 3, 12, tzinfo=UTC),
+        ),
+        (
+            "research_brief",
+            canonical_json_bytes(brief.model_dump(mode="json")),
+            "openai_validated",
+            datetime(2026, 10, 3, 12, 0, 30, tzinfo=UTC),
+        ),
+        (
+            "jev_decision",
+            canonical_json_bytes(decision.model_dump(mode="json")),
+            "jev_validated",
+            datetime(2026, 10, 3, 12, 1, tzinfo=UTC),
+        ),
+        (
+            "execution_book",
+            cycle["raw"]["execution_book_bytes"].encode(),
+            "clob_public",
+            datetime(2026, 10, 3, 12, 2, tzinfo=UTC),
+        ),
+    )
+    artifacts: list[ArtifactToFreeze] = []
+    predecessor: str | None = None
+    for kind, payload, source, retrieved_at in values:
+        artifacts.append(
+            ArtifactToFreeze(
+                kind=kind,
+                payload=payload,
+                source_uri_label=source,
+                retrieved_at=retrieved_at,
+                predecessor_stage_sha256=predecessor,
+            )
+        )
+        predecessor = hashlib.sha256(payload).hexdigest()
+    assert result.research_brief_sha256 == hashlib.sha256(values[1][1]).hexdigest()
+    assert result.jev_decision_sha256 == hashlib.sha256(values[2][1]).hexdigest()
+    return artifacts
+
+
+def _retarget(
+    artifacts: list[ArtifactToFreeze], result: ObservationResult
+) -> list[ArtifactToFreeze]:
+    return [
+        ArtifactToFreeze(
+            kind=item.kind,
+            payload=item.payload,
+            source_uri_label=item.source_uri_label,
+            retrieved_at=item.retrieved_at,
+            predecessor_stage_sha256=item.predecessor_stage_sha256,
+        )
+        for item in artifacts
+    ]
+
+
+def _process_record(
+    output: str, fixture: dict[str, Any], suffix: str, queue: multiprocessing.Queue[str]
+) -> None:
+    try:
+        result = _result(fixture, suffix)
+        record_observation(Path(output), result, _retarget(_artifacts(fixture), result))
+    except BaseException as error:  # pragma: no cover - returned to parent
+        queue.put(f"{type(error).__name__}: {error}")
+    else:
+        queue.put("ok")
+
+
+def _journal_lines(path: Path) -> list[bytes]:
+    return path.read_bytes().splitlines()
+
+
+def test_publishes_exact_fixture_bytes_and_replays_verified_artifacts(
+    tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    output = tmp_path / "output"
+    result = _result(cycle)
+
+    stored = record_observation(output, result, _artifacts(cycle))
+    replay = load_observation(output, result.observation_id)
+
+    assert stored == result
+    assert replay.result == result
+    assert replay.artifacts["evidence"] == cycle["raw"]["gamma_bytes"].encode()
+    assert (
+        replay.artifacts["execution_book"]
+        == cycle["raw"]["execution_book_bytes"].encode()
+    )
+    assert (
+        hashlib.sha256(replay.artifacts["evidence"]).hexdigest()
+        == (cycle["expected"]["artifact_sha256"]["gamma_bytes"])
+    )
+    assert set(replay.artifacts) == {
+        "evidence",
+        "research_brief",
+        "jev_decision",
+        "execution_book",
+    }
+
+
+def test_journals_are_canonical_strict_and_private(
+    tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    output = tmp_path / "output"
+    result = _result(cycle)
+    record_observation(output, result, _artifacts(cycle))
+
+    result_line = _journal_lines(output / "results.jsonl")[0]
+    assert result_line == canonical_json_bytes(result.model_dump(mode="json"))
+    assert ObservationResult.model_validate_json(result_line) == result
+    for line in _journal_lines(output / "artifacts.jsonl"):
+        envelope = ArtifactEnvelope.model_validate_json(line)
+        assert line == canonical_json_bytes(envelope.model_dump(mode="json"))
+    assert stat.S_IMODE(output.stat().st_mode) == 0o700
+    assert stat.S_IMODE((output / "results.jsonl").stat().st_mode) == 0o600
+    assert stat.S_IMODE((output / "artifacts.jsonl").stat().st_mode) == 0o600
+
+
+def test_same_observation_is_idempotent_without_duplicate_lines(
+    tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    output = tmp_path / "output"
+    result = _result(cycle)
+    artifacts = _artifacts(cycle)
+
+    assert record_observation(output, result, artifacts) == result
+    before = (
+        (output / "artifacts.jsonl").read_bytes(),
+        (output / "results.jsonl").read_bytes(),
+    )
+    assert record_observation(output, result, artifacts) == result
+
+    assert (output / "artifacts.jsonl").read_bytes() == before[0]
+    assert (output / "results.jsonl").read_bytes() == before[1]
+
+
+def test_same_identity_with_different_canonical_result_conflicts(
+    tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    output = tmp_path / "output"
+    result = _result(cycle)
+    record_observation(output, result, _artifacts(cycle))
+    changed = result.model_copy(
+        update={"observed_at": datetime(2026, 11, 1, 20, 0, 1, tzinfo=UTC)}
+    )
+
+    with pytest.raises(StoreConflictError, match="observation identity"):
+        record_observation(output, changed, _artifacts(cycle))
+
+    assert len(_journal_lines(output / "results.jsonl")) == 1
+
+
+def test_same_result_with_different_artifact_set_conflicts(
+    tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    output = tmp_path / "output"
+    result = _result(cycle)
+    artifacts = _artifacts(cycle)
+    record_observation(output, result, artifacts)
+    changed = [
+        *artifacts,
+        ArtifactToFreeze(
+            kind="provider_output",
+            payload=b"validated but different invocation",
+            source_uri_label="openai_validated",
+            retrieved_at=datetime(2026, 10, 3, 12, 3, tzinfo=UTC),
+            predecessor_stage_sha256=hashlib.sha256(artifacts[-1].payload).hexdigest(),
+        ),
+    ]
+
+    with pytest.raises(StoreConflictError, match="artifact set"):
+        record_observation(output, result, changed)
+
+    assert len(_journal_lines(output / "results.jsonl")) == 1
+
+
+@pytest.mark.parametrize("journal", ("results.jsonl", "artifacts.jsonl"))
+def test_truncated_tail_fails_closed(
+    tmp_path: Path, cycle: dict[str, Any], journal: str
+) -> None:
+    output = tmp_path / "output"
+    result = _result(cycle)
+    record_observation(output, result, _artifacts(cycle))
+    path = output / journal
+    path.write_bytes(path.read_bytes()[:-1])
+    path.chmod(0o600)
+
+    with pytest.raises(StoreCorruptError, match="truncated"):
+        load_observation(output, result.observation_id)
+
+
+def test_duplicate_keys_and_duplicate_ids_fail_closed(
+    tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    output = tmp_path / "output"
+    result = _result(cycle)
+    record_observation(output, result, _artifacts(cycle))
+    results = output / "results.jsonl"
+    original = _journal_lines(results)[0]
+    duplicate_key = (
+        original[:-1]
+        + b',"observation_id":"'
+        + result.observation_id.encode()
+        + b'"}\n'
+    )
+    results.write_bytes(duplicate_key)
+    results.chmod(0o600)
+    with pytest.raises(StoreCorruptError, match="result journal"):
+        load_observation(output, result.observation_id)
+
+    results.write_bytes(original + b"\n" + original + b"\n")
+    results.chmod(0o600)
+    with pytest.raises(StoreCorruptError, match="duplicate observation"):
+        load_observation(output, result.observation_id)
+
+
+def test_replay_rejects_missing_and_corrupt_blob(
+    tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    output = tmp_path / "output"
+    result = _result(cycle)
+    record_observation(output, result, _artifacts(cycle))
+    envelope = ArtifactEnvelope.model_validate_json(
+        _journal_lines(output / "artifacts.jsonl")[0]
+    )
+    blob = output / "blobs" / envelope.storage_relpath
+
+    blob.write_bytes(b"tampered")
+    blob.chmod(0o600)
+    with pytest.raises(StoreCorruptError, match="artifact blob"):
+        load_observation(output, result.observation_id)
+
+    blob.unlink()
+    with pytest.raises(StoreCorruptError, match="artifact blob"):
+        load_observation(output, result.observation_id)
+
+
+def test_replay_rejects_bad_envelope_hash(
+    tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    output = tmp_path / "output"
+    result = _result(cycle)
+    record_observation(output, result, _artifacts(cycle))
+    journal = output / "artifacts.jsonl"
+    lines = _journal_lines(journal)
+    value = json.loads(lines[0])
+    value["sha256"] = "0" * 64
+    value["storage_relpath"] = "00/00/" + "0" * 64
+    lines[0] = canonical_json_bytes(value)
+    journal.write_bytes(b"\n".join(lines) + b"\n")
+    journal.chmod(0o600)
+
+    with pytest.raises(StoreCorruptError, match="artifact"):
+        load_observation(output, result.observation_id)
+
+
+def test_output_symlink_is_rejected(tmp_path: Path, cycle: dict[str, Any]) -> None:
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    linked = tmp_path / "output"
+    linked.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(StoreSecurityError, match="output"):
+        record_observation(linked, _result(cycle), _artifacts(cycle))
+
+    assert not (real / "results.jsonl").exists()
+
+
+@pytest.mark.parametrize("attack", ("symlink", "fifo", "hardlink", "weak_mode"))
+def test_unsafe_existing_result_journal_is_rejected(
+    tmp_path: Path, cycle: dict[str, Any], attack: str
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir(mode=0o700)
+    path = output / "results.jsonl"
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"")
+    outside.chmod(0o600)
+    if attack == "symlink":
+        path.symlink_to(outside)
+    elif attack == "fifo":
+        os.mkfifo(path, 0o600)
+    elif attack == "hardlink":
+        os.link(outside, path)
+    else:
+        path.write_bytes(b"")
+        path.chmod(0o640)
+
+    with pytest.raises(StoreSecurityError, match="journal"):
+        record_observation(output, _result(cycle), _artifacts(cycle))
+
+
+def test_failure_appending_artifacts_never_appends_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    from jev_trading_lab.polymarket import store
+
+    output = tmp_path / "output"
+    real_append = store._append_lines
+
+    def fail_artifacts(descriptor: int, lines: list[bytes], *, label: str) -> None:
+        if label == "artifact journal":
+            raise OSError("simulated artifact journal failure")
+        real_append(descriptor, lines, label=label)
+
+    monkeypatch.setattr(store, "_append_lines", fail_artifacts)
+    with pytest.raises(OSError, match="simulated"):
+        record_observation(output, _result(cycle), _artifacts(cycle))
+
+    results = output / "results.jsonl"
+    assert not results.exists() or results.read_bytes() == b""
+
+
+def test_threads_append_distinct_results_and_same_identity_converges(
+    tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    output = tmp_path / "output"
+    artifacts = _artifacts(cycle)
+    results = [_result(cycle, str(index)) for index in range(8)]
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        futures = [
+            pool.submit(
+                record_observation, output, result, _retarget(artifacts, result)
+            )
+            for result in results
+        ]
+        futures.extend(
+            pool.submit(
+                record_observation, output, results[0], _retarget(artifacts, results[0])
+            )
+            for _ in range(4)
+        )
+        assert [future.result() for future in futures]
+
+    lines = _journal_lines(output / "results.jsonl")
+    parsed = [ObservationResult.model_validate_json(line) for line in lines]
+    assert len(parsed) == len(results)
+    assert {item.observation_id for item in parsed} == {
+        item.observation_id for item in results
+    }
+
+
+def test_processes_append_intact_lines_and_same_identity_converges(
+    tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    output = tmp_path / "output"
+    context = multiprocessing.get_context("fork")
+    queue: multiprocessing.Queue[str] = context.Queue()
+    suffixes = ("same", "same", "distinct-1", "distinct-2")
+    processes = [
+        context.Process(
+            target=_process_record,
+            args=(str(output), cycle, suffix, queue),
+        )
+        for suffix in suffixes
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(30)
+        assert process.exitcode == 0
+    assert [queue.get(timeout=5) for _ in processes] == ["ok"] * len(processes)
+
+    lines = _journal_lines(output / "results.jsonl")
+    assert len(lines) == len(set(suffixes))
+    assert len(
+        {ObservationResult.model_validate_json(line).observation_id for line in lines}
+    ) == len(set(suffixes))
+
+
+def test_journals_do_not_serialize_secrets_from_raw_payloads(
+    tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    output = tmp_path / "output"
+    artifacts = _artifacts(cycle)
+    secret = b"OPENAI_API_KEY TYPESAFE_API_KEY Authorization FIXTURE_SECRET_SENTINEL"
+    artifacts.append(
+        ArtifactToFreeze(
+            kind="provider_output",
+            payload=secret,
+            source_uri_label="openai_validated",
+            retrieved_at=datetime(2026, 10, 3, 12, 3, tzinfo=UTC),
+            predecessor_stage_sha256=hashlib.sha256(artifacts[-1].payload).hexdigest(),
+        )
+    )
+
+    record_observation(output, _result(cycle), artifacts)
+
+    serialized = (output / "artifacts.jsonl").read_bytes() + (
+        output / "results.jsonl"
+    ).read_bytes()
+    for forbidden in (
+        b"OPENAI_API_KEY",
+        b"TYPESAFE_API_KEY",
+        b"Authorization",
+        b"FIXTURE_SECRET_SENTINEL",
+    ):
+        assert forbidden not in serialized
+
+
+def test_envelope_and_input_validation_is_strict(cycle: dict[str, Any]) -> None:
+    artifact = _artifacts(cycle)[0]
+    with pytest.raises(ValueError, match="source URI label"):
+        ArtifactToFreeze(
+            kind=artifact.kind,
+            payload=artifact.payload,
+            source_uri_label="https://example.test/?api_key=secret",
+            retrieved_at=artifact.retrieved_at,
+            predecessor_stage_sha256=None,
+        )
+    with pytest.raises(ValidationError):
+        ArtifactEnvelope.model_validate(
+            {
+                "kind": "evidence",
+                "sha256": "0" * 64,
+                "byte_size": True,
+                "storage_relpath": "00/00/" + "0" * 64,
+                "source_uri_label": "gamma_public",
+                "retrieved_at": "2026-10-03T12:00:00Z",
+                "opportunity_id": "1" * 64,
+                "predecessor_stage_sha256": None,
+                "extra": 1,
+            }
+        )
