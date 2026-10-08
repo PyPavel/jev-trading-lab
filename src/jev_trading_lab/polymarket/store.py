@@ -73,10 +73,12 @@ class ArtifactKind(StrEnum):
     SANITIZED_EVIDENCE = "sanitized_evidence"
     OPENAI_REQUEST = "openai_request"
     OPENAI_RESPONSE_SUCCESS = "openai_response_success"
+    OPENAI_SUCCESS_METADATA = "openai_success_metadata"
     OPENAI_FAILURE = "openai_failure"
     RESEARCH_BRIEF = "research_brief"
     JEV_REQUEST = "jev_request"
     JEV_RESPONSE_SUCCESS = "jev_response_success"
+    JEV_SUCCESS_METADATA = "jev_success_metadata"
     JEV_FAILURE = "jev_failure"
     JEV_DECISION = "jev_decision"
 
@@ -86,9 +88,11 @@ _SUCCESS_PATH = (
     ArtifactKind.SANITIZED_EVIDENCE,
     ArtifactKind.OPENAI_REQUEST,
     ArtifactKind.OPENAI_RESPONSE_SUCCESS,
+    ArtifactKind.OPENAI_SUCCESS_METADATA,
     ArtifactKind.RESEARCH_BRIEF,
     ArtifactKind.JEV_REQUEST,
     ArtifactKind.JEV_RESPONSE_SUCCESS,
+    ArtifactKind.JEV_SUCCESS_METADATA,
     ArtifactKind.JEV_DECISION,
 )
 _OPENAI_FAILURE_PATH = (
@@ -102,6 +106,7 @@ _JEV_FAILURE_PATH = (
     ArtifactKind.SANITIZED_EVIDENCE,
     ArtifactKind.OPENAI_REQUEST,
     ArtifactKind.OPENAI_RESPONSE_SUCCESS,
+    ArtifactKind.OPENAI_SUCCESS_METADATA,
     ArtifactKind.RESEARCH_BRIEF,
     ArtifactKind.JEV_REQUEST,
     ArtifactKind.JEV_FAILURE,
@@ -115,6 +120,16 @@ _RESULT_HASH_KINDS = {
 Label = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
 ByteSize = Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)]
 TypedArtifact = StrictModel | Mapping[str, object] | None
+
+
+class SuccessArtifact(UtcModel):
+    """Canonical non-secret billing metadata for one successful provider reply."""
+
+    provider: Literal["openai", "jev"]
+    request_sha256: Sha256
+    response_sha256: Sha256
+    retrieved_at: datetime
+    billed_cost_microdollars: ByteSize
 
 
 class FailureArtifact(UtcModel):
@@ -257,6 +272,15 @@ def failure_artifact_from_adapter(failure: AdapterFailure) -> FailureArtifact:
     )
 
 
+def _success_artifact(
+    payload: bytes, provider: Literal["openai", "jev"]
+) -> SuccessArtifact:
+    success = SuccessArtifact.model_validate_json(payload)
+    if success.provider != provider:
+        raise ValueError("success artifact provider does not match stage")
+    return success
+
+
 def _failure_artifact(
     payload: bytes, provider: Literal["openai", "jev"]
 ) -> FailureArtifact:
@@ -264,6 +288,37 @@ def _failure_artifact(
     if failure.provider != provider:
         raise ValueError("failure artifact provider does not match stage")
     return failure
+
+
+def _validate_success_provenance(
+    typed: dict[str, TypedArtifact],
+    envelopes: list[ArtifactEnvelope],
+    *,
+    fail: Callable[[str], None],
+) -> None:
+    envelope_by_kind = {item.kind: item for item in envelopes}
+    for provider, request_kind, response_kind, metadata_kind in (
+        (
+            "OpenAI",
+            ArtifactKind.OPENAI_REQUEST,
+            ArtifactKind.OPENAI_RESPONSE_SUCCESS,
+            ArtifactKind.OPENAI_SUCCESS_METADATA,
+        ),
+        (
+            "Jev",
+            ArtifactKind.JEV_REQUEST,
+            ArtifactKind.JEV_RESPONSE_SUCCESS,
+            ArtifactKind.JEV_SUCCESS_METADATA,
+        ),
+    ):
+        metadata = typed.get(metadata_kind)
+        if metadata is None:
+            continue
+        assert isinstance(metadata, SuccessArtifact)
+        if metadata.request_sha256 != envelope_by_kind[request_kind].sha256:
+            fail(f"{provider} success request hash does not match frozen request")
+        if metadata.response_sha256 != envelope_by_kind[response_kind].sha256:
+            fail(f"{provider} success response hash does not match frozen response")
 
 
 def _validate_failure_provenance(
@@ -292,22 +347,11 @@ def _validate_failure_provenance(
         fail(f"{label} failure request hash does not match frozen request")
 
 
-def _openai_success_cost(response: OpenAIResponse) -> int:
-    """Price the approved GPT-5 snapshot from its exact frozen usage counters."""
-
-    usage = response.usage
-    if usage is None:
-        raise ValueError("OpenAI success response has no usage")
-    cached_tokens = usage.input_tokens_details.cached_tokens
-    if cached_tokens > usage.input_tokens:
-        raise ValueError("OpenAI cached input tokens exceed total input tokens")
-    # gpt-5-2025-08-07: $1.25/M input, $0.125/M cached, $10/M output.
-    eighth_microdollars = (
-        (usage.input_tokens - cached_tokens) * 10
-        + cached_tokens
-        + usage.output_tokens * 80
-    )
-    return (eighth_microdollars + 7) // 8
+def _add_model_costs(left: int, right: int) -> int:
+    total = left + right
+    if total > INT64_MAX:
+        raise ValueError("cumulative model cost exceeds signed 64-bit range")
+    return total
 
 
 def _expected_model_cost(
@@ -317,13 +361,34 @@ def _expected_model_cost(
         failure = typed[ArtifactKind.OPENAI_FAILURE]
         assert isinstance(failure, FailureArtifact)
         return failure.billed_cost_microdollars
+    openai = typed[ArtifactKind.OPENAI_SUCCESS_METADATA]
+    assert isinstance(openai, SuccessArtifact)
     if path == _JEV_FAILURE_PATH:
-        openai_response = typed[ArtifactKind.OPENAI_RESPONSE_SUCCESS]
         failure = typed[ArtifactKind.JEV_FAILURE]
-        assert isinstance(openai_response, OpenAIResponse)
         assert isinstance(failure, FailureArtifact)
-        return _openai_success_cost(openai_response) + failure.billed_cost_microdollars
-    return 0
+        return _add_model_costs(
+            openai.billed_cost_microdollars, failure.billed_cost_microdollars
+        )
+    jev = typed[ArtifactKind.JEV_SUCCESS_METADATA]
+    assert isinstance(jev, SuccessArtifact)
+    return _add_model_costs(
+        openai.billed_cost_microdollars, jev.billed_cost_microdollars
+    )
+
+
+def _validate_success_terminal(
+    result: ObservationResult,
+    path: tuple[ArtifactKind, ...],
+    typed: dict[str, TypedArtifact],
+    *,
+    fail: Callable[[str], None],
+) -> None:
+    if path != _SUCCESS_PATH:
+        return
+    if result.ai.model_cost_microdollars != _expected_model_cost(path, typed):
+        fail("terminal AI model cost does not match provider success metadata")
+    if result.deterministic.model_cost_microdollars != 0:
+        fail("deterministic arm model cost must be zero")
 
 
 def _validate_failure_terminal(
@@ -686,8 +751,12 @@ def _reconstruct_orphan(kind: ArtifactKind, payload: bytes) -> TypedArtifact:
         ):
             raise ValueError("OpenAI response is not a completed success")
         return response
+    if kind is ArtifactKind.OPENAI_SUCCESS_METADATA:
+        return _success_artifact(payload, "openai")
     if kind is ArtifactKind.JEV_RESPONSE_SUCCESS:
         return JevResponse.model_validate_json(payload)
+    if kind is ArtifactKind.JEV_SUCCESS_METADATA:
+        return _success_artifact(payload, "jev")
     if kind is ArtifactKind.OPENAI_FAILURE:
         return _failure_artifact(payload, "openai")
     if kind is ArtifactKind.JEV_FAILURE:
@@ -713,6 +782,7 @@ def _validate_reconstructed(
     result: ObservationResult,
     typed: dict[str, TypedArtifact],
     path: tuple[ArtifactKind, ...],
+    envelopes: list[ArtifactEnvelope],
     *,
     corruption: bool,
 ) -> None:
@@ -750,6 +820,7 @@ def _validate_reconstructed(
         fail("research brief does not match observation evidence")
     if openai_response_brief(openai_response) != brief:
         fail("OpenAI response does not match research brief")
+    _validate_success_provenance(typed, envelopes, fail=fail)
     jev_request = typed[ArtifactKind.JEV_REQUEST]
     if jev_request != load_strict_json(
         build_jev_request(brief, evidence, JEV_MODEL_ID)
@@ -781,6 +852,7 @@ def _validate_reconstructed(
         or result.ai.signal_action != decision.action
     ):
         fail("terminal AI signal does not match frozen Jev decision")
+    _validate_success_terminal(result, path, typed, fail=fail)
 
 
 def _prepare(
@@ -824,7 +896,7 @@ def _prepare(
         envelope = envelopes[path.index(kind)]
         if envelope.sha256 != getattr(result, field):
             raise ValueError(f"{kind.value} artifact does not match observation hash")
-    _validate_reconstructed(result, typed, path, corruption=False)
+    _validate_reconstructed(result, typed, path, envelopes, corruption=False)
     return artifacts, envelopes, typed
 
 
@@ -972,7 +1044,7 @@ def _verify_replay_locked(
             raise StoreCorruptError("artifact blob is missing or corrupt") from error
         artifacts[kind.value] = payload
         predecessor = _canonical_stage_hash(envelope)
-    _validate_reconstructed(result, typed, path, corruption=True)
+    _validate_reconstructed(result, typed, path, selected, corruption=True)
     return ObservationReplay(
         result=result,
         envelopes=by_kind,

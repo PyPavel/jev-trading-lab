@@ -145,6 +145,24 @@ def _artifacts(
             ),
         ),
         (
+            "openai_success_metadata",
+            _success_metadata(
+                provider="openai",
+                cost=cycle["model_costs_microdollars"]["openai"],
+                request_bytes=cycle["model_artifacts"]["openai_request_bytes"].encode(),
+                response_bytes=cycle["model_artifacts"][
+                    "openai_response_bytes"
+                ].encode(),
+                retrieved_at=datetime.fromisoformat(
+                    cycle["chronology"]["openai_response_at"].replace("Z", "+00:00")
+                ),
+            ),
+            "openai_success_metadata",
+            datetime.fromisoformat(
+                cycle["chronology"]["openai_response_at"].replace("Z", "+00:00")
+            ),
+        ),
+        (
             "research_brief",
             canonical_json_bytes(brief.model_dump(mode="json")),
             "openai_validated",
@@ -164,6 +182,22 @@ def _artifacts(
             "jev_response_success",
             cycle["model_artifacts"]["jev_response_bytes"].encode(),
             "jev_response",
+            datetime.fromisoformat(
+                cycle["chronology"]["jev_response_at"].replace("Z", "+00:00")
+            ),
+        ),
+        (
+            "jev_success_metadata",
+            _success_metadata(
+                provider="jev",
+                cost=cycle["model_costs_microdollars"]["jev"],
+                request_bytes=cycle["model_artifacts"]["jev_request_bytes"].encode(),
+                response_bytes=cycle["model_artifacts"]["jev_response_bytes"].encode(),
+                retrieved_at=datetime.fromisoformat(
+                    cycle["chronology"]["jev_response_at"].replace("Z", "+00:00")
+                ),
+            ),
+            "jev_success_metadata",
             datetime.fromisoformat(
                 cycle["chronology"]["jev_response_at"].replace("Z", "+00:00")
             ),
@@ -189,9 +223,28 @@ def _artifacts(
         )
         artifacts.append(artifact)
         predecessor = _stage_hash(result, artifact, predecessor)
-    assert result.research_brief_sha256 == hashlib.sha256(values[4][1]).hexdigest()
-    assert result.jev_decision_sha256 == hashlib.sha256(values[7][1]).hexdigest()
+    assert result.research_brief_sha256 == hashlib.sha256(values[5][1]).hexdigest()
+    assert result.jev_decision_sha256 == hashlib.sha256(values[9][1]).hexdigest()
     return artifacts
+
+
+def _success_metadata(
+    *,
+    provider: str,
+    cost: int,
+    request_bytes: bytes,
+    response_bytes: bytes,
+    retrieved_at: datetime,
+) -> bytes:
+    return canonical_json_bytes(
+        {
+            "provider": provider,
+            "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
+            "response_sha256": hashlib.sha256(response_bytes).hexdigest(),
+            "retrieved_at": retrieved_at.isoformat().replace("+00:00", "Z"),
+            "billed_cost_microdollars": cost,
+        }
+    )
 
 
 def _openai_success_cost(cycle: dict[str, Any]) -> int:
@@ -203,6 +256,38 @@ def _openai_success_cost(cycle: dict[str, Any]) -> int:
     )
     assert numerator % 8 == 0
     return numerator // 8
+
+
+def _with_ai_model_cost(
+    result: ObservationResult, model_cost_microdollars: int
+) -> ObservationResult:
+    value = result.model_dump(mode="json")
+    trading = value["ai"]["trading_pnl_microdollars"]
+    deterministic_economic = value["deterministic"]["economic_pnl_microdollars"]
+    value["ai"]["model_cost_microdollars"] = model_cost_microdollars
+    value["ai"]["economic_pnl_microdollars"] = trading - model_cost_microdollars
+    value["paired_economic_pnl_delta_microdollars"] = (
+        trading - model_cost_microdollars - deterministic_economic
+    )
+    return ObservationResult.model_validate_json(canonical_json_bytes(value))
+
+
+def _replace_success_cost(
+    artifacts: list[ArtifactToFreeze], provider: str, cost: int
+) -> list[ArtifactToFreeze]:
+    kind = f"{provider}_success_metadata"
+    index = next(i for i, item in enumerate(artifacts) if item.kind == kind)
+    value = json.loads(artifacts[index].payload)
+    value["billed_cost_microdollars"] = cost
+    item = artifacts[index]
+    artifacts[index] = ArtifactToFreeze(
+        kind=item.kind,
+        payload=canonical_json_bytes(value),
+        source_uri_label=item.source_uri_label,
+        retrieved_at=item.retrieved_at,
+        predecessor_stage_sha256=item.predecessor_stage_sha256,
+    )
+    return artifacts
 
 
 def _failure_result(
@@ -263,8 +348,9 @@ def _failure_artifacts(
     cycle: dict[str, Any], *, openai_failed: bool
 ) -> tuple[ObservationResult, list[ArtifactToFreeze], bytes]:
     success = _artifacts(cycle)
-    by_kind = {item.kind: item for item in success}
     openai_cost = _openai_success_cost(cycle)
+    success = _replace_success_cost(success, "openai", openai_cost)
+    by_kind = {item.kind: item for item in success}
     jev_cost = cycle["model_costs_microdollars"]["jev"]
     response_body = b"Authorization: Basic top-secret"
     if openai_failed:
@@ -283,6 +369,7 @@ def _failure_artifacts(
             "sanitized_evidence",
             "openai_request",
             "openai_response_success",
+            "openai_success_metadata",
             "research_brief",
             "jev_request",
         ]
@@ -389,9 +476,11 @@ def test_publishes_exact_fixture_bytes_and_replays_verified_artifacts(
         "sanitized_evidence",
         "openai_request",
         "openai_response_success",
+        "openai_success_metadata",
         "research_brief",
         "jev_request",
         "jev_response_success",
+        "jev_success_metadata",
         "jev_decision",
     }
     assert isinstance(replay.typed_artifacts["sanitized_evidence"], EvidencePacket)
@@ -625,6 +714,88 @@ def test_forged_failure_provenance_rejects_before_journal_write(
 
     assert not (output / "artifacts.jsonl").exists()
     assert not (output / "results.jsonl").exists()
+
+
+@pytest.mark.parametrize("delta", (-1, 1))
+def test_success_path_requires_exact_cumulative_model_cost(
+    tmp_path: Path, cycle: dict[str, Any], delta: int
+) -> None:
+    result = _result(cycle)
+    mismatched = _with_ai_model_cost(result, result.ai.model_cost_microdollars + delta)
+
+    with pytest.raises(ValueError, match="model cost|provider success"):
+        record_observation(
+            tmp_path / "output", mismatched, _retarget(_artifacts(cycle), mismatched)
+        )
+
+    assert mismatched.ai.trading_pnl_microdollars == result.ai.trading_pnl_microdollars
+    assert not (tmp_path / "output" / "artifacts.jsonl").exists()
+    assert not (tmp_path / "output" / "results.jsonl").exists()
+
+
+@pytest.mark.parametrize("provider", ("openai", "jev"))
+def test_success_path_cost_follows_frozen_provider_metadata(
+    tmp_path: Path, cycle: dict[str, Any], provider: str
+) -> None:
+    result = _result(cycle)
+    changed_cost = cycle["model_costs_microdollars"][provider] + 7
+    artifacts = _replace_success_cost(_artifacts(cycle), provider, changed_cost)
+    expected_cost = result.ai.model_cost_microdollars + 7
+    changed = _with_ai_model_cost(result, expected_cost)
+    artifacts = _retarget(artifacts, changed)
+
+    stored = record_observation(tmp_path / "output", changed, artifacts)
+
+    assert stored.ai.model_cost_microdollars == expected_cost
+    assert stored.ai.trading_pnl_microdollars == result.ai.trading_pnl_microdollars
+    assert (
+        stored.ai.economic_pnl_microdollars
+        == stored.ai.trading_pnl_microdollars - expected_cost
+    )
+
+
+def test_success_path_rejects_int64_cost_sum_overflow_without_persist(
+    tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    result = _result(cycle)
+    artifacts = _replace_success_cost(_artifacts(cycle), "openai", 2**63 - 1)
+    artifacts = _replace_success_cost(artifacts, "jev", 1)
+
+    with pytest.raises(ValueError, match="model cost|64-bit|overflow"):
+        record_observation(tmp_path / "output", result, _retarget(artifacts, result))
+
+    assert not (tmp_path / "output" / "artifacts.jsonl").exists()
+    assert not (tmp_path / "output" / "results.jsonl").exists()
+
+
+def test_success_path_rejects_nonzero_deterministic_model_cost(
+    tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    value = _result(cycle).model_dump(mode="json")
+    value["deterministic"]["model_cost_microdollars"] = 1
+    value["deterministic"]["economic_pnl_microdollars"] -= 1
+    value["paired_economic_pnl_delta_microdollars"] += 1
+    result = ObservationResult.model_validate_json(canonical_json_bytes(value))
+
+    with pytest.raises(ValueError, match="deterministic.*model cost"):
+        record_observation(
+            tmp_path / "output", result, _retarget(_artifacts(cycle), result)
+        )
+
+
+def test_replay_rejects_success_result_with_adjusted_model_cost(
+    tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    output = tmp_path / "output"
+    result = _result(cycle)
+    record_observation(output, result, _artifacts(cycle))
+    forged = _with_ai_model_cost(result, result.ai.model_cost_microdollars + 1)
+    results = output / "results.jsonl"
+    results.write_bytes(canonical_json_bytes(forged.model_dump(mode="json")) + b"\n")
+    results.chmod(0o600)
+
+    with pytest.raises(StoreCorruptError, match="model cost|provider success"):
+        load_observation(output, result.observation_id)
 
 
 @pytest.mark.parametrize("openai_failed", (True, False))
@@ -1698,7 +1869,7 @@ def test_same_opportunity_distinct_observations_coexist(
     assert load_observation(output, first.observation_id).result == first
     assert load_observation(output, second.observation_id).result == second
     assert len(_journal_lines(output / "results.jsonl")) == 2
-    assert len(_journal_lines(output / "artifacts.jsonl")) == 16
+    assert len(_journal_lines(output / "artifacts.jsonl")) == 20
 
 
 def test_envelope_and_input_validation_is_strict(cycle: dict[str, Any]) -> None:
