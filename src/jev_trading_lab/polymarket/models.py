@@ -212,12 +212,6 @@ class OpenAIInputTokenDetails(StrictModel):
     cache_write_tokens: NonNegativeInt | None = None
 
 
-class OpenAIConversation(StrictModel):
-    """Conversation associated with an official Responses API envelope."""
-
-    id: NonEmptyStr
-
-
 class OpenAIOutputTokenDetails(StrictModel):
     """Raw Responses API output-token detail counts."""
 
@@ -299,25 +293,37 @@ class OpenAITextConfig(StrictModel):
 
 
 class OpenAIResponse(StrictModel):
-    """Reviewed closed-world OpenAI Responses API envelope."""
+    """Reviewed closed-world OpenAI Responses API envelope.
+
+    ``access_programs`` is required but restricted to null because this experiment
+    requests no programmatic or tool capability.
+    """
 
     id: NonEmptyStr
+    access_programs: None
     object: Literal["response"]
     created_at: UnixNumber
     model: Literal["gpt-5-2025-08-07"]
     status: Literal["completed"]
-    error: None
-    incomplete_details: None
-    instructions: str | None
+    error: None = None
+    incomplete_details: None = None
+    instructions: None = None
     background: bool | None = None
     completed_at: UnixNumber | None = None
-    conversation: OpenAIConversation | None = None
-    max_output_tokens: NonNegativeInt | None
+    conversation: None = None
+    max_output_tokens: NonNegativeInt | None = None
     max_tool_calls: NonNegativeInt | None = None
-    metadata: dict[str, str]
+    metadata: dict[str, str] | None = None
+    moderation: None = None
+    output_text: str | None = None
+    prompt: None = None
     prompt_cache_key: str | None = None
+    prompt_cache_options: None = None
+    prompt_cache_retention: Literal["in_memory", "24h"] | None = None
     safety_identifier: Annotated[str, StringConstraints(max_length=64)] | None = None
-    service_tier: Literal["auto", "default", "flex", "priority", "scale"] | None = None
+    service_tier: (
+        Literal["auto", "default", "fast", "flex", "priority", "scale"] | None
+    ) = None
     top_logprobs: Annotated[int, Field(strict=True, ge=0, le=20)] | None = None
     user: str | None = None
     output: Annotated[
@@ -325,15 +331,15 @@ class OpenAIResponse(StrictModel):
         Field(min_length=1, max_length=32),
     ]
     parallel_tool_calls: bool
-    previous_response_id: str | None
-    reasoning: OpenAIReasoningConfig | None
-    store: bool
+    previous_response_id: str | None = None
+    reasoning: OpenAIReasoningConfig | None = None
+    store: bool | None = None
     temperature: Annotated[float, Field(strict=True, ge=0.0, le=2.0)] | None = None
     top_p: Annotated[float, Field(strict=True, ge=0.0, le=1.0)] | None = None
-    text: OpenAITextConfig
-    tool_choice: Literal["auto", "none"] | None = None
-    tools: Annotated[list[Any], Field(max_length=0)] | None = None
-    truncation: Literal["auto", "disabled"]
+    text: OpenAITextConfig | None = None
+    tool_choice: Literal["auto", "none"]
+    tools: Annotated[list[Any], Field(max_length=0)]
+    truncation: Literal["auto", "disabled"] | None = None
     usage: OpenAIUsage
 
     @model_validator(mode="after")
@@ -345,8 +351,14 @@ class OpenAIResponse(StrictModel):
             raise ValueError(
                 "response must contain exactly one completed assistant message"
             )
-        if len(self.metadata) > 16 or any(
-            len(key) > 64 or len(value) > 512 for key, value in self.metadata.items()
+        message_text = messages[0].content[0].text
+        if self.output_text is not None:
+            if self.output_text != message_text:
+                raise ValueError("output_text must equal the sole message output_text")
+            ResearchBrief.model_validate_json(self.output_text)
+        metadata = self.metadata or {}
+        if len(metadata) > 16 or any(
+            len(key) > 64 or len(value) > 512 for key, value in metadata.items()
         ):
             raise ValueError("response metadata exceeds reviewed bounds")
         return self

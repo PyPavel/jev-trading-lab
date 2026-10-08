@@ -842,39 +842,52 @@ def test_score_to_micros_uses_deterministic_half_up_rounding(
 
 
 def _official_openai_response(cycle: dict[str, Any]) -> dict[str, Any]:
+    fixture = _openai_body(cycle)
+    return {
+        "access_programs": None,
+        "created_at": fixture["created_at"],
+        "id": fixture["id"],
+        "model": fixture["model"],
+        "object": fixture["object"],
+        "output": fixture["output"],
+        "parallel_tool_calls": fixture["parallel_tool_calls"],
+        "status": fixture["status"],
+        "tool_choice": fixture["tool_choice"],
+        "tools": fixture["tools"],
+        "usage": fixture["usage"],
+    }
+
+
+def _openai_optional_fields(cycle: dict[str, Any]) -> dict[str, object]:
     response = _openai_body(cycle)
-    response.update(
-        {
-            "id": "resp_fixture_openai_001",
-            "object": "response",
-            "created_at": 1_780_488_030,
-            "error": None,
-            "incomplete_details": None,
-            "instructions": None,
-            "max_output_tokens": None,
-            "metadata": {},
-            "parallel_tool_calls": True,
-            "previous_response_id": None,
-            "reasoning": {"effort": "medium", "summary": None},
-            "store": True,
-            "temperature": 1.0,
-            "text": {"format": {"type": "json_schema"}, "verbosity": "medium"},
-            "tool_choice": "auto",
-            "tools": [],
-            "top_p": 1.0,
-            "truncation": "disabled",
-        }
-    )
-    response["output"].insert(
-        0,
-        {
-            "id": "rs_fixture_openai_001",
-            "type": "reasoning",
-            "summary": [],
-            "status": "completed",
-        },
-    )
-    return response
+    return {
+        "background": False,
+        "completed_at": 1_780_488_031,
+        "conversation": None,
+        "error": None,
+        "incomplete_details": None,
+        "instructions": None,
+        "max_output_tokens": None,
+        "max_tool_calls": None,
+        "metadata": {},
+        "moderation": None,
+        "output_text": _official_message(response)["content"][0]["text"],
+        "previous_response_id": None,
+        "prompt": None,
+        "prompt_cache_key": None,
+        "prompt_cache_options": None,
+        "prompt_cache_retention": "in_memory",
+        "reasoning": None,
+        "safety_identifier": None,
+        "service_tier": "fast",
+        "store": None,
+        "temperature": None,
+        "text": None,
+        "top_logprobs": None,
+        "top_p": None,
+        "truncation": None,
+        "user": None,
+    }
 
 
 def _official_message(response: dict[str, Any]) -> dict[str, Any]:
@@ -1098,21 +1111,113 @@ def test_openai_uses_official_pinned_gpt5_snapshot_and_rejects_old_id(
         build_openai_request(evidence, "gpt-5-2026-09-30")
 
 
-_OPENAI_OPTIONAL_FIELDS: dict[str, object] = {
-    "background": False,
-    "completed_at": 1_780_488_031,
-    "conversation": {"id": "conv_fixture_openai_001"},
-    "max_tool_calls": 0,
-    "prompt_cache_key": "cache-fixture",
-    "safety_identifier": "safe-user-fixture",
-    "service_tier": "default",
-    "top_logprobs": 0,
-    "user": "legacy-user-fixture",
-}
+@pytest.mark.parametrize(
+    "field",
+    (
+        "background",
+        "completed_at",
+        "conversation",
+        "error",
+        "incomplete_details",
+        "instructions",
+        "max_output_tokens",
+        "max_tool_calls",
+        "metadata",
+        "moderation",
+        "output_text",
+        "previous_response_id",
+        "prompt",
+        "prompt_cache_key",
+        "prompt_cache_options",
+        "prompt_cache_retention",
+        "reasoning",
+        "safety_identifier",
+        "service_tier",
+        "store",
+        "temperature",
+        "text",
+        "top_logprobs",
+        "top_p",
+        "truncation",
+        "user",
+    ),
+)
+def test_openai_accepts_each_current_optional_response_field(
+    cycle: dict[str, Any],
+    evidence: EvidencePacket,
+    field: str,
+) -> None:
+    value = _openai_optional_fields(cycle)[field]
+    response = _official_openai_response(cycle)
+    response[field] = value
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, OpenAISuccess)
 
 
-@pytest.mark.parametrize(("field", "value"), tuple(_OPENAI_OPTIONAL_FIELDS.items()))
-def test_openai_accepts_each_documented_optional_response_field(
+def test_openai_accepts_current_official_response_fields_together_without_store(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief
+) -> None:
+    response = _official_openai_response(cycle)
+    response.update(_openai_optional_fields(cycle))
+    response.pop("store")
+
+    result = call_openai(
+        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+    )
+
+    assert isinstance(result, OpenAISuccess)
+    assert result.brief == brief
+
+
+def test_openai_requires_access_programs_and_allows_only_null(
+    cycle: dict[str, Any], evidence: EvidencePacket
+) -> None:
+    missing = _official_openai_response(cycle)
+    missing.pop("access_programs")
+    enabled = _official_openai_response(cycle)
+    enabled["access_programs"] = {"cyber": "standard"}
+
+    for response in (missing, enabled):
+        result = call_openai(
+            evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+        )
+        assert isinstance(result, AdapterFailure)
+        assert result.code == "PARSE_ERROR"
+
+
+def test_openai_output_text_must_equal_sole_strict_research_brief(
+    cycle: dict[str, Any], evidence: EvidencePacket
+) -> None:
+    for value in ("{}", "mismatched"):
+        response = _official_openai_response(cycle)
+        response["output_text"] = value
+
+        result = call_openai(
+            evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
+        )
+
+        assert isinstance(result, AdapterFailure)
+        assert result.code == "PARSE_ERROR"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("instructions", []),
+        ("moderation", {}),
+        ("prompt", {}),
+        ("prompt_cache_options", {}),
+        ("prompt_cache_retention", "forever"),
+        ("conversation", {}),
+        ("tools", [{"type": "web_search"}]),
+        ("tool_choice", {"type": "function"}),
+    ),
+)
+def test_openai_rejects_unsupported_optional_capabilities(
     cycle: dict[str, Any],
     evidence: EvidencePacket,
     field: str,
@@ -1125,20 +1230,8 @@ def test_openai_accepts_each_documented_optional_response_field(
         evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
     )
 
-    assert isinstance(result, OpenAISuccess)
-
-
-def test_openai_accepts_all_documented_optional_response_fields_together(
-    cycle: dict[str, Any], evidence: EvidencePacket
-) -> None:
-    response = _official_openai_response(cycle)
-    response.update(_OPENAI_OPTIONAL_FIELDS)
-
-    result = call_openai(
-        evidence, OPENAI_MODEL_ID, FixtureTransport(_wire_json(response))
-    )
-
-    assert isinstance(result, OpenAISuccess)
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "PARSE_ERROR"
 
 
 @pytest.mark.parametrize("value", (0, 1_780_488_030, 0.0, 1_780_488_030.0))
