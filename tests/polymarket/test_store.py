@@ -8,7 +8,7 @@ import os
 import stat
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +17,11 @@ from pydantic import ValidationError
 
 from jev_trading_lab.core.ids import canonical_json_bytes
 from jev_trading_lab.persistence.blobs import BlobStore
-from jev_trading_lab.polymarket.ai import AdapterFailure
+from jev_trading_lab.polymarket.ai import (
+    OPENAI_MODEL_ID,
+    AdapterFailure,
+    build_openai_request,
+)
 from jev_trading_lab.polymarket.models import (
     EvidencePacket,
     JevDecision,
@@ -1246,6 +1250,342 @@ def _leave_durable_artifact_orphan(
 
     assert len(_journal_lines(output / "artifacts.jsonl")) == len(artifacts)
     assert (output / "results.jsonl").read_bytes() == b""
+
+
+def _replace_artifact_payload(
+    artifacts: list[ArtifactToFreeze], kind: str, value: dict[str, Any]
+) -> list[ArtifactToFreeze]:
+    return _replace_artifact_bytes(artifacts, kind, canonical_json_bytes(value))
+
+
+def _replace_artifact_bytes(
+    artifacts: list[ArtifactToFreeze], kind: str, payload: bytes
+) -> list[ArtifactToFreeze]:
+    index = next(i for i, item in enumerate(artifacts) if item.kind == kind)
+    item = artifacts[index]
+    artifacts[index] = ArtifactToFreeze(
+        kind=item.kind,
+        payload=payload,
+        source_uri_label=item.source_uri_label,
+        retrieved_at=item.retrieved_at,
+        predecessor_stage_sha256=item.predecessor_stage_sha256,
+    )
+    return artifacts
+
+
+def _install_durable_artifact_orphan(
+    output: Path,
+    result: ObservationResult,
+    artifacts: list[ArtifactToFreeze],
+) -> None:
+    lines: list[bytes] = []
+    with BlobStore(output / "blobs") as blob_store:
+        for artifact in artifacts:
+            ref = blob_store.publish(artifact.payload)
+            envelope = ArtifactEnvelope(
+                kind=artifact.kind,
+                sha256=ref.sha256,
+                byte_size=ref.byte_length,
+                storage_relpath=ref.relative_path,
+                source_uri_label=artifact.source_uri_label,
+                retrieved_at=artifact.retrieved_at,
+                opportunity_id=result.opportunity_id,
+                observation_id=result.observation_id,
+                predecessor_stage_sha256=artifact.predecessor_stage_sha256,
+            )
+            lines.append(canonical_json_bytes(envelope.model_dump(mode="json")))
+    journal = output / "artifacts.jsonl"
+    journal.write_bytes(b"\n".join(lines) + b"\n")
+    journal.chmod(0o600)
+
+
+def _forged_success_orphan(
+    cycle: dict[str, Any], result: ObservationResult, mutation: str
+) -> list[ArtifactToFreeze]:
+    artifacts = _artifacts(cycle)
+    if mutation == "evidence_source":
+        raw = json.loads(artifacts[0].payload)
+        raw["forged"] = True
+        artifacts = _replace_artifact_payload(artifacts, "raw_gamma", raw)
+    elif mutation == "evidence_identity":
+        evidence = json.loads(
+            next(
+                item.payload for item in artifacts if item.kind == "sanitized_evidence"
+            )
+        )
+        evidence["question"] = "Forged question?"
+        artifacts = _replace_artifact_payload(artifacts, "sanitized_evidence", evidence)
+        evidence_bytes = next(
+            item.payload for item in artifacts if item.kind == "sanitized_evidence"
+        )
+        request = load_strict_json(
+            build_openai_request(
+                EvidencePacket.model_validate_json(evidence_bytes), OPENAI_MODEL_ID
+            )
+        )
+        artifacts = _replace_artifact_payload(artifacts, "openai_request", request)
+        request_bytes = next(
+            item.payload for item in artifacts if item.kind == "openai_request"
+        )
+        metadata = json.loads(
+            next(
+                item.payload
+                for item in artifacts
+                if item.kind == "openai_success_metadata"
+            )
+        )
+        metadata["request_sha256"] = hashlib.sha256(request_bytes).hexdigest()
+        artifacts = _replace_artifact_payload(
+            artifacts, "openai_success_metadata", metadata
+        )
+    elif mutation == "openai_metadata_time":
+        index = next(
+            i
+            for i, item in enumerate(artifacts)
+            if item.kind == "openai_success_metadata"
+        )
+        item = artifacts[index]
+        artifacts[index] = ArtifactToFreeze(
+            kind=item.kind,
+            payload=item.payload,
+            source_uri_label=item.source_uri_label,
+            retrieved_at=item.retrieved_at + timedelta(seconds=1),
+            predecessor_stage_sha256=item.predecessor_stage_sha256,
+        )
+    elif mutation in {"openai_request_hash", "openai_response_hash", "openai_cost"}:
+        index = next(
+            i
+            for i, item in enumerate(artifacts)
+            if item.kind == "openai_success_metadata"
+        )
+        metadata = json.loads(artifacts[index].payload)
+        field = {
+            "openai_request_hash": "request_sha256",
+            "openai_response_hash": "response_sha256",
+            "openai_cost": "billed_cost_microdollars",
+        }[mutation]
+        metadata[field] = 2**63 - 1 if mutation == "openai_cost" else "0" * 64
+        artifacts = _replace_artifact_payload(
+            artifacts, "openai_success_metadata", metadata
+        )
+    elif mutation == "openai_response_brief":
+        response = json.loads(
+            next(
+                item.payload
+                for item in artifacts
+                if item.kind == "openai_response_success"
+            )
+        )
+        message = next(item for item in response["output"] if item["type"] == "message")
+        brief = json.loads(message["content"][0]["text"])
+        brief["quality"] = "HIGH"
+        message["content"][0]["text"] = canonical_json_bytes(brief).decode()
+        artifacts = _replace_artifact_bytes(
+            artifacts,
+            "openai_response_success",
+            json.dumps(response, separators=(",", ":"), sort_keys=True).encode(),
+        )
+        response_bytes = next(
+            item.payload for item in artifacts if item.kind == "openai_response_success"
+        )
+        metadata = json.loads(
+            next(
+                item.payload
+                for item in artifacts
+                if item.kind == "openai_success_metadata"
+            )
+        )
+        metadata["response_sha256"] = hashlib.sha256(response_bytes).hexdigest()
+        artifacts = _replace_artifact_payload(
+            artifacts, "openai_success_metadata", metadata
+        )
+    elif mutation == "research_brief_request":
+        request = json.loads(
+            next(item.payload for item in artifacts if item.kind == "jev_request")
+        )
+        request["state"]["research_brief_sha256"] = "0" * 64
+        artifacts = _replace_artifact_payload(artifacts, "jev_request", request)
+        request_bytes = next(
+            item.payload for item in artifacts if item.kind == "jev_request"
+        )
+        metadata = json.loads(
+            next(
+                item.payload
+                for item in artifacts
+                if item.kind == "jev_success_metadata"
+            )
+        )
+        metadata["request_sha256"] = hashlib.sha256(request_bytes).hexdigest()
+        artifacts = _replace_artifact_payload(
+            artifacts, "jev_success_metadata", metadata
+        )
+    elif mutation == "jev_request_books":
+        request = json.loads(
+            next(item.payload for item in artifacts if item.kind == "jev_request")
+        )
+        request["state"]["execution_book_sha256"] = result.execution_book_sha256
+        artifacts = _replace_artifact_payload(artifacts, "jev_request", request)
+        request_bytes = next(
+            item.payload for item in artifacts if item.kind == "jev_request"
+        )
+        metadata = json.loads(
+            next(
+                item.payload
+                for item in artifacts
+                if item.kind == "jev_success_metadata"
+            )
+        )
+        metadata["request_sha256"] = hashlib.sha256(request_bytes).hexdigest()
+        artifacts = _replace_artifact_payload(
+            artifacts, "jev_success_metadata", metadata
+        )
+    elif mutation == "jev_metadata_time":
+        index = next(
+            i for i, item in enumerate(artifacts) if item.kind == "jev_success_metadata"
+        )
+        item = artifacts[index]
+        artifacts[index] = ArtifactToFreeze(
+            kind=item.kind,
+            payload=item.payload,
+            source_uri_label=item.source_uri_label,
+            retrieved_at=item.retrieved_at + timedelta(seconds=1),
+            predecessor_stage_sha256=item.predecessor_stage_sha256,
+        )
+    elif mutation in {"jev_request_hash", "jev_response_hash", "jev_cost"}:
+        index = next(
+            i for i, item in enumerate(artifacts) if item.kind == "jev_success_metadata"
+        )
+        metadata = json.loads(artifacts[index].payload)
+        field = {
+            "jev_request_hash": "request_sha256",
+            "jev_response_hash": "response_sha256",
+            "jev_cost": "billed_cost_microdollars",
+        }[mutation]
+        metadata[field] = 2**63 - 1 if mutation == "jev_cost" else "0" * 64
+        artifacts = _replace_artifact_payload(
+            artifacts, "jev_success_metadata", metadata
+        )
+    else:
+        decision = json.loads(
+            next(item.payload for item in artifacts if item.kind == "jev_decision")
+        )
+        decision["p_yes_micros"] -= 1
+        artifacts = _replace_artifact_payload(artifacts, "jev_decision", decision)
+    return _retarget(artifacts, result)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "evidence_source",
+        "evidence_identity",
+        "openai_request_hash",
+        "openai_response_hash",
+        "openai_metadata_time",
+        "openai_cost",
+        "openai_response_brief",
+        "research_brief_request",
+        "jev_request_books",
+        "jev_request_hash",
+        "jev_response_hash",
+        "jev_metadata_time",
+        "jev_cost",
+        "jev_response_decision",
+    ),
+)
+def test_forged_complete_success_orphan_blocks_unrelated_before_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    cycle: dict[str, Any],
+    mutation: str,
+) -> None:
+    from jev_trading_lab.polymarket import store
+
+    output = tmp_path / "output"
+    orphan = _result(cycle, "orphan-a")
+    artifacts = _retarget(_artifacts(cycle), orphan)
+    _leave_durable_artifact_orphan(monkeypatch, output, orphan, artifacts)
+    forged = _forged_success_orphan(cycle, orphan, mutation)
+    _install_durable_artifact_orphan(output, orphan, forged)
+    before = (
+        (output / "artifacts.jsonl").read_bytes(),
+        (output / "results.jsonl").read_bytes(),
+    )
+    published = 0
+    real_publish = store.BlobStore.publish
+
+    def count_publish(blob_store: store.BlobStore, payload: bytes):
+        nonlocal published
+        published += 1
+        return real_publish(blob_store, payload)
+
+    monkeypatch.setattr(store.BlobStore, "publish", count_publish)
+    unrelated = _result(cycle, "unrelated-b")
+
+    with pytest.raises(StoreCorruptError):
+        record_observation(output, unrelated, _retarget(_artifacts(cycle), unrelated))
+
+    assert published == 0
+    assert (output / "artifacts.jsonl").read_bytes() == before[0]
+    assert (output / "results.jsonl").read_bytes() == before[1]
+
+
+def test_success_prefix_rejects_cumulative_cost_overflow(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    output = tmp_path / "output"
+    orphan = _result(cycle, "orphan-a")
+    artifacts = _replace_success_cost(_artifacts(cycle), "openai", 2**63 - 1)
+    artifacts = _replace_success_cost(artifacts, "jev", 1)
+    prefix = _retarget(artifacts, orphan)[:9]
+    valid = _retarget(_artifacts(cycle), orphan)
+    _leave_durable_artifact_orphan(monkeypatch, output, orphan, valid)
+    _install_durable_artifact_orphan(output, orphan, prefix)
+    before = (output / "artifacts.jsonl").read_bytes()
+    unrelated = _result(cycle, "unrelated-b")
+
+    with pytest.raises(StoreCorruptError, match="model cost|64-bit|overflow"):
+        record_observation(output, unrelated, _retarget(_artifacts(cycle), unrelated))
+
+    assert (output / "artifacts.jsonl").read_bytes() == before
+    assert (output / "results.jsonl").read_bytes() == b""
+
+
+def test_forged_success_prefix_validates_all_available_bindings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    output = tmp_path / "output"
+    orphan = _result(cycle, "orphan-a")
+    artifacts = _retarget(_artifacts(cycle), orphan)
+    _leave_durable_artifact_orphan(monkeypatch, output, orphan, artifacts)
+    forged = _forged_success_orphan(cycle, orphan, "openai_request_hash")[:5]
+    _install_durable_artifact_orphan(output, orphan, forged)
+    before = (output / "artifacts.jsonl").read_bytes()
+    unrelated = _result(cycle, "unrelated-b")
+
+    with pytest.raises(StoreCorruptError, match="OpenAI success request hash"):
+        record_observation(output, unrelated, _retarget(_artifacts(cycle), unrelated))
+
+    assert (output / "artifacts.jsonl").read_bytes() == before
+    assert (output / "results.jsonl").read_bytes() == b""
+
+
+def test_valid_complete_success_orphan_allows_unrelated_then_recovers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    output = tmp_path / "output"
+    orphan = _result(cycle, "orphan-a")
+    orphan_artifacts = _retarget(_artifacts(cycle), orphan)
+    _leave_durable_artifact_orphan(monkeypatch, output, orphan, orphan_artifacts)
+    unrelated = _result(cycle, "unrelated-b")
+
+    assert (
+        record_observation(output, unrelated, _retarget(_artifacts(cycle), unrelated))
+        == unrelated
+    )
+    assert record_observation(output, orphan, orphan_artifacts) == orphan
+    assert len(_journal_lines(output / "artifacts.jsonl")) == 20
+    assert len(_journal_lines(output / "results.jsonl")) == 2
 
 
 def test_retry_recovers_matching_artifact_journal_after_result_append_failure(

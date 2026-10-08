@@ -317,8 +317,15 @@ def _validate_success_provenance(
         assert isinstance(metadata, SuccessArtifact)
         if metadata.request_sha256 != envelope_by_kind[request_kind].sha256:
             fail(f"{provider} success request hash does not match frozen request")
-        if metadata.response_sha256 != envelope_by_kind[response_kind].sha256:
+        response = envelope_by_kind[response_kind]
+        if metadata.response_sha256 != response.sha256:
             fail(f"{provider} success response hash does not match frozen response")
+        metadata_envelope = envelope_by_kind[metadata_kind]
+        if (
+            metadata.retrieved_at != response.retrieved_at
+            or metadata.retrieved_at != metadata_envelope.retrieved_at
+        ):
+            fail(f"{provider} success retrieval time does not match frozen response")
 
 
 def _validate_failure_provenance(
@@ -778,81 +785,171 @@ def _reconstruct(
         raise ValueError(f"{label} artifact violates its strict contract") from error
 
 
-def _validate_reconstructed(
-    result: ObservationResult,
+def _validate_reconstructed_path(
+    result: ObservationResult | None,
     typed: dict[str, TypedArtifact],
     path: tuple[ArtifactKind, ...],
     envelopes: list[ArtifactEnvelope],
     *,
     corruption: bool,
 ) -> None:
+    """Validate every semantic binding available in one reviewed path prefix."""
+
     def fail(message: str) -> None:
         if corruption:
             raise StoreCorruptError(message)
         raise ValueError(message)
 
-    evidence = typed[ArtifactKind.SANITIZED_EVIDENCE]
-    if not isinstance(evidence, EvidencePacket):
+    envelope_by_kind = {item.kind: item for item in envelopes}
+    evidence = typed.get(ArtifactKind.SANITIZED_EVIDENCE)
+    if evidence is not None and not isinstance(evidence, EvidencePacket):
         fail("sanitized evidence artifact type is invalid")
         return
-    if (
-        evidence.market_id != result.market_id
-        or evidence.source_sha256 != result.evidence_sha256
-    ):
-        fail("sanitized evidence does not match observation")
-    openai_request = typed[ArtifactKind.OPENAI_REQUEST]
-    if openai_request != load_strict_json(
-        build_openai_request(evidence, OPENAI_MODEL_ID)
-    ):
-        fail("OpenAI request does not match evidence")
-    if path == _OPENAI_FAILURE_PATH:
+    if isinstance(evidence, EvidencePacket):
+        raw = envelope_by_kind.get(ArtifactKind.RAW_GAMMA)
+        if raw is not None and evidence.source_sha256 != raw.sha256:
+            fail("sanitized evidence does not match frozen source")
+        raw_gamma = typed.get(ArtifactKind.RAW_GAMMA)
+        if isinstance(raw_gamma, Mapping):
+            evidence_value = evidence.model_dump(mode="json")
+            raw_bindings = {
+                "market_id": raw_gamma.get("id"),
+                "question": raw_gamma.get("question"),
+                "description": raw_gamma.get("description"),
+                "rules": raw_gamma.get("rules"),
+                "category": raw_gamma.get("category"),
+                "tags": raw_gamma.get("tags"),
+                "resolution_source_text": raw_gamma.get("resolutionSource"),
+                "closes_at": raw_gamma.get("endDate"),
+            }
+            if any(
+                evidence_value[field] != value for field, value in raw_bindings.items()
+            ):
+                fail("sanitized evidence does not match raw Gamma identity")
+        if result is not None and (
+            evidence.market_id != result.market_id
+            or evidence.cutoff_at != result.cutoff_at
+            or evidence.source_sha256 != result.evidence_sha256
+        ):
+            fail("sanitized evidence does not match observation")
+
+    if result is not None:
+        for kind, field in _RESULT_HASH_KINDS.items():
+            envelope = envelope_by_kind.get(kind)
+            if envelope is not None and envelope.sha256 != getattr(result, field):
+                fail(f"{kind.value} artifact does not match observation hash")
+        expected_opportunity_id = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "policy_version": result.policy_version,
+                    "market_id": result.market_id,
+                    "cutoff_at": result.cutoff_at.isoformat().replace("+00:00", "Z"),
+                }
+            )
+        ).hexdigest()
+        expected_observation_id = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "opportunity_id": result.opportunity_id,
+                    "evidence_sha256": result.evidence_sha256,
+                    "execution_book_sha256": result.execution_book_sha256,
+                    "policy_version": result.policy_version,
+                }
+            )
+        ).hexdigest()
+        if result.opportunity_id != expected_opportunity_id:
+            fail("opportunity ID does not match observation identity")
+        if result.observation_id != expected_observation_id:
+            fail("observation ID does not match frozen evidence and execution book")
+
+    openai_request = typed.get(ArtifactKind.OPENAI_REQUEST)
+    if isinstance(evidence, EvidencePacket) and openai_request is not None:
+        if openai_request != load_strict_json(
+            build_openai_request(evidence, OPENAI_MODEL_ID)
+        ):
+            fail("OpenAI request does not match evidence")
+
+    _validate_success_provenance(typed, envelopes, fail=fail)
+
+    if path == _OPENAI_FAILURE_PATH and ArtifactKind.OPENAI_FAILURE in typed:
         _validate_failure_provenance(path, typed, fail=fail)
-        _validate_failure_terminal(result, path, typed, fail=fail)
+        if result is not None:
+            _validate_failure_terminal(result, path, typed, fail=fail)
         return
-    brief = typed[ArtifactKind.RESEARCH_BRIEF]
-    openai_response = typed[ArtifactKind.OPENAI_RESPONSE_SUCCESS]
-    if not isinstance(brief, ResearchBrief) or not isinstance(
-        openai_response, OpenAIResponse
-    ):
+
+    brief = typed.get(ArtifactKind.RESEARCH_BRIEF)
+    openai_response = typed.get(ArtifactKind.OPENAI_RESPONSE_SUCCESS)
+    if brief is not None and not isinstance(brief, ResearchBrief):
+        fail("research brief artifact type is invalid")
+        return
+    if openai_response is not None and not isinstance(openai_response, OpenAIResponse):
         fail("OpenAI success artifact type is invalid")
         return
-    if brief.evidence_sha256 != result.evidence_sha256:
-        fail("research brief does not match observation evidence")
-    if openai_response_brief(openai_response) != brief:
-        fail("OpenAI response does not match research brief")
-    _validate_success_provenance(typed, envelopes, fail=fail)
-    jev_request = typed[ArtifactKind.JEV_REQUEST]
-    if jev_request != load_strict_json(
-        build_jev_request(brief, evidence, JEV_MODEL_ID)
+    if isinstance(brief, ResearchBrief):
+        if isinstance(evidence, EvidencePacket) and (
+            brief.evidence_sha256 != evidence.source_sha256
+        ):
+            fail("research brief does not match frozen evidence")
+        if result is not None and brief.evidence_sha256 != result.evidence_sha256:
+            fail("research brief does not match observation evidence")
+        if (
+            isinstance(openai_response, OpenAIResponse)
+            and openai_response_brief(openai_response) != brief
+        ):
+            fail("OpenAI response does not match research brief")
+
+    jev_request = typed.get(ArtifactKind.JEV_REQUEST)
+    if (
+        isinstance(brief, ResearchBrief)
+        and isinstance(evidence, EvidencePacket)
+        and jev_request is not None
+        and jev_request
+        != load_strict_json(build_jev_request(brief, evidence, JEV_MODEL_ID))
     ):
         fail("Jev request does not match evidence and brief")
-    if path == _JEV_FAILURE_PATH:
+
+    if path == _JEV_FAILURE_PATH and ArtifactKind.JEV_FAILURE in typed:
         _validate_failure_provenance(path, typed, fail=fail)
-        _validate_failure_terminal(result, path, typed, fail=fail)
+        try:
+            _expected_model_cost(path, typed)
+        except ValueError as error:
+            fail(str(error))
+        if result is not None:
+            _validate_failure_terminal(result, path, typed, fail=fail)
         return
-    decision = typed[ArtifactKind.JEV_DECISION]
-    jev_response = typed[ArtifactKind.JEV_RESPONSE_SUCCESS]
-    if not isinstance(decision, JevDecision) or not isinstance(
-        jev_response, JevResponse
-    ):
+
+    decision = typed.get(ArtifactKind.JEV_DECISION)
+    jev_response = typed.get(ArtifactKind.JEV_RESPONSE_SUCCESS)
+    if decision is not None and not isinstance(decision, JevDecision):
+        fail("Jev decision artifact type is invalid")
+        return
+    if jev_response is not None and not isinstance(jev_response, JevResponse):
         fail("Jev success artifact type is invalid")
         return
-    if jev_response_decision(jev_response) != decision:
-        fail("Jev response does not match decision")
-    if (
-        result.jev_decision_sha256
-        != hashlib.sha256(
-            canonical_json_bytes(decision.model_dump(mode="json"))
-        ).hexdigest()
-    ):
-        fail("Jev decision hash does not match observation")
-    if (
-        result.ai.signal_probability_micros != decision.p_yes_micros
-        or result.ai.forecast_probability_micros != decision.p_yes_micros
-        or result.ai.signal_action != decision.action
-    ):
-        fail("terminal AI signal does not match frozen Jev decision")
-    _validate_success_terminal(result, path, typed, fail=fail)
+    if isinstance(decision, JevDecision) and isinstance(jev_response, JevResponse):
+        if jev_response_decision(jev_response) != decision:
+            fail("Jev response does not match decision")
+        if result is not None and (
+            result.ai.signal_probability_micros != decision.p_yes_micros
+            or result.ai.forecast_probability_micros != decision.p_yes_micros
+            or result.ai.signal_action != decision.action
+        ):
+            fail("terminal AI signal does not match frozen Jev decision")
+
+    success_metadata_complete = all(
+        kind in typed
+        for kind in (
+            ArtifactKind.OPENAI_SUCCESS_METADATA,
+            ArtifactKind.JEV_SUCCESS_METADATA,
+        )
+    )
+    if success_metadata_complete:
+        try:
+            _expected_model_cost(_SUCCESS_PATH, typed)
+        except ValueError as error:
+            fail(str(error))
+    if len(envelopes) == len(_SUCCESS_PATH) and result is not None:
+        _validate_success_terminal(result, path, typed, fail=fail)
 
 
 def _prepare(
@@ -896,7 +993,7 @@ def _prepare(
         envelope = envelopes[path.index(kind)]
         if envelope.sha256 != getattr(result, field):
             raise ValueError(f"{kind.value} artifact does not match observation hash")
-    _validate_reconstructed(result, typed, path, envelopes, corruption=False)
+    _validate_reconstructed_path(result, typed, path, envelopes, corruption=False)
     return artifacts, envelopes, typed
 
 
@@ -986,18 +1083,17 @@ def _validate_journals_locked(
                 raise StoreCorruptError(
                     "artifact blob is missing or corrupt"
                 ) from error
-        failure_paths = [
-            path
-            for path in matching_paths
-            if len(selected) == len(path)
-            and path in {_OPENAI_FAILURE_PATH, _JEV_FAILURE_PATH}
-        ]
-        if failure_paths:
-
-            def fail(message: str) -> None:
-                raise StoreCorruptError(message)
-
-            _validate_failure_provenance(failure_paths[0], typed, fail=fail)
+        closed_path = next(
+            (path for path in matching_paths if len(selected) == len(path)), None
+        )
+        validation_path = closed_path or matching_paths[0]
+        _validate_reconstructed_path(
+            None,
+            typed,
+            validation_path,
+            selected,
+            corruption=True,
+        )
 
     missing = results.keys() - grouped.keys()
     if missing:
@@ -1044,7 +1140,7 @@ def _verify_replay_locked(
             raise StoreCorruptError("artifact blob is missing or corrupt") from error
         artifacts[kind.value] = payload
         predecessor = _canonical_stage_hash(envelope)
-    _validate_reconstructed(result, typed, path, selected, corruption=True)
+    _validate_reconstructed_path(result, typed, path, selected, corruption=True)
     return ObservationReplay(
         result=result,
         envelopes=by_kind,
