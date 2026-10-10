@@ -1516,6 +1516,12 @@ def _verify_replay_locked(
     )
 
 
+def _is_legacy_replay(replay: ObservationReplay) -> bool:
+    return tuple(replay.artifacts) in {
+        tuple(kind.value for kind in path) for path in _LEGACY_STAGE_PATHS
+    }
+
+
 def freeze_observation_artifacts(
     output_dir: str | os.PathLike[str],
     identity: ObservationResult | FixtureIdentity,
@@ -1579,12 +1585,19 @@ def freeze_observation_artifacts(
                     existing_envelopes = _parse_envelopes(
                         _read_journal(artifacts_fd, label="artifact journal")
                     )
-                    _validate_journals_locked(
+                    replays = _validate_journals_locked(
                         store,
                         existing_results,
                         existing_envelopes,
                         forbidden_secret_values,
                     )
+                    existing_replay = replays.get(verified_identity.observation_id)
+                    if existing_replay is not None and _is_legacy_replay(
+                        existing_replay
+                    ):
+                        raise StoreConflictError(
+                            "completed legacy observation is replay-only"
+                        )
                     _publish(store, artifacts, envelopes)
                     prior = [
                         item
@@ -1648,12 +1661,19 @@ def record_observation(
                     existing_envelopes = _parse_envelopes(
                         _read_journal(artifacts_fd, label="artifact journal")
                     )
-                    _validate_journals_locked(
+                    replays = _validate_journals_locked(
                         store,
                         existing_results,
                         existing_envelopes,
                         forbidden_secret_values,
                     )
+                    existing_replay = replays.get(verified_identity.observation_id)
+                    if existing_replay is not None and _is_legacy_replay(
+                        existing_replay
+                    ):
+                        raise StoreConflictError(
+                            "completed legacy observation is replay-only"
+                        )
                     _publish(store, artifacts, envelopes)
                     prior_artifacts = [
                         item
@@ -1702,13 +1722,13 @@ def record_observation(
         os.close(root_fd)
 
 
-def load_observation(
+def load_existing_terminal(
     output_dir: str | os.PathLike[str],
     observation_id: str,
     *,
     forbidden_secret_values: tuple[bytes, ...] = (),
-) -> ObservationReplay:
-    """Replay one observation only from strict journals and verified exact blobs."""
+) -> ObservationReplay | None:
+    """Return a verified current or legacy terminal observation, if present."""
 
     if (
         type(observation_id) is not str
@@ -1725,9 +1745,6 @@ def load_observation(
                 results = _parse_results(
                     _read_journal(results_fd, label="result journal")
                 )
-                found = results.get(observation_id)
-                if found is None:
-                    raise StoreCorruptError("observation result is missing")
                 artifacts_fd = _open_journal(root_fd, "artifacts.jsonl")
                 try:
                     _lock(artifacts_fd, fcntl.LOCK_SH)
@@ -1737,10 +1754,28 @@ def load_observation(
                     replays = _validate_journals_locked(
                         store, results, envelopes, forbidden_secret_values
                     )
-                    return replays[observation_id]
+                    return replays.get(observation_id)
                 finally:
                     os.close(artifacts_fd)
             finally:
                 os.close(results_fd)
     finally:
         os.close(root_fd)
+
+
+def load_observation(
+    output_dir: str | os.PathLike[str],
+    observation_id: str,
+    *,
+    forbidden_secret_values: tuple[bytes, ...] = (),
+) -> ObservationReplay:
+    """Replay one observation only from strict journals and verified exact blobs."""
+
+    replay = load_existing_terminal(
+        output_dir,
+        observation_id,
+        forbidden_secret_values=forbidden_secret_values,
+    )
+    if replay is None:
+        raise StoreCorruptError("observation result is missing")
+    return replay

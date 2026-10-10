@@ -50,6 +50,7 @@ from jev_trading_lab.polymarket.store import (
     SuccessArtifact,
     failure_artifact_from_adapter,
     freeze_observation_artifacts,
+    load_existing_terminal,
     load_observation,
     record_observation,
 )
@@ -493,6 +494,9 @@ def replay_fixture(
         or identity.observation_id != expected_observation_id
     ):
         raise ValueError("price-free fixture identity hashes are invalid")
+    existing = load_existing_terminal(output_dir, identity.observation_id)
+    if existing is not None:
+        return _summary(existing.result, existing.envelopes)
     evidence_model = prefix_model.sanitized_evidence
     model_values = prefix_model.model_artifacts
     chronology = prefix_model.chronology

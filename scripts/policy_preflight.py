@@ -115,10 +115,10 @@ EXPECTED_SOURCE_HASHES = {
         "a8d3754b325a1da673fb0ce30a81bf92931550d68002b5c3b5fef7b64d2b4b00"
     ),
     "src/jev_trading_lab/polymarket/pipeline.py": (
-        "e1396cc509c972cf8ab4de0260ce56802dbc10a77ac7803a30bc6b2222939c2a"
+        "80ff0691ce1c63ec238218f44da5521f1debf6cdce7fa87f77b37c13ee0565b3"
     ),
     "src/jev_trading_lab/polymarket/store.py": (
-        "39ab654b0cb26b04f642d948c90cfbf713c49eb6e7578d49cca04a53da6bdb88"
+        "d7fe360eac784cb42c74c688cccb84e2af88aab8f7b5e61d5ca112417508184b"
     ),
     "src/jev_trading_lab/stocks/__init__.py": (
         "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"

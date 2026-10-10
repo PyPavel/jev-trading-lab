@@ -6,13 +6,20 @@ import socket
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
+from jev_trading_lab.polymarket.ai import TransportResponse
 from jev_trading_lab.polymarket.models import load_strict_json
 from jev_trading_lab.polymarket.pipeline import replay_fixture
-from jev_trading_lab.polymarket.store import load_observation
+from jev_trading_lab.polymarket.store import (
+    ArtifactToFreeze,
+    StoreConflictError,
+    freeze_observation_artifacts,
+    load_observation,
+    record_observation,
+)
 
 FIXTURE = Path(__file__).parents[1] / "fixtures/polymarket/feasibility_cycle.json"
 
@@ -41,6 +48,111 @@ def _fixture() -> dict[str, Any]:
     value = load_strict_json(FIXTURE.read_bytes())
     assert isinstance(value, dict)
     return value
+
+
+def _journal_tree(output: Path) -> dict[str, tuple[bytes, str]]:
+    return {
+        path.relative_to(output).as_posix(): (
+            path.read_bytes(),
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        for path in output.rglob("*")
+        if path.is_file()
+    }
+
+
+def _legacy_terminal(
+    output: Path, shape: str
+) -> tuple[dict[str, object], list[ArtifactToFreeze]]:
+    def failed(request_bytes: bytes) -> TransportResponse:
+        del request_bytes
+        raise TimeoutError
+
+    kwargs: dict[str, Any] = {}
+    if shape == "openai_failure":
+        kwargs["openai_transport"] = failed
+    elif shape == "jev_failure":
+        kwargs["jev_transport"] = failed
+    summary = replay_fixture(FIXTURE, output, **kwargs)
+    replay = load_observation(output, str(summary["observation_id"]))
+    artifacts = [
+        ArtifactToFreeze(
+            kind=kind,
+            payload=replay.artifacts[kind],
+            source_uri_label=envelope.source_uri_label,
+            retrieved_at=envelope.retrieved_at,
+            predecessor_stage_sha256=envelope.predecessor_stage_sha256,
+        )
+        for kind, envelope in replay.envelopes.items()
+    ]
+    assert artifacts[-1].kind == "decision_frozen"
+    decision_blob = (
+        output / "blobs" / replay.envelopes["decision_frozen"].storage_relpath
+    )
+    lines = (output / "artifacts.jsonl").read_bytes().splitlines(keepends=True)
+    (output / "artifacts.jsonl").write_bytes(b"".join(lines[:-1]))
+    decision_blob.unlink()
+    decision_blob.parent.rmdir()
+    decision_blob.parent.parent.rmdir()
+    summary = dict(summary)
+    artifact_hashes = dict(cast(dict[str, str], summary["artifact_hashes"]))
+    artifact_hashes.pop("decision_frozen")
+    summary["artifact_hashes"] = artifact_hashes
+    summary["artifact_count"] = len(artifact_hashes)
+    return summary, artifacts
+
+
+@pytest.mark.parametrize("shape", ("success", "openai_failure", "jev_failure"))
+def test_completed_legacy_replay_is_read_only_before_transport_or_book_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    from jev_trading_lab.polymarket import pipeline
+
+    output = tmp_path / shape
+    expected, _artifacts = _legacy_terminal(output, shape)
+    before = _journal_tree(output)
+    accesses: list[str] = []
+    monkeypatch.setattr(
+        pipeline,
+        "_load_fixture",
+        lambda _path: _NoBookAccessTrap(_fixture(), accesses),
+    )
+    provider_calls: list[str] = []
+
+    def forbidden_transport(request_bytes: bytes) -> TransportResponse:
+        del request_bytes
+        provider_calls.append("called")
+        raise AssertionError("legacy replay called provider transport")
+
+    actual = replay_fixture(
+        FIXTURE,
+        output,
+        openai_transport=forbidden_transport,
+        jev_transport=forbidden_transport,
+    )
+
+    assert actual == expected
+    assert provider_calls == []
+    assert accesses == []
+    assert _journal_tree(output) == before
+
+
+@pytest.mark.parametrize("shape", ("success", "openai_failure", "jev_failure"))
+def test_completed_legacy_rejects_current_stage_publication(
+    tmp_path: Path, shape: str
+) -> None:
+    output = tmp_path / shape
+    summary, artifacts = _legacy_terminal(output, shape)
+    replay = load_observation(output, str(summary["observation_id"]))
+    before = _journal_tree(output)
+
+    with pytest.raises(StoreConflictError, match="legacy|terminal|replay"):
+        freeze_observation_artifacts(output, replay.result, artifacts)
+    assert _journal_tree(output) == before
+
+    with pytest.raises(StoreConflictError, match="legacy|terminal|replay"):
+        record_observation(output, replay.result, artifacts)
+    assert _journal_tree(output) == before
 
 
 def test_replay_is_offline_ordered_and_matches_recomputed_fixture(
