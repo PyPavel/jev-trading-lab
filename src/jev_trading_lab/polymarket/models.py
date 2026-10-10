@@ -43,7 +43,7 @@ Disposition = Literal[
     "BOOK_FAILURE",
 ]
 MICROS_PER_UNIT = 1_000_000
-_FAILURE_DISPOSITIONS = frozenset({"INELIGIBLE", "MODEL_FAILURE", "BOOK_FAILURE"})
+_UNAVAILABLE_DISPOSITIONS = frozenset({"INELIGIBLE", "MODEL_FAILURE"})
 _FILL_DISPOSITIONS = frozenset({"FILLED", "PARTIAL_FILL"})
 
 
@@ -593,9 +593,17 @@ class ArmResult(StrictModel):
 
     def _validate_signal(self) -> None:
         signal = (self.signal_probability_micros, self.signal_action)
-        if self.disposition in _FAILURE_DISPOSITIONS:
+        if self.disposition in _UNAVAILABLE_DISPOSITIONS:
             if signal != (None, None):
                 raise ValueError("failure disposition requires an unavailable signal")
+            return
+        if self.disposition == "BOOK_FAILURE":
+            if signal == (None, None):
+                return
+            if signal[0] is None or signal[1] is None:
+                raise ValueError(
+                    "book failure signal must be wholly available or unavailable"
+                )
             return
         if self.disposition == "ABSTAIN" and signal == (None, "ABSTAIN"):
             return
@@ -741,12 +749,15 @@ class ObservationResult(UtcModel):
     cutoff_at: datetime
     observed_at: datetime
     evidence_sha256: Sha256
-    execution_book_sha256: Sha256
+    execution_book_sha256: Sha256 | None
+    planned_execution_book_sha256: Sha256 | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     research_brief_sha256: Sha256
     jev_decision_sha256: Sha256
     ai: ArmResult
     deterministic: ArmResult
-    baseline_probability_micros: Micros
+    baseline_probability_micros: Micros | None
     resolution: Literal[0, 1] | None
     baseline_brier_micros: Micros | None
     paired_trading_pnl_delta_microdollars: SignedInt | None
@@ -759,6 +770,23 @@ class ObservationResult(UtcModel):
             raise ValueError("observation requires one AI and one deterministic arm")
         if self.observed_at < self.cutoff_at:
             raise ValueError("observation cannot precede cutoff")
+        book_unavailable = self.execution_book_sha256 is None
+        if book_unavailable != (self.baseline_probability_micros is None):
+            raise ValueError("execution book and baseline availability must match")
+        if book_unavailable:
+            if self.planned_execution_book_sha256 is None:
+                raise ValueError("missing execution book requires a planned book hash")
+            if any(
+                arm.disposition != "BOOK_FAILURE"
+                for arm in (self.ai, self.deterministic)
+            ):
+                raise ValueError("missing execution book requires BOOK_FAILURE arms")
+        elif self.planned_execution_book_sha256 is not None:
+            raise ValueError("observed execution book cannot carry a planned-only hash")
+        elif any(
+            arm.disposition == "BOOK_FAILURE" for arm in (self.ai, self.deterministic)
+        ):
+            raise ValueError("BOOK_FAILURE arms require an unavailable execution book")
         expected_payout = (
             None if self.resolution is None else self.resolution * MICROS_PER_UNIT
         )
@@ -804,8 +832,10 @@ class ObservationResult(UtcModel):
                     raise ValueError("unresolved arm has inconsistent forecast state")
         else:
             payout_micros = self.resolution * MICROS_PER_UNIT
-            expected_baseline = _brier_micros(
-                self.baseline_probability_micros, payout_micros
+            expected_baseline = (
+                _brier_micros(self.baseline_probability_micros, payout_micros)
+                if self.baseline_probability_micros is not None
+                else None
             )
             if self.baseline_brier_micros != expected_baseline:
                 raise ValueError("baseline Brier value does not match resolution")
@@ -888,13 +918,14 @@ class NormalizedTokens(StrictModel):
 
 
 class FixtureChronology(UtcModel):
-    """Declared model and decision-freeze event times for Unit 1 binding."""
+    """Declared model, freeze, and planned execution-book event times."""
 
     openai_request_at: datetime
     openai_response_at: datetime
     jev_request_at: datetime
     jev_response_at: datetime
     decision_frozen_at: datetime
+    planned_execution_book_at: datetime
 
     @model_validator(mode="after")
     def require_strict_stage_order(self) -> Self:
@@ -904,6 +935,7 @@ class FixtureChronology(UtcModel):
             self.jev_request_at,
             self.jev_response_at,
             self.decision_frozen_at,
+            self.planned_execution_book_at,
         )
         if any(left >= right for left, right in zip(stages, stages[1:])):
             raise ValueError("model chronology must be strictly increasing")
@@ -1021,17 +1053,19 @@ def _observation_id(
     *,
     opportunity_id: str,
     evidence_sha256: str,
-    execution_book_sha256: str,
+    execution_book_sha256: str | None,
+    planned_execution_book_sha256: str | None = None,
     policy_version: str,
 ) -> str:
     """Hash canonical JSON of opportunity, evidence, book, and policy identity."""
 
+    bound_book_sha256 = execution_book_sha256 or planned_execution_book_sha256
     return hashlib.sha256(
         canonical_json_bytes(
             {
                 "opportunity_id": opportunity_id,
                 "evidence_sha256": evidence_sha256,
-                "execution_book_sha256": execution_book_sha256,
+                "execution_book_sha256": bound_book_sha256,
                 "policy_version": policy_version,
             }
         )
@@ -1195,6 +1229,7 @@ def validate_feasibility_fixture(fixture: dict[str, Any]) -> None:
         opportunity_id=observation.opportunity_id,
         evidence_sha256=observation.evidence_sha256,
         execution_book_sha256=observation.execution_book_sha256,
+        planned_execution_book_sha256=observation.planned_execution_book_sha256,
         policy_version=observation.policy_version,
     )
     if observation.observation_id != expected_observation_id:
@@ -1324,6 +1359,8 @@ def validate_feasibility_fixture(fixture: dict[str, Any]) -> None:
     chronology = validated.chronology
     if chronology.openai_request_at <= cutoff:
         raise ValueError("OpenAI request must follow cutoff")
+    if chronology.planned_execution_book_at != books["execution_book"].retrieved_at:
+        raise ValueError("planned execution time must bind the execution book")
     if chronology.decision_frozen_at >= books["execution_book"].retrieved_at:
         raise ValueError("decision must freeze before execution book retrieval")
     if books["precheck_book"].retrieved_at > cutoff:

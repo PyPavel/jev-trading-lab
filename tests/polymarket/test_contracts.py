@@ -886,7 +886,7 @@ def _unavailable_ai(cycle: dict[str, Any], disposition: str) -> dict[str, Any]:
     return arm
 
 
-@pytest.mark.parametrize("disposition", ("INELIGIBLE", "MODEL_FAILURE", "BOOK_FAILURE"))
+@pytest.mark.parametrize("disposition", ("INELIGIBLE", "MODEL_FAILURE"))
 def test_resolved_observation_allows_unavailable_terminal_arm(
     cycle: dict[str, Any], disposition: str
 ) -> None:
@@ -1430,6 +1430,16 @@ def test_fixture_rejects_nonincreasing_or_duplicate_causal_history(
         polymarket_models.validate_feasibility_fixture(mutated)
 
 
+def test_full_fixture_still_rejects_decision_after_execution_book(
+    cycle: dict[str, Any],
+) -> None:
+    mutated = deepcopy(cycle)
+    mutated["chronology"]["decision_frozen_at"] = "2026-10-03T12:02:00Z"
+
+    with pytest.raises(ValueError, match="chronology|decision must freeze"):
+        polymarket_models.validate_feasibility_fixture(mutated)
+
+
 def test_fixture_declares_model_and_decision_freeze_chronology(
     cycle: dict[str, Any],
 ) -> None:
@@ -1439,6 +1449,7 @@ def test_fixture_declares_model_and_decision_freeze_chronology(
         "jev_request_at": "2026-10-03T12:00:31Z",
         "jev_response_at": "2026-10-03T12:01:00Z",
         "decision_frozen_at": "2026-10-03T12:01:30Z",
+        "planned_execution_book_at": "2026-10-03T12:02:00Z",
     }
 
 

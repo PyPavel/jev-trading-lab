@@ -14,7 +14,8 @@
     "jev_request_at": "2026-10-03T12:00:31Z",
     "jev_response_at": "2026-10-03T12:01:00Z",
     "openai_request_at": "2026-10-03T12:00:01Z",
-    "openai_response_at": "2026-10-03T12:00:30Z"
+    "openai_response_at": "2026-10-03T12:00:30Z",
+    "planned_execution_book_at": "2026-10-03T12:02:00Z"
   },
   "economics": {
     "entry_fee_pp_micros": 10000,

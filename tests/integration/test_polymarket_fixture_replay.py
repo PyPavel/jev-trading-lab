@@ -486,6 +486,220 @@ def _openai_response_with_bad_citation(raw: bytes) -> bytes:
     return json.dumps(value, separators=(",", ":")).encode()
 
 
+@pytest.mark.parametrize("provider", ("openai", "jev"))
+def test_request_input_failure_closes_without_request_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    from jev_trading_lab.polymarket import pipeline
+
+    output = tmp_path / provider
+    opened = [False]
+    accesses: list[str] = []
+    monkeypatch.setattr(
+        pipeline,
+        "_load_fixture",
+        lambda _path: _AccessTrap(_fixture(), opened, accesses),
+    )
+    original_freeze = pipeline.freeze_observation_artifacts
+
+    def durable_freeze(*args: Any, **kwargs: Any) -> Any:
+        result = original_freeze(*args, **kwargs)
+        artifacts = list(args[2])
+        if artifacts[-1].kind == "decision_frozen":
+            opened[0] = True
+        return result
+
+    monkeypatch.setattr(pipeline, "freeze_observation_artifacts", durable_freeze)
+    monkeypatch.setattr(pipeline, f"{provider.upper()}_MODEL_ID", "invalid-model")
+
+    first = replay_fixture(FIXTURE, output)
+    second = replay_fixture(FIXTURE, output)
+    replay = load_observation(output, first["observation_id"])
+    kinds = list(replay.artifacts)
+    failure = json.loads(replay.artifacts[f"{provider}_failure"])
+    barrier = json.loads(replay.artifacts["decision_frozen"])
+    empty_hash = hashlib.sha256(b"").hexdigest()
+
+    assert first == second
+    assert accesses
+    assert f"{provider}_request" not in kinds
+    assert failure["code"] == "INPUT_ERROR"
+    assert failure["request_sha256"] == empty_hash
+    assert barrier[f"{provider}_request_sha256"] == empty_hash
+    assert kinds[-2:] == [f"{provider}_failure", "decision_frozen"]
+    assert len((output / "results.jsonl").read_text().splitlines()) == 1
+    assert replay.result.ai.disposition == "MODEL_FAILURE"
+    assert replay.result.ai.quantity == replay.result.deterministic.quantity == 0
+
+
+class _NoBookAccessTrap(dict[str, Any]):
+    def __init__(self, value: dict[str, Any], accesses: list[str]):
+        super().__init__(value)
+        self._accesses = accesses
+
+    def __getitem__(self, key: str) -> Any:
+        if key in {
+            "execution_book",
+            "precheck_book",
+            "economics",
+            "expected",
+            "resolution",
+        }:
+            self._accesses.append(key)
+            raise AssertionError(f"late path accessed {key}")
+        value = super().__getitem__(key)
+        if isinstance(value, dict):
+            return _NoBookAccessTrap(value, self._accesses)
+        return value
+
+
+@pytest.mark.parametrize(("provider", "status_code"), (("openai", 500), ("jev", 503)))
+def test_late_provider_failure_terminalizes_without_book_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    status_code: int,
+) -> None:
+    from jev_trading_lab.polymarket import pipeline
+    from jev_trading_lab.polymarket.ai import TransportResponse
+
+    output = tmp_path / provider
+    accesses: list[str] = []
+    monkeypatch.setattr(
+        pipeline,
+        "_load_fixture",
+        lambda _path: _NoBookAccessTrap(_fixture(), accesses),
+    )
+
+    def late_failure(_request: bytes) -> TransportResponse:
+        return TransportResponse(
+            status_code=status_code,
+            headers={},
+            raw_bytes=b"late failure body",
+            retrieved_at=datetime(2026, 10, 3, 12, 2, tzinfo=UTC),
+            billed_cost_microdollars=31,
+        )
+
+    events: list[str] = []
+    kwargs: dict[str, Any] = {
+        f"{provider}_transport": late_failure,
+        "event_sink": events.append,
+    }
+    summary = replay_fixture(FIXTURE, output, **kwargs)
+    replay = load_observation(output, summary["observation_id"])
+    kinds = list(replay.artifacts)
+    unavailable = json.loads(replay.artifacts["book_unavailable"])
+
+    assert accesses == []
+    assert events == ["decision_frozen"]
+    assert kinds[-2:] == ["decision_frozen", "book_unavailable"]
+    assert unavailable["reason"] == "STALE_PRECHECK"
+    assert unavailable["planned_retrieved_at"] == "2026-10-03T12:02:00Z"
+    assert replay.result.execution_book_sha256 is None
+    assert replay.result.baseline_probability_micros is None
+    assert replay.result.ai.disposition == "BOOK_FAILURE"
+    assert replay.result.ai.quantity == replay.result.deterministic.quantity == 0
+    assert replay.result.ai.trading_pnl_microdollars == 0
+    assert replay.result.ai.economic_pnl_microdollars == -(
+        31
+        + (_fixture()["model_costs_microdollars"]["openai"] if provider == "jev" else 0)
+    )
+    assert replay.result.deterministic.economic_pnl_microdollars == 0
+    assert len((output / "results.jsonl").read_text().splitlines()) == 1
+
+
+def test_late_jev_success_preserves_forecast_without_book_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from jev_trading_lab.polymarket import pipeline
+    from jev_trading_lab.polymarket.ai import TransportResponse
+
+    raw = _fixture()
+    output = tmp_path / "late-success"
+    accesses: list[str] = []
+    monkeypatch.setattr(
+        pipeline,
+        "_load_fixture",
+        lambda _path: _NoBookAccessTrap(raw, accesses),
+    )
+
+    def late_success(_request: bytes) -> TransportResponse:
+        return TransportResponse(
+            status_code=200,
+            headers={},
+            raw_bytes=raw["model_artifacts"]["jev_response_bytes"].encode(),
+            retrieved_at=datetime(2026, 10, 3, 12, 2, tzinfo=UTC),
+            billed_cost_microdollars=raw["model_costs_microdollars"]["jev"],
+        )
+
+    events: list[str] = []
+    first = replay_fixture(
+        FIXTURE, output, jev_transport=late_success, event_sink=events.append
+    )
+    second = replay_fixture(FIXTURE, output, jev_transport=late_success)
+    replay = load_observation(output, first["observation_id"])
+
+    assert first == second
+    assert accesses == []
+    assert events == ["decision_frozen"]
+    assert list(replay.artifacts)[-2:] == ["decision_frozen", "book_unavailable"]
+    assert replay.result.ai.disposition == "BOOK_FAILURE"
+    assert (
+        replay.result.ai.signal_probability_micros
+        == raw["jev_decision"]["p_yes_micros"]
+    )
+    assert (
+        replay.result.ai.forecast_probability_micros
+        == raw["jev_decision"]["p_yes_micros"]
+    )
+    assert replay.result.ai.quantity == 0
+    assert replay.result.deterministic.quantity == 0
+    assert len((output / "results.jsonl").read_text().splitlines()) == 1
+
+
+def test_late_path_crash_after_unavailable_artifact_recovers_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from jev_trading_lab.polymarket import pipeline
+    from jev_trading_lab.polymarket.ai import TransportResponse
+
+    raw = _fixture()
+    output = tmp_path / "late-crash"
+    original_record = pipeline.record_observation
+    crashed = False
+
+    def crash_once(*args: Any, **kwargs: Any) -> Any:
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise RuntimeError("crash after book unavailable")
+        return original_record(*args, **kwargs)
+
+    def late_success(_request: bytes) -> TransportResponse:
+        return TransportResponse(
+            status_code=200,
+            headers={},
+            raw_bytes=raw["model_artifacts"]["jev_response_bytes"].encode(),
+            retrieved_at=datetime(2026, 10, 3, 12, 2, tzinfo=UTC),
+            billed_cost_microdollars=raw["model_costs_microdollars"]["jev"],
+        )
+
+    monkeypatch.setattr(pipeline, "record_observation", crash_once)
+    with pytest.raises(RuntimeError, match="crash after book unavailable"):
+        replay_fixture(FIXTURE, output, jev_transport=late_success)
+
+    assert not (output / "results.jsonl").read_text()
+    kinds = [
+        json.loads(line)["kind"]
+        for line in (output / "artifacts.jsonl").read_text().splitlines()
+    ]
+    assert kinds[-2:] == ["decision_frozen", "book_unavailable"]
+
+    summary = replay_fixture(FIXTURE, output, jev_transport=late_success)
+    assert summary["ai"]["disposition"] == "BOOK_FAILURE"
+    assert len((output / "results.jsonl").read_text().splitlines()) == 1
+
+
 def test_openai_failure_crash_after_barrier_recovers_on_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

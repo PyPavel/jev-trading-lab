@@ -90,6 +90,7 @@ class ArtifactKind(StrEnum):
     JEV_FAILURE = "jev_failure"
     JEV_DECISION = "jev_decision"
     DECISION_FROZEN = "decision_frozen"
+    BOOK_UNAVAILABLE = "book_unavailable"
 
 
 class DecisionFrozenArtifact(UtcModel):
@@ -167,6 +168,12 @@ _OPENAI_FAILURE_PATH = (
     ArtifactKind.OPENAI_FAILURE,
     ArtifactKind.DECISION_FROZEN,
 )
+_OPENAI_INPUT_FAILURE_PATH = (
+    ArtifactKind.RAW_GAMMA,
+    ArtifactKind.SANITIZED_EVIDENCE,
+    ArtifactKind.OPENAI_FAILURE,
+    ArtifactKind.DECISION_FROZEN,
+)
 _JEV_FAILURE_PATH = (
     ArtifactKind.RAW_GAMMA,
     ArtifactKind.SANITIZED_EVIDENCE,
@@ -178,7 +185,36 @@ _JEV_FAILURE_PATH = (
     ArtifactKind.JEV_FAILURE,
     ArtifactKind.DECISION_FROZEN,
 )
-_STAGE_PATHS = (_SUCCESS_PATH, _OPENAI_FAILURE_PATH, _JEV_FAILURE_PATH)
+_JEV_INPUT_FAILURE_PATH = (
+    ArtifactKind.RAW_GAMMA,
+    ArtifactKind.SANITIZED_EVIDENCE,
+    ArtifactKind.OPENAI_REQUEST,
+    ArtifactKind.OPENAI_RESPONSE_SUCCESS,
+    ArtifactKind.OPENAI_SUCCESS_METADATA,
+    ArtifactKind.RESEARCH_BRIEF,
+    ArtifactKind.JEV_FAILURE,
+    ArtifactKind.DECISION_FROZEN,
+)
+_BASE_PATHS = (
+    _SUCCESS_PATH,
+    _OPENAI_FAILURE_PATH,
+    _OPENAI_INPUT_FAILURE_PATH,
+    _JEV_FAILURE_PATH,
+    _JEV_INPUT_FAILURE_PATH,
+)
+_LATE_PATHS = tuple((*path, ArtifactKind.BOOK_UNAVAILABLE) for path in _BASE_PATHS)
+_STAGE_PATHS = (*_BASE_PATHS, *_LATE_PATHS)
+_FAILURE_PATHS = frozenset(
+    {
+        _OPENAI_FAILURE_PATH,
+        _OPENAI_INPUT_FAILURE_PATH,
+        _JEV_FAILURE_PATH,
+        _JEV_INPUT_FAILURE_PATH,
+    }
+)
+_LATE_FAILURE_PATHS = frozenset(
+    (*path, ArtifactKind.BOOK_UNAVAILABLE) for path in _FAILURE_PATHS
+)
 _RESULT_HASH_KINDS = {
     ArtifactKind.RAW_GAMMA: "evidence_sha256",
     ArtifactKind.RESEARCH_BRIEF: "research_brief_sha256",
@@ -197,6 +233,15 @@ class SuccessArtifact(UtcModel):
     response_sha256: Sha256
     retrieved_at: datetime
     billed_cost_microdollars: ByteSize
+
+
+class BookUnavailableArtifact(UtcModel):
+    """Price-free explanation for refusing a planned execution book."""
+
+    reason: Literal["STALE_PRECHECK"]
+    planned_retrieved_at: datetime
+    planned_source_sha256: Sha256
+    terminal_model_at: datetime
 
 
 class FailureArtifact(UtcModel):
@@ -289,8 +334,11 @@ def _stage_path_for_result(
     result: ObservationResult, kinds: tuple[str, ...]
 ) -> tuple[ArtifactKind, ...]:
     path = _stage_path(kinds)
-    failed = result.ai.disposition == "MODEL_FAILURE"
-    if failed != (path in {_OPENAI_FAILURE_PATH, _JEV_FAILURE_PATH}):
+    late = path in _LATE_PATHS
+    if late:
+        if result.ai.disposition != "BOOK_FAILURE":
+            raise ValueError("late provider path requires terminal BOOK_FAILURE")
+    elif (result.ai.disposition == "MODEL_FAILURE") != (path in _FAILURE_PATHS):
         raise ValueError("terminal AI disposition does not match provider outcome path")
     return path
 
@@ -406,25 +454,39 @@ def _validate_success_provenance(
             fail(f"{provider} success retrieval time does not match frozen response")
 
 
+def _base_path(path: tuple[ArtifactKind, ...]) -> tuple[ArtifactKind, ...]:
+    return path[:-1] if path in _LATE_PATHS else path
+
+
 def _validate_failure_provenance(
     path: tuple[ArtifactKind, ...],
     typed: dict[str, TypedArtifact],
     *,
     fail: Callable[[str], None],
 ) -> None:
-    if path == _OPENAI_FAILURE_PATH:
+    base = _base_path(path)
+    if base in {_OPENAI_FAILURE_PATH, _OPENAI_INPUT_FAILURE_PATH}:
         failure_kind = ArtifactKind.OPENAI_FAILURE
         request_kind = ArtifactKind.OPENAI_REQUEST
         label = "OpenAI"
-    elif path == _JEV_FAILURE_PATH:
+    elif base in {_JEV_FAILURE_PATH, _JEV_INPUT_FAILURE_PATH}:
         failure_kind = ArtifactKind.JEV_FAILURE
         request_kind = ArtifactKind.JEV_REQUEST
         label = "Jev"
     else:
         return
     failure = typed[failure_kind]
-    request = typed[request_kind]
     assert isinstance(failure, FailureArtifact)
+    request = typed.get(request_kind)
+    if request is None:
+        if (
+            failure.code != "INPUT_ERROR"
+            or failure.request_sha256 != hashlib.sha256(b"").hexdigest()
+        ):
+            fail(f"{label} missing request is allowed only for canonical INPUT_ERROR")
+        return
+    if failure.code == "INPUT_ERROR":
+        fail(f"{label} INPUT_ERROR cannot include a request artifact")
     if (
         failure.request_sha256
         != hashlib.sha256(canonical_json_bytes(request)).hexdigest()
@@ -442,13 +504,14 @@ def _add_model_costs(left: int, right: int) -> int:
 def _expected_model_cost(
     path: tuple[ArtifactKind, ...], typed: dict[str, TypedArtifact]
 ) -> int:
-    if path == _OPENAI_FAILURE_PATH:
+    base = _base_path(path)
+    if base in {_OPENAI_FAILURE_PATH, _OPENAI_INPUT_FAILURE_PATH}:
         failure = typed[ArtifactKind.OPENAI_FAILURE]
         assert isinstance(failure, FailureArtifact)
         return failure.billed_cost_microdollars
     openai = typed[ArtifactKind.OPENAI_SUCCESS_METADATA]
     assert isinstance(openai, SuccessArtifact)
-    if path == _JEV_FAILURE_PATH:
+    if base in {_JEV_FAILURE_PATH, _JEV_INPUT_FAILURE_PATH}:
         failure = typed[ArtifactKind.JEV_FAILURE]
         assert isinstance(failure, FailureArtifact)
         return _add_model_costs(
@@ -484,7 +547,7 @@ def _validate_failure_terminal(
     fail: Callable[[str], None],
 ) -> None:
     ai = result.ai
-    if path not in {_OPENAI_FAILURE_PATH, _JEV_FAILURE_PATH}:
+    if path not in _FAILURE_PATHS:
         return
     expected = _expected_model_cost(path, typed)
     if (
@@ -498,6 +561,67 @@ def _validate_failure_terminal(
         or ai.economic_pnl_microdollars != -expected
     ):
         fail("terminal AI arm does not match provider failure outcome")
+
+
+def _validate_late_terminal(
+    result: ObservationResult,
+    path: tuple[ArtifactKind, ...],
+    typed: dict[str, TypedArtifact],
+    *,
+    fail: Callable[[str], None],
+) -> None:
+    if path not in _LATE_PATHS:
+        return
+    unavailable = typed.get(ArtifactKind.BOOK_UNAVAILABLE)
+    frozen = typed.get(ArtifactKind.DECISION_FROZEN)
+    if not isinstance(unavailable, BookUnavailableArtifact) or not isinstance(
+        frozen, DecisionFrozenArtifact
+    ):
+        fail("late path requires typed book-unavailable and decision barriers")
+        return
+    if (
+        unavailable.terminal_model_at != frozen.frozen_at
+        or unavailable.terminal_model_at < unavailable.planned_retrieved_at
+        or result.execution_book_sha256 is not None
+        or result.planned_execution_book_sha256 != unavailable.planned_source_sha256
+        or result.baseline_probability_micros is not None
+        or result.baseline_brier_micros is not None
+        or any(
+            arm.disposition != "BOOK_FAILURE"
+            or arm.quantity != 0
+            or arm.trading_pnl_microdollars != 0
+            for arm in (result.ai, result.deterministic)
+        )
+        or result.deterministic.model_cost_microdollars != 0
+        or result.deterministic.economic_pnl_microdollars != 0
+    ):
+        fail("terminal arms do not match unavailable execution book")
+    expected_cost = _expected_model_cost(path, typed)
+    if (
+        result.ai.model_cost_microdollars != expected_cost
+        or result.ai.economic_pnl_microdollars != -expected_cost
+    ):
+        fail("late terminal AI arm does not match incurred provider costs")
+    decision = typed.get(ArtifactKind.JEV_DECISION)
+    expected_signal = (
+        (decision.p_yes_micros, decision.action)
+        if isinstance(decision, JevDecision)
+        else (None, None)
+    )
+    if (
+        result.ai.signal_probability_micros,
+        result.ai.signal_action,
+    ) != expected_signal or result.ai.forecast_probability_micros != expected_signal[0]:
+        fail("late terminal forecast does not match available model decision")
+    if any(
+        value is not None
+        for value in (
+            result.deterministic.signal_probability_micros,
+            result.deterministic.signal_action,
+            result.deterministic.forecast_probability_micros,
+        )
+    ):
+        fail("late deterministic arm cannot infer a forecast without a book")
 
 
 class StoreError(Exception):
@@ -732,16 +856,15 @@ def _validate_identity(result: ObservationResult, *, corruption: bool) -> None:
             }
         )
     ).hexdigest()
-    observation = hashlib.sha256(
-        canonical_json_bytes(
-            {
-                "opportunity_id": result.opportunity_id,
-                "evidence_sha256": result.evidence_sha256,
-                "execution_book_sha256": result.execution_book_sha256,
-                "policy_version": result.policy_version,
-            }
-        )
-    ).hexdigest()
+    observation_identity = {
+        "opportunity_id": result.opportunity_id,
+        "evidence_sha256": result.evidence_sha256,
+        "execution_book_sha256": (
+            result.execution_book_sha256 or result.planned_execution_book_sha256
+        ),
+        "policy_version": result.policy_version,
+    }
+    observation = hashlib.sha256(canonical_json_bytes(observation_identity)).hexdigest()
     if opportunity != result.opportunity_id or observation != result.observation_id:
         error = "persisted observation identity is invalid"
         if corruption:
@@ -810,6 +933,8 @@ def _reconstruct_orphan(kind: ArtifactKind, payload: bytes) -> TypedArtifact:
         return JevDecision.model_validate_json(payload)
     if kind is ArtifactKind.DECISION_FROZEN:
         return DecisionFrozenArtifact.model_validate_json(payload)
+    if kind is ArtifactKind.BOOK_UNAVAILABLE:
+        return BookUnavailableArtifact.model_validate_json(payload)
     if kind is ArtifactKind.OPENAI_RESPONSE_SUCCESS:
         response = OpenAIResponse.model_validate_json(payload)
         if (
@@ -909,15 +1034,16 @@ def _validate_reconstructed_path(
                 }
             )
         ).hexdigest()
+        observation_identity = {
+            "opportunity_id": result.opportunity_id,
+            "evidence_sha256": result.evidence_sha256,
+            "execution_book_sha256": (
+                result.execution_book_sha256 or result.planned_execution_book_sha256
+            ),
+            "policy_version": result.policy_version,
+        }
         expected_observation_id = hashlib.sha256(
-            canonical_json_bytes(
-                {
-                    "opportunity_id": result.opportunity_id,
-                    "evidence_sha256": result.evidence_sha256,
-                    "execution_book_sha256": result.execution_book_sha256,
-                    "policy_version": result.policy_version,
-                }
-            )
+            canonical_json_bytes(observation_identity)
         ).hexdigest()
         if result.opportunity_id != expected_opportunity_id:
             fail("opportunity ID does not match observation identity")
@@ -933,10 +1059,14 @@ def _validate_reconstructed_path(
 
     _validate_success_provenance(typed, envelopes, fail=fail)
 
-    if path == _OPENAI_FAILURE_PATH and ArtifactKind.OPENAI_FAILURE in typed:
+    base_path = _base_path(path)
+    if (
+        base_path in {_OPENAI_FAILURE_PATH, _OPENAI_INPUT_FAILURE_PATH}
+        and ArtifactKind.OPENAI_FAILURE in typed
+    ):
         _validate_failure_provenance(path, typed, fail=fail)
-        if result is not None:
-            _validate_failure_terminal(result, path, typed, fail=fail)
+        if result is not None and path not in _LATE_PATHS:
+            _validate_failure_terminal(result, base_path, typed, fail=fail)
 
     brief = typed.get(ArtifactKind.RESEARCH_BRIEF)
     openai_response = typed.get(ArtifactKind.OPENAI_RESPONSE_SUCCESS)
@@ -969,14 +1099,17 @@ def _validate_reconstructed_path(
     ):
         fail("Jev request does not match evidence and brief")
 
-    if path == _JEV_FAILURE_PATH and ArtifactKind.JEV_FAILURE in typed:
+    if (
+        base_path in {_JEV_FAILURE_PATH, _JEV_INPUT_FAILURE_PATH}
+        and ArtifactKind.JEV_FAILURE in typed
+    ):
         _validate_failure_provenance(path, typed, fail=fail)
         try:
             _expected_model_cost(path, typed)
         except ValueError as error:
             fail(str(error))
-        if result is not None:
-            _validate_failure_terminal(result, path, typed, fail=fail)
+        if result is not None and path not in _LATE_PATHS:
+            _validate_failure_terminal(result, base_path, typed, fail=fail)
 
     decision = typed.get(ArtifactKind.JEV_DECISION)
     jev_response = typed.get(ArtifactKind.JEV_RESPONSE_SUCCESS)
@@ -1007,14 +1140,24 @@ def _validate_reconstructed_path(
         ):
             fail("decision frozen artifact identity is inconsistent")
         frozen_envelope = envelope_by_kind.get(ArtifactKind.DECISION_FROZEN)
+        terminal_envelope = envelopes[-2] if path in _LATE_PATHS else envelopes[-1]
+        prior_terminal_envelope = envelopes[
+            path.index(ArtifactKind.DECISION_FROZEN) - 1
+        ]
         if (
             frozen_envelope is None
             or frozen.frozen_at != frozen_envelope.retrieved_at
-            or frozen.frozen_at < envelopes[-2].retrieved_at
+            or frozen_envelope is not terminal_envelope
+            or frozen.frozen_at < prior_terminal_envelope.retrieved_at
         ):
             fail("decision frozen timestamp is inconsistent")
-        request_envelope = envelope_by_kind[ArtifactKind.OPENAI_REQUEST]
-        if frozen.openai_request_sha256 != request_envelope.sha256:
+        request_envelope = envelope_by_kind.get(ArtifactKind.OPENAI_REQUEST)
+        expected_openai_request = (
+            request_envelope.sha256
+            if request_envelope is not None
+            else hashlib.sha256(b"").hexdigest()
+        )
+        if frozen.openai_request_sha256 != expected_openai_request:
             fail("decision frozen artifact does not bind OpenAI request")
         openai_response_envelope = envelope_by_kind.get(
             ArtifactKind.OPENAI_RESPONSE_SUCCESS
@@ -1035,9 +1178,16 @@ def _validate_reconstructed_path(
         if frozen.openai_response_sha256 != expected_openai_response:
             fail("decision frozen artifact does not bind OpenAI response")
         jev_request_envelope = envelope_by_kind.get(ArtifactKind.JEV_REQUEST)
-        if frozen.jev_request_sha256 != (
-            jev_request_envelope.sha256 if jev_request_envelope else None
-        ):
+        jev_failure_artifact = typed.get(ArtifactKind.JEV_FAILURE)
+        expected_jev_request = (
+            jev_request_envelope.sha256
+            if jev_request_envelope is not None
+            else hashlib.sha256(b"").hexdigest()
+            if isinstance(jev_failure_artifact, FailureArtifact)
+            and jev_failure_artifact.code == "INPUT_ERROR"
+            else None
+        )
+        if frozen.jev_request_sha256 != expected_jev_request:
             fail("decision frozen artifact does not bind Jev request")
         jev_response_envelope = envelope_by_kind.get(ArtifactKind.JEV_RESPONSE_SUCCESS)
         jev_failure_response = (
@@ -1116,6 +1266,8 @@ def _validate_reconstructed_path(
             fail(str(error))
     if path in {_SUCCESS_PATH, _LEGACY_SUCCESS_PATH} and result is not None:
         _validate_success_terminal(result, path, typed, fail=fail)
+    if result is not None:
+        _validate_late_terminal(result, path, typed, fail=fail)
 
 
 def _prepare(

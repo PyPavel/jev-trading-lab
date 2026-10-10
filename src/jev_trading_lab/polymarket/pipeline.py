@@ -28,6 +28,7 @@ from jev_trading_lab.polymarket.models import (
     ArmResult,
     FeasibilityFixture,
     FixtureIdentity,
+    JevDecision,
     ObservationResult,
     PriceFreeFixturePrefix,
     StrictModel,
@@ -36,6 +37,7 @@ from jev_trading_lab.polymarket.models import (
     validate_feasibility_fixture,
 )
 from jev_trading_lab.polymarket.paper import (
+    STARTING_CASH_MICRODOLLARS,
     evaluate_ai_arm,
     evaluate_control_arm,
     evaluate_fixture,
@@ -43,6 +45,7 @@ from jev_trading_lab.polymarket.paper import (
 from jev_trading_lab.polymarket.store import (
     ArtifactEnvelope,
     ArtifactToFreeze,
+    BookUnavailableArtifact,
     DecisionFrozenArtifact,
     SuccessArtifact,
     failure_artifact_from_adapter,
@@ -236,7 +239,7 @@ def _decision_barrier(
         openai_request_sha256=hashlib.sha256(openai_request).hexdigest(),
         openai_response_sha256=openai_response_sha256,
         jev_request_sha256=(
-            hashlib.sha256(jev_request).hexdigest() if jev_request else None
+            hashlib.sha256(jev_request).hexdigest() if jev_request is not None else None
         ),
         jev_response_sha256=jev_response_sha256,
         jev_decision_sha256=jev_decision_sha256,
@@ -284,6 +287,118 @@ def _failure_result(
             "paired_brier_delta_micros": None,
         }
     )
+
+
+def _book_failure_arm(
+    *,
+    arm: str,
+    model_cost: int,
+    decision: JevDecision | None = None,
+) -> ArmResult:
+    probability = getattr(decision, "p_yes_micros", None)
+    action = getattr(decision, "action", None)
+    return ArmResult(
+        arm=arm,  # type: ignore[arg-type]
+        signal_probability_micros=probability,
+        signal_action=action,
+        disposition="BOOK_FAILURE",
+        entry_side=None,
+        entry_vwap_micros=None,
+        entry_notional_microdollars=None,
+        quantity=0,
+        fees_microdollars=0,
+        initial_cash_microdollars=STARTING_CASH_MICRODOLLARS,
+        final_cash_microdollars=STARTING_CASH_MICRODOLLARS,
+        mark_micros=None,
+        payout_micros=None,
+        valuation_notional_microdollars=None,
+        trading_pnl_microdollars=0,
+        economic_pnl_microdollars=-model_cost,
+        model_cost_microdollars=model_cost,
+        forecast_probability_micros=probability,
+        forecast_status=(
+            "PENDING_RESOLUTION" if probability is not None else "UNAVAILABLE"
+        ),
+        brier_micros=None,
+    )
+
+
+def _book_unavailable_result(
+    identity: FixtureIdentity,
+    evidence_at: datetime,
+    *,
+    terminal_at: datetime,
+    research_brief_sha256: str,
+    decision: JevDecision | None,
+    decision_sha256: str,
+    model_cost: int,
+) -> ObservationResult:
+    ai = _book_failure_arm(arm="AI", model_cost=model_cost, decision=decision)
+    control = _book_failure_arm(arm="DETERMINISTIC", model_cost=0)
+    return ObservationResult(
+        observation_id=identity.observation_id,
+        opportunity_id=identity.opportunity_id,
+        market_id=identity.market_id,
+        policy_version=identity.policy_version,
+        cutoff_at=identity.cutoff_at,
+        observed_at=max(terminal_at, evidence_at),
+        evidence_sha256=identity.evidence_sha256,
+        execution_book_sha256=None,
+        planned_execution_book_sha256=identity.execution_book_sha256,
+        research_brief_sha256=research_brief_sha256,
+        jev_decision_sha256=decision_sha256,
+        ai=ai,
+        deterministic=control,
+        baseline_probability_micros=None,
+        resolution=None,
+        baseline_brier_micros=None,
+        paired_trading_pnl_delta_microdollars=0,
+        paired_economic_pnl_delta_microdollars=-model_cost,
+        paired_brier_delta_micros=None,
+    )
+
+
+def _finish_book_unavailable(
+    output_dir: str | os.PathLike[str],
+    identity: FixtureIdentity,
+    values: list[tuple[str, bytes, str, datetime]],
+    *,
+    planned_at: datetime,
+    terminal_at: datetime,
+    evidence_at: datetime,
+    research_brief_sha256: str,
+    decision: JevDecision | None,
+    decision_sha256: str,
+    model_cost: int,
+) -> Summary:
+    unavailable = BookUnavailableArtifact(
+        reason="STALE_PRECHECK",
+        planned_retrieved_at=planned_at,
+        planned_source_sha256=identity.execution_book_sha256,
+        terminal_model_at=terminal_at,
+    )
+    late_values = values + [
+        (
+            "book_unavailable",
+            _model_bytes(unavailable),
+            "book_unavailable",
+            terminal_at,
+        )
+    ]
+    artifacts = _chain(identity, late_values)
+    freeze_observation_artifacts(output_dir, identity, artifacts)
+    result = _book_unavailable_result(
+        identity,
+        evidence_at,
+        terminal_at=terminal_at,
+        research_brief_sha256=research_brief_sha256,
+        decision=decision,
+        decision_sha256=decision_sha256,
+        model_cost=model_cost,
+    )
+    record_observation(output_dir, result, artifacts)
+    replay = load_observation(output_dir, result.observation_id)
+    return _summary(replay.result, replay.envelopes)
 
 
 def _arm_summary(arm: ArmResult) -> dict[str, object]:
@@ -339,6 +454,7 @@ def replay_fixture(
     if set(raw) != required_keys:
         raise ValueError(f"fixture must contain exactly {sorted(required_keys)}")
     raw_values = raw["raw"]
+    chronology_value = dict(raw["chronology"])
     prefix_model = PriceFreeFixturePrefix.model_validate_json(
         canonical_json_bytes(
             {
@@ -346,7 +462,7 @@ def replay_fixture(
                 "identity": raw["identity"],
                 "gamma_bytes": raw_values["gamma_bytes"],
                 "sanitized_evidence": raw["sanitized_evidence"],
-                "chronology": raw["chronology"],
+                "chronology": chronology_value,
                 "model_artifacts": raw["model_artifacts"],
                 "model_costs_microdollars": raw["model_costs_microdollars"],
             }
@@ -438,12 +554,13 @@ def replay_fixture(
                 failure_at,
             )
         ]
+        frozen_at = max(chronology.decision_frozen_at, failure_at)
         values, _barrier = _decision_barrier(
             identity,
             failure_prefix,
             state="OPENAI_FAILURE",
             failure_code=openai.code,
-            frozen_at=max(chronology.decision_frozen_at, failure_at),
+            frozen_at=frozen_at,
             openai_request=openai.request_bytes,
             openai_response_sha256=openai.response_sha256,
             jev_request=None,
@@ -455,6 +572,19 @@ def replay_fixture(
         artifacts = _chain(identity, values)
         freeze_observation_artifacts(output_dir, identity, artifacts)
         gate.freeze()
+        if frozen_at >= chronology.planned_execution_book_at:
+            return _finish_book_unavailable(
+                output_dir,
+                identity,
+                values,
+                planned_at=chronology.planned_execution_book_at,
+                terminal_at=frozen_at,
+                evidence_at=evidence_model.retrieved_at,
+                research_brief_sha256="0" * 64,
+                decision=None,
+                decision_sha256="0" * 64,
+                model_cost=openai.billed_cost_microdollars,
+            )
         fixture = gate.get()
         result = _failure_result(fixture, openai, 0)
         record_observation(output_dir, result, artifacts)
@@ -529,12 +659,13 @@ def replay_fixture(
                 failure_at,
             )
         ]
+        frozen_at = max(chronology.decision_frozen_at, failure_at)
         values, _barrier = _decision_barrier(
             identity,
             failure_prefix,
             state="JEV_FAILURE",
             failure_code=jev.code,
-            frozen_at=max(chronology.decision_frozen_at, failure_at),
+            frozen_at=frozen_at,
             openai_request=openai.request_bytes,
             openai_response_sha256=hashlib.sha256(openai.response_bytes).hexdigest(),
             jev_request=jev.request_bytes,
@@ -546,6 +677,23 @@ def replay_fixture(
         artifacts = _chain(identity, values)
         freeze_observation_artifacts(output_dir, identity, artifacts)
         gate.freeze()
+        if frozen_at >= chronology.planned_execution_book_at:
+            return _finish_book_unavailable(
+                output_dir,
+                identity,
+                values,
+                planned_at=chronology.planned_execution_book_at,
+                terminal_at=frozen_at,
+                evidence_at=evidence_model.retrieved_at,
+                research_brief_sha256=hashlib.sha256(
+                    _model_bytes(openai.brief)
+                ).hexdigest(),
+                decision=None,
+                decision_sha256="0" * 64,
+                model_cost=(
+                    openai.billed_cost_microdollars + jev.billed_cost_microdollars
+                ),
+            )
         fixture = gate.get()
         result = _failure_result(fixture, jev, openai.billed_cost_microdollars)
         record_observation(output_dir, result, artifacts)
@@ -553,7 +701,7 @@ def replay_fixture(
         return _summary(replay.result, replay.envelopes)
     assert isinstance(jev, JevSuccess)
 
-    frozen_at = chronology.decision_frozen_at
+    frozen_at = max(chronology.decision_frozen_at, jev.retrieved_at)
     decision_bytes = _model_bytes(jev.decision)
     decision_hash = hashlib.sha256(decision_bytes).hexdigest()
     success_prefix = prefix + [
@@ -594,6 +742,21 @@ def replay_fixture(
     artifacts = _chain(identity, values)
     freeze_observation_artifacts(output_dir, identity, artifacts)
     gate.freeze()
+    if frozen_at >= chronology.planned_execution_book_at:
+        return _finish_book_unavailable(
+            output_dir,
+            identity,
+            values,
+            planned_at=chronology.planned_execution_book_at,
+            terminal_at=frozen_at,
+            evidence_at=evidence_model.retrieved_at,
+            research_brief_sha256=hashlib.sha256(
+                _model_bytes(openai.brief)
+            ).hexdigest(),
+            decision=jev.decision,
+            decision_sha256=decision_hash,
+            model_cost=(openai.billed_cost_microdollars + jev.billed_cost_microdollars),
+        )
 
     fixture = gate.get()
     result = evaluate_fixture(fixture)

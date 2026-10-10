@@ -826,6 +826,10 @@ def test_each_adapter_failure_variant_roundtrips_canonical_metadata(
     artifacts = _retarget(artifacts, result)
     output = tmp_path / f"{provider}-{failure_code.lower()}"
 
+    if failure_code == "INPUT_ERROR":
+        with pytest.raises(ValueError, match="INPUT_ERROR|request"):
+            record_observation(output, result, artifacts)
+        return
     assert record_observation(output, result, artifacts) == result
     replay = load_observation(output, result.observation_id)
 
