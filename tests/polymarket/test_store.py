@@ -38,6 +38,7 @@ from jev_trading_lab.polymarket.store import (
     StoreConflictError,
     StoreCorruptError,
     StoreSecurityError,
+    SuccessArtifact,
     failure_artifact_from_adapter,
     load_observation,
     record_observation,
@@ -1515,6 +1516,193 @@ def _install_durable_artifact_orphan(
     journal = output / "artifacts.jsonl"
     journal.write_bytes(b"\n".join(lines) + b"\n")
     journal.chmod(0o600)
+
+
+def _legacy_observation(
+    cycle: dict[str, Any], shape: str, suffix: str = ""
+) -> tuple[ObservationResult, list[ArtifactToFreeze]]:
+    if shape == "success":
+        result = _result(cycle, suffix)
+        artifacts = _retarget(_artifacts(cycle), result)
+    else:
+        result, artifacts, _raw_failure = _failure_artifacts(
+            cycle, openai_failed=shape == "openai_failure"
+        )
+        if suffix:
+            value = result.model_dump(mode="json")
+            value["policy_version"] += f"-{suffix}"
+            value["opportunity_id"] = hashlib.sha256(
+                canonical_json_bytes(
+                    {
+                        "policy_version": value["policy_version"],
+                        "market_id": value["market_id"],
+                        "cutoff_at": value["cutoff_at"],
+                    }
+                )
+            ).hexdigest()
+            value["observation_id"] = hashlib.sha256(
+                canonical_json_bytes(
+                    {
+                        "opportunity_id": value["opportunity_id"],
+                        "evidence_sha256": value["evidence_sha256"],
+                        "execution_book_sha256": value["execution_book_sha256"],
+                        "policy_version": value["policy_version"],
+                    }
+                )
+            ).hexdigest()
+            result = ObservationResult.model_validate_json(canonical_json_bytes(value))
+            artifacts = _retarget(artifacts, result)
+    assert artifacts[-1].kind == "decision_frozen"
+    return result, artifacts[:-1]
+
+
+def _install_completed_legacy(
+    output: Path, result: ObservationResult, artifacts: list[ArtifactToFreeze]
+) -> None:
+    _install_durable_artifact_orphan(output, result, artifacts)
+    results = output / "results.jsonl"
+    results.write_bytes(canonical_json_bytes(result.model_dump(mode="json")) + b"\n")
+    results.chmod(0o600)
+
+
+@pytest.mark.parametrize("shape", ("success", "openai_failure", "jev_failure"))
+def test_replays_reviewed_unit4_legacy_terminal_journals(
+    tmp_path: Path, cycle: dict[str, Any], shape: str
+) -> None:
+    output = tmp_path / shape
+    result, artifacts = _legacy_observation(cycle, shape)
+    _install_completed_legacy(output, result, artifacts)
+
+    replay = load_observation(output, result.observation_id)
+
+    assert replay.result == result
+    assert tuple(replay.artifacts) == tuple(item.kind for item in artifacts)
+    assert "decision_frozen" not in replay.artifacts
+    assert "book_unavailable" not in replay.artifacts
+    assert replay.envelopes["raw_gamma"].sha256 == result.evidence_sha256
+    if shape == "success":
+        openai = replay.typed_artifacts["openai_success_metadata"]
+        jev = replay.typed_artifacts["jev_success_metadata"]
+        decision = replay.typed_artifacts["jev_decision"]
+        assert isinstance(openai, SuccessArtifact)
+        assert isinstance(jev, SuccessArtifact)
+        assert isinstance(decision, JevDecision)
+        assert openai.request_sha256 == replay.envelopes["openai_request"].sha256
+        assert (
+            openai.response_sha256 == replay.envelopes["openai_response_success"].sha256
+        )
+        assert jev.request_sha256 == replay.envelopes["jev_request"].sha256
+        assert jev.response_sha256 == replay.envelopes["jev_response_success"].sha256
+        assert replay.envelopes["jev_decision"].sha256 == result.jev_decision_sha256
+        assert result.ai.model_cost_microdollars == (
+            openai.billed_cost_microdollars + jev.billed_cost_microdollars
+        )
+        assert (result.ai.signal_probability_micros, result.ai.signal_action) == (
+            decision.p_yes_micros,
+            decision.action,
+        )
+    else:
+        failure_kind = "openai_failure" if shape == "openai_failure" else "jev_failure"
+        failure = replay.typed_artifacts[failure_kind]
+        request_kind = "openai_request" if shape == "openai_failure" else "jev_request"
+        assert isinstance(failure, FailureArtifact)
+        assert failure.request_sha256 == replay.envelopes[request_kind].sha256
+        expected_cost = failure.billed_cost_microdollars
+        if shape == "jev_failure":
+            openai = replay.typed_artifacts["openai_success_metadata"]
+            assert isinstance(openai, SuccessArtifact)
+            expected_cost += openai.billed_cost_microdollars
+        assert result.ai.model_cost_microdollars == expected_cost
+        assert result.ai.economic_pnl_microdollars == -expected_cost
+
+
+@pytest.mark.parametrize("shape", ("success", "openai_failure", "jev_failure"))
+def test_new_record_rejects_reviewed_legacy_path_without_decision_barrier(
+    tmp_path: Path, cycle: dict[str, Any], shape: str
+) -> None:
+    result, artifacts = _legacy_observation(cycle, shape)
+
+    with pytest.raises(ValueError, match="stage order|decision_frozen"):
+        record_observation(tmp_path / shape, result, artifacts)
+
+    assert not (tmp_path / shape / "artifacts.jsonl").exists()
+    assert not (tmp_path / shape / "results.jsonl").exists()
+
+
+@pytest.mark.parametrize("shape", ("success", "openai_failure", "jev_failure"))
+def test_completed_legacy_journal_allows_unrelated_current_write(
+    tmp_path: Path, cycle: dict[str, Any], shape: str
+) -> None:
+    output = tmp_path / shape
+    legacy_result, legacy_artifacts = _legacy_observation(cycle, shape, "legacy")
+    _install_completed_legacy(output, legacy_result, legacy_artifacts)
+    current = _result(cycle, "current")
+
+    assert (
+        record_observation(output, current, _retarget(_artifacts(cycle), current))
+        == current
+    )
+    assert (
+        load_observation(output, legacy_result.observation_id).result == legacy_result
+    )
+    assert load_observation(output, current.observation_id).result == current
+
+
+@pytest.mark.parametrize("shape", ("success", "openai_failure", "jev_failure"))
+def test_legacy_orphan_without_terminal_result_blocks_current_write(
+    tmp_path: Path, cycle: dict[str, Any], shape: str
+) -> None:
+    output = tmp_path / shape
+    legacy_result, legacy_artifacts = _legacy_observation(cycle, shape, "legacy")
+    _install_durable_artifact_orphan(output, legacy_result, legacy_artifacts)
+    current = _result(cycle, "current")
+
+    with pytest.raises(StoreCorruptError, match="legacy|terminal result|incomplete"):
+        record_observation(output, current, _retarget(_artifacts(cycle), current))
+
+    assert (output / "results.jsonl").read_bytes() == b""
+
+
+@pytest.mark.parametrize("shape", ("success", "openai_failure", "jev_failure"))
+def test_corrupt_completed_legacy_chain_blocks_unrelated_write(
+    tmp_path: Path, cycle: dict[str, Any], shape: str
+) -> None:
+    output = tmp_path / shape
+    legacy_result, legacy_artifacts = _legacy_observation(cycle, shape, "legacy")
+    _install_completed_legacy(output, legacy_result, legacy_artifacts)
+    _corrupt_second_stage_predecessor(output)
+    before = (
+        (output / "artifacts.jsonl").read_bytes(),
+        (output / "results.jsonl").read_bytes(),
+    )
+    current = _result(cycle, "current")
+
+    with pytest.raises(StoreCorruptError, match="predecessor"):
+        record_observation(output, current, _retarget(_artifacts(cycle), current))
+
+    assert (output / "artifacts.jsonl").read_bytes() == before[0]
+    assert (output / "results.jsonl").read_bytes() == before[1]
+
+
+@pytest.mark.parametrize("shape", ("success", "openai_failure", "jev_failure"))
+def test_replay_rejects_corrupt_legacy_semantic_binding(
+    tmp_path: Path, cycle: dict[str, Any], shape: str
+) -> None:
+    output = tmp_path / shape
+    result, artifacts = _legacy_observation(cycle, shape)
+    if shape == "success":
+        artifacts = _forged_success_orphan(cycle, result, "openai_request_hash")[:-1]
+    else:
+        failure_kind = "openai_failure" if shape == "openai_failure" else "jev_failure"
+        index = next(i for i, item in enumerate(artifacts) if item.kind == failure_kind)
+        value = json.loads(artifacts[index].payload)
+        value["request_sha256"] = "0" * 64
+        artifacts = _replace_artifact_payload(artifacts, failure_kind, value)
+        artifacts = _retarget(artifacts, result)
+    _install_completed_legacy(output, result, artifacts)
+
+    with pytest.raises(StoreCorruptError, match="request hash"):
+        load_observation(output, result.observation_id)
 
 
 def _forged_success_orphan(

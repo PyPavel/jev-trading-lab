@@ -160,21 +160,13 @@ _LEGACY_SUCCESS_PATH = (
     ArtifactKind.JEV_SUCCESS_METADATA,
     ArtifactKind.JEV_DECISION,
 )
-_SUCCESS_PATH = (*_LEGACY_SUCCESS_PATH, ArtifactKind.DECISION_FROZEN)
-_OPENAI_FAILURE_PATH = (
+_LEGACY_OPENAI_FAILURE_PATH = (
     ArtifactKind.RAW_GAMMA,
     ArtifactKind.SANITIZED_EVIDENCE,
     ArtifactKind.OPENAI_REQUEST,
     ArtifactKind.OPENAI_FAILURE,
-    ArtifactKind.DECISION_FROZEN,
 )
-_OPENAI_INPUT_FAILURE_PATH = (
-    ArtifactKind.RAW_GAMMA,
-    ArtifactKind.SANITIZED_EVIDENCE,
-    ArtifactKind.OPENAI_FAILURE,
-    ArtifactKind.DECISION_FROZEN,
-)
-_JEV_FAILURE_PATH = (
+_LEGACY_JEV_FAILURE_PATH = (
     ArtifactKind.RAW_GAMMA,
     ArtifactKind.SANITIZED_EVIDENCE,
     ArtifactKind.OPENAI_REQUEST,
@@ -183,8 +175,16 @@ _JEV_FAILURE_PATH = (
     ArtifactKind.RESEARCH_BRIEF,
     ArtifactKind.JEV_REQUEST,
     ArtifactKind.JEV_FAILURE,
+)
+_SUCCESS_PATH = (*_LEGACY_SUCCESS_PATH, ArtifactKind.DECISION_FROZEN)
+_OPENAI_FAILURE_PATH = (*_LEGACY_OPENAI_FAILURE_PATH, ArtifactKind.DECISION_FROZEN)
+_OPENAI_INPUT_FAILURE_PATH = (
+    ArtifactKind.RAW_GAMMA,
+    ArtifactKind.SANITIZED_EVIDENCE,
+    ArtifactKind.OPENAI_FAILURE,
     ArtifactKind.DECISION_FROZEN,
 )
+_JEV_FAILURE_PATH = (*_LEGACY_JEV_FAILURE_PATH, ArtifactKind.DECISION_FROZEN)
 _JEV_INPUT_FAILURE_PATH = (
     ArtifactKind.RAW_GAMMA,
     ArtifactKind.SANITIZED_EVIDENCE,
@@ -195,16 +195,24 @@ _JEV_INPUT_FAILURE_PATH = (
     ArtifactKind.JEV_FAILURE,
     ArtifactKind.DECISION_FROZEN,
 )
-_BASE_PATHS = (
+_WRITE_BASE_PATHS = (
     _SUCCESS_PATH,
     _OPENAI_FAILURE_PATH,
     _OPENAI_INPUT_FAILURE_PATH,
     _JEV_FAILURE_PATH,
     _JEV_INPUT_FAILURE_PATH,
 )
-_LATE_PATHS = tuple((*path, ArtifactKind.BOOK_UNAVAILABLE) for path in _BASE_PATHS)
-_STAGE_PATHS = (*_BASE_PATHS, *_LATE_PATHS)
-_FAILURE_PATHS = frozenset(
+_LATE_PATHS = tuple(
+    (*path, ArtifactKind.BOOK_UNAVAILABLE) for path in _WRITE_BASE_PATHS
+)
+_WRITE_STAGE_PATHS = (*_WRITE_BASE_PATHS, *_LATE_PATHS)
+_LEGACY_STAGE_PATHS = (
+    _LEGACY_SUCCESS_PATH,
+    _LEGACY_OPENAI_FAILURE_PATH,
+    _LEGACY_JEV_FAILURE_PATH,
+)
+_REPLAY_STAGE_PATHS = (*_WRITE_STAGE_PATHS, *_LEGACY_STAGE_PATHS)
+_WRITE_FAILURE_PATHS = frozenset(
     {
         _OPENAI_FAILURE_PATH,
         _OPENAI_INPUT_FAILURE_PATH,
@@ -212,8 +220,11 @@ _FAILURE_PATHS = frozenset(
         _JEV_INPUT_FAILURE_PATH,
     }
 )
+_FAILURE_PATHS = _WRITE_FAILURE_PATHS | frozenset(
+    {_LEGACY_OPENAI_FAILURE_PATH, _LEGACY_JEV_FAILURE_PATH}
+)
 _LATE_FAILURE_PATHS = frozenset(
-    (*path, ArtifactKind.BOOK_UNAVAILABLE) for path in _FAILURE_PATHS
+    (*path, ArtifactKind.BOOK_UNAVAILABLE) for path in _WRITE_FAILURE_PATHS
 )
 _RESULT_HASH_KINDS = {
     ArtifactKind.RAW_GAMMA: "evidence_sha256",
@@ -313,7 +324,7 @@ class FailureArtifact(UtcModel):
 
 
 def _stage_path(kinds: tuple[str, ...]) -> tuple[ArtifactKind, ...]:
-    for path in _STAGE_PATHS:
+    for path in _WRITE_STAGE_PATHS:
         if kinds == tuple(kind.value for kind in path):
             return path
     raise ValueError("artifact stage order must match one reviewed path")
@@ -322,7 +333,7 @@ def _stage_path(kinds: tuple[str, ...]) -> tuple[ArtifactKind, ...]:
 def _stage_path_prefix(kinds: tuple[str, ...]) -> tuple[ArtifactKind, ...]:
     matches = [
         path
-        for path in _STAGE_PATHS
+        for path in _WRITE_STAGE_PATHS
         if kinds == tuple(kind.value for kind in path[: len(kinds)])
     ]
     if not matches:
@@ -346,12 +357,20 @@ def _stage_path_for_result(
 def _stage_path_from_envelopes(
     result: ObservationResult, selected: list[ArtifactEnvelope]
 ) -> tuple[ArtifactKind, ...]:
-    try:
-        return _stage_path_for_result(result, tuple(item.kind for item in selected))
-    except ValueError as error:
-        raise StoreCorruptError(
-            "artifact stage order is incomplete or invalid"
-        ) from error
+    kinds = tuple(item.kind for item in selected)
+    for path in _REPLAY_STAGE_PATHS:
+        if kinds != tuple(kind.value for kind in path):
+            continue
+        if path in _LEGACY_STAGE_PATHS:
+            failed = result.ai.disposition == "MODEL_FAILURE"
+            if failed != (path in _FAILURE_PATHS):
+                break
+            return path
+        try:
+            return _stage_path_for_result(result, kinds)
+        except ValueError:
+            break
+    raise StoreCorruptError("artifact stage order is incomplete or invalid")
 
 
 def _normalized_key(value: str) -> str:
@@ -465,11 +484,19 @@ def _validate_failure_provenance(
     fail: Callable[[str], None],
 ) -> None:
     base = _base_path(path)
-    if base in {_OPENAI_FAILURE_PATH, _OPENAI_INPUT_FAILURE_PATH}:
+    if base in {
+        _OPENAI_FAILURE_PATH,
+        _OPENAI_INPUT_FAILURE_PATH,
+        _LEGACY_OPENAI_FAILURE_PATH,
+    }:
         failure_kind = ArtifactKind.OPENAI_FAILURE
         request_kind = ArtifactKind.OPENAI_REQUEST
         label = "OpenAI"
-    elif base in {_JEV_FAILURE_PATH, _JEV_INPUT_FAILURE_PATH}:
+    elif base in {
+        _JEV_FAILURE_PATH,
+        _JEV_INPUT_FAILURE_PATH,
+        _LEGACY_JEV_FAILURE_PATH,
+    }:
         failure_kind = ArtifactKind.JEV_FAILURE
         request_kind = ArtifactKind.JEV_REQUEST
         label = "Jev"
@@ -505,13 +532,21 @@ def _expected_model_cost(
     path: tuple[ArtifactKind, ...], typed: dict[str, TypedArtifact]
 ) -> int:
     base = _base_path(path)
-    if base in {_OPENAI_FAILURE_PATH, _OPENAI_INPUT_FAILURE_PATH}:
+    if base in {
+        _OPENAI_FAILURE_PATH,
+        _OPENAI_INPUT_FAILURE_PATH,
+        _LEGACY_OPENAI_FAILURE_PATH,
+    }:
         failure = typed[ArtifactKind.OPENAI_FAILURE]
         assert isinstance(failure, FailureArtifact)
         return failure.billed_cost_microdollars
     openai = typed[ArtifactKind.OPENAI_SUCCESS_METADATA]
     assert isinstance(openai, SuccessArtifact)
-    if base in {_JEV_FAILURE_PATH, _JEV_INPUT_FAILURE_PATH}:
+    if base in {
+        _JEV_FAILURE_PATH,
+        _JEV_INPUT_FAILURE_PATH,
+        _LEGACY_JEV_FAILURE_PATH,
+    }:
         failure = typed[ArtifactKind.JEV_FAILURE]
         assert isinstance(failure, FailureArtifact)
         return _add_model_costs(
@@ -1061,7 +1096,12 @@ def _validate_reconstructed_path(
 
     base_path = _base_path(path)
     if (
-        base_path in {_OPENAI_FAILURE_PATH, _OPENAI_INPUT_FAILURE_PATH}
+        base_path
+        in {
+            _OPENAI_FAILURE_PATH,
+            _OPENAI_INPUT_FAILURE_PATH,
+            _LEGACY_OPENAI_FAILURE_PATH,
+        }
         and ArtifactKind.OPENAI_FAILURE in typed
     ):
         _validate_failure_provenance(path, typed, fail=fail)
@@ -1100,7 +1140,12 @@ def _validate_reconstructed_path(
         fail("Jev request does not match evidence and brief")
 
     if (
-        base_path in {_JEV_FAILURE_PATH, _JEV_INPUT_FAILURE_PATH}
+        base_path
+        in {
+            _JEV_FAILURE_PATH,
+            _JEV_INPUT_FAILURE_PATH,
+            _LEGACY_JEV_FAILURE_PATH,
+        }
         and ArtifactKind.JEV_FAILURE in typed
     ):
         _validate_failure_provenance(path, typed, fail=fail)
@@ -1350,7 +1395,7 @@ def _validate_journals_locked(
         kinds = tuple(item.kind for item in selected)
         matching_paths = [
             path
-            for path in _STAGE_PATHS
+            for path in _REPLAY_STAGE_PATHS
             if kinds == tuple(kind.value for kind in path[: len(kinds)])
         ]
         if not matching_paths:
@@ -1388,6 +1433,10 @@ def _validate_journals_locked(
                 store, result, selected, forbidden_secret_values
             )
             continue
+        if any(
+            kinds == tuple(kind.value for kind in path) for path in _LEGACY_STAGE_PATHS
+        ):
+            raise StoreCorruptError("legacy artifact path requires a terminal result")
 
         typed: dict[str, TypedArtifact] = {}
         for envelope, kind in zip(selected, matching_paths[0], strict=False):
