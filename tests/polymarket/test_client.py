@@ -163,6 +163,14 @@ def test_precheck_book_gates(changes: dict[str, Any], reason: str) -> None:
     result = PolymarketClient(transport).poll(limit=1, now=NOW)
     assert not result.eligible
     assert result.rejections[0].reason == reason
+    rejection = result.rejections[0]
+    if reason in {"WIDE_SPREAD", "LOW_DEPTH"}:
+        assert rejection.precheck_book_bytes is not None
+        assert rejection.precheck_book is not None
+        assert rejection.precheck_failure_sha256 is None
+    else:
+        assert rejection.precheck_book is None
+        assert rejection.precheck_failure_sha256 is not None
 
 
 def test_price_free_evidence_uses_gamma_text_and_raw_market_bytes() -> None:

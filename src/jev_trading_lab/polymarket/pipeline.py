@@ -64,6 +64,7 @@ from jev_trading_lab.polymarket.store import (
     BookUnavailableArtifact,
     DecisionFrozenArtifact,
     EligibilityRejectionArtifact,
+    PrecheckBookFailureArtifact,
     SuccessArtifact,
     failure_artifact_from_adapter,
     freeze_observation_artifacts,
@@ -450,8 +451,7 @@ def _finish_book_unavailable(
         )
     ]
     artifacts = _chain(identity, late_values)
-    if model_cost is not None:
-        freeze_observation_artifacts(output_dir, identity, artifacts)
+    freeze_observation_artifacts(output_dir, identity, artifacts)
     result = _book_unavailable_result(
         identity,
         evidence_at,
@@ -545,6 +545,25 @@ def _live_policy() -> Economics:
     )
 
 
+def _live_causal_history(candidate: MarketCandidate) -> list[CausalHistoryPoint]:
+    return (
+        [
+            CausalHistoryPoint(
+                midpoint_micros=midpoint_micros(candidate.precheck_book),
+                observed_at=candidate.precheck_book.retrieved_at,
+            )
+        ]
+        if candidate.precheck_book.retrieved_at < candidate.evidence.cutoff_at
+        else []
+    )
+
+
+def _causal_history_bytes(candidate: MarketCandidate) -> bytes:
+    return canonical_json_bytes(
+        [point.model_dump(mode="json") for point in _live_causal_history(candidate)]
+    )
+
+
 def _live_result(
     identity: FixtureIdentity,
     candidate: MarketCandidate,
@@ -555,16 +574,7 @@ def _live_result(
     decision_sha256: str,
     model_cost: int | None,
 ) -> ObservationResult:
-    history = (
-        [
-            CausalHistoryPoint(
-                midpoint_micros=midpoint_micros(candidate.precheck_book),
-                observed_at=candidate.precheck_book.retrieved_at,
-            )
-        ]
-        if candidate.precheck_book.retrieved_at < candidate.evidence.cutoff_at
-        else []
-    )
+    history = _live_causal_history(candidate)
     policy = _live_policy()
     ai = (
         _cost_overflow_arm()
@@ -757,6 +767,18 @@ def _live_artifacts(
             "gamma_sanitized",
             candidate.evidence.retrieved_at,
         ),
+        (
+            "precheck_book",
+            candidate.precheck_book_bytes,
+            "clob_precheck_book",
+            candidate.precheck_book.retrieved_at,
+        ),
+        (
+            "causal_history",
+            _causal_history_bytes(candidate),
+            "precheck_causal_history",
+            candidate.precheck_book.retrieved_at,
+        ),
     ]
     if isinstance(openai, AdapterFailure):
         if openai.request_bytes:
@@ -836,10 +858,13 @@ def _live_artifacts(
                 frozen_at,
             )
         )
+        aggregate_cost = _sum_model_cost(
+            openai.billed_cost_microdollars, jev.billed_cost_microdollars
+        )
         values, _ = _decision_barrier(
             identity,
             prefix,
-            state="JEV_FAILURE",
+            state="JEV_FAILURE" if aggregate_cost is not None else "COST_OVERFLOW",
             failure_code=jev.code,
             frozen_at=frozen_at,
             openai_request=openai.request_bytes,
@@ -850,15 +875,7 @@ def _live_artifacts(
             openai_cost=openai.billed_cost_microdollars,
             jev_cost=jev.billed_cost_microdollars,
         )
-        return (
-            values,
-            None,
-            brief_hash,
-            "0" * 64,
-            _sum_model_cost(
-                openai.billed_cost_microdollars, jev.billed_cost_microdollars
-            ),
-        )
+        return values, None, brief_hash, "0" * 64, aggregate_cost
     decision_bytes = _model_bytes(jev.decision)
     decision_hash = hashlib.sha256(decision_bytes).hexdigest()
     prefix.extend(
@@ -885,10 +902,13 @@ def _live_artifacts(
             ("jev_decision", decision_bytes, "jev_validated", jev.retrieved_at),
         ]
     )
+    aggregate_cost = _sum_model_cost(
+        openai.billed_cost_microdollars, jev.billed_cost_microdollars
+    )
     values, _ = _decision_barrier(
         identity,
         prefix,
-        state="JEV_SUCCESS",
+        state="JEV_SUCCESS" if aggregate_cost is not None else "COST_OVERFLOW",
         failure_code=None,
         frozen_at=frozen_at,
         openai_request=openai.request_bytes,
@@ -899,13 +919,7 @@ def _live_artifacts(
         openai_cost=openai.billed_cost_microdollars,
         jev_cost=jev.billed_cost_microdollars,
     )
-    return (
-        values,
-        jev.decision,
-        brief_hash,
-        decision_hash,
-        _sum_model_cost(openai.billed_cost_microdollars, jev.billed_cost_microdollars),
-    )
+    return values, jev.decision, brief_hash, decision_hash, aggregate_cost
 
 
 def _record_rejections(
@@ -986,20 +1000,62 @@ def _record_rejections(
             market_id=rejection.market_id,
             reason=rejection.reason,
             raw_gamma_sha256=rejection.raw_gamma_sha256,
+            precheck_book_sha256=(
+                rejection.precheck_book.source_sha256
+                if rejection.precheck_book is not None
+                else rejection.precheck_failure_sha256
+            ),
             rejected_at=observed_at,
         )
-        artifacts = _chain(
-            result,
-            [
-                ("raw_gamma", rejection.raw_gamma_bytes, "gamma_market", observed_at),
+        rejection_values = [
+            ("raw_gamma", rejection.raw_gamma_bytes, "gamma_market", observed_at)
+        ]
+        if rejection.evidence is not None:
+            rejection_values.append(
                 (
-                    "eligibility_rejection",
-                    _model_bytes(rejection_artifact),
-                    "eligibility_rejection",
-                    observed_at,
-                ),
-            ],
+                    "sanitized_evidence",
+                    _model_bytes(rejection.evidence),
+                    "gamma_sanitized",
+                    rejection.evidence.retrieved_at,
+                )
+            )
+            if (
+                rejection.precheck_book_bytes is not None
+                and rejection.precheck_book is not None
+            ):
+                rejection_values.append(
+                    (
+                        "precheck_book",
+                        rejection.precheck_book_bytes,
+                        "clob_precheck_book",
+                        rejection.precheck_book.retrieved_at,
+                    )
+                )
+            elif rejection.precheck_failure_sha256 is not None:
+                failure = PrecheckBookFailureArtifact(
+                    market_id=rejection.market_id,
+                    token_id=rejection.yes_token_id or "UNKNOWN",
+                    reason=rejection.reason,
+                    raw_book_sha256=rejection.precheck_failure_sha256,
+                    retrieved_at=rejection.precheck_retrieved_at or observed_at,
+                )
+                rejection_values.append(
+                    (
+                        "precheck_book_failure",
+                        _model_bytes(failure),
+                        "clob_precheck_failure",
+                        failure.retrieved_at,
+                    )
+                )
+        rejection_values.append(
+            (
+                "eligibility_rejection",
+                _model_bytes(rejection_artifact),
+                "eligibility_rejection",
+                observed_at,
+            )
         )
+        artifacts = _chain(result, rejection_values)
         record_observation(output_dir, result, artifacts)
         replay = load_observation(output_dir, observation_id)
         summary = _summary(replay.result, replay.envelopes)
@@ -1047,6 +1103,18 @@ def observe_markets(
                 "gamma_sanitized",
                 candidate.evidence.retrieved_at,
             ),
+            (
+                "precheck_book",
+                candidate.precheck_book_bytes,
+                "clob_precheck_book",
+                candidate.precheck_book.retrieved_at,
+            ),
+            (
+                "causal_history",
+                _causal_history_bytes(candidate),
+                "precheck_causal_history",
+                candidate.precheck_book.retrieved_at,
+            ),
         ]
         freeze_observation_artifacts(output_dir, provisional, _chain(provisional, base))
         openai = call_openai(candidate.evidence, OPENAI_MODEL_ID, openai_sender)
@@ -1063,12 +1131,33 @@ def observe_markets(
         provisional_values, _, _, _, provisional_cost = _live_artifacts(
             provisional, candidate, openai, jev, frozen_at=frozen_at
         )
-        if provisional_cost is not None:
-            freeze_observation_artifacts(
-                output_dir, provisional, _chain(provisional, provisional_values)
-            )
+        freeze_observation_artifacts(
+            output_dir, provisional, _chain(provisional, provisional_values)
+        )
         if event_sink is not None:
             event_sink("decision_frozen")
+        if provisional_cost is None:
+            values, decision, brief_hash, decision_hash, _ = _live_artifacts(
+                provisional, candidate, openai, jev, frozen_at=frozen_at
+            )
+            summaries.append(
+                _finish_book_unavailable(
+                    output_dir,
+                    provisional,
+                    values,
+                    planned_at=max(cutoff, frozen_at + timedelta(seconds=1)),
+                    terminal_at=frozen_at,
+                    observed_at=max(datetime.now(UTC), frozen_at),
+                    reason="COST_OVERFLOW",
+                    evidence_at=candidate.evidence.retrieved_at,
+                    research_brief_sha256=brief_hash,
+                    decision=decision,
+                    decision_sha256=decision_hash,
+                    model_cost=None,
+                )
+            )
+            continue
+        if event_sink is not None:
             event_sink("execution_book_requested")
         try:
             raw_execution, execution_book = public.execution_book(
@@ -1109,15 +1198,14 @@ def observe_markets(
         values, decision, brief_hash, decision_hash, model_cost = _live_artifacts(
             final, candidate, openai, jev, frozen_at=frozen_at
         )
-        if decision is not None:
-            values.append(
-                (
-                    "execution_book",
-                    raw_execution,
-                    "clob_execution_book",
-                    execution_book.retrieved_at,
-                )
+        values.append(
+            (
+                "execution_book",
+                raw_execution,
+                "clob_execution_book",
+                execution_book.retrieved_at,
             )
+        )
         artifacts = _chain(final, values)
         result = _live_result(
             final,

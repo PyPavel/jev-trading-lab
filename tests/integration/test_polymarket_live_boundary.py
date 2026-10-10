@@ -16,7 +16,13 @@ from jev_trading_lab.polymarket.client import (
 )
 from jev_trading_lab.polymarket.models import BookSnapshot
 from jev_trading_lab.polymarket.pipeline import observe_markets
-from jev_trading_lab.polymarket.store import load_observation
+from jev_trading_lab.polymarket.store import StoreCorruptError, load_observation
+
+
+def _corrupt_blob(output: Path, replay: Any, kind: str) -> None:
+    blob = output / "blobs" / replay.envelopes[kind].storage_relpath
+    blob.write_bytes(b"corrupt")
+
 
 FIXTURE = Path(__file__).parents[1] / "fixtures/polymarket/feasibility_cycle.json"
 NOW = datetime(2026, 10, 10, 12, tzinfo=UTC)
@@ -190,14 +196,19 @@ def test_observe_freezes_then_calls_models_then_fresh_book_and_records_both_arms
     assert not (tmp_path / "live-artifacts.jsonl").exists()
 
 
-def test_provider_failure_still_writes_synchronized_terminal_observation(
-    tmp_path: Path,
+@pytest.mark.parametrize("provider", ["openai", "jev"])
+def test_provider_failure_freezes_precheck_history_and_consumed_execution_book(
+    tmp_path: Path, provider: str
 ) -> None:
     public = PublicNetwork()
     client = PolymarketClient(public)
     raw_market = json.dumps(_market(), separators=(",", ":")).encode()
-    openai = ModelTransport("openai", hashlib.sha256(raw_market).hexdigest(), fail=True)
-    jev = ModelTransport("jev")
+    openai = ModelTransport(
+        "openai",
+        hashlib.sha256(raw_market).hexdigest(),
+        fail=provider == "openai",
+    )
+    jev = ModelTransport("jev", fail=provider == "jev")
     summaries = observe_markets(
         limit=1,
         output_dir=tmp_path,
@@ -208,11 +219,47 @@ def test_provider_failure_still_writes_synchronized_terminal_observation(
     )
     assert summaries[0]["ai"]["disposition"] == "MODEL_FAILURE"
     assert summaries[0]["control"]["disposition"] == "ABSTAIN"
-    assert len(openai.requests) == 1
-    assert not jev.requests
     result = json.loads((tmp_path / "results.jsonl").read_text().strip())
-    assert result["ai"]["model_cost_microdollars"] == 17
+    replay = load_observation(tmp_path, result["observation_id"])
+    kinds = list(replay.artifacts)
+    assert kinds[2:4] == ["precheck_book", "causal_history"]
+    assert kinds[-2:] == ["decision_frozen", "execution_book"]
+    assert (
+        replay.artifacts["precheck_book"]
+        == json.dumps(_book(0), separators=(",", ":")).encode()
+    )
+    assert (
+        replay.artifacts["execution_book"]
+        == json.dumps(_book(3), separators=(",", ":")).encode()
+    )
+    assert replay.envelopes["execution_book"].sha256 == result["execution_book_sha256"]
+    assert result["ai"]["model_cost_microdollars"] == 17 * (int(provider == "jev") + 1)
     assert result["deterministic"]["model_cost_microdollars"] == 0
+
+    _corrupt_blob(tmp_path, replay, "execution_book")
+    with pytest.raises(StoreCorruptError):
+        load_observation(tmp_path, result["observation_id"])
+
+
+def test_precheck_corruption_blocks_terminal_replay(tmp_path: Path) -> None:
+    public = PublicNetwork()
+    raw_market = json.dumps(_market(), separators=(",", ":")).encode()
+    summary = observe_markets(
+        limit=1,
+        output_dir=tmp_path,
+        client=PolymarketClient(public),
+        openai_transport=ModelTransport(
+            "openai", hashlib.sha256(raw_market).hexdigest()
+        ),
+        jev_transport=ModelTransport("jev"),
+        now=NOW,
+    )[0]
+    replay = load_observation(tmp_path, str(summary["observation_id"]))
+    history = json.loads(replay.artifacts["causal_history"])
+    assert history == []
+    _corrupt_blob(tmp_path, replay, "precheck_book")
+    with pytest.raises(StoreCorruptError):
+        load_observation(tmp_path, str(summary["observation_id"]))
 
 
 @pytest.mark.parametrize(
@@ -349,14 +396,26 @@ def test_eligibility_rejection_is_canonical_terminal_observation(
     assert not (tmp_path / "rejections.jsonl").exists()
 
 
-def test_cumulative_model_cost_overflow_is_honest_terminal_result(
+def test_cumulative_model_cost_overflow_is_barriered_without_fresh_book(
     tmp_path: Path,
 ) -> None:
+    class FreshBookTrap(PublicNetwork):
+        def __call__(self, request: HttpRequest) -> HttpResponse:
+            if "clob.polymarket.com" in request.url and len(self.requests) >= 2:
+                journal = tmp_path / "artifacts.jsonl"
+                assert journal.is_file()
+                assert json.loads(journal.read_text().splitlines()[-1])["kind"] == (
+                    "decision_frozen"
+                )
+                raise AssertionError("cost overflow must not fetch an execution book")
+            return super().__call__(request)
+
+    public = FreshBookTrap()
     raw_market = json.dumps(_market(), separators=(",", ":")).encode()
     summaries = observe_markets(
         limit=1,
         output_dir=tmp_path,
-        client=PolymarketClient(PublicNetwork()),
+        client=PolymarketClient(public),
         openai_transport=ModelTransport(
             "openai", hashlib.sha256(raw_market).hexdigest(), cost=2**63 - 1
         ),
@@ -365,10 +424,18 @@ def test_cumulative_model_cost_overflow_is_honest_terminal_result(
     )
     result = json.loads((tmp_path / "results.jsonl").read_text())
     assert summaries[0]["ai"]["disposition"] == "COST_OVERFLOW"
+    assert len(public.requests) == 2
+    assert result["execution_book_sha256"] is None
+    assert result["baseline_probability_micros"] is None
     assert result["ai"]["model_cost_microdollars"] is None
     assert result["ai"]["economic_pnl_microdollars"] is None
     assert result["paired_economic_pnl_delta_microdollars"] is None
     replay = load_observation(tmp_path, result["observation_id"])
+    assert list(replay.artifacts)[-2:] == ["decision_frozen", "book_unavailable"]
+    barrier = json.loads(replay.artifacts["decision_frozen"])
+    assert barrier["terminal_model_state"] == "COST_OVERFLOW"
+    assert json.loads(replay.artifacts["book_unavailable"])["reason"] == "COST_OVERFLOW"
+    assert "execution_book" not in replay.artifacts
     assert (
         json.loads(replay.artifacts["openai_success_metadata"])[
             "billed_cost_microdollars"
@@ -379,6 +446,51 @@ def test_cumulative_model_cost_overflow_is_honest_terminal_result(
         json.loads(replay.artifacts["jev_success_metadata"])["billed_cost_microdollars"]
         == 1
     )
+
+
+def test_cost_overflow_crash_after_barrier_retries_without_book(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from jev_trading_lab.polymarket import pipeline
+
+    raw_market = json.dumps(_market(), separators=(",", ":")).encode()
+    original = pipeline._finish_book_unavailable
+    crashed = False
+
+    def crash_once(*args: Any, **kwargs: Any) -> Any:
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            kinds = [
+                json.loads(line)["kind"]
+                for line in (tmp_path / "artifacts.jsonl").read_text().splitlines()
+            ]
+            assert kinds[-1] == "decision_frozen"
+            raise RuntimeError("simulated crash after overflow barrier")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "_finish_book_unavailable", crash_once)
+
+    def kwargs() -> dict[str, Any]:
+        return {
+            "limit": 1,
+            "output_dir": tmp_path,
+            "client": PolymarketClient(PublicNetwork()),
+            "openai_transport": ModelTransport(
+                "openai", hashlib.sha256(raw_market).hexdigest(), cost=2**63 - 1
+            ),
+            "jev_transport": ModelTransport("jev", cost=1),
+            "now": NOW,
+        }
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        observe_markets(**kwargs())
+    assert not (tmp_path / "results.jsonl").read_text()
+
+    summary = observe_markets(**kwargs())[0]
+    replay = load_observation(tmp_path, str(summary["observation_id"]))
+    assert replay.result.ai.disposition == "COST_OVERFLOW"
+    assert "execution_book" not in replay.artifacts
 
 
 @pytest.mark.parametrize("fresh_unavailable", [False, True])

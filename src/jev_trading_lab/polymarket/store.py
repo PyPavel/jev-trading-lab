@@ -16,7 +16,13 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal, Self
 
-from pydantic import Field, StringConstraints, field_validator, model_validator
+from pydantic import (
+    Field,
+    StringConstraints,
+    TypeAdapter,
+    field_validator,
+    model_validator,
+)
 
 from jev_trading_lab.core.ids import canonical_json_bytes
 from jev_trading_lab.persistence.blobs import (
@@ -40,6 +46,7 @@ from jev_trading_lab.polymarket.client import reconstruct_book_snapshot
 from jev_trading_lab.polymarket.models import (
     INT64_MAX,
     BookSnapshot,
+    CausalHistoryPoint,
     EvidencePacket,
     FixtureIdentity,
     JevDecision,
@@ -82,6 +89,9 @@ _CREDENTIAL_KEYS = frozenset(
 class ArtifactKind(StrEnum):
     RAW_GAMMA = "raw_gamma"
     SANITIZED_EVIDENCE = "sanitized_evidence"
+    PRECHECK_BOOK = "precheck_book"
+    PRECHECK_BOOK_FAILURE = "precheck_book_failure"
+    CAUSAL_HISTORY = "causal_history"
     OPENAI_REQUEST = "openai_request"
     OPENAI_RESPONSE_SUCCESS = "openai_response_success"
     OPENAI_SUCCESS_METADATA = "openai_success_metadata"
@@ -103,7 +113,9 @@ class DecisionFrozenArtifact(UtcModel):
 
     opportunity_id: Sha256
     observation_id: Sha256
-    terminal_model_state: Literal["OPENAI_FAILURE", "JEV_FAILURE", "JEV_SUCCESS"]
+    terminal_model_state: Literal[
+        "OPENAI_FAILURE", "JEV_FAILURE", "JEV_SUCCESS", "COST_OVERFLOW"
+    ]
     failure_code: FailureCode | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -140,6 +152,16 @@ class DecisionFrozenArtifact(UtcModel):
                 or self.jev_decision_sha256 is not None
             ):
                 raise ValueError("Jev failure barrier fields are inconsistent")
+        elif self.terminal_model_state == "COST_OVERFLOW":
+            if (
+                self.openai_response_sha256 is None
+                or self.jev_request_sha256 is None
+                or self.jev_response_sha256 is None
+                or self.openai_cost_microdollars + self.jev_cost_microdollars
+                <= INT64_MAX
+                or (self.failure_code is None) != (self.jev_decision_sha256 is not None)
+            ):
+                raise ValueError("cost overflow barrier fields are inconsistent")
         elif self.failure_code is not None or any(
             value is None
             for value in (
@@ -182,7 +204,6 @@ _LEGACY_JEV_FAILURE_PATH = (
     ArtifactKind.JEV_FAILURE,
 )
 _SUCCESS_PATH = (*_LEGACY_SUCCESS_PATH, ArtifactKind.DECISION_FROZEN)
-_UNIT6_SUCCESS_PATH = (*_SUCCESS_PATH, ArtifactKind.EXECUTION_BOOK)
 _OPENAI_FAILURE_PATH = (*_LEGACY_OPENAI_FAILURE_PATH, ArtifactKind.DECISION_FROZEN)
 _OPENAI_INPUT_FAILURE_PATH = (
     ArtifactKind.RAW_GAMMA,
@@ -201,26 +222,98 @@ _JEV_INPUT_FAILURE_PATH = (
     ArtifactKind.JEV_FAILURE,
     ArtifactKind.DECISION_FROZEN,
 )
+_UNIT6_PREFIX = (
+    ArtifactKind.RAW_GAMMA,
+    ArtifactKind.SANITIZED_EVIDENCE,
+    ArtifactKind.PRECHECK_BOOK,
+    ArtifactKind.CAUSAL_HISTORY,
+)
+_UNIT6_SUCCESS_BASE = (
+    *_UNIT6_PREFIX,
+    *_LEGACY_SUCCESS_PATH[2:],
+    ArtifactKind.DECISION_FROZEN,
+)
+_UNIT6_OPENAI_FAILURE_BASE = (
+    *_UNIT6_PREFIX,
+    *_LEGACY_OPENAI_FAILURE_PATH[2:],
+    ArtifactKind.DECISION_FROZEN,
+)
+_UNIT6_OPENAI_INPUT_FAILURE_BASE = (
+    *_UNIT6_PREFIX,
+    ArtifactKind.OPENAI_FAILURE,
+    ArtifactKind.DECISION_FROZEN,
+)
+_UNIT6_JEV_FAILURE_BASE = (
+    *_UNIT6_PREFIX,
+    *_LEGACY_JEV_FAILURE_PATH[2:],
+    ArtifactKind.DECISION_FROZEN,
+)
+_UNIT6_JEV_INPUT_FAILURE_BASE = (
+    *_UNIT6_PREFIX,
+    ArtifactKind.OPENAI_REQUEST,
+    ArtifactKind.OPENAI_RESPONSE_SUCCESS,
+    ArtifactKind.OPENAI_SUCCESS_METADATA,
+    ArtifactKind.RESEARCH_BRIEF,
+    ArtifactKind.JEV_FAILURE,
+    ArtifactKind.DECISION_FROZEN,
+)
+_UNIT6_BASE_PATHS = (
+    _UNIT6_SUCCESS_BASE,
+    _UNIT6_OPENAI_FAILURE_BASE,
+    _UNIT6_OPENAI_INPUT_FAILURE_BASE,
+    _UNIT6_JEV_FAILURE_BASE,
+    _UNIT6_JEV_INPUT_FAILURE_BASE,
+)
+_UNIT6_EXECUTION_PATHS = tuple(
+    (*path, ArtifactKind.EXECUTION_BOOK) for path in _UNIT6_BASE_PATHS
+)
+_UNIT6_LATE_PATHS = tuple(
+    (*path, ArtifactKind.BOOK_UNAVAILABLE) for path in _UNIT6_BASE_PATHS
+)
+_UNIT6_SUCCESS_PATH = _UNIT6_EXECUTION_PATHS[0]
 _ELIGIBILITY_REJECTION_PATH = (
     ArtifactKind.RAW_GAMMA,
     ArtifactKind.ELIGIBILITY_REJECTION,
 )
+_PRECHECK_REJECTION_PATH = (
+    ArtifactKind.RAW_GAMMA,
+    ArtifactKind.SANITIZED_EVIDENCE,
+    ArtifactKind.PRECHECK_BOOK,
+    ArtifactKind.ELIGIBILITY_REJECTION,
+)
+_PRECHECK_FAILURE_REJECTION_PATH = (
+    ArtifactKind.RAW_GAMMA,
+    ArtifactKind.SANITIZED_EVIDENCE,
+    ArtifactKind.PRECHECK_BOOK_FAILURE,
+    ArtifactKind.ELIGIBILITY_REJECTION,
+)
+_REJECTION_PATHS = {
+    _ELIGIBILITY_REJECTION_PATH,
+    _PRECHECK_REJECTION_PATH,
+    _PRECHECK_FAILURE_REJECTION_PATH,
+}
 _WRITE_BASE_PATHS = (
     _SUCCESS_PATH,
-    _UNIT6_SUCCESS_PATH,
     _OPENAI_FAILURE_PATH,
     _OPENAI_INPUT_FAILURE_PATH,
     _JEV_FAILURE_PATH,
     _JEV_INPUT_FAILURE_PATH,
-    _ELIGIBILITY_REJECTION_PATH,
+    *_REJECTION_PATHS,
+    *_UNIT6_BASE_PATHS,
+    *_UNIT6_EXECUTION_PATHS,
 )
 _LATE_PATHS = (
     (*_SUCCESS_PATH, ArtifactKind.BOOK_UNAVAILABLE),
     *(
         (*path, ArtifactKind.BOOK_UNAVAILABLE)
-        for path in _WRITE_BASE_PATHS
-        if path not in {_SUCCESS_PATH, _UNIT6_SUCCESS_PATH, _ELIGIBILITY_REJECTION_PATH}
+        for path in (
+            _OPENAI_FAILURE_PATH,
+            _OPENAI_INPUT_FAILURE_PATH,
+            _JEV_FAILURE_PATH,
+            _JEV_INPUT_FAILURE_PATH,
+        )
     ),
+    *_UNIT6_LATE_PATHS,
 )
 _WRITE_STAGE_PATHS = (*_WRITE_BASE_PATHS, *_LATE_PATHS)
 _LEGACY_STAGE_PATHS = (
@@ -254,7 +347,7 @@ _RESULT_HASH_KINDS = {
 }
 Label = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
 ByteSize = Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)]
-TypedArtifact = StrictModel | Mapping[str, object] | None
+TypedArtifact = StrictModel | Mapping[str, object] | list[CausalHistoryPoint] | None
 
 
 class SuccessArtifact(UtcModel):
@@ -277,6 +370,7 @@ class BookUnavailableArtifact(UtcModel):
         "MARKET_DRIFT",
         "BOOK_UNAVAILABLE",
         "STALE_PRECHECK",
+        "COST_OVERFLOW",
     ]
     planned_retrieved_at: datetime
     planned_source_sha256: Sha256
@@ -289,7 +383,18 @@ class EligibilityRejectionArtifact(UtcModel):
     market_id: NonEmptyStr
     reason: NonEmptyStr
     raw_gamma_sha256: Sha256
+    precheck_book_sha256: Sha256 | None = None
     rejected_at: datetime
+
+
+class PrecheckBookFailureArtifact(UtcModel):
+    """Strict metadata for malformed precheck bytes that cannot form a snapshot."""
+
+    market_id: NonEmptyStr
+    token_id: NonEmptyStr
+    reason: NonEmptyStr
+    raw_book_sha256: Sha256
+    retrieved_at: datetime
 
 
 class FailureArtifact(UtcModel):
@@ -388,22 +493,33 @@ def _stage_path_for_result(
     result: ObservationResult, kinds: tuple[str, ...]
 ) -> tuple[ArtifactKind, ...]:
     path = _stage_path(kinds)
-    if path == _ELIGIBILITY_REJECTION_PATH:
+    if path in _REJECTION_PATHS:
         if any(
             arm.disposition != "INELIGIBLE" for arm in (result.ai, result.deterministic)
         ):
             raise ValueError("eligibility path requires terminal INELIGIBLE arms")
         return path
     late = path in _LATE_PATHS
+    provider_path = _provider_shape(path)
+    failure_path = provider_path in _FAILURE_PATHS
     if late:
         if result.ai.disposition not in {"BOOK_FAILURE", "COST_OVERFLOW"}:
             raise ValueError(
                 "late provider path requires terminal BOOK_FAILURE or COST_OVERFLOW"
             )
+    elif path in _UNIT6_EXECUTION_PATHS:
+        if result.execution_book_sha256 is None:
+            raise ValueError("execution-book path requires an observed execution book")
+        if result.ai.disposition == "COST_OVERFLOW":
+            raise ValueError("cost overflow must terminalize without an execution book")
+        if (result.ai.disposition == "MODEL_FAILURE") != failure_path:
+            raise ValueError(
+                "terminal AI disposition does not match provider outcome path"
+            )
     elif result.ai.disposition == "COST_OVERFLOW":
-        if path not in _FAILURE_PATHS | {_SUCCESS_PATH, _UNIT6_SUCCESS_PATH}:
+        if path not in _FAILURE_PATHS | {_SUCCESS_PATH}:
             raise ValueError("cost overflow does not match provider outcome path")
-    elif (result.ai.disposition == "MODEL_FAILURE") != (path in _FAILURE_PATHS):
+    elif (result.ai.disposition == "MODEL_FAILURE") != failure_path:
         raise ValueError("terminal AI disposition does not match provider outcome path")
     return path
 
@@ -528,7 +644,16 @@ def _validate_success_provenance(
 
 
 def _base_path(path: tuple[ArtifactKind, ...]) -> tuple[ArtifactKind, ...]:
-    return path[:-1] if path in _LATE_PATHS else path
+    if path in _LATE_PATHS or path in _UNIT6_EXECUTION_PATHS:
+        return path[:-1]
+    return path
+
+
+def _provider_shape(path: tuple[ArtifactKind, ...]) -> tuple[ArtifactKind, ...]:
+    base = _base_path(path)
+    if base in _UNIT6_BASE_PATHS:
+        return (ArtifactKind.RAW_GAMMA, ArtifactKind.SANITIZED_EVIDENCE, *base[4:])
+    return base
 
 
 def _validate_failure_provenance(
@@ -537,7 +662,7 @@ def _validate_failure_provenance(
     *,
     fail: Callable[[str], None],
 ) -> None:
-    base = _base_path(path)
+    base = _provider_shape(path)
     if base in {
         _OPENAI_FAILURE_PATH,
         _OPENAI_INPUT_FAILURE_PATH,
@@ -590,7 +715,7 @@ def _unit6_model_cost(left: int, right: int) -> int | None:
 def _expected_model_cost(
     path: tuple[ArtifactKind, ...], typed: dict[str, TypedArtifact]
 ) -> int | None:
-    base = _base_path(path)
+    base = _provider_shape(path)
     if base in {
         _OPENAI_FAILURE_PATH,
         _OPENAI_INPUT_FAILURE_PATH,
@@ -613,7 +738,7 @@ def _expected_model_cost(
         )
     jev = typed[ArtifactKind.JEV_SUCCESS_METADATA]
     assert isinstance(jev, SuccessArtifact)
-    if base == _UNIT6_SUCCESS_PATH:
+    if _base_path(path) in _UNIT6_BASE_PATHS:
         return _unit6_model_cost(
             openai.billed_cost_microdollars, jev.billed_cost_microdollars
         )
@@ -629,7 +754,7 @@ def _validate_success_terminal(
     *,
     fail: Callable[[str], None],
 ) -> None:
-    if path not in {_SUCCESS_PATH, _UNIT6_SUCCESS_PATH, _LEGACY_SUCCESS_PATH}:
+    if path not in {_SUCCESS_PATH, _LEGACY_SUCCESS_PATH, *_UNIT6_EXECUTION_PATHS}:
         return
     if result.deterministic.model_cost_microdollars != 0:
         fail("deterministic arm model cost must be zero")
@@ -712,7 +837,7 @@ def _validate_late_terminal(
             and unavailable.terminal_model_at < unavailable.planned_retrieved_at
         )
         or (
-            unavailable.reason != "STALE_PRECHECK"
+            unavailable.reason not in {"STALE_PRECHECK", "COST_OVERFLOW"}
             and unavailable.terminal_model_at >= unavailable.planned_retrieved_at
         )
         or result.execution_book_sha256 is not None
@@ -1065,6 +1190,10 @@ def _reconstruct_orphan(kind: ArtifactKind, payload: bytes) -> TypedArtifact:
         return value
     if kind is ArtifactKind.SANITIZED_EVIDENCE:
         return EvidencePacket.model_validate_json(payload)
+    if kind is ArtifactKind.CAUSAL_HISTORY:
+        return TypeAdapter(list[CausalHistoryPoint]).validate_json(payload)
+    if kind is ArtifactKind.PRECHECK_BOOK:
+        raise ValueError("precheck book reconstruction requires observation identity")
     if kind is ArtifactKind.RESEARCH_BRIEF:
         return ResearchBrief.model_validate_json(payload)
     if kind is ArtifactKind.JEV_DECISION:
@@ -1075,6 +1204,8 @@ def _reconstruct_orphan(kind: ArtifactKind, payload: bytes) -> TypedArtifact:
         return BookUnavailableArtifact.model_validate_json(payload)
     if kind is ArtifactKind.ELIGIBILITY_REJECTION:
         return EligibilityRejectionArtifact.model_validate_json(payload)
+    if kind is ArtifactKind.PRECHECK_BOOK_FAILURE:
+        return PrecheckBookFailureArtifact.model_validate_json(payload)
     if kind is ArtifactKind.EXECUTION_BOOK:
         raise ValueError("execution book reconstruction requires observation identity")
     if kind is ArtifactKind.OPENAI_RESPONSE_SUCCESS:
@@ -1107,7 +1238,7 @@ def _reconstruct(
     kind: ArtifactKind, payload: bytes, result: ObservationResult | FixtureIdentity
 ) -> TypedArtifact:
     try:
-        if kind is ArtifactKind.EXECUTION_BOOK:
+        if kind in {ArtifactKind.PRECHECK_BOOK, ArtifactKind.EXECUTION_BOOK}:
             return reconstruct_book_snapshot(payload, market_id=result.market_id)
         return _reconstruct_orphan(kind, payload)
     except (TypeError, ValueError) as error:
@@ -1202,6 +1333,28 @@ def _validate_reconstructed_path(
         raw = envelope_by_kind.get(ArtifactKind.RAW_GAMMA)
         if raw is None or rejection.raw_gamma_sha256 != raw.sha256:
             fail("eligibility rejection does not bind raw Gamma bytes")
+        precheck_rejection = typed.get(ArtifactKind.PRECHECK_BOOK)
+        precheck_failure = typed.get(ArtifactKind.PRECHECK_BOOK_FAILURE)
+        precheck_envelope = envelope_by_kind.get(ArtifactKind.PRECHECK_BOOK)
+        frozen_precheck_sha = (
+            precheck_envelope.sha256
+            if precheck_envelope is not None
+            else precheck_failure.raw_book_sha256
+            if isinstance(precheck_failure, PrecheckBookFailureArtifact)
+            else None
+        )
+        if rejection.precheck_book_sha256 != frozen_precheck_sha:
+            fail("eligibility rejection does not bind its precheck book")
+        if precheck_failure is not None and (
+            not isinstance(precheck_failure, PrecheckBookFailureArtifact)
+            or precheck_failure.market_id != rejection.market_id
+            or precheck_failure.raw_book_sha256 != rejection.precheck_book_sha256
+        ):
+            fail("precheck failure metadata does not bind rejection")
+        if precheck_rejection is not None and not isinstance(
+            precheck_rejection, BookSnapshot
+        ):
+            fail("eligibility precheck book is invalid")
         if result is not None and (
             result.market_id != rejection.market_id
             or result.evidence_sha256 != rejection.raw_gamma_sha256
@@ -1218,6 +1371,47 @@ def _validate_reconstructed_path(
             )
         ):
             fail("terminal result does not match eligibility rejection")
+
+    precheck_book = typed.get(ArtifactKind.PRECHECK_BOOK)
+    causal_history = typed.get(ArtifactKind.CAUSAL_HISTORY)
+    if precheck_book is not None or causal_history is not None:
+        precheck_envelope = envelope_by_kind.get(ArtifactKind.PRECHECK_BOOK)
+        valid_history = path == _PRECHECK_REJECTION_PATH or (
+            isinstance(causal_history, list)
+            and all(isinstance(item, CausalHistoryPoint) for item in causal_history)
+            and isinstance(precheck_book, BookSnapshot)
+            and isinstance(evidence, EvidencePacket)
+            and causal_history
+            == (
+                [
+                    CausalHistoryPoint(
+                        midpoint_micros=(
+                            precheck_book.bids[0].price_micros
+                            + precheck_book.asks[0].price_micros
+                        )
+                        // 2,
+                        observed_at=precheck_book.retrieved_at,
+                    )
+                ]
+                if precheck_book.retrieved_at < evidence.cutoff_at
+                else []
+            )
+        )
+        if (
+            not isinstance(precheck_book, BookSnapshot)
+            or precheck_envelope is None
+            or precheck_book.source_sha256 != precheck_envelope.sha256
+            or precheck_book.retrieved_at != precheck_envelope.retrieved_at
+            or (
+                isinstance(evidence, EvidencePacket)
+                and (
+                    precheck_book.market_id != evidence.market_id
+                    or precheck_book.retrieved_at > evidence.cutoff_at
+                )
+            )
+            or not valid_history
+        ):
+            fail("precheck book and causal history are not exactly bound")
 
     execution_book = typed.get(ArtifactKind.EXECUTION_BOOK)
     if execution_book is not None:
@@ -1252,7 +1446,7 @@ def _validate_reconstructed_path(
 
     _validate_success_provenance(typed, envelopes, fail=fail)
 
-    base_path = _base_path(path)
+    base_path = _provider_shape(path)
     if (
         base_path
         in {
@@ -1310,8 +1504,12 @@ def _validate_reconstructed_path(
         try:
             _expected_model_cost(path, typed)
         except ValueError as error:
+            frozen_overflow = typed.get(ArtifactKind.DECISION_FROZEN)
             terminal_overflow = (
                 result is not None and result.ai.disposition == "COST_OVERFLOW"
+            ) or (
+                isinstance(frozen_overflow, DecisionFrozenArtifact)
+                and frozen_overflow.terminal_model_state == "COST_OVERFLOW"
             )
             if not (terminal_overflow or allow_cost_overflow_prefix):
                 fail(str(error))
@@ -1437,8 +1635,11 @@ def _validate_reconstructed_path(
             if isinstance(jev_failure, FailureArtifact)
             else 0
         )
+        total_cost = openai_cost + jev_cost
         expected_state = (
-            "OPENAI_FAILURE"
+            "COST_OVERFLOW"
+            if total_cost > INT64_MAX and _base_path(path) in _UNIT6_BASE_PATHS
+            else "OPENAI_FAILURE"
             if ArtifactKind.OPENAI_FAILURE in typed
             else "JEV_FAILURE"
             if ArtifactKind.JEV_FAILURE in typed
@@ -1473,15 +1674,19 @@ def _validate_reconstructed_path(
         try:
             _expected_model_cost(_SUCCESS_PATH, typed)
         except ValueError as error:
+            frozen_overflow = typed.get(ArtifactKind.DECISION_FROZEN)
             terminal_overflow = (
                 result is not None
                 and result.ai.disposition == "COST_OVERFLOW"
-                and (path == _UNIT6_SUCCESS_PATH or path in _LATE_PATHS)
+                and path in _LATE_PATHS
+            ) or (
+                isinstance(frozen_overflow, DecisionFrozenArtifact)
+                and frozen_overflow.terminal_model_state == "COST_OVERFLOW"
             )
             if not (terminal_overflow or allow_cost_overflow_prefix):
                 fail(str(error))
     if (
-        path in {_SUCCESS_PATH, _UNIT6_SUCCESS_PATH, _LEGACY_SUCCESS_PATH}
+        path in {_SUCCESS_PATH, _LEGACY_SUCCESS_PATH, *_UNIT6_EXECUTION_PATHS}
         and result is not None
     ):
         _validate_success_terminal(result, path, typed, fail=fail)
@@ -1617,12 +1822,10 @@ def _validate_journals_locked(
             try:
                 payload = store.read_verified(envelope.blob_ref())
                 _screen_payload(payload, forbidden_secret_values, strict_json=True)
-                if kind is ArtifactKind.EXECUTION_BOOK:
+                if kind in {ArtifactKind.PRECHECK_BOOK, ArtifactKind.EXECUTION_BOOK}:
                     evidence = typed.get(ArtifactKind.SANITIZED_EVIDENCE)
                     if not isinstance(evidence, EvidencePacket):
-                        raise ValueError(
-                            "execution book reconstruction requires frozen evidence"
-                        )
+                        raise ValueError("book reconstruction requires frozen evidence")
                     typed[kind.value] = reconstruct_book_snapshot(
                         payload, market_id=evidence.market_id
                     )

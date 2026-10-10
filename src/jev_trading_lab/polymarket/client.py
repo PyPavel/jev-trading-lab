@@ -204,6 +204,12 @@ class MarketRejection:
     reason: str
     raw_gamma_bytes: bytes = field(repr=False)
     raw_gamma_sha256: str
+    evidence: EvidencePacket | None = None
+    yes_token_id: str | None = None
+    precheck_book_bytes: bytes | None = field(default=None, repr=False)
+    precheck_book: BookSnapshot | None = None
+    precheck_failure_sha256: str | None = None
+    precheck_retrieved_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -585,7 +591,23 @@ class PolymarketClient:
                 continue
             assert market_id and isinstance(tokens, list)
             yes_token, no_token = str(tokens[0]), str(tokens[1])
+            source_sha = hashlib.sha256(raw_market).hexdigest()
+            evidence = EvidencePacket(
+                market_id=market_id,
+                question=question,
+                description=description,
+                rules=rules,
+                category=category,
+                tags=tags,
+                resolution_source_text=resolution_source,
+                closes_at=close,
+                retrieved_at=min(retrieved_at, cutoff),
+                cutoff_at=cutoff,
+                source_sha256=source_sha,
+            )
             book_url = f"{CLOB_ENDPOINT}?{urlencode({'token_id': yes_token})}"
+            raw_book: bytes | None = None
+            snapshot: BookSnapshot | None = None
             try:
                 raw_book, book_value, _ = self._get(book_url, label="CLOB")
                 snapshot = _book_snapshot(
@@ -621,29 +643,35 @@ class PolymarketClient:
             except (PublicDataError, TypeError, ValueError) as error:
                 reason = _reason(error)
             if reason is not None:
+                rejection_book = (
+                    snapshot if reason in {"WIDE_SPREAD", "LOW_DEPTH"} else None
+                )
+                rejection_bytes = (
+                    raw_book if reason in {"WIDE_SPREAD", "LOW_DEPTH"} else None
+                )
+                failure_hash = (
+                    hashlib.sha256(raw_book).hexdigest()
+                    if raw_book is not None and rejection_book is None
+                    else None
+                )
                 rejected.append(
                     MarketRejection(
-                        market_id,
-                        reason,
-                        raw_market,
-                        hashlib.sha256(raw_market).hexdigest(),
+                        market_id=market_id,
+                        reason=reason,
+                        raw_gamma_bytes=raw_market,
+                        raw_gamma_sha256=source_sha,
+                        evidence=evidence,
+                        yes_token_id=yes_token,
+                        precheck_book_bytes=rejection_bytes,
+                        precheck_book=rejection_book,
+                        precheck_failure_sha256=failure_hash,
+                        precheck_retrieved_at=(
+                            snapshot.retrieved_at if snapshot is not None else cutoff
+                        ),
                     )
                 )
                 continue
-            source_sha = hashlib.sha256(raw_market).hexdigest()
-            evidence = EvidencePacket(
-                market_id=market_id,
-                question=question,
-                description=description,
-                rules=rules,
-                category=category,
-                tags=tags,
-                resolution_source_text=resolution_source,
-                closes_at=close,
-                retrieved_at=min(retrieved_at, cutoff),
-                cutoff_at=cutoff,
-                source_sha256=source_sha,
-            )
+            assert raw_book is not None and snapshot is not None
             eligible.append(
                 MarketCandidate(
                     market_id=market_id,
