@@ -718,9 +718,14 @@ def evaluate_fixture(fixture: FeasibilityFixture) -> ObservationResult:
             ai.trading_pnl_microdollars,
             deterministic.trading_pnl_microdollars,
         ),
-        paired_economic_pnl_delta_microdollars=int64_delta(
-            ai.economic_pnl_microdollars,
-            deterministic.economic_pnl_microdollars,
+        paired_economic_pnl_delta_microdollars=(
+            int64_delta(
+                ai.economic_pnl_microdollars,
+                deterministic.economic_pnl_microdollars,
+            )
+            if ai.economic_pnl_microdollars is not None
+            and deterministic.economic_pnl_microdollars is not None
+            else None
         ),
         paired_brier_delta_micros=(
             ai.brier_micros - deterministic.brier_micros

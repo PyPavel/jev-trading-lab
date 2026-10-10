@@ -79,20 +79,18 @@ ByteTransport = Callable[[HttpRequest], HttpResponse]
 Resolver = Callable[..., list[tuple[Any, ...]]]
 
 
-def _safe_public_ip(value: str) -> bool:
+def is_safe_global_ip(value: str) -> bool:
+    """Accept only globally routed addresses, including their mapped IPv4 value."""
+
     try:
         address = ipaddress.ip_address(value)
     except ValueError:
         return False
-    return not any(
-        (
-            address.is_private,
-            address.is_loopback,
-            address.is_link_local,
-            address.is_multicast,
-            address.is_unspecified,
-            address.is_reserved,
-        )
+    mapped = getattr(address, "ipv4_mapped", None)
+    return (
+        address.is_global
+        and not address.is_multicast
+        and (mapped is None or (mapped.is_global and not mapped.is_multicast))
     )
 
 
@@ -106,7 +104,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         raw = socket.create_connection((self._ip, 443), self.timeout)
         try:
             peer = raw.getpeername()[0]
-            if peer != self._ip:
+            if peer != self._ip or not is_safe_global_ip(peer):
                 raise PublicDataError("HTTPS peer differs from the validated address")
             self.sock = self._tls_context.wrap_socket(raw, server_hostname=self.host)
         except Exception:
@@ -134,7 +132,12 @@ class SecureHttpTransport:
         if request.method != "GET" or request.body is not None:
             raise PublicDataError("Polymarket public transport permits GET only")
         parsed = urlsplit(request.url)
-        if parsed.scheme != "https" or parsed.username or parsed.password:
+        if (
+            parsed.scheme != "https"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+        ):
             raise PublicDataError("public endpoint must use HTTPS without userinfo")
         if parsed.port not in {None, 443}:
             raise PublicDataError("public endpoint must use port 443")
@@ -158,7 +161,9 @@ class SecureHttpTransport:
             raise PublicDataError("public endpoint is outside the exact allowlist")
         answers = self.resolver(host, 443, 0, socket.SOCK_STREAM)
         addresses = {str(answer[4][0]) for answer in answers if len(answer) >= 5}
-        if not addresses or any(not _safe_public_ip(address) for address in addresses):
+        if not addresses or any(
+            not is_safe_global_ip(address) for address in addresses
+        ):
             raise PublicDataError("DNS returned an unsafe or mixed answer set")
         return (
             host,
@@ -197,6 +202,8 @@ class SecureHttpTransport:
 class MarketRejection:
     market_id: str
     reason: str
+    raw_gamma_bytes: bytes = field(repr=False)
+    raw_gamma_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -428,6 +435,28 @@ def _reason(error: Exception) -> str:
     return "MALFORMED_BOOK"
 
 
+def reconstruct_book_snapshot(raw: bytes, *, market_id: str) -> BookSnapshot:
+    """Reconstruct a strict normalized book from authoritative raw CLOB bytes."""
+
+    try:
+        value = load_strict_json(raw)
+        if not isinstance(value, Mapping):
+            raise ValueError("book must be an object")
+        condition_id = _text(value.get("market"))
+        token_id = _text(value.get("asset_id"))
+        captured_at = _book_time(value.get("timestamp"))
+        return _book_snapshot(
+            raw,
+            value,
+            expected_market_id=market_id,
+            expected_condition_id=condition_id,
+            expected_token_id=token_id,
+            now=captured_at,
+        )
+    except (TypeError, ValueError) as error:
+        raise PublicDataError("execution book artifact is invalid") from error
+
+
 class PolymarketClient:
     """Discover at most twenty candidates and fetch only their public YES books."""
 
@@ -504,7 +533,7 @@ class PolymarketClient:
             reason: str | None = None
             question = _text(item.get("question"))
             description = _text(item.get("description"))
-            rules = _text(item.get("rules")) or description
+            rules = _text(item.get("rules"))
             resolution_source = _text(item.get("resolutionSource"))
             category = _text(item.get("category")) or "Uncategorized"
             tags = _tags(item.get("tags"))
@@ -545,7 +574,14 @@ class PolymarketClient:
                 except (TypeError, ValueError):
                     reason = "MALFORMED_MARKET"
             if reason is not None:
-                rejected.append(MarketRejection(market_id or "UNKNOWN", reason))
+                rejected.append(
+                    MarketRejection(
+                        market_id or "UNKNOWN",
+                        reason,
+                        raw_market,
+                        hashlib.sha256(raw_market).hexdigest(),
+                    )
+                )
                 continue
             assert market_id and isinstance(tokens, list)
             yes_token, no_token = str(tokens[0]), str(tokens[1])
@@ -566,8 +602,18 @@ class PolymarketClient:
                 ):
                     reason = "WIDE_SPREAD"
                 elif (
-                    sum(level.quantity for level in snapshot.bids[:2]) < 5_000
-                    or sum(level.quantity for level in snapshot.asks[:2]) < 5_000
+                    sum(
+                        level.quantity
+                        for level in snapshot.bids
+                        if snapshot.bids[0].price_micros - level.price_micros <= 20_000
+                    )
+                    < 5_000
+                    or sum(
+                        level.quantity
+                        for level in snapshot.asks
+                        if level.price_micros - snapshot.asks[0].price_micros <= 20_000
+                    )
+                    < 5_000
                 ):
                     reason = "LOW_DEPTH"
             except TimeoutError:
@@ -575,7 +621,14 @@ class PolymarketClient:
             except (PublicDataError, TypeError, ValueError) as error:
                 reason = _reason(error)
             if reason is not None:
-                rejected.append(MarketRejection(market_id, reason))
+                rejected.append(
+                    MarketRejection(
+                        market_id,
+                        reason,
+                        raw_market,
+                        hashlib.sha256(raw_market).hexdigest(),
+                    )
+                )
                 continue
             source_sha = hashlib.sha256(raw_market).hexdigest()
             evidence = EvidencePacket(

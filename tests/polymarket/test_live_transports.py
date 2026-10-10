@@ -11,6 +11,7 @@ from jev_trading_lab.polymarket.ai import (
     OPENAI_MODEL_ID,
     LiveHttpRequest,
     LiveHttpResponse,
+    _provider_network,
     live_jev_transport,
     live_openai_transport,
 )
@@ -141,3 +142,19 @@ def test_live_network_rejects_redirect_content_type_and_oversize(
         transport = live_openai_transport(network=lambda _: response)
         with pytest.raises(ValueError):
             transport(b"{}")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user@api.openai.com/v1/responses",
+        "https://@api.openai.com/v1/responses",
+        "https://:pass@api.typesafe.ai/v1/systemone",
+        "https://api.openai.com/v1/responses#fragment",
+        "https://api.openai.com/v1/responses?extra=1",
+        "https://api.openai.com:444/v1/responses",
+    ],
+)
+def test_provider_network_rejects_non_exact_uris(url: str) -> None:
+    with pytest.raises(ValueError):
+        _provider_network(LiveHttpRequest("POST", url, {}, b"{}"))

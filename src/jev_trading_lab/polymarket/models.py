@@ -41,9 +41,10 @@ Disposition = Literal[
     "INELIGIBLE",
     "MODEL_FAILURE",
     "BOOK_FAILURE",
+    "COST_OVERFLOW",
 ]
 MICROS_PER_UNIT = 1_000_000
-_UNAVAILABLE_DISPOSITIONS = frozenset({"INELIGIBLE", "MODEL_FAILURE"})
+_UNAVAILABLE_DISPOSITIONS = frozenset({"INELIGIBLE", "MODEL_FAILURE", "COST_OVERFLOW"})
 _FILL_DISPOSITIONS = frozenset({"FILLED", "PARTIAL_FILL"})
 
 
@@ -577,8 +578,8 @@ class ArmResult(StrictModel):
     payout_micros: Literal[0, 1_000_000] | None
     valuation_notional_microdollars: NonNegativeInt | None
     trading_pnl_microdollars: SignedInt
-    economic_pnl_microdollars: SignedInt
-    model_cost_microdollars: NonNegativeInt
+    economic_pnl_microdollars: SignedInt | None
+    model_cost_microdollars: NonNegativeInt | None
     forecast_probability_micros: Micros | None
     forecast_status: Literal["SCORED", "PENDING_RESOLUTION", "UNAVAILABLE"]
     brier_micros: Micros | None
@@ -651,6 +652,21 @@ class ArmResult(StrictModel):
             raise ValueError("filled arm requires exactly one mark or payout")
 
     def _validate_economics(self) -> None:
+        if self.disposition == "COST_OVERFLOW":
+            if (
+                self.model_cost_microdollars is not None
+                or self.economic_pnl_microdollars is not None
+                or self.quantity != 0
+                or self.trading_pnl_microdollars != 0
+                or self.final_cash_microdollars != self.initial_cash_microdollars
+            ):
+                raise ValueError("cost overflow requires null aggregate economics")
+            return
+        if (
+            self.model_cost_microdollars is None
+            or self.economic_pnl_microdollars is None
+        ):
+            raise ValueError("only cost overflow permits null aggregate economics")
         if self.quantity == 0:
             expected_trading = 0
         else:
@@ -773,14 +789,24 @@ class ObservationResult(UtcModel):
         book_unavailable = self.execution_book_sha256 is None
         if book_unavailable != (self.baseline_probability_micros is None):
             raise ValueError("execution book and baseline availability must match")
-        if book_unavailable:
+        ineligible = all(
+            arm.disposition == "INELIGIBLE" for arm in (self.ai, self.deterministic)
+        )
+        if ineligible:
+            if self.planned_execution_book_sha256 is not None:
+                raise ValueError("ineligible observation cannot plan an execution book")
+            if self.baseline_probability_micros is not None:
+                raise ValueError("ineligible observation cannot have a baseline")
+        elif book_unavailable:
             if self.planned_execution_book_sha256 is None:
                 raise ValueError("missing execution book requires a planned book hash")
-            if any(
-                arm.disposition != "BOOK_FAILURE"
-                for arm in (self.ai, self.deterministic)
+            if (
+                self.ai.disposition not in {"BOOK_FAILURE", "COST_OVERFLOW"}
+                or self.deterministic.disposition != "BOOK_FAILURE"
             ):
-                raise ValueError("missing execution book requires BOOK_FAILURE arms")
+                raise ValueError(
+                    "missing execution book requires BOOK_FAILURE or cost overflow"
+                )
         elif self.planned_execution_book_sha256 is not None:
             raise ValueError("observed execution book cannot carry a planned-only hash")
         elif any(
@@ -804,9 +830,14 @@ class ObservationResult(UtcModel):
                 "paired trading P&L delta must be exact AI minus deterministic, "
                 "or null on int64 overflow"
             )
-        expected_economic_delta = int64_delta(
-            self.ai.economic_pnl_microdollars,
-            self.deterministic.economic_pnl_microdollars,
+        expected_economic_delta = (
+            int64_delta(
+                self.ai.economic_pnl_microdollars,
+                self.deterministic.economic_pnl_microdollars,
+            )
+            if self.ai.economic_pnl_microdollars is not None
+            and self.deterministic.economic_pnl_microdollars is not None
+            else None
         )
         if self.paired_economic_pnl_delta_microdollars != expected_economic_delta:
             raise ValueError(

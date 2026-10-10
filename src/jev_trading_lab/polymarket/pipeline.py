@@ -31,6 +31,7 @@ from jev_trading_lab.polymarket.client import (
     CLOB_ENDPOINT,
     GAMMA_ENDPOINT,
     MarketCandidate,
+    MarketRejection,
     PolymarketClient,
     SecureHttpTransport,
 )
@@ -62,6 +63,7 @@ from jev_trading_lab.polymarket.store import (
     ArtifactToFreeze,
     BookUnavailableArtifact,
     DecisionFrozenArtifact,
+    EligibilityRejectionArtifact,
     SuccessArtifact,
     failure_artifact_from_adapter,
     freeze_observation_artifacts,
@@ -275,14 +277,17 @@ def _failure_result(
     prior_cost: int,
 ) -> ObservationResult:
     base = evaluate_fixture(fixture)
-    cost = prior_cost + failure.billed_cost_microdollars
-    ai = evaluate_ai_arm(
-        fixture.execution_book,
-        None,
-        fixture.economics,
-        resolution=fixture.resolution.payout if fixture.resolution else None,
-        model_cost_microdollars=cost,
-    )
+    cost = _sum_model_cost(prior_cost, failure.billed_cost_microdollars)
+    if cost is None:
+        ai = _cost_overflow_arm()
+    else:
+        ai = evaluate_ai_arm(
+            fixture.execution_book,
+            None,
+            fixture.economics,
+            resolution=fixture.resolution.payout if fixture.resolution else None,
+            model_cost_microdollars=cost,
+        )
     control = evaluate_control_arm(
         fixture, resolution=fixture.resolution.payout if fixture.resolution else None
     )
@@ -297,8 +302,13 @@ def _failure_result(
             "paired_trading_pnl_delta_microdollars": int64_delta(
                 ai.trading_pnl_microdollars, control.trading_pnl_microdollars
             ),
-            "paired_economic_pnl_delta_microdollars": int64_delta(
-                ai.economic_pnl_microdollars, control.economic_pnl_microdollars
+            "paired_economic_pnl_delta_microdollars": (
+                int64_delta(
+                    ai.economic_pnl_microdollars, control.economic_pnl_microdollars
+                )
+                if ai.economic_pnl_microdollars is not None
+                and control.economic_pnl_microdollars is not None
+                else None
             ),
             "paired_brier_delta_micros": None,
         }
@@ -339,6 +349,36 @@ def _book_failure_arm(
     )
 
 
+def _sum_model_cost(left: int, right: int) -> int | None:
+    total = left + right
+    return total if total <= 2**63 - 1 else None
+
+
+def _cost_overflow_arm() -> ArmResult:
+    return ArmResult(
+        arm="AI",
+        signal_probability_micros=None,
+        signal_action=None,
+        disposition="COST_OVERFLOW",
+        entry_side=None,
+        entry_vwap_micros=None,
+        entry_notional_microdollars=None,
+        quantity=0,
+        fees_microdollars=0,
+        initial_cash_microdollars=STARTING_CASH_MICRODOLLARS,
+        final_cash_microdollars=STARTING_CASH_MICRODOLLARS,
+        mark_micros=None,
+        payout_micros=None,
+        valuation_notional_microdollars=None,
+        trading_pnl_microdollars=0,
+        economic_pnl_microdollars=None,
+        model_cost_microdollars=None,
+        forecast_probability_micros=None,
+        forecast_status="UNAVAILABLE",
+        brier_micros=None,
+    )
+
+
 def _book_unavailable_result(
     identity: FixtureIdentity,
     evidence_at: datetime,
@@ -347,9 +387,13 @@ def _book_unavailable_result(
     research_brief_sha256: str,
     decision: JevDecision | None,
     decision_sha256: str,
-    model_cost: int,
+    model_cost: int | None,
 ) -> ObservationResult:
-    ai = _book_failure_arm(arm="AI", model_cost=model_cost, decision=decision)
+    ai = (
+        _cost_overflow_arm()
+        if model_cost is None
+        else _book_failure_arm(arm="AI", model_cost=model_cost, decision=decision)
+    )
     control = _book_failure_arm(arm="DETERMINISTIC", model_cost=0)
     return ObservationResult(
         observation_id=identity.observation_id,
@@ -369,7 +413,9 @@ def _book_unavailable_result(
         resolution=None,
         baseline_brier_micros=None,
         paired_trading_pnl_delta_microdollars=0,
-        paired_economic_pnl_delta_microdollars=-model_cost,
+        paired_economic_pnl_delta_microdollars=(
+            -model_cost if model_cost is not None else None
+        ),
         paired_brier_delta_micros=None,
     )
 
@@ -381,14 +427,16 @@ def _finish_book_unavailable(
     *,
     planned_at: datetime,
     terminal_at: datetime,
+    observed_at: datetime,
+    reason: str,
     evidence_at: datetime,
     research_brief_sha256: str,
     decision: JevDecision | None,
     decision_sha256: str,
-    model_cost: int,
+    model_cost: int | None,
 ) -> Summary:
     unavailable = BookUnavailableArtifact(
-        reason="STALE_PRECHECK",
+        reason=reason,  # type: ignore[arg-type]
         planned_retrieved_at=planned_at,
         planned_source_sha256=identity.execution_book_sha256,
         terminal_model_at=terminal_at,
@@ -402,11 +450,12 @@ def _finish_book_unavailable(
         )
     ]
     artifacts = _chain(identity, late_values)
-    freeze_observation_artifacts(output_dir, identity, artifacts)
+    if model_cost is not None:
+        freeze_observation_artifacts(output_dir, identity, artifacts)
     result = _book_unavailable_result(
         identity,
         evidence_at,
-        terminal_at=terminal_at,
+        terminal_at=max(observed_at, terminal_at),
         research_brief_sha256=research_brief_sha256,
         decision=decision,
         decision_sha256=decision_sha256,
@@ -504,7 +553,7 @@ def _live_result(
     decision: JevDecision | None,
     research_brief_sha256: str,
     decision_sha256: str,
-    model_cost: int,
+    model_cost: int | None,
 ) -> ObservationResult:
     history = (
         [
@@ -517,12 +566,16 @@ def _live_result(
         else []
     )
     policy = _live_policy()
-    ai = evaluate_ai_arm(
-        execution_book,
-        decision,
-        policy,
-        resolution=None,
-        model_cost_microdollars=model_cost,
+    ai = (
+        _cost_overflow_arm()
+        if model_cost is None
+        else evaluate_ai_arm(
+            execution_book,
+            decision,
+            policy,
+            resolution=None,
+            model_cost_microdollars=model_cost,
+        )
     )
     control = evaluate_control_inputs(
         history,
@@ -550,8 +603,11 @@ def _live_result(
         paired_trading_pnl_delta_microdollars=int64_delta(
             ai.trading_pnl_microdollars, control.trading_pnl_microdollars
         ),
-        paired_economic_pnl_delta_microdollars=int64_delta(
-            ai.economic_pnl_microdollars, control.economic_pnl_microdollars
+        paired_economic_pnl_delta_microdollars=(
+            int64_delta(ai.economic_pnl_microdollars, control.economic_pnl_microdollars)
+            if ai.economic_pnl_microdollars is not None
+            and control.economic_pnl_microdollars is not None
+            else None
         ),
         paired_brier_delta_micros=None,
     )
@@ -680,7 +736,13 @@ def _live_artifacts(
     jev: JevSuccess | AdapterFailure | None,
     *,
     frozen_at: datetime,
-) -> tuple[list[tuple[str, bytes, str, datetime]], JevDecision | None, str, str, int]:
+) -> tuple[
+    list[tuple[str, bytes, str, datetime]],
+    JevDecision | None,
+    str,
+    str,
+    int | None,
+]:
     evidence_bytes = _model_bytes(candidate.evidence)
     prefix: list[tuple[str, bytes, str, datetime]] = [
         (
@@ -793,7 +855,9 @@ def _live_artifacts(
             None,
             brief_hash,
             "0" * 64,
-            openai.billed_cost_microdollars + jev.billed_cost_microdollars,
+            _sum_model_cost(
+                openai.billed_cost_microdollars, jev.billed_cost_microdollars
+            ),
         )
     decision_bytes = _model_bytes(jev.decision)
     decision_hash = hashlib.sha256(decision_bytes).hexdigest()
@@ -840,7 +904,7 @@ def _live_artifacts(
         jev.decision,
         brief_hash,
         decision_hash,
-        openai.billed_cost_microdollars + jev.billed_cost_microdollars,
+        _sum_model_cost(openai.billed_cost_microdollars, jev.billed_cost_microdollars),
     )
 
 
@@ -850,30 +914,100 @@ def _record_rejections(
     *,
     observed_at: datetime,
 ) -> list[Summary]:
-    if not rejections:
-        return []
-    root = Path(output_dir)
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    descriptor = os.open(
-        root / "rejections.jsonl",
-        os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
-        0o600,
-    )
     summaries: list[Summary] = []
-    try:
-        for rejection in rejections:
-            value = {
-                "market_id": rejection.market_id,
-                "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
-                "policy_version": POLICY_VERSION,
-                "reason": rejection.reason,
-                "terminal_status": "ELIGIBILITY_REJECTION",
-            }
-            os.write(descriptor, canonical_json_bytes(value) + b"\n")
-            summaries.append(dict(value))
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    for rejection in rejections:
+        assert isinstance(rejection, MarketRejection)
+        cutoff_text = observed_at.isoformat().replace("+00:00", "Z")
+        opportunity_id = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "policy_version": POLICY_VERSION,
+                    "market_id": rejection.market_id,
+                    "cutoff_at": cutoff_text,
+                }
+            )
+        ).hexdigest()
+        observation_id = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "opportunity_id": opportunity_id,
+                    "evidence_sha256": rejection.raw_gamma_sha256,
+                    "execution_book_sha256": None,
+                    "policy_version": POLICY_VERSION,
+                }
+            )
+        ).hexdigest()
+
+        def arm(name: str) -> ArmResult:
+            return ArmResult(
+                arm=name,  # type: ignore[arg-type]
+                signal_probability_micros=None,
+                signal_action=None,
+                disposition="INELIGIBLE",
+                entry_side=None,
+                entry_vwap_micros=None,
+                entry_notional_microdollars=None,
+                quantity=0,
+                fees_microdollars=0,
+                initial_cash_microdollars=STARTING_CASH_MICRODOLLARS,
+                final_cash_microdollars=STARTING_CASH_MICRODOLLARS,
+                mark_micros=None,
+                payout_micros=None,
+                valuation_notional_microdollars=None,
+                trading_pnl_microdollars=0,
+                economic_pnl_microdollars=0,
+                model_cost_microdollars=0,
+                forecast_probability_micros=None,
+                forecast_status="UNAVAILABLE",
+                brier_micros=None,
+            )
+
+        result = ObservationResult(
+            observation_id=observation_id,
+            opportunity_id=opportunity_id,
+            market_id=rejection.market_id,
+            policy_version=POLICY_VERSION,
+            cutoff_at=observed_at,
+            observed_at=observed_at,
+            evidence_sha256=rejection.raw_gamma_sha256,
+            execution_book_sha256=None,
+            research_brief_sha256="0" * 64,
+            jev_decision_sha256="0" * 64,
+            ai=arm("AI"),
+            deterministic=arm("DETERMINISTIC"),
+            baseline_probability_micros=None,
+            resolution=None,
+            baseline_brier_micros=None,
+            paired_trading_pnl_delta_microdollars=0,
+            paired_economic_pnl_delta_microdollars=0,
+            paired_brier_delta_micros=None,
+        )
+        rejection_artifact = EligibilityRejectionArtifact(
+            market_id=rejection.market_id,
+            reason=rejection.reason,
+            raw_gamma_sha256=rejection.raw_gamma_sha256,
+            rejected_at=observed_at,
+        )
+        artifacts = _chain(
+            result,
+            [
+                ("raw_gamma", rejection.raw_gamma_bytes, "gamma_market", observed_at),
+                (
+                    "eligibility_rejection",
+                    _model_bytes(rejection_artifact),
+                    "eligibility_rejection",
+                    observed_at,
+                ),
+            ],
+        )
+        record_observation(output_dir, result, artifacts)
+        replay = load_observation(output_dir, observation_id)
+        summary = _summary(replay.result, replay.envelopes)
+        summary.update(
+            reason=rejection.reason,
+            terminal_status="ELIGIBILITY_REJECTION",
+        )
+        summaries.append(summary)
     return summaries
 
 
@@ -915,14 +1049,6 @@ def observe_markets(
             ),
         ]
         freeze_observation_artifacts(output_dir, provisional, _chain(provisional, base))
-        _freeze_live_values(output_dir, provisional, base)
-        _freeze_live_bytes(
-            output_dir,
-            provisional,
-            kind="precheck_book",
-            payload=candidate.precheck_book_bytes,
-            retrieved_at=candidate.precheck_book.retrieved_at,
-        )
         openai = call_openai(candidate.evidence, OPENAI_MODEL_ID, openai_sender)
         jev: JevSuccess | AdapterFailure | None = None
         if isinstance(openai, OpenAISuccess):
@@ -934,13 +1060,13 @@ def observe_markets(
             if jev is not None and jev.retrieved_at is not None
             else cutoff,
         )
-        provisional_values, _, _, _, _ = _live_artifacts(
+        provisional_values, _, _, _, provisional_cost = _live_artifacts(
             provisional, candidate, openai, jev, frozen_at=frozen_at
         )
-        freeze_observation_artifacts(
-            output_dir, provisional, _chain(provisional, provisional_values)
-        )
-        _freeze_live_values(output_dir, provisional, provisional_values[len(base) :])
+        if provisional_cost is not None:
+            freeze_observation_artifacts(
+                output_dir, provisional, _chain(provisional, provisional_values)
+            )
         if event_sink is not None:
             event_sink("decision_frozen")
             event_sink("execution_book_requested")
@@ -948,7 +1074,17 @@ def observe_markets(
             raw_execution, execution_book = public.execution_book(
                 candidate, now=max(cutoff, frozen_at + timedelta(seconds=1))
             )
-        except Exception:
+            if execution_book.retrieved_at <= frozen_at:
+                raise ValueError("STALE_BOOK")
+        except Exception as error:
+            reason = str(error)
+            if reason not in {
+                "STALE_BOOK",
+                "CROSSED_BOOK",
+                "TOKEN_DRIFT",
+                "MARKET_DRIFT",
+            }:
+                reason = "BOOK_UNAVAILABLE"
             values, decision, brief_hash, decision_hash, model_cost = _live_artifacts(
                 provisional, candidate, openai, jev, frozen_at=frozen_at
             )
@@ -957,8 +1093,10 @@ def observe_markets(
                     output_dir,
                     provisional,
                     values,
-                    planned_at=candidate.precheck_book.retrieved_at,
-                    terminal_at=max(datetime.now(UTC), frozen_at),
+                    planned_at=max(cutoff, frozen_at + timedelta(seconds=1)),
+                    terminal_at=frozen_at,
+                    observed_at=max(datetime.now(UTC), frozen_at),
+                    reason=reason,
                     evidence_at=candidate.evidence.retrieved_at,
                     research_brief_sha256=brief_hash,
                     decision=decision,
@@ -968,16 +1106,18 @@ def observe_markets(
             )
             continue
         final = _identity(candidate, execution_book.source_sha256)
-        _freeze_live_bytes(
-            output_dir,
-            final,
-            kind="execution_book",
-            payload=raw_execution,
-            retrieved_at=execution_book.retrieved_at,
-        )
         values, decision, brief_hash, decision_hash, model_cost = _live_artifacts(
             final, candidate, openai, jev, frozen_at=frozen_at
         )
+        if decision is not None:
+            values.append(
+                (
+                    "execution_book",
+                    raw_execution,
+                    "clob_execution_book",
+                    execution_book.retrieved_at,
+                )
+            )
         artifacts = _chain(final, values)
         result = _live_result(
             final,
@@ -1138,6 +1278,8 @@ def replay_fixture(
                 values,
                 planned_at=chronology.planned_execution_book_at,
                 terminal_at=frozen_at,
+                observed_at=frozen_at,
+                reason="STALE_PRECHECK",
                 evidence_at=evidence_model.retrieved_at,
                 research_brief_sha256="0" * 64,
                 decision=None,
@@ -1243,6 +1385,8 @@ def replay_fixture(
                 values,
                 planned_at=chronology.planned_execution_book_at,
                 terminal_at=frozen_at,
+                observed_at=frozen_at,
+                reason="STALE_PRECHECK",
                 evidence_at=evidence_model.retrieved_at,
                 research_brief_sha256=hashlib.sha256(
                     _model_bytes(openai.brief)
@@ -1308,6 +1452,8 @@ def replay_fixture(
             values,
             planned_at=chronology.planned_execution_book_at,
             terminal_at=frozen_at,
+            observed_at=frozen_at,
+            reason="STALE_PRECHECK",
             evidence_at=evidence_model.retrieved_at,
             research_brief_sha256=hashlib.sha256(
                 _model_bytes(openai.brief)
@@ -1323,6 +1469,7 @@ def replay_fixture(
         raise ValueError(
             "fixture expected result differs from recomputed engine result"
         )
+    artifacts = _chain(identity, values)
     record_observation(output_dir, result, artifacts)
     replay = load_observation(output_dir, result.observation_id)
     return _summary(replay.result, replay.envelopes)

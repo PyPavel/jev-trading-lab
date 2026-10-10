@@ -46,7 +46,7 @@ EXPECTED_SOURCE_HASHES = {
         "583ff05fc923ac30ef5cd0e9c44271e53746a65e312f53f112ec1b49e827647b"
     ),
     "src/jev_trading_lab/cli.py": (
-        "d00730b9fcad3dc28ac7a1b3412456b89261378896e4a763f69f5bcad6cfe4bd"
+        "5cace8245387ec229b0bfa56fd062c366c57c838b42b681aa6228afaac9dda88"
     ),
     "src/jev_trading_lab/core/ids.py": (
         "0e73742a406e112f269e7b8d5fd205c448eb4fbf49541cab3c669bf7b4dc0dd4"
@@ -103,22 +103,25 @@ EXPECTED_SOURCE_HASHES = {
         "2c8708e587ec6804d9c15736661a265c5b441cc3ce83b0b152e15f5a2fcf6739"
     ),
     "src/jev_trading_lab/polymarket/ai.py": (
-        "ca474a0d323e6f19513981133ec04b18a42620664a8829031153e282a17a2ad5"
+        "5b833331b9d6a852f2ffd50be109f8e57c4cdae316a26ccafb37268bb1bb9a4b"
+    ),
+    "src/jev_trading_lab/polymarket/client.py": (
+        "099429389a89e6792ee38e69476a3b5314edc1f28e2d04ff04c1da74fe207647"
     ),
     "src/jev_trading_lab/polymarket/control.py": (
         "cadd87042c9293c2fd97d0017f532b06500d2afd23b07a9bd16c5e7bceef2b8d"
     ),
     "src/jev_trading_lab/polymarket/models.py": (
-        "2fc7d68eebc303e734e41f208019559402d85c573746672d4bb4909fdac8905c"
+        "ceee2de6fcc1a8b9f2e335cc470c4e711aca0465df54eaa6671de37b5f351600"
     ),
     "src/jev_trading_lab/polymarket/paper.py": (
-        "a8d3754b325a1da673fb0ce30a81bf92931550d68002b5c3b5fef7b64d2b4b00"
+        "ee4f62c304bd7f5830c7f0e2632efb8a9397e905c9dfc5b0ae5858d6f22aa34e"
     ),
     "src/jev_trading_lab/polymarket/pipeline.py": (
-        "80ff0691ce1c63ec238218f44da5521f1debf6cdce7fa87f77b37c13ee0565b3"
+        "a0c67c1843d5039398441479e882ce6ba8bc50808319290f3945f8314143f364"
     ),
     "src/jev_trading_lab/polymarket/store.py": (
-        "d7fe360eac784cb42c74c688cccb84e2af88aab8f7b5e61d5ca112417508184b"
+        "e88858bec0c3871abf2364ea78a41ed10c540c428865e6e2a14e59ccf1e19f78"
     ),
     "src/jev_trading_lab/stocks/__init__.py": (
         "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"

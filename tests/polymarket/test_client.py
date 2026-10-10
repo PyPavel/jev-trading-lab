@@ -101,6 +101,7 @@ def test_pagination_normalization_and_deterministic_order() -> None:
         ({"category": "Sports"}, "SPORTS"),
         ({"tags": ["NBA"]}, "SPORTS"),
         ({"description": ""}, "MISSING_EVIDENCE"),
+        ({"rules": ""}, "MISSING_EVIDENCE"),
         ({"resolutionSource": ""}, "MISSING_EVIDENCE"),
         ({"endDate": (NOW + timedelta(minutes=59)).isoformat()}, "CLOSE_WINDOW"),
         ({"endDate": (NOW + timedelta(days=31)).isoformat()}, "CLOSE_WINDOW"),
@@ -203,6 +204,12 @@ def test_limit_and_transport_routes_are_closed_world() -> None:
         ("GET", "http://gamma-api.polymarket.com/markets"),
         ("GET", "https://evil.example/markets"),
         ("GET", "https://gamma-api.polymarket.com/evil"),
+        ("GET", "https://user@gamma-api.polymarket.com/markets"),
+        ("GET", "https://@gamma-api.polymarket.com/markets"),
+        ("GET", "https://:pass@gamma-api.polymarket.com/markets"),
+        ("GET", "https://gamma-api.polymarket.com/markets#fragment"),
+        ("GET", "https://clob.polymarket.com/book?token_id=x&extra=y"),
+        ("GET", "https://clob.polymarket.com:444/book?token_id=x"),
     ]:
         with pytest.raises(PublicDataError):
             transport.validate(HttpRequest(method=method, url=url))
@@ -237,6 +244,53 @@ def test_dns_rejects_mixed_safe_and_unsafe_answers() -> None:
         SecureHttpTransport(resolver=resolver).validate(
             HttpRequest("GET", "https://clob.polymarket.com/book?token_id=x")
         )
+
+
+@pytest.mark.parametrize("address", ["100.64.0.1", "::ffff:127.0.0.1"])
+def test_dns_requires_ipaddress_is_global_including_mapped_ipv4(address: str) -> None:
+    def resolver(*_: object) -> list[tuple[object, ...]]:
+        return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (address, 443))]
+
+    with pytest.raises(PublicDataError):
+        SecureHttpTransport(resolver=resolver).validate(
+            HttpRequest("GET", "https://clob.polymarket.com/book?token_id=x")
+        )
+
+
+def test_depth_sums_only_levels_within_twenty_thousand_micros() -> None:
+    distant = book(
+        bids=[
+            {"price": "0.48", "size": "4999"},
+            {"price": "0.45", "size": "1000000"},
+        ],
+        asks=[
+            {"price": "0.51", "size": "4999"},
+            {"price": "0.54", "size": "1000000"},
+        ],
+    )
+    result = PolymarketClient(CannedTransport([[market()]], [distant])).poll(
+        limit=1, now=NOW
+    )
+    assert result.rejections[0].reason == "LOW_DEPTH"
+
+    near = book(
+        bids=[
+            {"price": "0.48", "size": "2000"},
+            {"price": "0.47", "size": "1500"},
+            {"price": "0.46", "size": "1500"},
+            {"price": "0.459999", "size": "1000000"},
+        ],
+        asks=[
+            {"price": "0.51", "size": "2000"},
+            {"price": "0.52", "size": "1500"},
+            {"price": "0.53", "size": "1500"},
+            {"price": "0.530001", "size": "1000000"},
+        ],
+    )
+    result = PolymarketClient(CannedTransport([[market()]], [near])).poll(
+        limit=1, now=NOW
+    )
+    assert len(result.eligible) == 1
 
 
 def test_execution_book_rejects_stale_crossed_and_token_drift() -> None:

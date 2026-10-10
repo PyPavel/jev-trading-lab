@@ -36,12 +36,15 @@ from jev_trading_lab.polymarket.ai import (
     has_canonical_failure_response,
     is_canonical_failure_message,
 )
+from jev_trading_lab.polymarket.client import reconstruct_book_snapshot
 from jev_trading_lab.polymarket.models import (
     INT64_MAX,
+    BookSnapshot,
     EvidencePacket,
     FixtureIdentity,
     JevDecision,
     JevResponse,
+    NonEmptyStr,
     ObservationResult,
     OpenAIResponse,
     ResearchBrief,
@@ -91,6 +94,8 @@ class ArtifactKind(StrEnum):
     JEV_DECISION = "jev_decision"
     DECISION_FROZEN = "decision_frozen"
     BOOK_UNAVAILABLE = "book_unavailable"
+    ELIGIBILITY_REJECTION = "eligibility_rejection"
+    EXECUTION_BOOK = "execution_book"
 
 
 class DecisionFrozenArtifact(UtcModel):
@@ -177,6 +182,7 @@ _LEGACY_JEV_FAILURE_PATH = (
     ArtifactKind.JEV_FAILURE,
 )
 _SUCCESS_PATH = (*_LEGACY_SUCCESS_PATH, ArtifactKind.DECISION_FROZEN)
+_UNIT6_SUCCESS_PATH = (*_SUCCESS_PATH, ArtifactKind.EXECUTION_BOOK)
 _OPENAI_FAILURE_PATH = (*_LEGACY_OPENAI_FAILURE_PATH, ArtifactKind.DECISION_FROZEN)
 _OPENAI_INPUT_FAILURE_PATH = (
     ArtifactKind.RAW_GAMMA,
@@ -195,15 +201,26 @@ _JEV_INPUT_FAILURE_PATH = (
     ArtifactKind.JEV_FAILURE,
     ArtifactKind.DECISION_FROZEN,
 )
+_ELIGIBILITY_REJECTION_PATH = (
+    ArtifactKind.RAW_GAMMA,
+    ArtifactKind.ELIGIBILITY_REJECTION,
+)
 _WRITE_BASE_PATHS = (
     _SUCCESS_PATH,
+    _UNIT6_SUCCESS_PATH,
     _OPENAI_FAILURE_PATH,
     _OPENAI_INPUT_FAILURE_PATH,
     _JEV_FAILURE_PATH,
     _JEV_INPUT_FAILURE_PATH,
+    _ELIGIBILITY_REJECTION_PATH,
 )
-_LATE_PATHS = tuple(
-    (*path, ArtifactKind.BOOK_UNAVAILABLE) for path in _WRITE_BASE_PATHS
+_LATE_PATHS = (
+    (*_SUCCESS_PATH, ArtifactKind.BOOK_UNAVAILABLE),
+    *(
+        (*path, ArtifactKind.BOOK_UNAVAILABLE)
+        for path in _WRITE_BASE_PATHS
+        if path not in {_SUCCESS_PATH, _UNIT6_SUCCESS_PATH, _ELIGIBILITY_REJECTION_PATH}
+    ),
 )
 _WRITE_STAGE_PATHS = (*_WRITE_BASE_PATHS, *_LATE_PATHS)
 _LEGACY_STAGE_PATHS = (
@@ -211,7 +228,10 @@ _LEGACY_STAGE_PATHS = (
     _LEGACY_OPENAI_FAILURE_PATH,
     _LEGACY_JEV_FAILURE_PATH,
 )
-_REPLAY_STAGE_PATHS = (*_WRITE_STAGE_PATHS, *_LEGACY_STAGE_PATHS)
+_REPLAY_STAGE_PATHS = (
+    *_WRITE_STAGE_PATHS,
+    *_LEGACY_STAGE_PATHS,
+)
 _WRITE_FAILURE_PATHS = frozenset(
     {
         _OPENAI_FAILURE_PATH,
@@ -230,6 +250,7 @@ _RESULT_HASH_KINDS = {
     ArtifactKind.RAW_GAMMA: "evidence_sha256",
     ArtifactKind.RESEARCH_BRIEF: "research_brief_sha256",
     ArtifactKind.JEV_DECISION: "jev_decision_sha256",
+    ArtifactKind.EXECUTION_BOOK: "execution_book_sha256",
 }
 Label = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
 ByteSize = Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)]
@@ -249,10 +270,26 @@ class SuccessArtifact(UtcModel):
 class BookUnavailableArtifact(UtcModel):
     """Price-free explanation for refusing a planned execution book."""
 
-    reason: Literal["STALE_PRECHECK"]
+    reason: Literal[
+        "STALE_BOOK",
+        "CROSSED_BOOK",
+        "TOKEN_DRIFT",
+        "MARKET_DRIFT",
+        "BOOK_UNAVAILABLE",
+        "STALE_PRECHECK",
+    ]
     planned_retrieved_at: datetime
     planned_source_sha256: Sha256
     terminal_model_at: datetime
+
+
+class EligibilityRejectionArtifact(UtcModel):
+    """Canonical reason an exact raw Gamma market was not model-eligible."""
+
+    market_id: NonEmptyStr
+    reason: NonEmptyStr
+    raw_gamma_sha256: Sha256
+    rejected_at: datetime
 
 
 class FailureArtifact(UtcModel):
@@ -351,10 +388,21 @@ def _stage_path_for_result(
     result: ObservationResult, kinds: tuple[str, ...]
 ) -> tuple[ArtifactKind, ...]:
     path = _stage_path(kinds)
+    if path == _ELIGIBILITY_REJECTION_PATH:
+        if any(
+            arm.disposition != "INELIGIBLE" for arm in (result.ai, result.deterministic)
+        ):
+            raise ValueError("eligibility path requires terminal INELIGIBLE arms")
+        return path
     late = path in _LATE_PATHS
     if late:
-        if result.ai.disposition != "BOOK_FAILURE":
-            raise ValueError("late provider path requires terminal BOOK_FAILURE")
+        if result.ai.disposition not in {"BOOK_FAILURE", "COST_OVERFLOW"}:
+            raise ValueError(
+                "late provider path requires terminal BOOK_FAILURE or COST_OVERFLOW"
+            )
+    elif result.ai.disposition == "COST_OVERFLOW":
+        if path not in _FAILURE_PATHS | {_SUCCESS_PATH, _UNIT6_SUCCESS_PATH}:
+            raise ValueError("cost overflow does not match provider outcome path")
     elif (result.ai.disposition == "MODEL_FAILURE") != (path in _FAILURE_PATHS):
         raise ValueError("terminal AI disposition does not match provider outcome path")
     return path
@@ -534,9 +582,14 @@ def _add_model_costs(left: int, right: int) -> int:
     return total
 
 
+def _unit6_model_cost(left: int, right: int) -> int | None:
+    total = left + right
+    return None if total > INT64_MAX else total
+
+
 def _expected_model_cost(
     path: tuple[ArtifactKind, ...], typed: dict[str, TypedArtifact]
-) -> int:
+) -> int | None:
     base = _base_path(path)
     if base in {
         _OPENAI_FAILURE_PATH,
@@ -560,6 +613,10 @@ def _expected_model_cost(
         )
     jev = typed[ArtifactKind.JEV_SUCCESS_METADATA]
     assert isinstance(jev, SuccessArtifact)
+    if base == _UNIT6_SUCCESS_PATH:
+        return _unit6_model_cost(
+            openai.billed_cost_microdollars, jev.billed_cost_microdollars
+        )
     return _add_model_costs(
         openai.billed_cost_microdollars, jev.billed_cost_microdollars
     )
@@ -572,12 +629,21 @@ def _validate_success_terminal(
     *,
     fail: Callable[[str], None],
 ) -> None:
-    if path not in {_SUCCESS_PATH, _LEGACY_SUCCESS_PATH}:
+    if path not in {_SUCCESS_PATH, _UNIT6_SUCCESS_PATH, _LEGACY_SUCCESS_PATH}:
         return
-    if result.ai.model_cost_microdollars != _expected_model_cost(path, typed):
-        fail("terminal AI model cost does not match provider success metadata")
     if result.deterministic.model_cost_microdollars != 0:
         fail("deterministic arm model cost must be zero")
+    expected = _expected_model_cost(path, typed)
+    if expected is None:
+        if (
+            result.ai.disposition != "COST_OVERFLOW"
+            or result.ai.model_cost_microdollars is not None
+            or result.ai.economic_pnl_microdollars is not None
+        ):
+            fail("terminal AI arm must disclose cumulative cost overflow")
+        return
+    if result.ai.model_cost_microdollars != expected:
+        fail("terminal AI model cost does not match provider success metadata")
 
 
 def _validate_failure_terminal(
@@ -590,7 +656,20 @@ def _validate_failure_terminal(
     ai = result.ai
     if path not in _FAILURE_PATHS:
         return
-    expected = _expected_model_cost(path, typed)
+    try:
+        expected: int | None = _expected_model_cost(path, typed)
+    except ValueError:
+        if ai.disposition != "COST_OVERFLOW":
+            raise
+        expected = None
+    if expected is None:
+        if (
+            ai.disposition != "COST_OVERFLOW"
+            or ai.model_cost_microdollars is not None
+            or ai.economic_pnl_microdollars is not None
+        ):
+            fail("terminal AI arm must disclose cumulative cost overflow")
+        return
     if (
         ai.disposition != "MODEL_FAILURE"
         or ai.signal_probability_micros is not None
@@ -620,27 +699,41 @@ def _validate_late_terminal(
     ):
         fail("late path requires typed book-unavailable and decision barriers")
         return
+    try:
+        expected_cost: int | None = _expected_model_cost(path, typed)
+    except ValueError:
+        if result.ai.disposition != "COST_OVERFLOW":
+            raise
+        expected_cost = None
     if (
         unavailable.terminal_model_at != frozen.frozen_at
-        or unavailable.terminal_model_at < unavailable.planned_retrieved_at
+        or (
+            unavailable.reason == "STALE_PRECHECK"
+            and unavailable.terminal_model_at < unavailable.planned_retrieved_at
+        )
+        or (
+            unavailable.reason != "STALE_PRECHECK"
+            and unavailable.terminal_model_at >= unavailable.planned_retrieved_at
+        )
         or result.execution_book_sha256 is not None
         or result.planned_execution_book_sha256 != unavailable.planned_source_sha256
         or result.baseline_probability_micros is not None
         or result.baseline_brier_micros is not None
+        or result.ai.disposition
+        != ("COST_OVERFLOW" if expected_cost is None else "BOOK_FAILURE")
+        or result.deterministic.disposition != "BOOK_FAILURE"
         or any(
-            arm.disposition != "BOOK_FAILURE"
-            or arm.quantity != 0
-            or arm.trading_pnl_microdollars != 0
+            arm.quantity != 0 or arm.trading_pnl_microdollars != 0
             for arm in (result.ai, result.deterministic)
         )
         or result.deterministic.model_cost_microdollars != 0
         or result.deterministic.economic_pnl_microdollars != 0
     ):
         fail("terminal arms do not match unavailable execution book")
-    expected_cost = _expected_model_cost(path, typed)
+    expected_economic = -expected_cost if expected_cost is not None else None
     if (
         result.ai.model_cost_microdollars != expected_cost
-        or result.ai.economic_pnl_microdollars != -expected_cost
+        or result.ai.economic_pnl_microdollars != expected_economic
     ):
         fail("late terminal AI arm does not match incurred provider costs")
     decision = typed.get(ArtifactKind.JEV_DECISION)
@@ -649,10 +742,14 @@ def _validate_late_terminal(
         if isinstance(decision, JevDecision)
         else (None, None)
     )
-    if (
-        result.ai.signal_probability_micros,
-        result.ai.signal_action,
-    ) != expected_signal or result.ai.forecast_probability_micros != expected_signal[0]:
+    if result.ai.disposition != "COST_OVERFLOW" and (
+        (
+            result.ai.signal_probability_micros,
+            result.ai.signal_action,
+        )
+        != expected_signal
+        or result.ai.forecast_probability_micros != expected_signal[0]
+    ):
         fail("late terminal forecast does not match available model decision")
     if any(
         value is not None
@@ -976,6 +1073,10 @@ def _reconstruct_orphan(kind: ArtifactKind, payload: bytes) -> TypedArtifact:
         return DecisionFrozenArtifact.model_validate_json(payload)
     if kind is ArtifactKind.BOOK_UNAVAILABLE:
         return BookUnavailableArtifact.model_validate_json(payload)
+    if kind is ArtifactKind.ELIGIBILITY_REJECTION:
+        return EligibilityRejectionArtifact.model_validate_json(payload)
+    if kind is ArtifactKind.EXECUTION_BOOK:
+        raise ValueError("execution book reconstruction requires observation identity")
     if kind is ArtifactKind.OPENAI_RESPONSE_SUCCESS:
         response = OpenAIResponse.model_validate_json(payload)
         if (
@@ -1005,8 +1106,9 @@ def _reconstruct_orphan(kind: ArtifactKind, payload: bytes) -> TypedArtifact:
 def _reconstruct(
     kind: ArtifactKind, payload: bytes, result: ObservationResult | FixtureIdentity
 ) -> TypedArtifact:
-    del result
     try:
+        if kind is ArtifactKind.EXECUTION_BOOK:
+            return reconstruct_book_snapshot(payload, market_id=result.market_id)
         return _reconstruct_orphan(kind, payload)
     except (TypeError, ValueError) as error:
         label = "Gamma" if kind is ArtifactKind.RAW_GAMMA else kind.value
@@ -1020,6 +1122,7 @@ def _validate_reconstructed_path(
     envelopes: list[ArtifactEnvelope],
     *,
     corruption: bool,
+    allow_cost_overflow_prefix: bool = False,
 ) -> None:
     """Validate every semantic binding available in one reviewed path prefix."""
 
@@ -1091,6 +1194,55 @@ def _validate_reconstructed_path(
         if result.observation_id != expected_observation_id:
             fail("observation ID does not match frozen evidence and execution book")
 
+    rejection = typed.get(ArtifactKind.ELIGIBILITY_REJECTION)
+    if rejection is not None:
+        if not isinstance(rejection, EligibilityRejectionArtifact):
+            fail("eligibility rejection artifact type is invalid")
+            return
+        raw = envelope_by_kind.get(ArtifactKind.RAW_GAMMA)
+        if raw is None or rejection.raw_gamma_sha256 != raw.sha256:
+            fail("eligibility rejection does not bind raw Gamma bytes")
+        if result is not None and (
+            result.market_id != rejection.market_id
+            or result.evidence_sha256 != rejection.raw_gamma_sha256
+            or result.observed_at < rejection.rejected_at
+            or any(
+                arm.disposition != "INELIGIBLE"
+                or arm.quantity != 0
+                or arm.trading_pnl_microdollars != 0
+                or arm.economic_pnl_microdollars != 0
+                or arm.model_cost_microdollars != 0
+                or arm.initial_cash_microdollars != arm.final_cash_microdollars
+                or arm.forecast_status != "UNAVAILABLE"
+                for arm in (result.ai, result.deterministic)
+            )
+        ):
+            fail("terminal result does not match eligibility rejection")
+
+    execution_book = typed.get(ArtifactKind.EXECUTION_BOOK)
+    if execution_book is not None:
+        if not isinstance(execution_book, BookSnapshot):
+            fail("execution book artifact type is invalid")
+            return
+        envelope = envelope_by_kind.get(ArtifactKind.EXECUTION_BOOK)
+        frozen = typed.get(ArtifactKind.DECISION_FROZEN)
+        if (
+            envelope is None
+            or not isinstance(frozen, DecisionFrozenArtifact)
+            or execution_book.source_sha256 != envelope.sha256
+            or execution_book.retrieved_at != envelope.retrieved_at
+            or execution_book.retrieved_at <= frozen.frozen_at
+            or (
+                result is not None
+                and (
+                    execution_book.market_id != result.market_id
+                    or result.execution_book_sha256 != envelope.sha256
+                    or result.observed_at < execution_book.retrieved_at
+                )
+            )
+        ):
+            fail("execution book does not bind result identity and chronology")
+
     openai_request = typed.get(ArtifactKind.OPENAI_REQUEST)
     if isinstance(evidence, EvidencePacket) and openai_request is not None:
         if openai_request != load_strict_json(
@@ -1158,7 +1310,11 @@ def _validate_reconstructed_path(
         try:
             _expected_model_cost(path, typed)
         except ValueError as error:
-            fail(str(error))
+            terminal_overflow = (
+                result is not None and result.ai.disposition == "COST_OVERFLOW"
+            )
+            if not (terminal_overflow or allow_cost_overflow_prefix):
+                fail(str(error))
         if result is not None and path not in _LATE_PATHS:
             _validate_failure_terminal(result, base_path, typed, fail=fail)
 
@@ -1174,9 +1330,12 @@ def _validate_reconstructed_path(
         if jev_response_decision(jev_response) != decision:
             fail("Jev response does not match decision")
         if result is not None and (
-            result.ai.signal_probability_micros != decision.p_yes_micros
-            or result.ai.forecast_probability_micros != decision.p_yes_micros
-            or result.ai.signal_action != decision.action
+            result.ai.disposition != "COST_OVERFLOW"
+            and (
+                result.ai.signal_probability_micros != decision.p_yes_micros
+                or result.ai.forecast_probability_micros != decision.p_yes_micros
+                or result.ai.signal_action != decision.action
+            )
         ):
             fail("terminal AI signal does not match frozen Jev decision")
 
@@ -1191,7 +1350,7 @@ def _validate_reconstructed_path(
         ):
             fail("decision frozen artifact identity is inconsistent")
         frozen_envelope = envelope_by_kind.get(ArtifactKind.DECISION_FROZEN)
-        terminal_envelope = envelopes[-2] if path in _LATE_PATHS else envelopes[-1]
+        terminal_envelope = envelope_by_kind.get(ArtifactKind.DECISION_FROZEN)
         prior_terminal_envelope = envelopes[
             path.index(ArtifactKind.DECISION_FROZEN) - 1
         ]
@@ -1314,8 +1473,17 @@ def _validate_reconstructed_path(
         try:
             _expected_model_cost(_SUCCESS_PATH, typed)
         except ValueError as error:
-            fail(str(error))
-    if path in {_SUCCESS_PATH, _LEGACY_SUCCESS_PATH} and result is not None:
+            terminal_overflow = (
+                result is not None
+                and result.ai.disposition == "COST_OVERFLOW"
+                and (path == _UNIT6_SUCCESS_PATH or path in _LATE_PATHS)
+            )
+            if not (terminal_overflow or allow_cost_overflow_prefix):
+                fail(str(error))
+    if (
+        path in {_SUCCESS_PATH, _UNIT6_SUCCESS_PATH, _LEGACY_SUCCESS_PATH}
+        and result is not None
+    ):
         _validate_success_terminal(result, path, typed, fail=fail)
     if result is not None:
         _validate_late_terminal(result, path, typed, fail=fail)
@@ -1441,7 +1609,7 @@ def _validate_journals_locked(
             continue
         if any(
             kinds == tuple(kind.value for kind in path) for path in _LEGACY_STAGE_PATHS
-        ):
+        ) and kinds != tuple(kind.value for kind in _SUCCESS_PATH):
             raise StoreCorruptError("legacy artifact path requires a terminal result")
 
         typed: dict[str, TypedArtifact] = {}
@@ -1449,7 +1617,17 @@ def _validate_journals_locked(
             try:
                 payload = store.read_verified(envelope.blob_ref())
                 _screen_payload(payload, forbidden_secret_values, strict_json=True)
-                typed[kind.value] = _reconstruct_orphan(kind, payload)
+                if kind is ArtifactKind.EXECUTION_BOOK:
+                    evidence = typed.get(ArtifactKind.SANITIZED_EVIDENCE)
+                    if not isinstance(evidence, EvidencePacket):
+                        raise ValueError(
+                            "execution book reconstruction requires frozen evidence"
+                        )
+                    typed[kind.value] = reconstruct_book_snapshot(
+                        payload, market_id=evidence.market_id
+                    )
+                else:
+                    typed[kind.value] = _reconstruct_orphan(kind, payload)
             except StoreSecurityError:
                 raise
             except (BlobError, TypeError, ValueError) as error:
@@ -1571,7 +1749,14 @@ def freeze_observation_artifacts(
         typed[kind.value] = _reconstruct(kind, artifact.payload, verified_identity)
         envelopes.append(envelope)
         predecessor = _canonical_stage_hash(envelope)
-    _validate_reconstructed_path(None, typed, path, envelopes, corruption=False)
+    _validate_reconstructed_path(
+        None,
+        typed,
+        path,
+        envelopes,
+        corruption=False,
+        allow_cost_overflow_prefix=True,
+    )
     envelope_lines = [
         canonical_json_bytes(envelope.model_dump(mode="json")) for envelope in envelopes
     ]

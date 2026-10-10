@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import http.client
-import ipaddress
 import json
 import os
 import re
@@ -20,6 +19,7 @@ from urllib.parse import urlsplit
 from pydantic import ValidationError
 
 from jev_trading_lab.core.ids import canonical_json_bytes
+from jev_trading_lab.polymarket.client import is_safe_global_ip
 from jev_trading_lab.polymarket.models import (
     INT64_MAX,
     EvidencePacket,
@@ -179,20 +179,7 @@ def _public_addresses(host: str) -> list[str]:
     addresses = sorted({str(answer[4][0]) for answer in answers if len(answer) >= 5})
     safe: list[str] = []
     for value in addresses:
-        try:
-            address = ipaddress.ip_address(value)
-        except ValueError as error:
-            raise ValueError("provider DNS answer is invalid") from error
-        if any(
-            (
-                address.is_private,
-                address.is_loopback,
-                address.is_link_local,
-                address.is_multicast,
-                address.is_unspecified,
-                address.is_reserved,
-            )
-        ):
+        if not is_safe_global_ip(value):
             raise ValueError("provider DNS answer is unsafe")
         safe.append(value)
     if not safe:
@@ -209,7 +196,8 @@ class _ProviderHTTPSConnection(http.client.HTTPSConnection):
     def connect(self) -> None:
         raw = socket.create_connection((self._address, 443), self.timeout)
         try:
-            if raw.getpeername()[0] != self._address:
+            peer = raw.getpeername()[0]
+            if peer != self._address or not is_safe_global_ip(peer):
                 raise ValueError("provider peer differs from validated address")
             self.sock = self._tls_context.wrap_socket(raw, server_hostname=self.host)
         except Exception:
@@ -226,6 +214,8 @@ def _provider_network(request: LiveHttpRequest) -> LiveHttpResponse:
     if (
         request.method != "POST"
         or parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
         or parsed.port not in {None, 443}
         or parsed.query
         or parsed.fragment
