@@ -441,6 +441,7 @@ def _failure_artifacts(
                     "terminal_model_state": (
                         "OPENAI_FAILURE" if openai_failure else "JEV_FAILURE"
                     ),
+                    "failure_code": "HTTP_ERROR",
                     "openai_request_sha256": hashlib.sha256(
                         by_kind["openai_request"].payload
                     ).hexdigest(),
@@ -498,10 +499,12 @@ def _retarget(
         jev_failure = by_kind.get("jev_failure")
         openai_metadata = by_kind.get("openai_success_metadata")
         jev_metadata = by_kind.get("jev_success_metadata")
+        failure_code = None
         if openai_failure is not None:
             openai_terminal = json.loads(openai_failure.payload)
             openai_response_sha256 = openai_terminal["response_sha256"]
             openai_cost = openai_terminal["billed_cost_microdollars"]
+            failure_code = openai_terminal["code"]
         else:
             assert openai_metadata is not None
             openai_terminal = json.loads(openai_metadata.payload)
@@ -513,6 +516,7 @@ def _retarget(
             jev_terminal = json.loads(jev_failure.payload)
             jev_response_sha256 = jev_terminal["response_sha256"]
             jev_cost = jev_terminal["billed_cost_microdollars"]
+            failure_code = jev_terminal["code"]
         elif jev_metadata is not None:
             jev_terminal = json.loads(jev_metadata.payload)
             jev_response_sha256 = hashlib.sha256(
@@ -525,6 +529,7 @@ def _retarget(
         barrier.update(
             opportunity_id=result.opportunity_id,
             observation_id=result.observation_id,
+            failure_code=failure_code,
             openai_request_sha256=hashlib.sha256(
                 by_kind["openai_request"].payload
             ).hexdigest(),
@@ -755,6 +760,7 @@ _FAILURE_VARIANTS = (
     "HTTP_ERROR",
     "PARSE_ERROR",
     "MODEL_MISMATCH",
+    "CITATION_ERROR",
     "CREDENTIAL_REFLECTION",
 )
 
@@ -798,6 +804,13 @@ def test_each_adapter_failure_variant_roundtrips_canonical_metadata(
     elif failure_code == "MODEL_MISMATCH":
         value.update(
             message=f"{provider} response model does not match the approved snapshot",
+            status_code=200,
+        )
+    elif failure_code == "CITATION_ERROR":
+        if provider == "jev":
+            return
+        value.update(
+            message="openai brief does not cite the supplied evidence",
             status_code=200,
         )
     else:
@@ -978,6 +991,28 @@ def test_failure_path_exact_cost_and_economics_pass(
     assert result.deterministic.model_cost_microdollars == 0
     assert record_observation(tmp_path / "output", result, artifacts) == result
     assert load_observation(tmp_path / "output", result.observation_id).result == result
+
+
+@pytest.mark.parametrize("openai_failed", (True, False))
+def test_failure_barrier_rejects_mismatched_failure_code(
+    tmp_path: Path, cycle: dict[str, Any], openai_failed: bool
+) -> None:
+    result, artifacts, _raw_failure = _failure_artifacts(
+        cycle, openai_failed=openai_failed
+    )
+    barrier = artifacts[-1]
+    value = json.loads(barrier.payload)
+    value["failure_code"] = "PARSE_ERROR"
+    artifacts[-1] = ArtifactToFreeze(
+        kind=barrier.kind,
+        payload=canonical_json_bytes(value),
+        source_uri_label=barrier.source_uri_label,
+        retrieved_at=barrier.retrieved_at,
+        predecessor_stage_sha256=barrier.predecessor_stage_sha256,
+    )
+
+    with pytest.raises(ValueError, match="failure code"):
+        record_observation(tmp_path / "output", result, artifacts)
 
 
 @pytest.mark.parametrize("openai_failed", (True, False))

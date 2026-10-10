@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import socket
-from collections.abc import Iterator
-from datetime import datetime
+from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -319,6 +320,212 @@ def test_openai_failure_records_both_terminal_arms(tmp_path: Path) -> None:
     assert summary["control"]["disposition"] == "NO_EDGE"
     assert summary["control"]["quantity"] == 0
     assert summary["artifact_count"] == 5
+
+
+@pytest.mark.parametrize("body", (b'{"error":"unavailable"}', b""))
+def test_openai_http_failure_barrier_binds_response_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: bytes
+) -> None:
+    from jev_trading_lab.polymarket import pipeline
+    from jev_trading_lab.polymarket.ai import TransportResponse
+
+    output = tmp_path / "http-failure"
+    opened = [False]
+    accesses: list[str] = []
+    monkeypatch.setattr(
+        pipeline,
+        "_load_fixture",
+        lambda _path: _AccessTrap(_fixture(), opened, accesses),
+    )
+    original_freeze = pipeline.freeze_observation_artifacts
+
+    def durable_freeze(*args: Any, **kwargs: Any) -> Any:
+        result = original_freeze(*args, **kwargs)
+        artifacts = list(args[2])
+        if artifacts[-1].kind == "decision_frozen":
+            barrier = json.loads(artifacts[-1].payload)
+            assert barrier["openai_response_sha256"] == hashlib.sha256(body).hexdigest()
+            opened[0] = True
+        return result
+
+    monkeypatch.setattr(pipeline, "freeze_observation_artifacts", durable_freeze)
+
+    def failed(_request: bytes) -> TransportResponse:
+        return TransportResponse(
+            status_code=500,
+            headers={},
+            raw_bytes=body,
+            retrieved_at=datetime(2026, 10, 3, 12, 0, 30, tzinfo=UTC),
+            billed_cost_microdollars=17,
+        )
+
+    summary = replay_fixture(FIXTURE, output, openai_transport=failed)
+    replay = load_observation(output, summary["observation_id"])
+    failure = json.loads(replay.artifacts["openai_failure"])
+    barrier = json.loads(replay.artifacts["decision_frozen"])
+    digest = hashlib.sha256(body).hexdigest()
+
+    assert failure["response_sha256"] == digest
+    assert failure["response_byte_length"] == len(body)
+    assert barrier["openai_response_sha256"] == digest
+    assert barrier["failure_code"] == failure["code"]
+    assert barrier["openai_request_sha256"] == failure["request_sha256"]
+    assert barrier["openai_cost_microdollars"] == failure["billed_cost_microdollars"]
+    if body:
+        assert body not in b"".join(replay.artifacts.values())
+    assert accesses
+
+
+def test_jev_http_failure_barrier_binds_response_hash(tmp_path: Path) -> None:
+    from jev_trading_lab.polymarket.ai import TransportResponse
+
+    body = b'{"error":"jev unavailable"}'
+    output = tmp_path / "jev-http-failure"
+
+    def failed(_request: bytes) -> TransportResponse:
+        return TransportResponse(
+            status_code=503,
+            headers={},
+            raw_bytes=body,
+            retrieved_at=datetime(2026, 10, 3, 12, 1, 20, tzinfo=UTC),
+            billed_cost_microdollars=19,
+        )
+
+    summary = replay_fixture(FIXTURE, output, jev_transport=failed)
+    replay = load_observation(output, summary["observation_id"])
+    failure = json.loads(replay.artifacts["jev_failure"])
+    barrier = json.loads(replay.artifacts["decision_frozen"])
+
+    assert failure["response_sha256"] == hashlib.sha256(body).hexdigest()
+    assert barrier["failure_code"] == failure["code"]
+    assert barrier["jev_response_sha256"] == failure["response_sha256"]
+    assert body not in b"".join(replay.artifacts.values())
+
+
+@pytest.mark.parametrize(
+    ("failure_code", "mutate"),
+    (
+        ("PARSE_ERROR", lambda _raw: b"not-json"),
+        (
+            "MODEL_MISMATCH",
+            lambda raw: json.dumps(
+                {**json.loads(raw), "model": "unapproved-model"}, separators=(",", ":")
+            ).encode(),
+        ),
+        (
+            "CITATION_ERROR",
+            lambda raw: _openai_response_with_bad_citation(raw),
+        ),
+        (
+            "CREDENTIAL_REFLECTION",
+            lambda _raw: b"Authorization: Bearer reflected-secret",
+        ),
+    ),
+)
+def test_openai_response_failure_variants_bind_barrier_without_persisting_body(
+    tmp_path: Path,
+    failure_code: str,
+    mutate: Callable[[bytes], bytes],
+) -> None:
+    from jev_trading_lab.polymarket.ai import TransportResponse
+
+    fixture = _fixture()
+    original = fixture["model_artifacts"]["openai_response_bytes"].encode()
+    body = mutate(original)
+    output = tmp_path / failure_code.lower()
+
+    def failed(_request: bytes) -> TransportResponse:
+        return TransportResponse(
+            status_code=200,
+            headers={},
+            raw_bytes=body,
+            retrieved_at=datetime(2026, 10, 3, 12, 0, 30, tzinfo=UTC),
+            billed_cost_microdollars=23,
+        )
+
+    summary = replay_fixture(FIXTURE, output, openai_transport=failed)
+    replay = load_observation(output, summary["observation_id"])
+    failure = json.loads(replay.artifacts["openai_failure"])
+    barrier = json.loads(replay.artifacts["decision_frozen"])
+
+    assert failure["code"] == failure_code
+    assert failure["response_sha256"] == hashlib.sha256(body).hexdigest()
+    assert barrier["failure_code"] == failure_code
+    assert barrier["openai_response_sha256"] == failure["response_sha256"]
+    assert body not in b"".join(replay.artifacts.values())
+
+
+@pytest.mark.parametrize("exception", (TimeoutError, RuntimeError))
+def test_openai_pre_response_failures_leave_null_barrier_response_hash(
+    tmp_path: Path, exception: type[Exception]
+) -> None:
+    output = tmp_path / exception.__name__
+
+    def failed(_request: bytes) -> None:
+        raise exception
+
+    summary = replay_fixture(FIXTURE, output, openai_transport=failed)
+    replay = load_observation(output, summary["observation_id"])
+    failure = json.loads(replay.artifacts["openai_failure"])
+    barrier = json.loads(replay.artifacts["decision_frozen"])
+
+    assert failure["code"] == (
+        "TIMEOUT" if exception is TimeoutError else "PROVIDER_ERROR"
+    )
+    assert failure["response_sha256"] is None
+    assert barrier["failure_code"] == failure["code"]
+    assert barrier["openai_response_sha256"] is None
+
+
+def _openai_response_with_bad_citation(raw: bytes) -> bytes:
+    value = json.loads(raw)
+    message = next(item for item in value["output"] if item["type"] == "message")
+    brief = json.loads(message["content"][0]["text"])
+    brief["cited_facts"][0]["evidence_sha256"] = "0" * 64
+    message["content"][0]["text"] = json.dumps(brief, separators=(",", ":"))
+    return json.dumps(value, separators=(",", ":")).encode()
+
+
+def test_openai_failure_crash_after_barrier_recovers_on_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from jev_trading_lab.polymarket import pipeline
+    from jev_trading_lab.polymarket.ai import TransportResponse
+
+    output = tmp_path / "failure-crash"
+    original_get = pipeline._ExecutionBookGate.get
+    crashed = False
+
+    def crash_once(gate: Any) -> Any:
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise RuntimeError("crash after failure barrier")
+        return original_get(gate)
+
+    def failed(_request: bytes) -> TransportResponse:
+        return TransportResponse(
+            status_code=500,
+            headers={},
+            raw_bytes=b"temporary failure",
+            retrieved_at=datetime(2026, 10, 3, 12, 0, 30, tzinfo=UTC),
+            billed_cost_microdollars=29,
+        )
+
+    monkeypatch.setattr(pipeline._ExecutionBookGate, "get", crash_once)
+    with pytest.raises(RuntimeError, match="crash after failure barrier"):
+        replay_fixture(FIXTURE, output, openai_transport=failed)
+
+    kinds = [
+        json.loads(line)["kind"]
+        for line in (output / "artifacts.jsonl").read_text().splitlines()
+    ]
+    assert kinds[-2:] == ["openai_failure", "decision_frozen"]
+    assert not (output / "results.jsonl").read_text()
+
+    summary = replay_fixture(FIXTURE, output, openai_transport=failed)
+    assert summary["artifact_count"] == 5
+    assert len((output / "results.jsonl").read_text().splitlines()) == 1
 
 
 def test_corrupt_existing_artifact_fails_closed(tmp_path: Path) -> None:

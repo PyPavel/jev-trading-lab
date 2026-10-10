@@ -30,6 +30,7 @@ from jev_trading_lab.polymarket.ai import (
     JEV_MODEL_ID,
     OPENAI_MODEL_ID,
     AdapterFailure,
+    FailureCode,
     build_jev_request,
     build_openai_request,
     has_canonical_failure_response,
@@ -97,6 +98,9 @@ class DecisionFrozenArtifact(UtcModel):
     opportunity_id: Sha256
     observation_id: Sha256
     terminal_model_state: Literal["OPENAI_FAILURE", "JEV_FAILURE", "JEV_SUCCESS"]
+    failure_code: FailureCode | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     openai_request_sha256: Sha256
     openai_response_sha256: Sha256 | None
     jev_request_sha256: Sha256 | None
@@ -110,7 +114,8 @@ class DecisionFrozenArtifact(UtcModel):
     def require_state_fields(self) -> Self:
         if self.terminal_model_state == "OPENAI_FAILURE":
             if (
-                any(
+                self.failure_code is None
+                or any(
                     value is not None
                     for value in (
                         self.jev_request_sha256,
@@ -123,12 +128,13 @@ class DecisionFrozenArtifact(UtcModel):
                 raise ValueError("OpenAI failure barrier fields are inconsistent")
         elif self.terminal_model_state == "JEV_FAILURE":
             if (
-                self.openai_response_sha256 is None
+                self.failure_code is None
+                or self.openai_response_sha256 is None
                 or self.jev_request_sha256 is None
                 or self.jev_decision_sha256 is not None
             ):
                 raise ValueError("Jev failure barrier fields are inconsistent")
-        elif any(
+        elif self.failure_code is not None or any(
             value is None
             for value in (
                 self.openai_response_sha256,
@@ -1078,12 +1084,23 @@ def _validate_reconstructed_path(
             if ArtifactKind.JEV_FAILURE in typed
             else "JEV_SUCCESS"
         )
+        expected_failure_code = (
+            openai_failure.code
+            if isinstance(openai_failure, FailureArtifact)
+            else jev_failure.code
+            if isinstance(jev_failure, FailureArtifact)
+            else None
+        )
         if (
             frozen.terminal_model_state != expected_state
+            or frozen.failure_code != expected_failure_code
             or frozen.openai_cost_microdollars != openai_cost
             or frozen.jev_cost_microdollars != jev_cost
         ):
-            fail("decision frozen artifact terminal state or costs are inconsistent")
+            fail(
+                "decision frozen artifact terminal state, failure code, or costs "
+                "are inconsistent"
+            )
 
     success_metadata_complete = all(
         kind in typed
