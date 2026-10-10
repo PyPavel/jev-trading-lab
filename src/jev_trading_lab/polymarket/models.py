@@ -948,10 +948,35 @@ class FixtureExpected(StrictModel):
     observation_result: ObservationResult
 
 
+class FixtureIdentity(StrictModel):
+    """Price-free identity needed to journal pre-book model artifacts."""
+
+    policy_version: NonEmptyStr
+    market_id: NonEmptyStr
+    cutoff_at: datetime
+    opportunity_id: Sha256
+    observation_id: Sha256
+    evidence_sha256: Sha256
+    execution_book_sha256: Sha256
+
+
+class PriceFreeFixturePrefix(StrictModel):
+    """Strict pre-barrier fixture projection; book and economics keys stay opaque."""
+
+    schema_version: Literal[1]
+    identity: FixtureIdentity
+    gamma_bytes: str
+    sanitized_evidence: EvidencePacket
+    chronology: FixtureChronology
+    model_artifacts: ModelArtifacts
+    model_costs_microdollars: ModelCosts
+
+
 class FeasibilityFixture(StrictModel):
     """Closed-world Unit 1 canned cycle envelope."""
 
     schema_version: Literal[1]
+    identity: FixtureIdentity
     raw: RawArtifacts
     sanitized_evidence: EvidencePacket
     causal_history: Annotated[list[CausalHistoryPoint], Field(min_length=1)]
@@ -1094,6 +1119,7 @@ def validate_feasibility_fixture(fixture: dict[str, Any]) -> None:
     raw = validated.raw
     artifacts = validated.model_artifacts
     expected = validated.expected
+    observation = expected.observation_result
 
     artifact_values = {**raw.model_dump(), **artifacts.model_dump()}
     expected_artifacts = expected.artifact_sha256.model_dump()
@@ -1104,7 +1130,6 @@ def validate_feasibility_fixture(fixture: dict[str, Any]) -> None:
     gamma_hash = _sha256_text(raw.gamma_bytes)
     evidence = validated.sanitized_evidence
     brief = validated.research_brief
-    observation = expected.observation_result
     citation_hashes = {citation.evidence_sha256 for citation in brief.cited_facts}
     if not (
         evidence.source_sha256

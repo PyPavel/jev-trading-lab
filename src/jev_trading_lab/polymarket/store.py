@@ -19,7 +19,13 @@ from typing import Annotated, Literal, Self
 from pydantic import Field, StringConstraints, field_validator, model_validator
 
 from jev_trading_lab.core.ids import canonical_json_bytes
-from jev_trading_lab.persistence.blobs import BlobError, BlobRef, BlobStore
+from jev_trading_lab.persistence.blobs import (
+    BlobError,
+    BlobRef,
+    BlobSecurityError,
+    BlobStore,
+    _open_or_create_root,
+)
 from jev_trading_lab.polymarket.ai import (
     JEV_MODEL_ID,
     OPENAI_MODEL_ID,
@@ -32,6 +38,7 @@ from jev_trading_lab.polymarket.ai import (
 from jev_trading_lab.polymarket.models import (
     INT64_MAX,
     EvidencePacket,
+    FixtureIdentity,
     JevDecision,
     JevResponse,
     ObservationResult,
@@ -85,10 +92,53 @@ class ArtifactKind(StrEnum):
 
 
 class DecisionFrozenArtifact(UtcModel):
-    """Canonical barrier proving the model decision preceded book economics."""
+    """Canonical terminal model state durably frozen before book economics."""
 
-    jev_decision_sha256: Sha256
+    opportunity_id: Sha256
+    observation_id: Sha256
+    terminal_model_state: Literal["OPENAI_FAILURE", "JEV_FAILURE", "JEV_SUCCESS"]
+    openai_request_sha256: Sha256
+    openai_response_sha256: Sha256 | None
+    jev_request_sha256: Sha256 | None
+    jev_response_sha256: Sha256 | None
+    jev_decision_sha256: Sha256 | None
+    openai_cost_microdollars: Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)]
+    jev_cost_microdollars: Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)]
     frozen_at: datetime
+
+    @model_validator(mode="after")
+    def require_state_fields(self) -> Self:
+        if self.terminal_model_state == "OPENAI_FAILURE":
+            if (
+                any(
+                    value is not None
+                    for value in (
+                        self.jev_request_sha256,
+                        self.jev_response_sha256,
+                        self.jev_decision_sha256,
+                    )
+                )
+                or self.jev_cost_microdollars != 0
+            ):
+                raise ValueError("OpenAI failure barrier fields are inconsistent")
+        elif self.terminal_model_state == "JEV_FAILURE":
+            if (
+                self.openai_response_sha256 is None
+                or self.jev_request_sha256 is None
+                or self.jev_decision_sha256 is not None
+            ):
+                raise ValueError("Jev failure barrier fields are inconsistent")
+        elif any(
+            value is None
+            for value in (
+                self.openai_response_sha256,
+                self.jev_request_sha256,
+                self.jev_response_sha256,
+                self.jev_decision_sha256,
+            )
+        ):
+            raise ValueError("Jev success barrier fields are inconsistent")
+        return self
 
 
 _LEGACY_SUCCESS_PATH = (
@@ -109,6 +159,7 @@ _OPENAI_FAILURE_PATH = (
     ArtifactKind.SANITIZED_EVIDENCE,
     ArtifactKind.OPENAI_REQUEST,
     ArtifactKind.OPENAI_FAILURE,
+    ArtifactKind.DECISION_FROZEN,
 )
 _JEV_FAILURE_PATH = (
     ArtifactKind.RAW_GAMMA,
@@ -119,6 +170,7 @@ _JEV_FAILURE_PATH = (
     ArtifactKind.RESEARCH_BRIEF,
     ArtifactKind.JEV_REQUEST,
     ArtifactKind.JEV_FAILURE,
+    ArtifactKind.DECISION_FROZEN,
 )
 _STAGE_PATHS = (_SUCCESS_PATH, _OPENAI_FAILURE_PATH, _JEV_FAILURE_PATH)
 _RESULT_HASH_KINDS = {
@@ -533,27 +585,9 @@ class ObservationReplay:
 def _open_output(output_dir: Path) -> int:
     path = output_dir.absolute()
     try:
-        path.mkdir(mode=0o700)
-    except FileExistsError:
-        pass
-    except OSError as error:
-        raise StoreSecurityError("output directory cannot be created safely") from error
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as error:
-        raise StoreSecurityError("output directory cannot be opened safely") from error
-    metadata = os.fstat(descriptor)
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or stat.S_IMODE(metadata.st_mode) != 0o700
-    ):
-        os.close(descriptor)
-        raise StoreSecurityError(
-            "output directory must be private and owner-controlled"
-        )
-    return descriptor
+        return _open_or_create_root(path)
+    except BlobSecurityError as error:
+        raise StoreSecurityError("output ancestor or directory is not safe") from error
 
 
 def _open_journal(root_fd: int, name: str) -> int:
@@ -709,7 +743,7 @@ def _validate_identity(result: ObservationResult, *, corruption: bool) -> None:
         raise ValueError(error)
 
 
-def _verified_result(result: ObservationResult) -> tuple[ObservationResult, bytes]:
+def _verified_identity(result: ObservationResult) -> tuple[ObservationResult, bytes]:
     canonical = canonical_json_bytes(result.model_dump(mode="json"))
     verified = ObservationResult.model_validate_json(canonical)
     _validate_identity(verified, corruption=False)
@@ -797,7 +831,7 @@ def _reconstruct_orphan(kind: ArtifactKind, payload: bytes) -> TypedArtifact:
 
 
 def _reconstruct(
-    kind: ArtifactKind, payload: bytes, result: ObservationResult
+    kind: ArtifactKind, payload: bytes, result: ObservationResult | FixtureIdentity
 ) -> TypedArtifact:
     del result
     try:
@@ -897,7 +931,6 @@ def _validate_reconstructed_path(
         _validate_failure_provenance(path, typed, fail=fail)
         if result is not None:
             _validate_failure_terminal(result, path, typed, fail=fail)
-        return
 
     brief = typed.get(ArtifactKind.RESEARCH_BRIEF)
     openai_response = typed.get(ArtifactKind.OPENAI_RESPONSE_SUCCESS)
@@ -938,7 +971,6 @@ def _validate_reconstructed_path(
             fail(str(error))
         if result is not None:
             _validate_failure_terminal(result, path, typed, fail=fail)
-        return
 
     decision = typed.get(ArtifactKind.JEV_DECISION)
     jev_response = typed.get(ArtifactKind.JEV_RESPONSE_SUCCESS)
@@ -962,22 +994,96 @@ def _validate_reconstructed_path(
     if frozen is not None:
         if not isinstance(frozen, DecisionFrozenArtifact):
             fail("decision frozen artifact type is invalid")
-        elif not isinstance(decision, JevDecision):
-            fail("decision frozen artifact requires a Jev decision")
-        else:
-            decision_envelope = envelope_by_kind.get(ArtifactKind.JEV_DECISION)
-            if (
-                decision_envelope is None
-                or frozen.jev_decision_sha256 != decision_envelope.sha256
-            ):
-                fail("decision frozen artifact does not bind the Jev decision")
-            frozen_envelope = envelope_by_kind.get(ArtifactKind.DECISION_FROZEN)
-            if (
-                frozen_envelope is None
-                or frozen.frozen_at != frozen_envelope.retrieved_at
-                or frozen.frozen_at < envelopes[-2].retrieved_at
-            ):
-                fail("decision frozen timestamp is inconsistent")
+            return
+        if (
+            frozen.opportunity_id != envelopes[0].opportunity_id
+            or frozen.observation_id != envelopes[0].observation_id
+        ):
+            fail("decision frozen artifact identity is inconsistent")
+        frozen_envelope = envelope_by_kind.get(ArtifactKind.DECISION_FROZEN)
+        if (
+            frozen_envelope is None
+            or frozen.frozen_at != frozen_envelope.retrieved_at
+            or frozen.frozen_at < envelopes[-2].retrieved_at
+        ):
+            fail("decision frozen timestamp is inconsistent")
+        request_envelope = envelope_by_kind[ArtifactKind.OPENAI_REQUEST]
+        if frozen.openai_request_sha256 != request_envelope.sha256:
+            fail("decision frozen artifact does not bind OpenAI request")
+        openai_response_envelope = envelope_by_kind.get(
+            ArtifactKind.OPENAI_RESPONSE_SUCCESS
+        )
+        openai_failure_response = (
+            openai_failure.response_sha256
+            if isinstance(
+                openai_failure := typed.get(ArtifactKind.OPENAI_FAILURE),
+                FailureArtifact,
+            )
+            else None
+        )
+        expected_openai_response = (
+            openai_response_envelope.sha256
+            if openai_response_envelope
+            else openai_failure_response
+        )
+        if frozen.openai_response_sha256 != expected_openai_response:
+            fail("decision frozen artifact does not bind OpenAI response")
+        jev_request_envelope = envelope_by_kind.get(ArtifactKind.JEV_REQUEST)
+        if frozen.jev_request_sha256 != (
+            jev_request_envelope.sha256 if jev_request_envelope else None
+        ):
+            fail("decision frozen artifact does not bind Jev request")
+        jev_response_envelope = envelope_by_kind.get(ArtifactKind.JEV_RESPONSE_SUCCESS)
+        jev_failure_response = (
+            jev_failure.response_sha256
+            if isinstance(
+                jev_failure := typed.get(ArtifactKind.JEV_FAILURE), FailureArtifact
+            )
+            else None
+        )
+        expected_jev_response = (
+            jev_response_envelope.sha256
+            if jev_response_envelope
+            else jev_failure_response
+        )
+        if frozen.jev_response_sha256 != expected_jev_response:
+            fail("decision frozen artifact does not bind Jev response")
+        decision_envelope = envelope_by_kind.get(ArtifactKind.JEV_DECISION)
+        if frozen.jev_decision_sha256 != (
+            decision_envelope.sha256 if decision_envelope else None
+        ):
+            fail("decision frozen artifact does not bind the Jev decision")
+        openai_metadata = typed.get(ArtifactKind.OPENAI_SUCCESS_METADATA)
+        openai_failure = typed.get(ArtifactKind.OPENAI_FAILURE)
+        openai_cost = (
+            openai_metadata.billed_cost_microdollars
+            if isinstance(openai_metadata, SuccessArtifact)
+            else openai_failure.billed_cost_microdollars
+            if isinstance(openai_failure, FailureArtifact)
+            else 0
+        )
+        jev_metadata = typed.get(ArtifactKind.JEV_SUCCESS_METADATA)
+        jev_failure = typed.get(ArtifactKind.JEV_FAILURE)
+        jev_cost = (
+            jev_metadata.billed_cost_microdollars
+            if isinstance(jev_metadata, SuccessArtifact)
+            else jev_failure.billed_cost_microdollars
+            if isinstance(jev_failure, FailureArtifact)
+            else 0
+        )
+        expected_state = (
+            "OPENAI_FAILURE"
+            if ArtifactKind.OPENAI_FAILURE in typed
+            else "JEV_FAILURE"
+            if ArtifactKind.JEV_FAILURE in typed
+            else "JEV_SUCCESS"
+        )
+        if (
+            frozen.terminal_model_state != expected_state
+            or frozen.openai_cost_microdollars != openai_cost
+            or frozen.jev_cost_microdollars != jev_cost
+        ):
+            fail("decision frozen artifact terminal state or costs are inconsistent")
 
     success_metadata_complete = all(
         kind in typed
@@ -1194,20 +1300,25 @@ def _verify_replay_locked(
 
 def freeze_observation_artifacts(
     output_dir: str | os.PathLike[str],
-    result: ObservationResult,
+    identity: ObservationResult | FixtureIdentity,
     artifact_refs: Iterable[ArtifactToFreeze],
     *,
     forbidden_secret_values: tuple[bytes, ...] = (),
 ) -> tuple[ArtifactEnvelope, ...]:
-    """Publish and journal a validated success-path prefix without its result."""
+    """Publish and journal a validated reviewed-path prefix without its result."""
 
-    if type(result) is not ObservationResult:
-        raise TypeError("result must be an ObservationResult")
-    verified_result, _result_line = _verified_result(result)
+    if type(identity) is ObservationResult:
+        verified_identity: ObservationResult | FixtureIdentity = _verified_identity(
+            identity
+        )[0]
+    elif type(identity) is FixtureIdentity:
+        verified_identity = FixtureIdentity.model_validate_json(
+            canonical_json_bytes(identity.model_dump(mode="json"))
+        )
+    else:
+        raise TypeError("identity must be an ObservationResult or FixtureIdentity")
     artifacts = list(artifact_refs)
     path = _stage_path_prefix(tuple(item.kind for item in artifacts))
-    if path != _SUCCESS_PATH:
-        raise ValueError("only the success path supports staged freezing")
     envelopes: list[ArtifactEnvelope] = []
     typed: dict[str, TypedArtifact] = {}
     predecessor: str | None = None
@@ -1221,13 +1332,13 @@ def freeze_observation_artifacts(
             storage_relpath=f"{payload_hash[:2]}/{payload_hash[2:4]}/{payload_hash}",
             source_uri_label=artifact.source_uri_label,
             retrieved_at=artifact.retrieved_at,
-            opportunity_id=verified_result.opportunity_id,
-            observation_id=verified_result.observation_id,
+            opportunity_id=verified_identity.opportunity_id,
+            observation_id=verified_identity.observation_id,
             predecessor_stage_sha256=artifact.predecessor_stage_sha256,
         )
         if envelope.predecessor_stage_sha256 != predecessor:
             raise ValueError("artifact predecessor chain is invalid")
-        typed[kind.value] = _reconstruct(kind, artifact.payload, verified_result)
+        typed[kind.value] = _reconstruct(kind, artifact.payload, verified_identity)
         envelopes.append(envelope)
         predecessor = _canonical_stage_hash(envelope)
     _validate_reconstructed_path(None, typed, path, envelopes, corruption=False)
@@ -1260,7 +1371,7 @@ def freeze_observation_artifacts(
                     prior = [
                         item
                         for item in existing_envelopes
-                        if item.observation_id == verified_result.observation_id
+                        if item.observation_id == verified_identity.observation_id
                     ]
                     common = min(len(prior), len(envelopes))
                     if prior[:common] != envelopes[:common]:
@@ -1292,10 +1403,10 @@ def record_observation(
 
     if type(result) is not ObservationResult:
         raise TypeError("result must be an ObservationResult")
-    verified_result, result_line = _verified_result(result)
+    verified_identity, result_line = _verified_identity(result)
     _screen_payload(result_line, forbidden_secret_values)
     artifacts, envelopes, _typed = _prepare(
-        verified_result, artifact_refs, forbidden_secret_values
+        verified_identity, artifact_refs, forbidden_secret_values
     )
     envelope_lines = [
         canonical_json_bytes(envelope.model_dump(mode="json")) for envelope in envelopes
@@ -1312,7 +1423,7 @@ def record_observation(
                 existing_results = _parse_results(
                     _read_journal(results_fd, label="result journal")
                 )
-                existing = existing_results.get(verified_result.observation_id)
+                existing = existing_results.get(verified_identity.observation_id)
                 artifacts_fd = _open_journal(root_fd, "artifacts.jsonl")
                 try:
                     _lock(artifacts_fd, fcntl.LOCK_EX)
@@ -1329,7 +1440,7 @@ def record_observation(
                     prior_artifacts = [
                         item
                         for item in existing_envelopes
-                        if item.observation_id == verified_result.observation_id
+                        if item.observation_id == verified_identity.observation_id
                     ]
                     if prior_artifacts != envelopes[: len(prior_artifacts)]:
                         raise StoreConflictError(
@@ -1364,7 +1475,7 @@ def record_observation(
                     else:
                         os.fsync(artifacts_fd)
                     _append_lines(results_fd, [result_line], label="result journal")
-                    return verified_result
+                    return verified_identity
                 finally:
                     os.close(artifacts_fd)
             finally:

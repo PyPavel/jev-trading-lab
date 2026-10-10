@@ -275,5 +275,14 @@
       "Interest Rates"
     ]
   },
-  "schema_version": 1
+  "schema_version": 1,
+  "identity": {
+    "policy_version": "polymarket-feasibility-v1",
+    "market_id": "pm-fed-oct-2026",
+    "cutoff_at": "2026-10-03T12:00:00Z",
+    "opportunity_id": "d56368782bb44c2446a104cde2900df658435abb45fd0754f390bfcb0e178033",
+    "observation_id": "f9950bbc47b0db7f01bc2346cc6e8a3bcbaba900a3e8dfd55b12bde27d5841ce",
+    "evidence_sha256": "ece2c0bf0810baedbf74bd09c6539452c61464abdcaea45ed36c69d10a56e88f",
+    "execution_book_sha256": "bbd889f6781e3f6c87bf4da012f3266c958bb8fb2e519273ddcf614e837637c9"
+  }
 }

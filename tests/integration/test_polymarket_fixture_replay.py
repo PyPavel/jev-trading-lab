@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import socket
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -143,6 +144,160 @@ def test_decision_artifact_is_persisted_before_execution_book_validation(
     replay_fixture(FIXTURE, tmp_path / "replay")
 
 
+class _AccessTrap(dict[str, Any]):
+    def __init__(self, value: dict[str, Any], opened: list[bool], accesses: list[str]):
+        super().__init__(value)
+        self._opened = opened
+        self._accesses = accesses
+
+    def __getitem__(self, key: str) -> Any:
+        if key in {
+            "execution_book",
+            "precheck_book",
+            "economics",
+            "expected",
+            "resolution",
+        }:
+            assert self._opened[0], f"{key} accessed before durable decision barrier"
+            self._accesses.append(key)
+        value = super().__getitem__(key)
+        if isinstance(value, dict):
+            return _AccessTrap(value, self._opened, self._accesses)
+        return value
+
+    def __iter__(self) -> Iterator[str]:
+        return super().__iter__()
+
+
+def test_success_does_not_access_price_data_until_barrier_is_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from jev_trading_lab.polymarket import pipeline
+
+    raw = _fixture()
+    opened = [False]
+    accesses: list[str] = []
+    monkeypatch.setattr(
+        pipeline, "_load_fixture", lambda _path: _AccessTrap(raw, opened, accesses)
+    )
+    original_freeze = pipeline.freeze_observation_artifacts
+
+    def durable_freeze(*args: Any, **kwargs: Any) -> Any:
+        result = original_freeze(*args, **kwargs)
+        artifacts = list(args[2])
+        if artifacts[-1].kind == "decision_frozen":
+            journal = tmp_path / "success" / "artifacts.jsonl"
+            assert json.loads(journal.read_text().splitlines()[-1])["kind"] == (
+                "decision_frozen"
+            )
+            opened[0] = True
+        return result
+
+    monkeypatch.setattr(pipeline, "freeze_observation_artifacts", durable_freeze)
+    replay_fixture(FIXTURE, tmp_path / "success")
+
+    assert accesses
+    assert accesses[0] in {"execution_book", "precheck_book", "economics", "expected"}
+
+
+@pytest.mark.parametrize("provider", ["openai", "jev"])
+def test_failure_persists_decision_barrier_before_price_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    from jev_trading_lab.polymarket import pipeline
+
+    raw = _fixture()
+    opened = [False]
+    accesses: list[str] = []
+    monkeypatch.setattr(
+        pipeline, "_load_fixture", lambda _path: _AccessTrap(raw, opened, accesses)
+    )
+    original_freeze = pipeline.freeze_observation_artifacts
+
+    def durable_freeze(*args: Any, **kwargs: Any) -> Any:
+        result = original_freeze(*args, **kwargs)
+        artifacts = list(args[2])
+        if artifacts[-1].kind == "decision_frozen":
+            journal = tmp_path / provider / "artifacts.jsonl"
+            kinds = [
+                json.loads(line)["kind"] for line in journal.read_text().splitlines()
+            ]
+            assert kinds[-1] == "decision_frozen"
+            opened[0] = True
+        return result
+
+    monkeypatch.setattr(pipeline, "freeze_observation_artifacts", durable_freeze)
+
+    def timeout(_request: bytes) -> None:
+        raise TimeoutError
+
+    kwargs = {f"{provider}_transport": timeout}
+    replay_fixture(FIXTURE, tmp_path / provider, **kwargs)
+
+    assert accesses
+    kinds = [
+        json.loads(line)["kind"]
+        for line in (tmp_path / provider / "artifacts.jsonl").read_text().splitlines()
+    ]
+    assert kinds[-1] == "decision_frozen"
+    assert "openai_failure" in kinds or "jev_failure" in kinds
+
+
+def test_crash_after_durable_barrier_recovers_on_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from jev_trading_lab.polymarket import pipeline
+
+    output = tmp_path / "crash"
+    original_get = pipeline._ExecutionBookGate.get
+    crashed = False
+
+    def crash_once(gate: Any) -> Any:
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise RuntimeError("crash after barrier")
+        return original_get(gate)
+
+    monkeypatch.setattr(pipeline._ExecutionBookGate, "get", crash_once)
+    with pytest.raises(RuntimeError, match="crash after barrier"):
+        replay_fixture(FIXTURE, output)
+
+    assert not (output / "results.jsonl").read_text()
+    assert (
+        json.loads((output / "artifacts.jsonl").read_text().splitlines()[-1])["kind"]
+        == "decision_frozen"
+    )
+    summary = replay_fixture(FIXTURE, output)
+    assert summary["artifact_count"] == 11
+    assert len((output / "results.jsonl").read_text().splitlines()) == 1
+
+
+def test_complete_fixture_validation_failure_leaves_only_durable_prefix(
+    tmp_path: Path,
+) -> None:
+    raw = _fixture()
+    raw["economics"]["starting_cash_microdollars"] += 1
+    fixture_path = tmp_path / "invalid.json"
+    fixture_path.write_text(json.dumps(raw))
+    output = tmp_path / "invalid"
+
+    with pytest.raises(ValueError, match="starting capital"):
+        replay_fixture(fixture_path, output)
+
+    assert not (output / "results.jsonl").read_text()
+    kinds = [
+        json.loads(line)["kind"]
+        for line in (output / "artifacts.jsonl").read_text().splitlines()
+    ]
+    assert kinds[-1] == "decision_frozen"
+
+    fixture_path.write_bytes(FIXTURE.read_bytes())
+    summary = replay_fixture(fixture_path, output)
+    assert summary["artifact_count"] == 11
+    assert len((output / "results.jsonl").read_text().splitlines()) == 1
+
+
 def test_openai_failure_records_both_terminal_arms(tmp_path: Path) -> None:
     calls = 0
 
@@ -163,7 +318,7 @@ def test_openai_failure_records_both_terminal_arms(tmp_path: Path) -> None:
     assert summary["ai"]["economic_pnl_microdollars"] == 0
     assert summary["control"]["disposition"] == "NO_EDGE"
     assert summary["control"]["quantity"] == 0
-    assert summary["artifact_count"] == 4
+    assert summary["artifact_count"] == 5
 
 
 def test_corrupt_existing_artifact_fails_closed(tmp_path: Path) -> None:

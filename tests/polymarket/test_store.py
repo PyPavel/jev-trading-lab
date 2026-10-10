@@ -218,7 +218,26 @@ def _artifacts(
             "decision_frozen",
             canonical_json_bytes(
                 {
+                    "opportunity_id": result.opportunity_id,
+                    "observation_id": result.observation_id,
+                    "terminal_model_state": "JEV_SUCCESS",
+                    "openai_request_sha256": hashlib.sha256(
+                        cycle["model_artifacts"]["openai_request_bytes"].encode()
+                    ).hexdigest(),
+                    "openai_response_sha256": hashlib.sha256(
+                        cycle["model_artifacts"]["openai_response_bytes"].encode()
+                    ).hexdigest(),
+                    "jev_request_sha256": hashlib.sha256(
+                        cycle["model_artifacts"]["jev_request_bytes"].encode()
+                    ).hexdigest(),
+                    "jev_response_sha256": hashlib.sha256(
+                        cycle["model_artifacts"]["jev_response_bytes"].encode()
+                    ).hexdigest(),
                     "jev_decision_sha256": result.jev_decision_sha256,
+                    "openai_cost_microdollars": cycle["model_costs_microdollars"][
+                        "openai"
+                    ],
+                    "jev_cost_microdollars": cycle["model_costs_microdollars"]["jev"],
                     "frozen_at": cycle["chronology"]["decision_frozen_at"],
                 }
             ),
@@ -403,17 +422,55 @@ def _failure_artifacts(
         )
         for kind in path
     ]
+    failure_payload = _failure_metadata(
+        provider=provider,
+        cost=failure_cost,
+        request_bytes=request,
+        response_body=response_body,
+    )
+    failure_at = datetime(2026, 10, 3, 12, 0, 30, tzinfo=UTC)
+    values.append((failure_kind, failure_payload, failure_kind, failure_at))
+    openai_failure = openai_failed
     values.append(
         (
-            failure_kind,
-            _failure_metadata(
-                provider=provider,
-                cost=failure_cost,
-                request_bytes=request,
-                response_body=response_body,
+            "decision_frozen",
+            canonical_json_bytes(
+                {
+                    "opportunity_id": result.opportunity_id,
+                    "observation_id": result.observation_id,
+                    "terminal_model_state": (
+                        "OPENAI_FAILURE" if openai_failure else "JEV_FAILURE"
+                    ),
+                    "openai_request_sha256": hashlib.sha256(
+                        by_kind["openai_request"].payload
+                    ).hexdigest(),
+                    "openai_response_sha256": (
+                        json.loads(failure_payload)["response_sha256"]
+                        if openai_failure
+                        else hashlib.sha256(
+                            by_kind["openai_response_success"].payload
+                        ).hexdigest()
+                    ),
+                    "jev_request_sha256": (
+                        None
+                        if openai_failure
+                        else hashlib.sha256(by_kind["jev_request"].payload).hexdigest()
+                    ),
+                    "jev_response_sha256": (
+                        None
+                        if openai_failure
+                        else json.loads(failure_payload)["response_sha256"]
+                    ),
+                    "jev_decision_sha256": None,
+                    "openai_cost_microdollars": openai_cost,
+                    "jev_cost_microdollars": 0 if openai_failure else jev_cost,
+                    "frozen_at": cycle["chronology"]["decision_frozen_at"],
+                }
             ),
-            failure_kind,
-            datetime(2026, 10, 3, 12, 0, 30, tzinfo=UTC),
+            "decision_frozen",
+            datetime.fromisoformat(
+                cycle["chronology"]["decision_frozen_at"].replace("Z", "+00:00")
+            ),
         )
     )
     artifacts: list[ArtifactToFreeze] = []
@@ -434,6 +491,69 @@ def _failure_artifacts(
 def _retarget(
     artifacts: list[ArtifactToFreeze], result: ObservationResult
 ) -> list[ArtifactToFreeze]:
+    by_kind = {item.kind: item for item in artifacts}
+    if "decision_frozen" in by_kind:
+        barrier = json.loads(by_kind["decision_frozen"].payload)
+        openai_failure = by_kind.get("openai_failure")
+        jev_failure = by_kind.get("jev_failure")
+        openai_metadata = by_kind.get("openai_success_metadata")
+        jev_metadata = by_kind.get("jev_success_metadata")
+        if openai_failure is not None:
+            openai_terminal = json.loads(openai_failure.payload)
+            openai_response_sha256 = openai_terminal["response_sha256"]
+            openai_cost = openai_terminal["billed_cost_microdollars"]
+        else:
+            assert openai_metadata is not None
+            openai_terminal = json.loads(openai_metadata.payload)
+            openai_response_sha256 = hashlib.sha256(
+                by_kind["openai_response_success"].payload
+            ).hexdigest()
+            openai_cost = openai_terminal["billed_cost_microdollars"]
+        if jev_failure is not None:
+            jev_terminal = json.loads(jev_failure.payload)
+            jev_response_sha256 = jev_terminal["response_sha256"]
+            jev_cost = jev_terminal["billed_cost_microdollars"]
+        elif jev_metadata is not None:
+            jev_terminal = json.loads(jev_metadata.payload)
+            jev_response_sha256 = hashlib.sha256(
+                by_kind["jev_response_success"].payload
+            ).hexdigest()
+            jev_cost = jev_terminal["billed_cost_microdollars"]
+        else:
+            jev_response_sha256 = None
+            jev_cost = 0
+        barrier.update(
+            opportunity_id=result.opportunity_id,
+            observation_id=result.observation_id,
+            openai_request_sha256=hashlib.sha256(
+                by_kind["openai_request"].payload
+            ).hexdigest(),
+            openai_response_sha256=openai_response_sha256,
+            jev_request_sha256=(
+                hashlib.sha256(by_kind["jev_request"].payload).hexdigest()
+                if "jev_request" in by_kind
+                else None
+            ),
+            jev_response_sha256=jev_response_sha256,
+            jev_decision_sha256=(
+                hashlib.sha256(by_kind["jev_decision"].payload).hexdigest()
+                if "jev_decision" in by_kind
+                else None
+            ),
+            openai_cost_microdollars=openai_cost,
+            jev_cost_microdollars=jev_cost,
+        )
+        index = next(
+            i for i, item in enumerate(artifacts) if item.kind == "decision_frozen"
+        )
+        item = artifacts[index]
+        artifacts[index] = ArtifactToFreeze(
+            kind=item.kind,
+            payload=canonical_json_bytes(barrier),
+            source_uri_label=item.source_uri_label,
+            retrieved_at=item.retrieved_at,
+            predecessor_stage_sha256=item.predecessor_stage_sha256,
+        )
     retargeted: list[ArtifactToFreeze] = []
     predecessor: str | None = None
     for item in artifacts:
@@ -522,7 +642,7 @@ def test_failure_paths_record_and_replay_sanitized_metadata(
     result, artifacts, raw_failure = _failure_artifacts(
         cycle, openai_failed=openai_failed
     )
-    failure = artifacts[-1]
+    failure = artifacts[-2]
     failure_value = json.loads(failure.payload)
     failure_value["code"] = failure_code
     provider = failure_value["provider"]
@@ -534,7 +654,7 @@ def test_failure_paths_record_and_replay_sanitized_metadata(
     elif failure_code == "PARSE_ERROR":
         failure_value["message"] = f"{provider} response is not strict JSON"
         failure_value["status_code"] = 200
-    artifacts[-1] = ArtifactToFreeze(
+    artifacts[-2] = ArtifactToFreeze(
         kind=failure.kind,
         payload=canonical_json_bytes(failure_value),
         source_uri_label=failure.source_uri_label,
@@ -542,6 +662,7 @@ def test_failure_paths_record_and_replay_sanitized_metadata(
         predecessor_stage_sha256=failure.predecessor_stage_sha256,
     )
 
+    artifacts = _retarget(artifacts, result)
     assert record_observation(output, result, artifacts) == result
     replay = load_observation(output, result.observation_id)
 
@@ -572,7 +693,7 @@ def test_empty_failure_response_records_and_replays_canonical_hash(
     result, artifacts, _raw_failure = _failure_artifacts(
         cycle, openai_failed=openai_failed
     )
-    item = artifacts[-1]
+    item = artifacts[-2]
     value = json.loads(item.payload)
     value.update(
         code=failure_code,
@@ -585,7 +706,7 @@ def test_empty_failure_response_records_and_replays_canonical_hash(
         response_byte_length=0,
         status_code=500 if failure_code == "HTTP_ERROR" else 200,
     )
-    artifacts[-1] = ArtifactToFreeze(
+    artifacts[-2] = ArtifactToFreeze(
         kind=item.kind,
         payload=canonical_json_bytes(value),
         source_uri_label=item.source_uri_label,
@@ -649,7 +770,7 @@ def test_each_adapter_failure_variant_roundtrips_canonical_metadata(
     result, artifacts, _raw_failure = _failure_artifacts(
         cycle, openai_failed=openai_failed
     )
-    value = json.loads(artifacts[-1].payload)
+    value = json.loads(artifacts[-2].payload)
     provider = value["provider"]
     value["code"] = failure_code
     if failure_code in {"INPUT_ERROR", "PROVIDER_ERROR", "TIMEOUT"}:
@@ -681,8 +802,8 @@ def test_each_adapter_failure_variant_roundtrips_canonical_metadata(
         )
     else:
         value["message"] = f"{provider} response contained credential-like data"
-    item = artifacts[-1]
-    artifacts[-1] = ArtifactToFreeze(
+    item = artifacts[-2]
+    artifacts[-2] = ArtifactToFreeze(
         kind=item.kind,
         payload=canonical_json_bytes(value),
         source_uri_label=item.source_uri_label,
@@ -695,7 +816,7 @@ def test_each_adapter_failure_variant_roundtrips_canonical_metadata(
     assert record_observation(output, result, artifacts) == result
     replay = load_observation(output, result.observation_id)
 
-    failure = replay.typed_artifacts[artifacts[-1].kind]
+    failure = replay.typed_artifacts[artifacts[-2].kind]
     assert isinstance(failure, FailureArtifact)
     assert failure.code == failure_code
     assert failure.message == value["message"]
@@ -709,7 +830,7 @@ def test_forged_failure_provenance_rejects_before_journal_write(
 ) -> None:
     output = tmp_path / "output"
     result, artifacts, _raw_failure = _failure_artifacts(cycle, openai_failed=True)
-    value = json.loads(artifacts[-1].payload)
+    value = json.loads(artifacts[-2].payload)
     if mutation == "request_hash":
         value["request_sha256"] = "0" * 64
     elif mutation == "message":
@@ -718,8 +839,8 @@ def test_forged_failure_provenance_rejects_before_journal_write(
         value["response_sha256"] = None
     else:
         value["status_code"] = 200
-    item = artifacts[-1]
-    artifacts[-1] = ArtifactToFreeze(
+    item = artifacts[-2]
+    artifacts[-2] = ArtifactToFreeze(
         kind=item.kind,
         payload=canonical_json_bytes(value),
         source_uri_label=item.source_uri_label,
@@ -727,7 +848,7 @@ def test_forged_failure_provenance_rejects_before_journal_write(
         predecessor_stage_sha256=item.predecessor_stage_sha256,
     )
 
-    with pytest.raises(ValueError, match="failure|request|response|status"):
+    with pytest.raises(ValueError, match="failure|request|response|status|predecessor"):
         record_observation(output, result, artifacts)
 
     assert not (output / "artifacts.jsonl").exists()
@@ -872,7 +993,6 @@ def test_failure_path_rejects_stage_and_cost_mismatch(
     )
     if mutation == "missing":
         artifacts.pop(-2)
-        artifacts = _retarget(artifacts, result)
     elif mutation == "extra":
         artifacts.append(_artifacts(cycle)[-1])
         artifacts = _retarget(artifacts, result)
@@ -1183,6 +1303,51 @@ def test_replay_rejects_bad_envelope_hash(
 
     with pytest.raises(StoreCorruptError, match="artifact"):
         load_observation(output, result.observation_id)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_symlink_output_ancestor_is_rejected_without_target_mutation(
+    tmp_path: Path, cycle: dict[str, Any], nested: bool
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    sentinel = target / "sentinel"
+    sentinel.write_text("unchanged")
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    output = link / "nested" if nested else link / "output"
+
+    with pytest.raises(StoreSecurityError, match="ancestor|safe|output"):
+        record_observation(output, _result(cycle), _artifacts(cycle))
+
+    assert sentinel.read_text() == "unchanged"
+    assert sorted(path.name for path in target.iterdir()) == ["sentinel"]
+
+
+def test_nonsticky_writable_output_ancestor_is_rejected(
+    tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    ancestor = tmp_path / "writable"
+    ancestor.mkdir(mode=0o777)
+    ancestor.chmod(0o777)
+
+    with pytest.raises(StoreSecurityError, match="ancestor|safe"):
+        record_observation(ancestor / "output", _result(cycle), _artifacts(cycle))
+
+    assert not (ancestor / "output").exists()
+
+
+def test_sticky_tmp_ancestor_allows_private_output(
+    tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    output = Path("/tmp") / f"jev-store-{os.getpid()}-{tmp_path.name}"
+    try:
+        record_observation(output, _result(cycle), _artifacts(cycle))
+        assert stat.S_IMODE(output.stat().st_mode) == 0o700
+    finally:
+        import shutil
+
+        shutil.rmtree(output, ignore_errors=True)
 
 
 def test_output_symlink_is_rejected(tmp_path: Path, cycle: dict[str, Any]) -> None:

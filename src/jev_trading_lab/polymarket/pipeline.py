@@ -26,7 +26,9 @@ from jev_trading_lab.polymarket.ai import (
 from jev_trading_lab.polymarket.models import (
     ArmResult,
     FeasibilityFixture,
+    FixtureIdentity,
     ObservationResult,
+    PriceFreeFixturePrefix,
     StrictModel,
     int64_delta,
     load_strict_json,
@@ -70,6 +72,10 @@ class _ExecutionBookGate:
             raise RuntimeError(
                 "execution book cannot be accessed before decision freeze"
             )
+        self.raw_fixture["execution_book"]
+        self.raw_fixture["precheck_book"]
+        self.raw_fixture["economics"]
+        self.raw_fixture["expected"]
         validate_feasibility_fixture(self.raw_fixture)
         if self.event_sink is not None:
             self.event_sink("execution_book_accessed")
@@ -113,7 +119,9 @@ def _model_bytes(value: StrictModel) -> bytes:
     return canonical_json_bytes(value.model_dump(mode="json"))
 
 
-def _stage_hash(result: ObservationResult, artifact: ArtifactToFreeze) -> str:
+def _stage_hash(
+    identity: ObservationResult | FixtureIdentity, artifact: ArtifactToFreeze
+) -> str:
     payload_hash = hashlib.sha256(artifact.payload).hexdigest()
     envelope = ArtifactEnvelope(
         kind=artifact.kind,
@@ -122,8 +130,8 @@ def _stage_hash(result: ObservationResult, artifact: ArtifactToFreeze) -> str:
         storage_relpath=f"{payload_hash[:2]}/{payload_hash[2:4]}/{payload_hash}",
         source_uri_label=artifact.source_uri_label,
         retrieved_at=artifact.retrieved_at,
-        opportunity_id=result.opportunity_id,
-        observation_id=result.observation_id,
+        opportunity_id=identity.opportunity_id,
+        observation_id=identity.observation_id,
         predecessor_stage_sha256=artifact.predecessor_stage_sha256,
     )
     return hashlib.sha256(
@@ -132,7 +140,7 @@ def _stage_hash(result: ObservationResult, artifact: ArtifactToFreeze) -> str:
 
 
 def _chain(
-    result: ObservationResult,
+    identity: ObservationResult | FixtureIdentity,
     values: list[tuple[str, bytes, str, datetime]],
 ) -> list[ArtifactToFreeze]:
     artifacts: list[ArtifactToFreeze] = []
@@ -146,7 +154,7 @@ def _chain(
             predecessor_stage_sha256=predecessor,
         )
         artifacts.append(artifact)
-        predecessor = _stage_hash(result, artifact)
+        predecessor = _stage_hash(identity, artifact)
     return artifacts
 
 
@@ -202,6 +210,41 @@ def _success_metadata(
         billed_cost_microdollars=cost,
     )
     return _model_bytes(value)
+
+
+def _decision_barrier(
+    identity: FixtureIdentity,
+    prefix: list[tuple[str, bytes, str, datetime]],
+    *,
+    state: str,
+    frozen_at: datetime,
+    openai_request: bytes,
+    openai_response_sha256: str | None,
+    jev_request: bytes | None,
+    jev_response_sha256: str | None,
+    jev_decision_sha256: str | None,
+    openai_cost: int,
+    jev_cost: int,
+) -> tuple[list[tuple[str, bytes, str, datetime]], DecisionFrozenArtifact]:
+    barrier = DecisionFrozenArtifact(
+        opportunity_id=identity.opportunity_id,
+        observation_id=identity.observation_id,
+        terminal_model_state=state,  # type: ignore[arg-type]
+        openai_request_sha256=hashlib.sha256(openai_request).hexdigest(),
+        openai_response_sha256=openai_response_sha256,
+        jev_request_sha256=(
+            hashlib.sha256(jev_request).hexdigest() if jev_request else None
+        ),
+        jev_response_sha256=jev_response_sha256,
+        jev_decision_sha256=jev_decision_sha256,
+        openai_cost_microdollars=openai_cost,
+        jev_cost_microdollars=jev_cost,
+        frozen_at=frozen_at,
+    )
+    values = prefix + [
+        ("decision_frozen", _model_bytes(barrier), "decision_frozen", frozen_at)
+    ]
+    return values, barrier
 
 
 def _failure_result(
@@ -287,32 +330,63 @@ def replay_fixture(
 ) -> Summary:
     """Replay one canned observation without credentials, network, or fallback."""
 
-    output = Path(output_dir)
-    try:
-        output.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as error:
-        raise ValueError("output parent cannot be created") from error
     raw = _load_fixture(Path(fixture_path))
     gate = _ExecutionBookGate(raw, event_sink=event_sink)
-    fixture_preview = FeasibilityFixture.model_construct(**raw)
-    raw_evidence = fixture_preview.sanitized_evidence
-    if not isinstance(raw_evidence, dict):
-        raise ValueError("fixture evidence must be a JSON object")
-    from jev_trading_lab.polymarket.models import EvidencePacket
-
-    evidence_model = EvidencePacket.model_validate_json(
-        canonical_json_bytes(raw_evidence)
-    )
+    required_keys = set(FeasibilityFixture.model_fields)
+    if set(raw) != required_keys:
+        raise ValueError(f"fixture must contain exactly {sorted(required_keys)}")
     raw_values = raw["raw"]
-    model_values = raw["model_artifacts"]
-    chronology = raw["chronology"]
-    costs = raw["model_costs_microdollars"]
-    expected = raw["expected"]["observation_result"]
-    provisional = ObservationResult.model_validate_json(canonical_json_bytes(expected))
+    prefix_model = PriceFreeFixturePrefix.model_validate_json(
+        canonical_json_bytes(
+            {
+                "schema_version": raw["schema_version"],
+                "identity": raw["identity"],
+                "gamma_bytes": raw_values["gamma_bytes"],
+                "sanitized_evidence": raw["sanitized_evidence"],
+                "chronology": raw["chronology"],
+                "model_artifacts": raw["model_artifacts"],
+                "model_costs_microdollars": raw["model_costs_microdollars"],
+            }
+        )
+    )
+    identity = prefix_model.identity
+    expected_opportunity_id = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "policy_version": identity.policy_version,
+                "market_id": identity.market_id,
+                "cutoff_at": identity.cutoff_at.isoformat().replace("+00:00", "Z"),
+            }
+        )
+    ).hexdigest()
+    expected_observation_id = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "opportunity_id": identity.opportunity_id,
+                "evidence_sha256": identity.evidence_sha256,
+                "execution_book_sha256": identity.execution_book_sha256,
+                "policy_version": identity.policy_version,
+            }
+        )
+    ).hexdigest()
+    if (
+        identity.opportunity_id != expected_opportunity_id
+        or identity.observation_id != expected_observation_id
+    ):
+        raise ValueError("price-free fixture identity hashes are invalid")
+    evidence_model = prefix_model.sanitized_evidence
+    model_values = prefix_model.model_artifacts
+    chronology = prefix_model.chronology
+    costs = prefix_model.model_costs_microdollars
 
-    gamma = str(raw_values["gamma_bytes"]).encode()
-    if hashlib.sha256(gamma).hexdigest() != evidence_model.source_sha256:
-        raise ValueError("Gamma bytes do not bind sanitized evidence")
+    gamma = prefix_model.gamma_bytes.encode()
+    if (
+        hashlib.sha256(gamma).hexdigest() != evidence_model.source_sha256
+        or identity.evidence_sha256 != evidence_model.source_sha256
+        or identity.market_id != evidence_model.market_id
+        or identity.cutoff_at != evidence_model.cutoff_at
+    ):
+        raise ValueError("Gamma bytes do not bind price-free fixture identity")
 
     prefix = [
         ("raw_gamma", gamma, "gamma_public", evidence_model.retrieved_at),
@@ -323,16 +397,16 @@ def replay_fixture(
             evidence_model.retrieved_at,
         ),
     ]
-    freeze_observation_artifacts(output_dir, provisional, _chain(provisional, prefix))
+    freeze_observation_artifacts(output_dir, identity, _chain(identity, prefix))
 
-    openai_request = str(model_values["openai_request_bytes"]).encode()
-    openai_response = str(model_values["openai_response_bytes"]).encode()
-    openai_at = _dt(str(chronology["openai_response_at"]))
+    openai_request = model_values.openai_request_bytes.encode()
+    openai_response = model_values.openai_response_bytes.encode()
+    openai_at = _dt(str(raw["chronology"]["openai_response_at"]))
     openai_base_transport = openai_transport or _fixture_transport(
         openai_request,
         openai_response,
         openai_at,
-        int(costs["openai"]),
+        costs.openai,
     )
 
     def publish_openai_request(request_bytes: bytes) -> None:
@@ -341,12 +415,10 @@ def replay_fixture(
                 "openai_request",
                 request_bytes,
                 "openai_request",
-                _dt(str(chronology["openai_request_at"])),
+                chronology.openai_request_at,
             )
         )
-        freeze_observation_artifacts(
-            output_dir, provisional, _chain(provisional, prefix)
-        )
+        freeze_observation_artifacts(output_dir, identity, _chain(identity, prefix))
 
     openai = call_openai(
         evidence_model,
@@ -354,21 +426,33 @@ def replay_fixture(
         _publishing_transport(openai_base_transport, publish_openai_request),
     )
     if isinstance(openai, AdapterFailure):
+        failure_at = openai.retrieved_at or chronology.openai_response_at
+        failure_prefix = prefix + [
+            (
+                "openai_failure",
+                _model_bytes(failure_artifact_from_adapter(openai)),
+                "openai_failure",
+                failure_at,
+            )
+        ]
+        values, _barrier = _decision_barrier(
+            identity,
+            failure_prefix,
+            state="OPENAI_FAILURE",
+            frozen_at=max(chronology.decision_frozen_at, failure_at),
+            openai_request=openai.request_bytes,
+            openai_response_sha256=None,
+            jev_request=None,
+            jev_response_sha256=None,
+            jev_decision_sha256=None,
+            openai_cost=openai.billed_cost_microdollars,
+            jev_cost=0,
+        )
+        artifacts = _chain(identity, values)
+        freeze_observation_artifacts(output_dir, identity, artifacts)
         gate.freeze()
         fixture = gate.get()
         result = _failure_result(fixture, openai, 0)
-        artifacts = _chain(
-            result,
-            prefix
-            + [
-                (
-                    "openai_failure",
-                    _model_bytes(failure_artifact_from_adapter(openai)),
-                    "openai_failure",
-                    openai.retrieved_at or _dt(str(chronology["openai_response_at"])),
-                )
-            ],
-        )
         record_observation(output_dir, result, artifacts)
         replay = load_observation(output_dir, result.observation_id)
         return _summary(replay.result, replay.envelopes)
@@ -402,16 +486,16 @@ def replay_fixture(
             ),
         ]
     )
-    freeze_observation_artifacts(output_dir, provisional, _chain(provisional, prefix))
+    freeze_observation_artifacts(output_dir, identity, _chain(identity, prefix))
 
-    jev_request = str(model_values["jev_request_bytes"]).encode()
-    jev_response = str(model_values["jev_response_bytes"]).encode()
-    jev_at = _dt(str(chronology["jev_response_at"]))
+    jev_request = model_values.jev_request_bytes.encode()
+    jev_response = model_values.jev_response_bytes.encode()
+    jev_at = _dt(str(raw["chronology"]["jev_response_at"]))
     jev_base_transport = jev_transport or _fixture_transport(
         jev_request,
         jev_response,
         jev_at,
-        int(costs["jev"]),
+        costs.jev,
     )
 
     def publish_jev_request(request_bytes: bytes) -> None:
@@ -420,12 +504,10 @@ def replay_fixture(
                 "jev_request",
                 request_bytes,
                 "jev_request",
-                _dt(str(chronology["jev_request_at"])),
+                chronology.jev_request_at,
             )
         )
-        freeze_observation_artifacts(
-            output_dir, provisional, _chain(provisional, prefix)
-        )
+        freeze_observation_artifacts(output_dir, identity, _chain(identity, prefix))
 
     jev = call_jev(
         openai.brief,
@@ -434,30 +516,42 @@ def replay_fixture(
         _publishing_transport(jev_base_transport, publish_jev_request),
     )
     if isinstance(jev, AdapterFailure):
+        failure_at = jev.retrieved_at or jev_at
+        failure_prefix = prefix + [
+            (
+                "jev_failure",
+                _model_bytes(failure_artifact_from_adapter(jev)),
+                "jev_failure",
+                failure_at,
+            )
+        ]
+        values, _barrier = _decision_barrier(
+            identity,
+            failure_prefix,
+            state="JEV_FAILURE",
+            frozen_at=max(chronology.decision_frozen_at, failure_at),
+            openai_request=openai.request_bytes,
+            openai_response_sha256=hashlib.sha256(openai.response_bytes).hexdigest(),
+            jev_request=jev.request_bytes,
+            jev_response_sha256=jev.response_sha256,
+            jev_decision_sha256=None,
+            openai_cost=openai.billed_cost_microdollars,
+            jev_cost=jev.billed_cost_microdollars,
+        )
+        artifacts = _chain(identity, values)
+        freeze_observation_artifacts(output_dir, identity, artifacts)
         gate.freeze()
         fixture = gate.get()
         result = _failure_result(fixture, jev, openai.billed_cost_microdollars)
-        artifacts = _chain(
-            result,
-            prefix
-            + [
-                (
-                    "jev_failure",
-                    _model_bytes(failure_artifact_from_adapter(jev)),
-                    "jev_failure",
-                    jev.retrieved_at or jev_at,
-                )
-            ],
-        )
         record_observation(output_dir, result, artifacts)
         replay = load_observation(output_dir, result.observation_id)
         return _summary(replay.result, replay.envelopes)
     assert isinstance(jev, JevSuccess)
 
-    frozen_at = _dt(str(chronology["decision_frozen_at"]))
+    frozen_at = chronology.decision_frozen_at
     decision_bytes = _model_bytes(jev.decision)
     decision_hash = hashlib.sha256(decision_bytes).hexdigest()
-    values = prefix + [
+    success_prefix = prefix + [
         (
             "jev_response_success",
             jev.response_bytes,
@@ -477,20 +571,22 @@ def replay_fixture(
             jev.retrieved_at,
         ),
         ("jev_decision", decision_bytes, "jev_validated", jev.retrieved_at),
-        (
-            "decision_frozen",
-            _model_bytes(
-                DecisionFrozenArtifact(
-                    jev_decision_sha256=decision_hash,
-                    frozen_at=frozen_at,
-                )
-            ),
-            "decision_frozen",
-            frozen_at,
-        ),
     ]
-    artifacts = _chain(provisional, values)
-    freeze_observation_artifacts(output_dir, provisional, artifacts)
+    values, _barrier = _decision_barrier(
+        identity,
+        success_prefix,
+        state="JEV_SUCCESS",
+        frozen_at=frozen_at,
+        openai_request=openai.request_bytes,
+        openai_response_sha256=hashlib.sha256(openai.response_bytes).hexdigest(),
+        jev_request=jev.request_bytes,
+        jev_response_sha256=hashlib.sha256(jev.response_bytes).hexdigest(),
+        jev_decision_sha256=decision_hash,
+        openai_cost=openai.billed_cost_microdollars,
+        jev_cost=jev.billed_cost_microdollars,
+    )
+    artifacts = _chain(identity, values)
+    freeze_observation_artifacts(output_dir, identity, artifacts)
     gate.freeze()
 
     fixture = gate.get()

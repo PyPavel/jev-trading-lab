@@ -646,7 +646,7 @@ def _ensure_child_directory(
     return descriptor, created
 
 
-def _open_or_create_root(root: Path, resolver: FilesystemResolver) -> int:
+def _open_or_create_root(root: Path, resolver: FilesystemResolver | None = None) -> int:
     if not root.is_absolute() or root == Path(root.anchor):
         raise BlobSecurityError("blob root path is invalid")
     names = list(root.parts[1:])
@@ -667,7 +667,8 @@ def _open_or_create_root(root: Path, resolver: FilesystemResolver) -> int:
             descriptors.append(descriptor)
             created.append(was_created)
         root_fd = descriptors[-1]
-        _require_local_filesystem(Path(f"/proc/self/fd/{root_fd}"), resolver)
+        if resolver is not None:
+            _require_local_filesystem(Path(f"/proc/self/fd/{root_fd}"), resolver)
         descriptors.pop()
     except BaseException:
         for index in range(len(created) - 1, -1, -1):
