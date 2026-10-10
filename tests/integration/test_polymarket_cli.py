@@ -129,16 +129,23 @@ def test_actual_console_subprocess_needs_no_credentials() -> None:
         shutil.rmtree(output, ignore_errors=True)
 
 
-def test_help_exposes_no_live_or_execution_capability() -> None:
+def test_help_exposes_public_observe_but_no_execution_capability() -> None:
     runner = CliRunner()
     root_help = runner.invoke(app, ["--help"])
     polymarket_help = runner.invoke(app, ["polymarket", "--help"])
     replay_help = runner.invoke(app, ["polymarket", "replay", "--help"])
-    text = (root_help.stdout + polymarket_help.stdout + replay_help.stdout).casefold()
+    observe_help = runner.invoke(app, ["polymarket", "observe", "--help"])
+    text = "".join(
+        result.stdout
+        for result in (root_help, polymarket_help, replay_help, observe_help)
+    ).casefold()
 
-    assert (
-        root_help.exit_code == polymarket_help.exit_code == replay_help.exit_code == 0
+    assert all(
+        result.exit_code == 0
+        for result in (root_help, polymarket_help, replay_help, observe_help)
     )
+    assert "observe" in polymarket_help.stdout.casefold()
+    assert "--limit" in observe_help.stdout.casefold()
     for forbidden in (
         "wallet",
         "sign",
@@ -146,8 +153,6 @@ def test_help_exposes_no_live_or_execution_capability() -> None:
         "deposit",
         "withdraw",
         "execute",
-        "live",
-        "order",
     ):
         assert forbidden not in text
 

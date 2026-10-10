@@ -261,6 +261,7 @@ class FailureArtifact(UtcModel):
     provider: Literal["openai", "jev"]
     code: Literal[
         "INPUT_ERROR",
+        "CONFIG_FAILURE",
         "PROVIDER_ERROR",
         "TIMEOUT",
         "HTTP_ERROR",
@@ -312,7 +313,12 @@ class FailureArtifact(UtcModel):
             self.status_code is None or not has_response or self.retrieved_at is None
         ):
             raise ValueError("credential-reflection metadata is inconsistent")
-        elif self.code in {"INPUT_ERROR", "PROVIDER_ERROR", "TIMEOUT"}:
+        elif self.code in {
+            "INPUT_ERROR",
+            "CONFIG_FAILURE",
+            "PROVIDER_ERROR",
+            "TIMEOUT",
+        }:
             if (
                 self.status_code is not None
                 or has_response

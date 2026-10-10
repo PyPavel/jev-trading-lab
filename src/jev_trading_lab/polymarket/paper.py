@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Literal, cast
 
 from jev_trading_lab.core.ids import canonical_json_bytes
@@ -16,6 +16,7 @@ from jev_trading_lab.polymarket.models import (
     ArmResult,
     BookLevel,
     BookSnapshot,
+    CausalHistoryPoint,
     Economics,
     FeasibilityFixture,
     JevDecision,
@@ -592,34 +593,51 @@ def evaluate_ai_arm(
     )
 
 
-def evaluate_control_arm(
-    fixture: FeasibilityFixture, *, resolution: Literal[0, 1] | None
+def evaluate_control_inputs(
+    history: list[CausalHistoryPoint],
+    *,
+    cutoff_at: datetime,
+    book: BookSnapshot,
+    policy: Economics,
+    resolution: Literal[0, 1] | None,
 ) -> ArmResult:
-    probability = control_probability(
-        fixture.causal_history, cutoff_at=fixture.sanitized_evidence.cutoff_at
-    )
+    """Evaluate the deterministic arm from causal inputs without a fixture envelope."""
+
+    probability = control_probability(history, cutoff_at=cutoff_at)
     if probability is None:
         return _arm(
             arm="DETERMINISTIC",
             probability_micros=None,
             action="ABSTAIN",
             disposition="ABSTAIN",
-            book=fixture.execution_book,
-            policy=fixture.economics,
+            book=book,
+            policy=policy,
             resolution=resolution,
             model_cost_microdollars=0,
         )
-    side = _preferred_side(fixture.execution_book, probability)
+    side = _preferred_side(book, probability)
     action: Literal["BUY_YES", "BUY_NO"] = "BUY_YES" if side == "YES" else "BUY_NO"
     return _arm(
         arm="DETERMINISTIC",
         probability_micros=probability,
         action=action,
         disposition="FILLED",
+        book=book,
+        policy=policy,
+        resolution=resolution,
+        model_cost_microdollars=0,
+    )
+
+
+def evaluate_control_arm(
+    fixture: FeasibilityFixture, *, resolution: Literal[0, 1] | None
+) -> ArmResult:
+    return evaluate_control_inputs(
+        fixture.causal_history,
+        cutoff_at=fixture.sanitized_evidence.cutoff_at,
         book=fixture.execution_book,
         policy=fixture.economics,
         resolution=resolution,
-        model_cost_microdollars=0,
     )
 
 

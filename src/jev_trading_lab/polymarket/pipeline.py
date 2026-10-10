@@ -7,11 +7,12 @@ import os
 import stat
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from jev_trading_lab.core.ids import canonical_json_bytes
+from jev_trading_lab.persistence.blobs import BlobStore
 from jev_trading_lab.polymarket.ai import (
     JEV_MODEL_ID,
     OPENAI_MODEL_ID,
@@ -23,9 +24,20 @@ from jev_trading_lab.polymarket.ai import (
     TransportResponse,
     call_jev,
     call_openai,
+    live_jev_transport,
+    live_openai_transport,
+)
+from jev_trading_lab.polymarket.client import (
+    CLOB_ENDPOINT,
+    GAMMA_ENDPOINT,
+    MarketCandidate,
+    PolymarketClient,
+    SecureHttpTransport,
 )
 from jev_trading_lab.polymarket.models import (
     ArmResult,
+    CausalHistoryPoint,
+    Economics,
     FeasibilityFixture,
     FixtureIdentity,
     JevDecision,
@@ -37,10 +49,13 @@ from jev_trading_lab.polymarket.models import (
     validate_feasibility_fixture,
 )
 from jev_trading_lab.polymarket.paper import (
+    POLICY_VERSION,
     STARTING_CASH_MICRODOLLARS,
     evaluate_ai_arm,
     evaluate_control_arm,
+    evaluate_control_inputs,
     evaluate_fixture,
+    midpoint_micros,
 )
 from jev_trading_lab.polymarket.store import (
     ArtifactEnvelope,
@@ -437,6 +452,546 @@ def _summary(
             result.paired_trading_pnl_delta_microdollars
         ),
     }
+
+
+def _identity(candidate: MarketCandidate, execution_hash: str) -> FixtureIdentity:
+    cutoff = candidate.evidence.cutoff_at.isoformat().replace("+00:00", "Z")
+    opportunity_id = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "policy_version": POLICY_VERSION,
+                "market_id": candidate.market_id,
+                "cutoff_at": cutoff,
+            }
+        )
+    ).hexdigest()
+    observation_id = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "opportunity_id": opportunity_id,
+                "evidence_sha256": candidate.evidence.source_sha256,
+                "execution_book_sha256": execution_hash,
+                "policy_version": POLICY_VERSION,
+            }
+        )
+    ).hexdigest()
+    return FixtureIdentity(
+        policy_version=POLICY_VERSION,
+        market_id=candidate.market_id,
+        cutoff_at=candidate.evidence.cutoff_at,
+        opportunity_id=opportunity_id,
+        observation_id=observation_id,
+        evidence_sha256=candidate.evidence.source_sha256,
+        execution_book_sha256=execution_hash,
+    )
+
+
+def _live_policy() -> Economics:
+    return Economics(
+        entry_fee_pp_micros=10_000,
+        exit_fee_pp_micros=0,
+        exit_slippage_pp_micros=10_000,
+        sigma_p_micros=100_000,
+        starting_cash_microdollars=STARTING_CASH_MICRODOLLARS,
+    )
+
+
+def _live_result(
+    identity: FixtureIdentity,
+    candidate: MarketCandidate,
+    execution_book: Any,
+    *,
+    decision: JevDecision | None,
+    research_brief_sha256: str,
+    decision_sha256: str,
+    model_cost: int,
+) -> ObservationResult:
+    history = (
+        [
+            CausalHistoryPoint(
+                midpoint_micros=midpoint_micros(candidate.precheck_book),
+                observed_at=candidate.precheck_book.retrieved_at,
+            )
+        ]
+        if candidate.precheck_book.retrieved_at < candidate.evidence.cutoff_at
+        else []
+    )
+    policy = _live_policy()
+    ai = evaluate_ai_arm(
+        execution_book,
+        decision,
+        policy,
+        resolution=None,
+        model_cost_microdollars=model_cost,
+    )
+    control = evaluate_control_inputs(
+        history,
+        cutoff_at=candidate.evidence.cutoff_at,
+        book=execution_book,
+        policy=policy,
+        resolution=None,
+    )
+    return ObservationResult(
+        observation_id=identity.observation_id,
+        opportunity_id=identity.opportunity_id,
+        market_id=identity.market_id,
+        policy_version=identity.policy_version,
+        cutoff_at=identity.cutoff_at,
+        observed_at=max(datetime.now(UTC), execution_book.retrieved_at),
+        evidence_sha256=identity.evidence_sha256,
+        execution_book_sha256=execution_book.source_sha256,
+        research_brief_sha256=research_brief_sha256,
+        jev_decision_sha256=decision_sha256,
+        ai=ai,
+        deterministic=control,
+        baseline_probability_micros=midpoint_micros(execution_book),
+        resolution=None,
+        baseline_brier_micros=None,
+        paired_trading_pnl_delta_microdollars=int64_delta(
+            ai.trading_pnl_microdollars, control.trading_pnl_microdollars
+        ),
+        paired_economic_pnl_delta_microdollars=int64_delta(
+            ai.economic_pnl_microdollars, control.economic_pnl_microdollars
+        ),
+        paired_brier_delta_micros=None,
+    )
+
+
+def _freeze_live_bytes(
+    output_dir: str | os.PathLike[str],
+    identity: FixtureIdentity,
+    *,
+    kind: str,
+    payload: bytes,
+    retrieved_at: datetime,
+) -> None:
+    """Freeze exact live bytes before the next causal stage."""
+
+    allowed = {
+        "raw_gamma",
+        "sanitized_evidence",
+        "precheck_book",
+        "openai_request",
+        "openai_response_success",
+        "openai_failure",
+        "research_brief",
+        "jev_request",
+        "jev_response_success",
+        "jev_failure",
+        "jev_decision",
+        "decision_frozen",
+        "execution_book",
+    }
+    if kind not in allowed:
+        raise ValueError("unsupported live artifact kind")
+    root = Path(output_dir)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with BlobStore(root.absolute() / "blobs") as store:
+        ref = store.publish(payload)
+    line = (
+        canonical_json_bytes(
+            {
+                "byte_size": ref.byte_length,
+                "kind": kind,
+                "observation_id": identity.observation_id,
+                "opportunity_id": identity.opportunity_id,
+                "retrieved_at": retrieved_at.isoformat().replace("+00:00", "Z"),
+                "sha256": ref.sha256,
+                "source_uri_label": "live_causal_stage",
+                "storage_relpath": ref.relative_path,
+            }
+        )
+        + b"\n"
+    )
+    descriptor = os.open(
+        root / "live-artifacts.jsonl",
+        os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        os.write(descriptor, line)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _freeze_live_values(
+    output_dir: str | os.PathLike[str],
+    identity: FixtureIdentity,
+    values: list[tuple[str, bytes, str, datetime]],
+) -> None:
+    for kind, payload, _source, retrieved_at in values:
+        if kind in {"openai_success_metadata", "jev_success_metadata"}:
+            continue
+        _freeze_live_bytes(
+            output_dir,
+            identity,
+            kind=kind,
+            payload=payload,
+            retrieved_at=retrieved_at,
+        )
+
+
+def _runtime_config(output_dir: str | os.PathLike[str]) -> None:
+    """Freeze non-secret endpoint, model, policy, and explicit billing configuration."""
+
+    root = Path(output_dir)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    value = {
+        "endpoints": {
+            "clob": CLOB_ENDPOINT,
+            "gamma": GAMMA_ENDPOINT,
+            "jev": "https://api.typesafe.ai/v1/systemone",
+            "openai": "https://api.openai.com/v1/responses",
+        },
+        "models": {"jev": JEV_MODEL_ID, "openai": OPENAI_MODEL_ID},
+        "policy_version": POLICY_VERSION,
+        "rates_microdollars_per_million_tokens": {
+            name: os.environ.get(name)
+            for name in (
+                "OPENAI_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
+                "OPENAI_CACHED_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
+                "OPENAI_OUTPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
+                "TYPESAFE_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
+                "TYPESAFE_OUTPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
+            )
+        },
+    }
+    payload = canonical_json_bytes(value) + b"\n"
+    path = root / "runtime-config.json"
+    if path.exists():
+        if path.read_bytes() != payload:
+            raise ValueError("runtime configuration differs from frozen artifact")
+        return
+    descriptor = os.open(
+        path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600
+    )
+    try:
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _live_artifacts(
+    identity: FixtureIdentity,
+    candidate: MarketCandidate,
+    openai: OpenAISuccess | AdapterFailure,
+    jev: JevSuccess | AdapterFailure | None,
+    *,
+    frozen_at: datetime,
+) -> tuple[list[tuple[str, bytes, str, datetime]], JevDecision | None, str, str, int]:
+    evidence_bytes = _model_bytes(candidate.evidence)
+    prefix: list[tuple[str, bytes, str, datetime]] = [
+        (
+            "raw_gamma",
+            candidate.raw_gamma_bytes,
+            "gamma_market",
+            candidate.evidence.retrieved_at,
+        ),
+        (
+            "sanitized_evidence",
+            evidence_bytes,
+            "gamma_sanitized",
+            candidate.evidence.retrieved_at,
+        ),
+    ]
+    if isinstance(openai, AdapterFailure):
+        if openai.request_bytes:
+            prefix.append(
+                (
+                    "openai_request",
+                    openai.request_bytes,
+                    "openai_request",
+                    candidate.evidence.retrieved_at,
+                )
+            )
+        prefix.append(
+            (
+                "openai_failure",
+                _model_bytes(failure_artifact_from_adapter(openai)),
+                "openai_failure",
+                frozen_at,
+            )
+        )
+        values, _ = _decision_barrier(
+            identity,
+            prefix,
+            state="OPENAI_FAILURE",
+            failure_code=openai.code,
+            frozen_at=frozen_at,
+            openai_request=openai.request_bytes,
+            openai_response_sha256=openai.response_sha256,
+            jev_request=None,
+            jev_response_sha256=None,
+            jev_decision_sha256=None,
+            openai_cost=openai.billed_cost_microdollars,
+            jev_cost=0,
+        )
+        return values, None, "0" * 64, "0" * 64, openai.billed_cost_microdollars
+    brief_bytes = _model_bytes(openai.brief)
+    brief_hash = hashlib.sha256(brief_bytes).hexdigest()
+    prefix.extend(
+        [
+            (
+                "openai_request",
+                openai.request_bytes,
+                "openai_request",
+                candidate.evidence.retrieved_at,
+            ),
+            (
+                "openai_response_success",
+                openai.response_bytes,
+                "openai_response",
+                openai.retrieved_at,
+            ),
+            (
+                "openai_success_metadata",
+                _success_metadata(
+                    "openai",
+                    openai.request_bytes,
+                    openai.response_bytes,
+                    openai.retrieved_at,
+                    openai.billed_cost_microdollars,
+                ),
+                "openai_success_metadata",
+                openai.retrieved_at,
+            ),
+            ("research_brief", brief_bytes, "openai_validated", openai.retrieved_at),
+        ]
+    )
+    assert jev is not None
+    if isinstance(jev, AdapterFailure):
+        if jev.request_bytes:
+            prefix.append(
+                ("jev_request", jev.request_bytes, "jev_request", openai.retrieved_at)
+            )
+        prefix.append(
+            (
+                "jev_failure",
+                _model_bytes(failure_artifact_from_adapter(jev)),
+                "jev_failure",
+                frozen_at,
+            )
+        )
+        values, _ = _decision_barrier(
+            identity,
+            prefix,
+            state="JEV_FAILURE",
+            failure_code=jev.code,
+            frozen_at=frozen_at,
+            openai_request=openai.request_bytes,
+            openai_response_sha256=hashlib.sha256(openai.response_bytes).hexdigest(),
+            jev_request=jev.request_bytes,
+            jev_response_sha256=jev.response_sha256,
+            jev_decision_sha256=None,
+            openai_cost=openai.billed_cost_microdollars,
+            jev_cost=jev.billed_cost_microdollars,
+        )
+        return (
+            values,
+            None,
+            brief_hash,
+            "0" * 64,
+            openai.billed_cost_microdollars + jev.billed_cost_microdollars,
+        )
+    decision_bytes = _model_bytes(jev.decision)
+    decision_hash = hashlib.sha256(decision_bytes).hexdigest()
+    prefix.extend(
+        [
+            ("jev_request", jev.request_bytes, "jev_request", openai.retrieved_at),
+            (
+                "jev_response_success",
+                jev.response_bytes,
+                "jev_response",
+                jev.retrieved_at,
+            ),
+            (
+                "jev_success_metadata",
+                _success_metadata(
+                    "jev",
+                    jev.request_bytes,
+                    jev.response_bytes,
+                    jev.retrieved_at,
+                    jev.billed_cost_microdollars,
+                ),
+                "jev_success_metadata",
+                jev.retrieved_at,
+            ),
+            ("jev_decision", decision_bytes, "jev_validated", jev.retrieved_at),
+        ]
+    )
+    values, _ = _decision_barrier(
+        identity,
+        prefix,
+        state="JEV_SUCCESS",
+        failure_code=None,
+        frozen_at=frozen_at,
+        openai_request=openai.request_bytes,
+        openai_response_sha256=hashlib.sha256(openai.response_bytes).hexdigest(),
+        jev_request=jev.request_bytes,
+        jev_response_sha256=hashlib.sha256(jev.response_bytes).hexdigest(),
+        jev_decision_sha256=decision_hash,
+        openai_cost=openai.billed_cost_microdollars,
+        jev_cost=jev.billed_cost_microdollars,
+    )
+    return (
+        values,
+        jev.decision,
+        brief_hash,
+        decision_hash,
+        openai.billed_cost_microdollars + jev.billed_cost_microdollars,
+    )
+
+
+def _record_rejections(
+    output_dir: str | os.PathLike[str],
+    rejections: tuple[Any, ...],
+    *,
+    observed_at: datetime,
+) -> list[Summary]:
+    if not rejections:
+        return []
+    root = Path(output_dir)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(
+        root / "rejections.jsonl",
+        os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    summaries: list[Summary] = []
+    try:
+        for rejection in rejections:
+            value = {
+                "market_id": rejection.market_id,
+                "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
+                "policy_version": POLICY_VERSION,
+                "reason": rejection.reason,
+                "terminal_status": "ELIGIBILITY_REJECTION",
+            }
+            os.write(descriptor, canonical_json_bytes(value) + b"\n")
+            summaries.append(dict(value))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return summaries
+
+
+def observe_markets(
+    *,
+    limit: int,
+    output_dir: str | os.PathLike[str],
+    client: PolymarketClient | None = None,
+    openai_transport: Transport | None = None,
+    jev_transport: Transport | None = None,
+    now: datetime | None = None,
+    event_sink: EventSink | None = None,
+) -> list[Summary]:
+    """Run one bounded, paper-only public polling pass."""
+
+    if not 1 <= limit <= 20:
+        raise ValueError("limit must be in 1..20")
+    cutoff = now or datetime.now(UTC)
+    public = client or PolymarketClient(SecureHttpTransport())
+    openai_sender = openai_transport or live_openai_transport()
+    jev_sender = jev_transport or live_jev_transport()
+    _runtime_config(output_dir)
+    polled = public.poll(limit=limit, now=cutoff)
+    summaries = _record_rejections(output_dir, polled.rejections, observed_at=cutoff)
+    for candidate in polled.eligible:
+        provisional = _identity(candidate, candidate.precheck_book.source_sha256)
+        base = [
+            (
+                "raw_gamma",
+                candidate.raw_gamma_bytes,
+                "gamma_market",
+                candidate.evidence.retrieved_at,
+            ),
+            (
+                "sanitized_evidence",
+                _model_bytes(candidate.evidence),
+                "gamma_sanitized",
+                candidate.evidence.retrieved_at,
+            ),
+        ]
+        freeze_observation_artifacts(output_dir, provisional, _chain(provisional, base))
+        _freeze_live_values(output_dir, provisional, base)
+        _freeze_live_bytes(
+            output_dir,
+            provisional,
+            kind="precheck_book",
+            payload=candidate.precheck_book_bytes,
+            retrieved_at=candidate.precheck_book.retrieved_at,
+        )
+        openai = call_openai(candidate.evidence, OPENAI_MODEL_ID, openai_sender)
+        jev: JevSuccess | AdapterFailure | None = None
+        if isinstance(openai, OpenAISuccess):
+            jev = call_jev(openai.brief, candidate.evidence, JEV_MODEL_ID, jev_sender)
+        frozen_at = max(
+            cutoff,
+            openai.retrieved_at if openai.retrieved_at is not None else cutoff,
+            jev.retrieved_at
+            if jev is not None and jev.retrieved_at is not None
+            else cutoff,
+        )
+        provisional_values, _, _, _, _ = _live_artifacts(
+            provisional, candidate, openai, jev, frozen_at=frozen_at
+        )
+        freeze_observation_artifacts(
+            output_dir, provisional, _chain(provisional, provisional_values)
+        )
+        _freeze_live_values(output_dir, provisional, provisional_values[len(base) :])
+        if event_sink is not None:
+            event_sink("decision_frozen")
+            event_sink("execution_book_requested")
+        try:
+            raw_execution, execution_book = public.execution_book(
+                candidate, now=max(cutoff, frozen_at + timedelta(seconds=1))
+            )
+        except Exception:
+            values, decision, brief_hash, decision_hash, model_cost = _live_artifacts(
+                provisional, candidate, openai, jev, frozen_at=frozen_at
+            )
+            summaries.append(
+                _finish_book_unavailable(
+                    output_dir,
+                    provisional,
+                    values,
+                    planned_at=candidate.precheck_book.retrieved_at,
+                    terminal_at=max(datetime.now(UTC), frozen_at),
+                    evidence_at=candidate.evidence.retrieved_at,
+                    research_brief_sha256=brief_hash,
+                    decision=decision,
+                    decision_sha256=decision_hash,
+                    model_cost=model_cost,
+                )
+            )
+            continue
+        final = _identity(candidate, execution_book.source_sha256)
+        _freeze_live_bytes(
+            output_dir,
+            final,
+            kind="execution_book",
+            payload=raw_execution,
+            retrieved_at=execution_book.retrieved_at,
+        )
+        values, decision, brief_hash, decision_hash, model_cost = _live_artifacts(
+            final, candidate, openai, jev, frozen_at=frozen_at
+        )
+        artifacts = _chain(final, values)
+        result = _live_result(
+            final,
+            candidate,
+            execution_book,
+            decision=decision,
+            research_brief_sha256=brief_hash,
+            decision_sha256=decision_hash,
+            model_cost=model_cost,
+        )
+        record_observation(output_dir, result, artifacts)
+        replay = load_observation(output_dir, result.observation_id)
+        summaries.append(_summary(replay.result, replay.envelopes))
+    return summaries
 
 
 def replay_fixture(

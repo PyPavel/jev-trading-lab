@@ -174,7 +174,7 @@ _APPROVED_SOURCE_HASHES = {
         "583ff05fc923ac30ef5cd0e9c44271e53746a65e312f53f112ec1b49e827647b"
     ),
     "src/jev_trading_lab/cli.py": (
-        "d00730b9fcad3dc28ac7a1b3412456b89261378896e4a763f69f5bcad6cfe4bd"
+        "5cace8245387ec229b0bfa56fd062c366c57c838b42b681aa6228afaac9dda88"
     ),
     "src/jev_trading_lab/core/ids.py": (
         "0e73742a406e112f269e7b8d5fd205c448eb4fbf49541cab3c669bf7b4dc0dd4"
@@ -231,7 +231,10 @@ _APPROVED_SOURCE_HASHES = {
         "2c8708e587ec6804d9c15736661a265c5b441cc3ce83b0b152e15f5a2fcf6739"
     ),
     "src/jev_trading_lab/polymarket/ai.py": (
-        "ca474a0d323e6f19513981133ec04b18a42620664a8829031153e282a17a2ad5"
+        "16224278547daaa6033d7e138623cf6a474c9efd2f0ea9cc1d94a70ba23138a9"
+    ),
+    "src/jev_trading_lab/polymarket/client.py": (
+        "7be3cd69aa6a922d18e96d283b68154071dae8ce77a16370eb129381bc2abd62"
     ),
     "src/jev_trading_lab/polymarket/control.py": (
         "cadd87042c9293c2fd97d0017f532b06500d2afd23b07a9bd16c5e7bceef2b8d"
@@ -240,13 +243,13 @@ _APPROVED_SOURCE_HASHES = {
         "2fc7d68eebc303e734e41f208019559402d85c573746672d4bb4909fdac8905c"
     ),
     "src/jev_trading_lab/polymarket/paper.py": (
-        "a8d3754b325a1da673fb0ce30a81bf92931550d68002b5c3b5fef7b64d2b4b00"
+        "3745314cb1a04476edfb8e00f4693daeeab1ddea06004fac01daf291b0ea4dc5"
     ),
     "src/jev_trading_lab/polymarket/pipeline.py": (
-        "80ff0691ce1c63ec238218f44da5521f1debf6cdce7fa87f77b37c13ee0565b3"
+        "f38647c6d4ea69093e2e10c6ba24e8f9bc879a670ae5cc681276b4af540d7840"
     ),
     "src/jev_trading_lab/polymarket/store.py": (
-        "d7fe360eac784cb42c74c688cccb84e2af88aab8f7b5e61d5ca112417508184b"
+        "3f6a1d07d81a5601aa5228050db0fd0a963fedff25c0aaad5bb31ddbbab5dcb4"
     ),
     "src/jev_trading_lab/stocks/__init__.py": (
         "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"
@@ -1628,6 +1631,7 @@ def test_built_artifacts_exclude_repository_and_host_junk(tmp_path: Path) -> Non
         "jev_trading_lab/persistence/schema/003_append_only_guards.sql",
         "jev_trading_lab/polymarket/__init__.py",
         "jev_trading_lab/polymarket/ai.py",
+        "jev_trading_lab/polymarket/client.py",
         "jev_trading_lab/polymarket/control.py",
         "jev_trading_lab/polymarket/models.py",
         "jev_trading_lab/polymarket/paper.py",

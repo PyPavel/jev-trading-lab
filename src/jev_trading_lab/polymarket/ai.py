@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
+import ipaddress
 import json
+import os
 import re
+import socket
+import ssl
 import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Final, Literal, Protocol
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
@@ -113,6 +119,7 @@ _FORBIDDEN_NAMES = frozenset(
 )
 type FailureCode = Literal[
     "INPUT_ERROR",
+    "CONFIG_FAILURE",
     "PROVIDER_ERROR",
     "TIMEOUT",
     "HTTP_ERROR",
@@ -139,6 +146,242 @@ class Transport(Protocol):
     """Single-attempt byte transport implemented by fixtures now and HTTP later."""
 
     def __call__(self, request_bytes: bytes) -> TransportResponse: ...
+
+
+@dataclass(frozen=True, slots=True)
+class LiveHttpRequest:
+    """One closed-world provider request; headers are never persisted."""
+
+    method: str
+    url: str
+    headers: Mapping[str, str] = field(repr=False)
+    body: bytes = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class LiveHttpResponse:
+    status_code: int
+    headers: Mapping[str, str] = field(repr=False)
+    body: bytes = field(repr=False)
+    retrieved_at: datetime
+    oversized: bool = False
+
+
+LiveNetwork = Callable[[LiveHttpRequest], LiveHttpResponse]
+_OPENAI_ENDPOINT: Final = "https://api.openai.com/v1/responses"
+_JEV_ENDPOINT: Final = "https://api.typesafe.ai/v1/systemone"
+_MAX_MODEL_RESPONSE_BYTES = 2 * 1024 * 1024
+_RATE_MAX = 1_000_000_000_000
+
+
+def _public_addresses(host: str) -> list[str]:
+    answers = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    addresses = sorted({str(answer[4][0]) for answer in answers if len(answer) >= 5})
+    safe: list[str] = []
+    for value in addresses:
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError as error:
+            raise ValueError("provider DNS answer is invalid") from error
+        if any(
+            (
+                address.is_private,
+                address.is_loopback,
+                address.is_link_local,
+                address.is_multicast,
+                address.is_unspecified,
+                address.is_reserved,
+            )
+        ):
+            raise ValueError("provider DNS answer is unsafe")
+        safe.append(value)
+    if not safe:
+        raise ValueError("provider DNS returned no public addresses")
+    return safe
+
+
+class _ProviderHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host: str, address: str, timeout: float) -> None:
+        self._tls_context = ssl.create_default_context()
+        super().__init__(host, port=443, timeout=timeout, context=self._tls_context)
+        self._address = address
+
+    def connect(self) -> None:
+        raw = socket.create_connection((self._address, 443), self.timeout)
+        try:
+            if raw.getpeername()[0] != self._address:
+                raise ValueError("provider peer differs from validated address")
+            self.sock = self._tls_context.wrap_socket(raw, server_hostname=self.host)
+        except Exception:
+            raw.close()
+            raise
+
+
+def _provider_network(request: LiveHttpRequest) -> LiveHttpResponse:
+    parsed = urlsplit(request.url)
+    allowed = {
+        ("api.openai.com", "/v1/responses"),
+        ("api.typesafe.ai", "/v1/systemone"),
+    }
+    if (
+        request.method != "POST"
+        or parsed.scheme != "https"
+        or parsed.port not in {None, 443}
+        or parsed.query
+        or parsed.fragment
+        or (parsed.hostname, parsed.path) not in allowed
+    ):
+        raise ValueError("provider route is outside the exact allowlist")
+    host = parsed.hostname
+    assert host is not None
+    connection = _ProviderHTTPSConnection(host, _public_addresses(host)[0], 30.0)
+    try:
+        connection.request(
+            "POST", parsed.path, body=request.body, headers=dict(request.headers)
+        )
+        response = connection.getresponse()
+        body = response.read(_MAX_MODEL_RESPONSE_BYTES + 1)
+        oversized = len(body) > _MAX_MODEL_RESPONSE_BYTES
+        return LiveHttpResponse(
+            status_code=response.status,
+            headers={key.lower(): value for key, value in response.getheaders()},
+            body=body[:_MAX_MODEL_RESPONSE_BYTES],
+            retrieved_at=datetime.now(UTC),
+            oversized=oversized,
+        )
+    except TimeoutError:
+        raise
+    except (OSError, ssl.SSLError, http.client.HTTPException) as error:
+        raise ValueError("provider HTTPS request failed") from error
+    finally:
+        connection.close()
+
+
+def _env_secret(name: str) -> str:
+    value = os.environ.get(name, "")
+    if not value or len(value.encode()) > _MAX_SENSITIVE_VALUE_BYTES:
+        raise ValueError("provider configuration is incomplete")
+    return value
+
+
+def _env_rate(name: str) -> int:
+    value = os.environ.get(name, "")
+    if not value.isascii() or not value.isdecimal():
+        raise ValueError("provider configuration is incomplete")
+    rate = int(value)
+    if not 0 < rate <= _RATE_MAX:
+        raise ValueError("provider configuration is incomplete")
+    return rate
+
+
+def _ceil_cost(terms: list[tuple[int, int]]) -> int:
+    numerator = sum(tokens * rate for tokens, rate in terms)
+    return (numerator + 999_999) // 1_000_000
+
+
+def _usage_cost(
+    body: bytes, provider: Literal["openai", "jev"], rates: tuple[int, ...]
+) -> int:
+    try:
+        decoded = load_strict_json(body)
+        if not isinstance(decoded, Mapping) or not isinstance(
+            decoded.get("usage"), Mapping
+        ):
+            return 0
+        usage = decoded["usage"]
+        input_tokens = usage.get("input_tokens")
+        output_tokens = usage.get("output_tokens")
+        if type(input_tokens) is not int or type(output_tokens) is not int:
+            return 0
+        if input_tokens < 0 or output_tokens < 0:
+            return 0
+        if provider == "jev":
+            return _ceil_cost([(input_tokens, rates[0]), (output_tokens, rates[1])])
+        details = usage.get("input_tokens_details")
+        if (
+            not isinstance(details, Mapping)
+            or type(details.get("cached_tokens")) is not int
+        ):
+            return 0
+        cached = details["cached_tokens"]
+        if cached < 0 or cached > input_tokens:
+            return 0
+        return _ceil_cost(
+            [
+                (input_tokens - cached, rates[0]),
+                (cached, rates[1]),
+                (output_tokens, rates[2]),
+            ]
+        )
+    except (TypeError, ValueError):
+        return 0
+
+
+def _live_transport(
+    *, provider: Literal["openai", "jev"], network: LiveNetwork
+) -> Transport:
+    endpoint = _OPENAI_ENDPOINT if provider == "openai" else _JEV_ENDPOINT
+
+    def send(request_bytes: bytes) -> TransportResponse:
+        if type(request_bytes) is not bytes or len(request_bytes) > 1024 * 1024:
+            raise ValueError("provider request is outside byte bounds")
+        rates: tuple[int, ...]
+        if provider == "openai":
+            secret = _env_secret("OPENAI_API_KEY")
+            rates = (
+                _env_rate("OPENAI_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS"),
+                _env_rate("OPENAI_CACHED_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS"),
+                _env_rate("OPENAI_OUTPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS"),
+            )
+        else:
+            secret = _env_secret("TYPESAFE_API_KEY")
+            rates = (
+                _env_rate("TYPESAFE_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS"),
+                _env_rate("TYPESAFE_OUTPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS"),
+            )
+        response = network(
+            LiveHttpRequest(
+                method="POST",
+                url=endpoint,
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {secret}",
+                    "Content-Type": "application/json",
+                },
+                body=request_bytes,
+            )
+        )
+        if response.oversized or len(response.body) > _MAX_MODEL_RESPONSE_BYTES:
+            raise ValueError("provider response exceeds byte limit")
+        if 300 <= response.status_code < 400:
+            raise ValueError("provider redirect is forbidden")
+        content_type = (
+            response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        )
+        if content_type != "application/json":
+            raise ValueError("provider response content type is invalid")
+        return TransportResponse(
+            status_code=response.status_code,
+            headers=response.headers,
+            raw_bytes=response.body,
+            retrieved_at=response.retrieved_at,
+            billed_cost_microdollars=_usage_cost(response.body, provider, rates),
+            sensitive_values=(secret.encode(),),
+        )
+
+    return send
+
+
+def live_openai_transport(*, network: LiveNetwork = _provider_network) -> Transport:
+    """Create the one-attempt Responses API transport; environment is read on send."""
+
+    return _live_transport(provider="openai", network=network)
+
+
+def live_jev_transport(*, network: LiveNetwork = _provider_network) -> Transport:
+    """Create one TypeSafe transport; environment is read only on send."""
+
+    return _live_transport(provider="jev", network=network)
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,6 +453,7 @@ def is_canonical_failure_message(
 
     fixed: dict[FailureCode, set[str]] = {
         "INPUT_ERROR": {f"{provider} request input is invalid"},
+        "CONFIG_FAILURE": {f"{provider} live configuration is incomplete"},
         "PROVIDER_ERROR": {f"{provider} transport returned invalid data"},
         "TIMEOUT": {f"{provider} transport timed out"},
         "HTTP_ERROR": {
@@ -494,6 +738,20 @@ def _send_once(
             provider=provider,
             code="TIMEOUT",
             message=f"{provider} transport timed out",
+            request_bytes=request_bytes,
+        )
+    except ValueError as error:
+        if str(error) == "provider configuration is incomplete":
+            return _failure(
+                provider=provider,
+                code="CONFIG_FAILURE",
+                message=f"{provider} live configuration is incomplete",
+                request_bytes=request_bytes,
+            )
+        return _failure(
+            provider=provider,
+            code="PROVIDER_ERROR",
+            message=f"{provider} transport returned invalid data",
             request_bytes=request_bytes,
         )
     except Exception:
