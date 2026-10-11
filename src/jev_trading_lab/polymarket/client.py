@@ -579,11 +579,7 @@ def normalize_gamma_identity(value: Mapping[str, object]) -> dict[str, object]:
     }
 
 
-_PUBLIC_DIRECT_CREDENTIAL_PATTERN = re.compile(
-    r"(?i)(?:sk-[a-z0-9_-]{8,}|"
-    r"bearer[ \t]+(?!token(?:[-_.]?(?:v)?\d+)*\b)\S{4,}|"
-    r"basic[ \t]+\S{4,})"
-)
+_PUBLIC_SK_CREDENTIAL_PATTERN = re.compile(r"(?i)sk-[a-z0-9_-]{8,}")
 _PUBLIC_PROSE_WORD_PATTERN = re.compile(r"\w+")
 _PUBLIC_CREDENTIAL_NAME_STARTS = frozenset(
     {
@@ -609,6 +605,7 @@ _PUBLIC_CREDENTIAL_NAME_STARTS = frozenset(
 )
 _PUBLIC_CREDENTIAL_CONNECTOR_WORDS = ("equals", "was", "is")
 _PUBLIC_CREDENTIAL_QUALIFIERS = ("credential", "value")
+_PUBLIC_AUTH_SCHEMES = ("bearer", "basic")
 _PUBLIC_HARMLESS_PREDICATES = frozenset(
     {
         "available",
@@ -622,9 +619,8 @@ _PUBLIC_HARMLESS_PREDICATES = frozenset(
         "used",
     }
 )
-_PUBLIC_TRAILING_PUNCTUATION = frozenset(".,;:!?")
-_PUBLIC_CANDIDATE_BOUNDARIES = frozenset(".,;:!?\"'\\()[]{}<>")
 _PUBLIC_MAX_CREDENTIAL_WORDS = 4
+_PUBLIC_MAX_CREDENTIAL_NAME_CHARS = 256
 _PUBLIC_MIN_CANDIDATE_CHARS = 4
 
 
@@ -659,16 +655,40 @@ def _public_assignment_value_start(text: str, name_end: int) -> int | None:
     return _skip_public_horizontal_space(text, cursor)
 
 
+def _is_public_credential_name(name: str) -> bool:
+    if len(name) > _PUBLIC_MAX_CREDENTIAL_NAME_CHARS:
+        return False
+    compact = "".join(
+        character
+        for character in unicodedata.normalize("NFKC", name).casefold()
+        if character.isalnum()
+    )
+    return is_credential_name(name) or compact in {
+        "authorization",
+        "proxyauthorization",
+        "setcookie",
+        "xapikey",
+    }
+
+
 def _public_credential_name_end(
     text: str, words: list[re.Match[str]], start: int
 ) -> int | None:
     first = words[start].group(0)
     if (
-        not is_credential_name(first)
+        not _is_public_credential_name(first)
         and first.casefold() not in _PUBLIC_CREDENTIAL_NAME_STARTS
+        and (
+            start + 1 >= len(words)
+            or any(
+                character.isspace()
+                for character in text[words[start].end() : words[start + 1].start()]
+            )
+        )
     ):
         return None
     stop = min(len(words), start + _PUBLIC_MAX_CREDENTIAL_WORDS)
+    matched: int | None = None
     for end in range(start + 1, stop + 1):
         if end > start + 1:
             separator = text[words[end - 2].end() : words[end - 1].start()]
@@ -677,88 +697,178 @@ def _public_credential_name_end(
             ):
                 break
         name = text[words[start].start() : words[end - 1].end()]
-        if (
-            is_credential_name(name)
-            and _public_assignment_value_start(text, words[end - 1].end()) is not None
-        ):
-            return words[end - 1].end()
+        if _is_public_credential_name(name):
+            matched = words[end - 1].end()
+    if (
+        matched is not None
+        and _public_assignment_value_start(text, matched) is not None
+    ):
+        return matched
     return None
 
 
-def _public_credential_assignment_spans(text: str) -> list[tuple[int, int]]:
+def _is_public_candidate_character(character: str) -> bool:
+    return character.isalnum() or character in "-._~+/=:"
+
+
+def _public_credential_atom_end(
+    text: str,
+    start: int,
+    *,
+    allow_scheme: bool,
+    require_matching_quote: bool,
+) -> tuple[int, str, bool] | None:
+    cursor = start
+    quote = text[cursor] if cursor < len(text) and text[cursor] in "\"'" else ""
+    if quote:
+        cursor += 1
+    scheme = False
+    if allow_scheme:
+        scheme_end = _public_word_at(text, cursor, _PUBLIC_AUTH_SCHEMES)
+        if (
+            scheme_end is not None
+            and scheme_end < len(text)
+            and text[scheme_end] in " \t"
+        ):
+            cursor = _skip_public_horizontal_space(text, scheme_end)
+            scheme = True
+            if not quote and cursor < len(text) and text[cursor] in "\"'":
+                quote = text[cursor]
+                cursor += 1
+    candidate_start = cursor
+    while cursor < len(text) and _is_public_candidate_character(text[cursor]):
+        cursor += 1
+    candidate_end = cursor
+    if not quote:
+        if candidate_end > candidate_start and text[candidate_end - 1] == ".":
+            candidate_end -= 1
+        cursor = candidate_end
+    elif cursor >= len(text) or text[cursor] != quote:
+        if require_matching_quote:
+            return None
+    else:
+        cursor += 1
+    candidate = text[candidate_start:candidate_end]
+    if len(candidate) < _PUBLIC_MIN_CANDIDATE_CHARS or not any(
+        character.isalnum() for character in candidate
+    ):
+        return None
+    return cursor, candidate, scheme
+
+
+def _public_assignment_span(
+    text: str,
+    words: list[re.Match[str]],
+    start: int,
+    *,
+    require_matching_quote: bool,
+) -> tuple[int, int] | None:
+    name_end = _public_credential_name_end(text, words, start)
+    value_start = (
+        _public_assignment_value_start(text, name_end) if name_end is not None else None
+    )
+    if value_start is None or value_start >= len(text):
+        return None
+    atom = _public_credential_atom_end(
+        text,
+        value_start,
+        allow_scheme=True,
+        require_matching_quote=require_matching_quote,
+    )
+    if atom is None:
+        return None
+    value_end, candidate, scheme = atom
+    if not scheme and candidate.casefold() in _PUBLIC_HARMLESS_PREDICATES:
+        return None
+    return words[start].start(), value_end
+
+
+def _public_direct_scheme_span(
+    text: str, word: re.Match[str]
+) -> tuple[int, int] | None:
+    if word.group(0).casefold() not in _PUBLIC_AUTH_SCHEMES:
+        return None
+    scheme_end = word.end()
+    if scheme_end >= len(text) or text[scheme_end] not in " \t":
+        return None
+    value_start = _skip_public_horizontal_space(text, scheme_end)
+    atom = _public_credential_atom_end(
+        text,
+        value_start,
+        allow_scheme=False,
+        require_matching_quote=False,
+    )
+    if atom is None:
+        return None
+    value_end, candidate, _scheme = atom
+    if is_credential_name(candidate):
+        return None
+    return word.start(), value_end
+
+
+def _public_credential_spans(
+    text: str, *, require_matching_quote: bool = True
+) -> list[tuple[int, int]]:
     words = list(_PUBLIC_PROSE_WORD_PATTERN.finditer(text))
     spans: list[tuple[int, int]] = []
     index = 0
     while index < len(words):
-        name_end = _public_credential_name_end(text, words, index)
-        value_start = (
-            _public_assignment_value_start(text, name_end)
-            if name_end is not None
-            else None
+        span = _public_assignment_span(
+            text,
+            words,
+            index,
+            require_matching_quote=require_matching_quote,
         )
-        if (
-            value_start is None
-            or value_start >= len(text)
-            or text[value_start].isspace()
-        ):
+        if span is None:
+            span = _public_direct_scheme_span(text, words[index])
+        if span is None:
             index += 1
             continue
-        value_end = value_start
-        while (
-            value_end < len(text)
-            and not text[value_end].isspace()
-            and text[value_end] not in _PUBLIC_CANDIDATE_BOUNDARIES
-        ):
-            value_end += 1
-        candidate_end = value_end
-        while (
-            candidate_end > value_start
-            and text[candidate_end - 1] in _PUBLIC_TRAILING_PUNCTUATION
-        ):
-            candidate_end -= 1
-        candidate = text[value_start:candidate_end]
-        if (
-            len(candidate) < _PUBLIC_MIN_CANDIDATE_CHARS
-            or candidate.casefold() in _PUBLIC_HARMLESS_PREDICATES
-        ):
-            index += 1
-            continue
-        spans.append((words[index].start(), candidate_end))
-        while index < len(words) and words[index].start() < value_end:
+        spans.append(span)
+        while index < len(words) and words[index].start() < span[1]:
             index += 1
     return spans
 
 
-def _redact_public_assignments(text: str) -> str:
-    spans = _public_credential_assignment_spans(text)
-    if not spans:
-        return text
-    parts: list[str] = []
-    cursor = 0
-    for start, end in spans:
-        parts.extend((text[cursor:start], "[REDACTED]"))
-        cursor = end
-    parts.append(text[cursor:])
-    return "".join(parts)
+def contains_public_credential_semantics(value: object) -> bool:
+    """Detect bounded credential assignments or auth atoms in nested provider input."""
 
-
-def _redact_public_direct_credential(match: re.Match[str]) -> str:
-    value = match.group(0)
-    punctuation_start = len(value)
-    while (
-        punctuation_start > 0
-        and value[punctuation_start - 1] in _PUBLIC_TRAILING_PUNCTUATION
-    ):
-        punctuation_start -= 1
-    return "[REDACTED]" + value[punctuation_start:]
+    if isinstance(value, Mapping):
+        return any(
+            contains_public_credential_semantics(key)
+            or contains_public_credential_semantics(nested)
+            for key, nested in value.items()
+        )
+    if isinstance(value, list | tuple):
+        return any(contains_public_credential_semantics(item) for item in value)
+    if not isinstance(value, str):
+        return False
+    normalized = unicodedata.normalize("NFKC", value)
+    return bool(
+        _PUBLIC_SK_CREDENTIAL_PATTERN.search(normalized)
+        or _public_credential_spans(normalized, require_matching_quote=False)
+    )
 
 
 def _sanitize_public_prose(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", text)
-    sanitized = _redact_public_assignments(normalized)
-    return _PUBLIC_DIRECT_CREDENTIAL_PATTERN.sub(
-        _redact_public_direct_credential, sanitized
+    spans = _public_credential_spans(normalized)
+    spans.extend(
+        match.span() for match in _PUBLIC_SK_CREDENTIAL_PATTERN.finditer(normalized)
     )
+    if not spans:
+        return normalized
+    spans.sort()
+    parts: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        if start < cursor:
+            cursor = max(cursor, end)
+            continue
+        parts.extend((normalized[cursor:start], "[REDACTED]"))
+        cursor = end
+    parts.append(normalized[cursor:])
+    return "".join(parts)
 
 
 def sanitized_gamma_identity(value: Mapping[str, object]) -> dict[str, object]:
@@ -1267,6 +1377,13 @@ class PolymarketClient:
             _, condition_id, yes_token, no_token = gamma_clob_identity(item)
             source_sha = hashlib.sha256(raw_market).hexdigest()
             safe_identity = sanitized_gamma_identity(item)
+            if contains_public_credential_semantics(safe_identity):
+                rejected.append(
+                    MarketRejection(
+                        market_id, "MALFORMED_MARKET", raw_market, source_sha
+                    )
+                )
+                continue
             safe_tags = safe_identity["tags"]
             if not isinstance(safe_tags, list):
                 raise ValueError("sanitized Gamma tags are invalid")

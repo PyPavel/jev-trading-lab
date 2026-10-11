@@ -21,6 +21,7 @@ from pydantic import ValidationError
 
 from jev_trading_lab.core.ids import canonical_json_bytes
 from jev_trading_lab.polymarket.client import (
+    contains_public_credential_semantics,
     is_safe_global_ip,
     read_bounded_body,
     remaining_seconds,
@@ -808,6 +809,8 @@ def build_openai_request(evidence: EvidencePacket, model: str) -> bytes:
         raise TypeError("OpenAI request requires an EvidencePacket")
     _require_model(model, OPENAI_MODEL_ID, "OpenAI")
     evidence_value = evidence.model_dump(mode="json")
+    if contains_public_credential_semantics(evidence_value):
+        raise ValueError("OpenAI evidence contains residual credential semantics")
     _reject_forbidden_names(evidence_value, label="OpenAI evidence")
     _reject_delimiters(evidence_value)
     evidence_input = (

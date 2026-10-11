@@ -39,6 +39,7 @@ from jev_trading_lab.polymarket.store import (
     StoreCorruptError,
     StoreSecurityError,
     SuccessArtifact,
+    _screen_artifact,
     failure_artifact_from_adapter,
     load_observation,
     record_observation,
@@ -61,6 +62,26 @@ def cycle() -> dict[str, Any]:
     value = load_strict_json(FIXTURE_PATH.read_bytes())
     assert isinstance(value, dict)
     return value
+
+
+@pytest.mark.parametrize(
+    "residual",
+    (
+        "The API key is 'AlphabeticSecret' in the report.",
+        "The API key is 'AlphabeticSecret",
+        "Authorization: Bearer AlphabeticSecret",
+        "client_secret=abc:def/ghi",
+        "Basic QWxwaGEvKz0=",
+    ),
+)
+def test_sanitized_artifact_screen_rejects_residual_credential_semantics(
+    cycle: dict[str, Any], residual: str
+) -> None:
+    payload = deepcopy(cycle["sanitized_evidence"])
+    payload["description"] = residual
+
+    with pytest.raises(StoreSecurityError, match="credential"):
+        _screen_artifact("sanitized_evidence", canonical_json_bytes(payload), ())
 
 
 def _result(cycle: dict[str, Any], suffix: str = "") -> ObservationResult:

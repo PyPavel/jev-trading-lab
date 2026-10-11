@@ -3340,6 +3340,10 @@ def test_hardening_gamma_access_token_prose_never_reaches_model_or_artifacts(
             b"UnicodeSecret",
         ),
         ("The BearerTokenV3: VersionSecret in the report.", b"VersionSecret"),
+        ("The API key is 'AlphabeticSecret' in the report.", b"AlphabeticSecret"),
+        ("Authorization: Bearer AlphabeticSecret", b"AlphabeticSecret"),
+        ("client_secret=abc:def/ghi", b"abc:def/ghi"),
+        ("Basic QWxwaGEvKz0=", b"QWxwaGEvKz0="),
     ),
 )
 def test_hardening_gamma_bearer_token_assignment_never_reaches_model_or_artifacts(

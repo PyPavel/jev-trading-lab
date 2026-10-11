@@ -61,6 +61,7 @@ from jev_trading_lab.polymarket.client import (
     _book_snapshot,
     _reason,
     _sanitize_public_prose,
+    contains_public_credential_semantics,
     derive_precheck_rejection,
     derive_precheck_transport_reason,
     gamma_clob_identity,
@@ -1776,7 +1777,11 @@ def _screen_payload(
             decoded = load_strict_json(payload)
         except (TypeError, ValueError):
             return
-        if _contains_credentials(decoded, tuple(sentinels), patterns=patterns):
+        if (
+            _contains_credentials(decoded, tuple(sentinels), patterns=patterns)
+            or patterns
+            and contains_public_credential_semantics(decoded)
+        ):
             raise StoreSecurityError("artifact contains credential-like data")
 
 
@@ -2225,18 +2230,21 @@ def _validate_reconstructed_path(
                     computed_reason = expected_reason
                     if expected_reason is None:
                         try:
-                            tags = normalized["tags"]
+                            sanitized = sanitized_gamma_identity(raw_gamma)
+                            if contains_public_credential_semantics(sanitized):
+                                raise ValueError("residual credential semantics")
+                            tags = sanitized["tags"]
                             if not isinstance(tags, list):
-                                raise ValueError("normalized Gamma tags are invalid")
+                                raise ValueError("sanitized Gamma tags are invalid")
                             EvidencePacket(
-                                market_id=str(normalized["market_id"]),
-                                question=str(normalized["question"]),
-                                description=str(normalized["description"]),
-                                rules=str(normalized["rules"]),
-                                category=str(normalized["category"]),
+                                market_id=str(sanitized["market_id"]),
+                                question=str(sanitized["question"]),
+                                description=str(sanitized["description"]),
+                                rules=str(sanitized["rules"]),
+                                category=str(sanitized["category"]),
                                 tags=[str(tag) for tag in tags],
                                 resolution_source_text=str(
-                                    normalized["resolution_source_text"]
+                                    sanitized["resolution_source_text"]
                                 ),
                                 closes_at=normalize_gamma_utc(raw_gamma.get("endDate")),
                                 retrieved_at=min(raw.retrieved_at, result.cutoff_at),

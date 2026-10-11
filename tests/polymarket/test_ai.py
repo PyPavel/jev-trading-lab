@@ -384,6 +384,32 @@ def test_direct_builders_reject_unapproved_models(
         build_jev_request(brief, evidence, "jev-preview")
 
 
+@pytest.mark.parametrize(
+    "residual",
+    (
+        "The API key is 'AlphabeticSecret' in the report.",
+        "The API key is 'AlphabeticSecret",
+        "Authorization: Bearer AlphabeticSecret",
+        "client_secret=abc:def/ghi",
+        "Basic QWxwaGEvKz0=",
+    ),
+)
+def test_openai_input_fails_closed_on_residual_credential_semantics(
+    evidence: EvidencePacket, residual: str
+) -> None:
+    unsafe = evidence.model_copy(update={"description": residual})
+    transport = FixtureTransport(b"never sent")
+
+    with pytest.raises(ValueError, match="credential"):
+        build_openai_request(unsafe, OPENAI_MODEL_ID)
+    result = call_openai(unsafe, OPENAI_MODEL_ID, transport)
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "INPUT_ERROR"
+    assert result.request_bytes == b""
+    assert transport.calls == []
+
+
 def test_jev_request_rejects_book_snapshot_at_runtime(
     cycle: dict[str, Any], brief: ResearchBrief
 ) -> None:

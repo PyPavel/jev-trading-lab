@@ -745,6 +745,47 @@ _HOSTILE_VALUES = st.one_of(_JSON, st.sampled_from(_HOSTILE_STRINGS))
             "UnicodeSecret",
             "The [REDACTED].",
         ),
+        (
+            "The API key is 'AlphabeticSecret' in the report.",
+            "AlphabeticSecret",
+            "The [REDACTED] in the report.",
+        ),
+        (
+            'The client secret equals "DoubleQuotedSecret"; retain evidence.',
+            "DoubleQuotedSecret",
+            "The [REDACTED]; retain evidence.",
+        ),
+        (
+            "Authorization: Bearer AlphabeticSecret, per report.",
+            "AlphabeticSecret",
+            "[REDACTED], per report.",
+        ),
+        (
+            "Proxy-Authorization = Basic QWxwaGEvKz0=!",
+            "QWxwaGEvKz0=",
+            "[REDACTED]!",
+        ),
+        (
+            "client_secret=abc:def/ghi next",
+            "abc:def/ghi",
+            "[REDACTED] next",
+        ),
+        (
+            "Prefix: Ｖｅｎｄｏｒ－Ｃｌｉｅｎｔ＿Ｓｅｃｒｅｔ.v12\tvalue = "
+            "Token-._~+/=: y",
+            "Token-._~+/=:",
+            "Prefix: [REDACTED] y",
+        ),
+        (
+            "Bearer Direct-._~+/=:; Basic QWxwaGEvKz0=.",
+            "Direct-._~+/=:",
+            "[REDACTED]; [REDACTED].",
+        ),
+        (
+            "api_key=FirstSecret, client_secret='Second/Secret+='; done.",
+            "FirstSecret",
+            "[REDACTED], [REDACTED]; done.",
+        ),
     ),
 )
 def test_gamma_credential_assignment_redacts_semantic_variants(
@@ -809,6 +850,36 @@ def test_gamma_credential_assignment_fuzz_never_retains_candidate(
     assert isinstance(sanitized, str)
     assert secret not in sanitized
     assert sanitized == "Before. [REDACTED]! After."
+
+
+@_PROPERTY
+@given(
+    _CREDENTIAL_PHRASES,
+    _CREDENTIAL_CONNECTORS,
+    st.from_regex(
+        r"[A-Za-z][A-Za-z0-9._~+/=:-]{6,30}[A-Za-z0-9_~+/=:-]", fullmatch=True
+    ),
+    st.sampled_from(("", "Bearer ", "Basic ")),
+    st.sampled_from(("", "'", '"')),
+    st.sampled_from((".", ",", ";", "!", "?")),
+)
+def test_gamma_credential_assignment_fuzz_handles_token_punctuation_and_quotes(
+    phrase: str,
+    connector: str,
+    secret: str,
+    scheme: str,
+    quote: str,
+    boundary: str,
+) -> None:
+    description = (
+        f"Before. {phrase}{connector}{quote}{scheme}{secret}{quote}{boundary} After."
+    )
+
+    sanitized = sanitized_gamma_identity(market(description=description))["description"]
+
+    assert isinstance(sanitized, str)
+    assert secret not in sanitized
+    assert sanitized == f"Before. [REDACTED]{boundary} After."
 
 
 @_PROPERTY
