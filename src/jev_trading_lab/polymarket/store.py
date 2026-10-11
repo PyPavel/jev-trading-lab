@@ -751,6 +751,7 @@ class FailureArtifact(UtcModel):
     code: Literal[
         "INPUT_ERROR",
         "CONFIG_FAILURE",
+        "UNKNOWN_IN_FLIGHT",
         "PROVIDER_ERROR",
         "TIMEOUT",
         "HTTP_ERROR",
@@ -2958,4 +2959,133 @@ def load_observation(
     )
     if replay is None:
         raise StoreCorruptError("observation result is missing")
+    try:
+        from jev_trading_lab.polymarket.call_journal import ProviderCallJournal
+
+        matched = ProviderCallJournal(output_dir).validate(replay.result.opportunity_id)
+        if (
+            "openai_request" in replay.artifacts
+            and "runtime_config" in replay.artifacts
+            and not matched
+        ):
+            raise ValueError("provider call opportunity binding is missing")
+    except ValueError as error:
+        raise StoreCorruptError("provider call journal is corrupt") from error
     return replay
+
+
+def load_completed_slot(
+    output_dir: str | os.PathLike[str],
+    *,
+    cutoff: datetime,
+    policy_version: str,
+    limit: int,
+) -> tuple[ObservationReplay, ...] | None:
+    """Return a fully validated completed polling slot, if one exists."""
+
+    output = Path(output_dir)
+    if not output.exists():
+        return None
+    root_fd = _open_output(output)
+    try:
+        journal_fd = _open_journal(root_fd, "completed_slots.jsonl")
+        try:
+            _lock(journal_fd, fcntl.LOCK_SH)
+            lines = _read_journal(journal_fd, label="completed slot journal")
+        finally:
+            os.close(journal_fd)
+    finally:
+        os.close(root_fd)
+    wanted = cutoff.isoformat().replace("+00:00", "Z")
+    selected: dict[str, object] | None = None
+    for line in lines:
+        try:
+            raw = load_strict_json(line)
+        except ValueError as error:
+            raise StoreCorruptError("completed slot journal is corrupt") from error
+        if (
+            not isinstance(raw, dict)
+            or canonical_json_bytes(raw) != line
+            or set(raw)
+            != {
+                "cutoff_at",
+                "limit",
+                "observation_ids",
+                "policy_version",
+            }
+        ):
+            raise StoreCorruptError("completed slot journal is corrupt")
+        value = dict(raw)
+        ids = value["observation_ids"]
+        if (
+            type(value["cutoff_at"]) is not str
+            or type(value["policy_version"]) is not str
+            or type(value["limit"]) is not int
+            or not 1 <= value["limit"] <= 20
+            or not isinstance(ids, list)
+            or len(ids) != len(set(ids))
+            or any(
+                type(item) is not str or re.fullmatch(r"[0-9a-f]{64}", item) is None
+                for item in ids
+            )
+        ):
+            raise StoreCorruptError("completed slot journal is corrupt")
+        if (
+            value["cutoff_at"] == wanted
+            and value["policy_version"] == policy_version
+            and value["limit"] == limit
+        ):
+            if selected is not None and selected != value:
+                raise StoreCorruptError("completed slot has conflicting records")
+            selected = value
+    if selected is None:
+        return None
+    ids = selected["observation_ids"]
+    assert isinstance(ids, list)
+    replays = tuple(load_observation(output, value) for value in ids)
+    if any(
+        replay.result.cutoff_at != cutoff
+        or replay.result.policy_version != policy_version
+        for replay in replays
+    ):
+        raise StoreCorruptError("completed slot observation binding is invalid")
+    return replays
+
+
+def record_completed_slot(
+    output_dir: str | os.PathLike[str],
+    *,
+    cutoff: datetime,
+    policy_version: str,
+    limit: int,
+    observation_ids: list[str],
+) -> None:
+    """Durably mark a polling slot complete after all terminal observations exist."""
+
+    if any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in observation_ids):
+        raise ValueError("completed slot observation ID is invalid")
+    for value in observation_ids:
+        load_observation(output_dir, value)
+    line = canonical_json_bytes(
+        {
+            "cutoff_at": cutoff.isoformat().replace("+00:00", "Z"),
+            "limit": limit,
+            "observation_ids": observation_ids,
+            "policy_version": policy_version,
+        }
+    )
+    output = Path(output_dir)
+    root_fd = _open_output(output)
+    try:
+        journal_fd = _open_journal(root_fd, "completed_slots.jsonl")
+        try:
+            _lock(journal_fd, fcntl.LOCK_EX)
+            lines = _read_journal(journal_fd, label="completed slot journal")
+            if line not in lines:
+                _append_lines(journal_fd, [line], label="completed slot journal")
+            else:
+                os.fsync(journal_fd)
+        finally:
+            os.close(journal_fd)
+    finally:
+        os.close(root_fd)

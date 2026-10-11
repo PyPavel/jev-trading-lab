@@ -24,10 +24,17 @@ from jev_trading_lab.polymarket.ai import (
     OpenAISuccess,
     Transport,
     TransportResponse,
+    build_jev_request,
+    build_openai_request,
     call_jev,
     call_openai,
     live_jev_transport,
     live_openai_transport,
+)
+from jev_trading_lab.polymarket.call_journal import (
+    ProviderCallJournal,
+    adapter_from_outcome,
+    adapter_outcome,
 )
 from jev_trading_lab.polymarket.client import (
     CLOB_ENDPOINT,
@@ -78,10 +85,12 @@ from jev_trading_lab.polymarket.store import (
     cost_overflow_artifact_from_adapter,
     failure_artifact_from_adapter,
     freeze_observation_artifacts,
+    load_completed_slot,
     load_existing_terminal,
     load_existing_terminal_for_inputs,
     load_observation,
     observation_lock,
+    record_completed_slot,
     record_observation,
 )
 
@@ -545,6 +554,77 @@ def _identity(candidate: MarketCandidate, execution_hash: str) -> FixtureIdentit
         evidence_sha256=candidate.evidence.source_sha256,
         execution_book_sha256=execution_hash,
     )
+
+
+def observation_slot(value: datetime) -> datetime:
+    """Return the deterministic UTC minute containing ``value``."""
+
+    if value.tzinfo is None or value.utcoffset() != timedelta(0):
+        raise ValueError("observation time must be UTC-aware")
+    return value.astimezone(UTC).replace(second=0, microsecond=0)
+
+
+def _unknown_provider_result(provider: str, request: bytes) -> AdapterFailure:
+    return AdapterFailure(
+        provider=provider,  # type: ignore[arg-type]
+        code="UNKNOWN_IN_FLIGHT",
+        message=f"{provider} call outcome is unknown after restart",
+        request_bytes=request,
+        response_sha256=None,
+        response_byte_length=0,
+        retrieved_at=None,
+        billed_cost_microdollars=0,
+        status_code=None,
+    )
+
+
+def _journaled_provider_call(
+    *,
+    journal: ProviderCallJournal,
+    provider: str,
+    opportunity_id: str,
+    request_bytes: bytes,
+    created_at: datetime,
+    invoke: Callable[[], object],
+    event_sink: EventSink | None,
+) -> object:
+    call_id = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "opportunity_id": opportunity_id,
+                "provider": provider,
+                "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
+            }
+        )
+    ).hexdigest()
+    existing = journal.state(call_id)
+    if existing is not None:
+        if existing["kind"] == "provider_call_result":
+            return adapter_from_outcome(provider, existing["outcome"])  # type: ignore[arg-type]
+        unknown = _unknown_provider_result(provider, request_bytes)
+        journal.finish(
+            call_id,
+            outcome=adapter_outcome(unknown),
+            finished_at=created_at,
+        )
+        return unknown
+    journal.begin(
+        provider=provider,  # type: ignore[arg-type]
+        opportunity_id=opportunity_id,
+        request_bytes=request_bytes,
+        created_at=created_at,
+    )
+    if event_sink is not None:
+        event_sink(f"{provider}_intent_frozen")
+    result = invoke()
+    journal.finish(
+        call_id,
+        outcome=adapter_outcome(result),
+        finished_at=getattr(result, "retrieved_at", None) or datetime.now(UTC),
+    )
+    if event_sink is not None:
+        event_sink(f"{provider}_result_frozen")
+    return result
 
 
 def _live_policy() -> Economics:
@@ -1136,6 +1216,20 @@ def _record_rejections(
     return summaries
 
 
+def _replay_summary(replay: Any) -> Summary:
+    summary = _summary(replay.result, replay.envelopes)
+    rejection = replay.artifacts.get("eligibility_rejection")
+    if rejection is not None:
+        value = load_strict_json(rejection)
+        if not isinstance(value, dict) or type(value.get("reason")) is not str:
+            raise ValueError("eligibility rejection replay is invalid")
+        summary.update(
+            reason=value["reason"],
+            terminal_status="ELIGIBILITY_REJECTION",
+        )
+    return summary
+
+
 def observe_markets(
     *,
     limit: int,
@@ -1161,16 +1255,30 @@ def observe_markets(
         raise ValueError("limit must be in 1..20")
     config = _runtime_config_bytes()
     with observation_lock(output_dir):
-        return _observe_locked(
+        cutoff = observation_slot(now or datetime.now(UTC))
+        completed = load_completed_slot(
+            output_dir, cutoff=cutoff, policy_version=POLICY_VERSION, limit=limit
+        )
+        if completed is not None:
+            return [_replay_summary(item) for item in completed]
+        summaries = _observe_locked(
             limit=limit,
             output_dir=output_dir,
             config=config,
             client=client,
             openai_transport=openai_transport,
             jev_transport=jev_transport,
-            now=now,
+            now=cutoff,
             event_sink=event_sink,
         )
+        record_completed_slot(
+            output_dir,
+            cutoff=cutoff,
+            policy_version=POLICY_VERSION,
+            limit=limit,
+            observation_ids=[str(item["observation_id"]) for item in summaries],
+        )
+        return summaries
 
 
 def _observe_locked(
@@ -1184,7 +1292,7 @@ def _observe_locked(
     now: datetime | None,
     event_sink: EventSink | None,
 ) -> list[Summary]:
-    cutoff = now or datetime.now(UTC)
+    cutoff = observation_slot(now or datetime.now(UTC))
     public = client or PolymarketClient(SecureHttpTransport())
     openai_sender = openai_transport or live_openai_transport()
     jev_sender = jev_transport or live_jev_transport()
@@ -1204,10 +1312,40 @@ def _observe_locked(
             continue
         base = _precheck_values(candidate, config)
         freeze_observation_artifacts(output_dir, provisional, _chain(provisional, base))
-        openai = call_openai(candidate.evidence, OPENAI_MODEL_ID, openai_sender)
+        call_journal = ProviderCallJournal(output_dir)
+        openai_request = build_openai_request(candidate.evidence, OPENAI_MODEL_ID)
+        openai = _journaled_provider_call(
+            journal=call_journal,
+            provider="openai",
+            opportunity_id=provisional.opportunity_id,
+            request_bytes=openai_request,
+            created_at=cutoff,
+            invoke=lambda: call_openai(
+                candidate.evidence, OPENAI_MODEL_ID, openai_sender
+            ),
+            event_sink=event_sink,
+        )
+        assert isinstance(openai, (OpenAISuccess, AdapterFailure, AdapterCostOverflow))
         jev: JevSuccess | AdapterFailure | AdapterCostOverflow | None = None
         if isinstance(openai, OpenAISuccess):
-            jev = call_jev(openai.brief, candidate.evidence, JEV_MODEL_ID, jev_sender)
+            jev_request = build_jev_request(
+                openai.brief, candidate.evidence, JEV_MODEL_ID
+            )
+            jev_value = _journaled_provider_call(
+                journal=call_journal,
+                provider="jev",
+                opportunity_id=provisional.opportunity_id,
+                request_bytes=jev_request,
+                created_at=openai.retrieved_at,
+                invoke=lambda: call_jev(
+                    openai.brief, candidate.evidence, JEV_MODEL_ID, jev_sender
+                ),
+                event_sink=event_sink,
+            )
+            assert isinstance(
+                jev_value, (JevSuccess, AdapterFailure, AdapterCostOverflow)
+            )
+            jev = jev_value
         frozen_at = max(
             cutoff,
             openai.retrieved_at if openai.retrieved_at is not None else cutoff,

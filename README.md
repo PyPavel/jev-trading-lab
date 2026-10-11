@@ -30,6 +30,34 @@ The CLI currently exposes only its safe research root:
 uv run jev-lab --help
 ```
 
+## Restart-safe Polymarket observations
+
+`polymarket observe` is public-data, paper-only research. It has no order, wallet,
+or signing path. Each UTC-minute slot is serialized under a bounded filesystem lock;
+a completed slot replays before any Gamma, CLOB, or model call. Adjacent slots remain
+distinct. Provider intent is fsynced before invocation and its sanitized result is
+content-addressed immediately afterward. A restart that finds intent without result
+records terminal `UNKNOWN_IN_FLIGHT` and never retries that call.
+
+Run a no-key public smoke (model calls fail closed when credentials are absent):
+
+```console
+env -u OPENAI_API_KEY -u JEV_API_KEY uv run jev-lab polymarket observe \
+  --limit 1 --output-dir /tmp/jev-public-smoke
+```
+
+Run deterministic offline replay twice against the same private output directory to
+verify idempotent recovery without network or credentials:
+
+```console
+uv run jev-lab polymarket replay \
+  --fixture tests/fixtures/polymarket/feasibility_cycle.json \
+  --output-dir /tmp/jev-offline-replay
+uv run jev-lab polymarket replay \
+  --fixture tests/fixtures/polymarket/feasibility_cycle.json \
+  --output-dir /tmp/jev-offline-replay
+```
+
 Clean-wheel migration and report-render smoke checks are deferred until those resources exist; they become mandatory release checks when introduced.
 
 ## Project documents

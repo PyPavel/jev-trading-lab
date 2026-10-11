@@ -9,7 +9,10 @@ import json
 import re
 import socket
 import ssl
+import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal, InvalidOperation
@@ -120,6 +123,61 @@ class HttpResponse:
 
 ByteTransport = Callable[[HttpRequest], HttpResponse]
 Resolver = Callable[..., list[tuple[Any, ...]]]
+_RESOLVERS = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bounded-dns")
+
+
+def remaining_seconds(
+    deadline: float, *, clock: Callable[[], float] = time.monotonic
+) -> float:
+    remaining = deadline - clock()
+    if remaining <= 0:
+        raise TimeoutError("end-to-end deadline exceeded")
+    return remaining
+
+
+def read_bounded_body(
+    response: Any,
+    *,
+    max_bytes: int,
+    deadline: float,
+    clock: Callable[[], float] = time.monotonic,
+    set_timeout: Callable[[float], object] | None = None,
+) -> bytes:
+    """Read through EOF under one monotonic deadline, rejecting slow drip."""
+
+    chunks: list[bytes] = []
+    total = 0
+    while total <= max_bytes:
+        remaining = remaining_seconds(deadline, clock=clock)
+        if set_timeout is not None:
+            set_timeout(remaining)
+        chunk = response.read(min(65536, max_bytes + 1 - total))
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
+def resolve_public_addresses(
+    resolver: Resolver,
+    host: str,
+    *,
+    deadline: float,
+    clock: Callable[[], float] = time.monotonic,
+) -> list[str]:
+    """Resolve on a bounded shared pool within the caller's deadline."""
+
+    future = _RESOLVERS.submit(resolver, host, 443, 0, socket.SOCK_STREAM)
+    try:
+        answers = future.result(timeout=remaining_seconds(deadline, clock=clock))
+    except FutureTimeout as error:
+        future.cancel()
+        raise TimeoutError("end-to-end deadline exceeded during DNS") from error
+    addresses = sorted({str(answer[4][0]) for answer in answers if len(answer) >= 5})
+    if not addresses or any(not is_safe_global_ip(value) for value in addresses):
+        raise PublicDataError("DNS returned an unsafe or mixed answer set")
+    return addresses
 
 
 def is_safe_global_ip(value: str) -> bool:
@@ -138,17 +196,21 @@ def is_safe_global_ip(value: str) -> bool:
 
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, host: str, ip: str, *, timeout: float) -> None:
+    def __init__(self, host: str, ip: str, *, timeout: float, deadline: float) -> None:
         self._tls_context = ssl.create_default_context()
         super().__init__(host, port=443, timeout=timeout, context=self._tls_context)
         self._ip = ip
+        self._deadline = deadline
 
     def connect(self) -> None:
-        raw = socket.create_connection((self._ip, 443), self.timeout)
+        raw = socket.create_connection(
+            (self._ip, 443), remaining_seconds(self._deadline)
+        )
         try:
             peer = raw.getpeername()[0]
             if peer != self._ip or not is_safe_global_ip(peer):
                 raise PublicDataError("HTTPS peer differs from the validated address")
+            raw.settimeout(remaining_seconds(self._deadline))
             self.sock = self._tls_context.wrap_socket(raw, server_hostname=self.host)
         except Exception:
             raw.close()
@@ -171,7 +233,9 @@ class SecureHttpTransport:
         self.max_bytes = max_bytes
         self.resolver = resolver
 
-    def validate(self, request: HttpRequest) -> tuple[str, str, str]:
+    def validate(
+        self, request: HttpRequest, *, deadline: float | None = None
+    ) -> tuple[str, str, str]:
         if request.method != "GET" or request.body is not None:
             raise PublicDataError("Polymarket public transport permits GET only")
         parsed = urlsplit(request.url)
@@ -202,27 +266,37 @@ class SecureHttpTransport:
                 raise PublicDataError("CLOB query must contain one token_id")
         else:
             raise PublicDataError("public endpoint is outside the exact allowlist")
-        answers = self.resolver(host, 443, 0, socket.SOCK_STREAM)
-        addresses = {str(answer[4][0]) for answer in answers if len(answer) >= 5}
-        if not addresses or any(
-            not is_safe_global_ip(address) for address in addresses
-        ):
-            raise PublicDataError("DNS returned an unsafe or mixed answer set")
+        if deadline is None:
+            deadline = time.monotonic() + self.timeout_seconds
+        addresses = resolve_public_addresses(self.resolver, host, deadline=deadline)
         return (
             host,
             parsed.path + (f"?{parsed.query}" if parsed.query else ""),
-            sorted(addresses)[0],
+            addresses[0],
         )
 
     def __call__(self, request: HttpRequest) -> HttpResponse:
-        host, target, address = self.validate(request)
-        connection = _PinnedHTTPSConnection(host, address, timeout=self.timeout_seconds)
+        deadline = time.monotonic() + self.timeout_seconds
+        host, target, address = self.validate(request, deadline=deadline)
+        connection = _PinnedHTTPSConnection(
+            host,
+            address,
+            timeout=remaining_seconds(deadline),
+            deadline=deadline,
+        )
         try:
             connection.request(
                 "GET", target, headers={"Accept": "application/json", "Host": host}
             )
+            assert connection.sock is not None
+            connection.sock.settimeout(remaining_seconds(deadline))
             response = connection.getresponse()
-            body = response.read(self.max_bytes + 1)
+            body = read_bounded_body(
+                response,
+                max_bytes=self.max_bytes,
+                deadline=deadline,
+                set_timeout=connection.sock.settimeout,
+            )
             oversized = len(body) > self.max_bytes
             if oversized:
                 body = body[: self.max_bytes]
@@ -494,6 +568,61 @@ def _sports(category: str, tags: list[str], question: str) -> bool:
         for word in f"{category} {' '.join(tags)} {question}".split()
     }
     return bool(words & _SPORTS)
+
+
+def gamma_eligibility_reason(
+    item: Mapping[str, object], *, cutoff: datetime
+) -> (
+    Literal[
+        "INACTIVE",
+        "CLOSED",
+        "SPORTS",
+        "NON_BINARY",
+        "MISSING_EVIDENCE",
+        "CLOSE_WINDOW",
+        "LOW_VOLUME",
+    ]
+    | None
+):
+    """Return the sole normalized Gamma eligibility decision."""
+
+    try:
+        if type(item.get("active")) is not bool or type(item.get("closed")) is not bool:
+            raise ValueError
+        identity = normalize_gamma_identity(item)
+        market_id, _condition_id, _yes_token, _no_token = gamma_clob_identity(item)
+        close = normalize_gamma_utc(item.get("endDate"))
+        volume = _decimal(item.get("volume24hr"), label="24h volume")
+        outcomes = _encoded_array(item.get("outcomes"), label="outcomes")
+        prices = _encoded_array(item.get("outcomePrices"), label="outcome prices")
+        parsed_prices = [_decimal(value, label="outcome price") for value in prices]
+        if any(not 0 <= value <= 1 for value in parsed_prices):
+            raise ValueError
+    except (TypeError, ValueError) as error:
+        raise ValueError("Gamma eligibility input is malformed") from error
+    question = str(identity["question"])
+    description = str(identity["description"])
+    rules = str(identity["rules"])
+    source = str(identity["resolution_source_text"])
+    category = str(identity["category"])
+    tags_value = identity["tags"]
+    assert isinstance(tags_value, list)
+    tags = [str(tag) for tag in tags_value]
+    if item["active"] is not True:
+        return "INACTIVE"
+    if item["closed"] is not False:
+        return "CLOSED"
+    if _sports(category, tags, question):
+        return "SPORTS"
+    if outcomes != ["Yes", "No"]:
+        return "NON_BINARY"
+    if not all((market_id, question, description, rules, source)):
+        return "MISSING_EVIDENCE"
+    if not timedelta(hours=1) <= close - cutoff <= timedelta(days=30):
+        return "CLOSE_WINDOW"
+    if volume < 10_000:
+        return "LOW_VOLUME"
+    return None
 
 
 def _book_time(value: object) -> datetime:
@@ -815,6 +944,7 @@ class PolymarketClient:
             reason: str | None = None
             try:
                 identity = normalize_gamma_identity(item)
+                reason = gamma_eligibility_reason(item, cutoff=cutoff)
             except ValueError:
                 identity = {
                     "question": "",
@@ -833,39 +963,6 @@ class PolymarketClient:
             raw_tags = identity["tags"]
             tags = [str(tag) for tag in raw_tags] if isinstance(raw_tags, list) else []
             condition_id = _text(item.get("conditionId")) or market_id
-            if reason is not None:
-                pass
-            elif item.get("active") is not True:
-                reason = "INACTIVE"
-            elif item.get("closed") is not False:
-                reason = "CLOSED"
-            elif _sports(category, tags, question):
-                reason = "SPORTS"
-            elif not all((market_id, question, description, rules, resolution_source)):
-                reason = "MISSING_EVIDENCE"
-            elif not timedelta(hours=1) <= close - cutoff <= timedelta(days=30):
-                reason = "CLOSE_WINDOW"
-            else:
-                try:
-                    volume = _decimal(item.get("volume24hr"), label="24h volume")
-                    outcomes = _encoded_array(item.get("outcomes"), label="outcomes")
-                    prices = _encoded_array(
-                        item.get("outcomePrices"), label="outcome prices"
-                    )
-                    _encoded_array(item.get("clobTokenIds"), label="token IDs")
-                    if volume < 10_000:
-                        reason = "LOW_VOLUME"
-                    elif outcomes != ["Yes", "No"]:
-                        reason = "NON_BINARY"
-                    else:
-                        parsed_prices = [
-                            _decimal(value, label="outcome price") for value in prices
-                        ]
-                        if any(not 0 <= value <= 1 for value in parsed_prices):
-                            raise ValueError("invalid outcome prices")
-                        gamma_clob_identity(item)
-                except (TypeError, ValueError):
-                    reason = "MALFORMED_MARKET"
             if reason is not None:
                 rejected.append(
                     MarketRejection(
@@ -907,7 +1004,7 @@ class PolymarketClient:
                 market_id=market_id,
                 condition_id=condition_id,
                 token_id=yes_token,
-                now=cutoff,
+                now=attempt.retrieved_at or cutoff,
             )
             if reason is not None:
                 rejection_book = (

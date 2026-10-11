@@ -231,10 +231,13 @@ _APPROVED_SOURCE_HASHES = {
         "2c8708e587ec6804d9c15736661a265c5b441cc3ce83b0b152e15f5a2fcf6739"
     ),
     "src/jev_trading_lab/polymarket/ai.py": (
-        "035ae1bd31285c02092c9f215a8cee0796463b1adb55abb9ac27f1eb7c9ab3d6"
+        "54b3f7061544424502d3ea8940bb583b0aec8bb731f45c972243ebb31bd94700"
+    ),
+    "src/jev_trading_lab/polymarket/call_journal.py": (
+        "69cc84cdf270be2165e0e75fb94557d7786b076ce9705855314cb4eecb934545"
     ),
     "src/jev_trading_lab/polymarket/client.py": (
-        "684a0c0610f651eab26fb1471984fca443e0bc595573b32a38033a14b8d0c07a"
+        "592c8ae7ef42de2c599d5b865c8b961c9d1680ffd57eed8e88552e18336f3848"
     ),
     "src/jev_trading_lab/polymarket/control.py": (
         "cadd87042c9293c2fd97d0017f532b06500d2afd23b07a9bd16c5e7bceef2b8d"
@@ -246,10 +249,10 @@ _APPROVED_SOURCE_HASHES = {
         "ee4f62c304bd7f5830c7f0e2632efb8a9397e905c9dfc5b0ae5858d6f22aa34e"
     ),
     "src/jev_trading_lab/polymarket/pipeline.py": (
-        "f78dad74392255c791ca3bda9e2803912e6e170954c3d0dbc6da4372f304f2b4"
+        "3cc43815ca119916ca6ff9f45aef4d8c8fe1b8c76ffe6501d5ba0592e87d2a14"
     ),
     "src/jev_trading_lab/polymarket/store.py": (
-        "739085877668e242d958dba1a8208d5cead214f2260ffc5c3d07bf3cfeca1a3f"
+        "17a3d9ac58349bc17bdf93ff68f0ad670f20cb7b500d3ead89ebde349e8b7137"
     ),
     "src/jev_trading_lab/stocks/__init__.py": (
         "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"
@@ -308,10 +311,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "4b51063eeafa5e6a727540bace92f4faeb0abce83e4c86566ca430e48d3dbfb4"
+    "215fd3c2764778de9f639065d3bd8150e3530e6eb950435487e297ccd5511fac"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "54caa78cf893949547069224baca5bdef61e97e5ed7a5565f3e4065ad785a474"
+    "abe88667075d3e33da96bea8e2f4bd1f91397e0b2e28e55d345dbfe09f9d0b3f"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = [
     "exchange-calendars==4.11.2",
@@ -1631,6 +1634,7 @@ def test_built_artifacts_exclude_repository_and_host_junk(tmp_path: Path) -> Non
         "jev_trading_lab/persistence/schema/003_append_only_guards.sql",
         "jev_trading_lab/polymarket/__init__.py",
         "jev_trading_lab/polymarket/ai.py",
+        "jev_trading_lab/polymarket/call_journal.py",
         "jev_trading_lab/polymarket/client.py",
         "jev_trading_lab/polymarket/control.py",
         "jev_trading_lab/polymarket/models.py",

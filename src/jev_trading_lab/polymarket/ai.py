@@ -9,6 +9,7 @@ import os
 import re
 import socket
 import ssl
+import time
 import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -19,7 +20,12 @@ from urllib.parse import urlsplit
 from pydantic import ValidationError
 
 from jev_trading_lab.core.ids import canonical_json_bytes
-from jev_trading_lab.polymarket.client import is_safe_global_ip
+from jev_trading_lab.polymarket.client import (
+    is_safe_global_ip,
+    read_bounded_body,
+    remaining_seconds,
+    resolve_public_addresses,
+)
 from jev_trading_lab.polymarket.models import (
     INT64_MAX,
     EvidencePacket,
@@ -120,6 +126,7 @@ _FORBIDDEN_NAMES = frozenset(
 type FailureCode = Literal[
     "INPUT_ERROR",
     "CONFIG_FAILURE",
+    "UNKNOWN_IN_FLIGHT",
     "PROVIDER_ERROR",
     "TIMEOUT",
     "HTTP_ERROR",
@@ -289,38 +296,40 @@ _RATE_MAX = 1_000_000_000_000
 MAX_USAGE_TOKENS: Final = 10**4300 - 1
 
 
-def _public_addresses(host: str) -> list[str]:
-    answers = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
-    addresses = sorted({str(answer[4][0]) for answer in answers if len(answer) >= 5})
-    safe: list[str] = []
-    for value in addresses:
-        if not is_safe_global_ip(value):
-            raise ValueError("provider DNS answer is unsafe")
-        safe.append(value)
-    if not safe:
-        raise ValueError("provider DNS returned no public addresses")
-    return safe
+def _public_addresses(host: str, *, deadline: float) -> list[str]:
+    try:
+        return resolve_public_addresses(socket.getaddrinfo, host, deadline=deadline)
+    except ValueError as error:
+        raise ValueError("provider DNS answer is unsafe") from error
 
 
 class _ProviderHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, host: str, address: str, timeout: float) -> None:
+    def __init__(
+        self, host: str, address: str, timeout: float, deadline: float
+    ) -> None:
         self._tls_context = ssl.create_default_context()
         super().__init__(host, port=443, timeout=timeout, context=self._tls_context)
         self._address = address
+        self._deadline = deadline
 
     def connect(self) -> None:
-        raw = socket.create_connection((self._address, 443), self.timeout)
+        raw = socket.create_connection(
+            (self._address, 443), remaining_seconds(self._deadline)
+        )
         try:
             peer = raw.getpeername()[0]
             if peer != self._address or not is_safe_global_ip(peer):
                 raise ValueError("provider peer differs from validated address")
+            raw.settimeout(remaining_seconds(self._deadline))
             self.sock = self._tls_context.wrap_socket(raw, server_hostname=self.host)
         except Exception:
             raw.close()
             raise
 
 
-def _provider_network(request: LiveHttpRequest) -> LiveHttpResponse:
+def _provider_network(
+    request: LiveHttpRequest, *, timeout_seconds: float = 30.0
+) -> LiveHttpResponse:
     parsed = urlsplit(request.url)
     allowed = {
         ("api.openai.com", "/v1/responses"),
@@ -339,13 +348,26 @@ def _provider_network(request: LiveHttpRequest) -> LiveHttpResponse:
         raise ValueError("provider route is outside the exact allowlist")
     host = parsed.hostname
     assert host is not None
-    connection = _ProviderHTTPSConnection(host, _public_addresses(host)[0], 30.0)
+    deadline = time.monotonic() + timeout_seconds
+    connection = _ProviderHTTPSConnection(
+        host,
+        _public_addresses(host, deadline=deadline)[0],
+        remaining_seconds(deadline),
+        deadline,
+    )
     try:
         connection.request(
             "POST", parsed.path, body=request.body, headers=dict(request.headers)
         )
+        assert connection.sock is not None
+        connection.sock.settimeout(remaining_seconds(deadline))
         response = connection.getresponse()
-        body = response.read(_MAX_MODEL_RESPONSE_BYTES + 1)
+        body = read_bounded_body(
+            response,
+            max_bytes=_MAX_MODEL_RESPONSE_BYTES,
+            deadline=deadline,
+            set_timeout=connection.sock.settimeout,
+        )
         oversized = len(body) > _MAX_MODEL_RESPONSE_BYTES
         return LiveHttpResponse(
             status_code=response.status,
@@ -611,6 +633,7 @@ def is_canonical_failure_message(
     fixed: dict[FailureCode, set[str]] = {
         "INPUT_ERROR": {f"{provider} request input is invalid"},
         "CONFIG_FAILURE": {f"{provider} live configuration is incomplete"},
+        "UNKNOWN_IN_FLIGHT": {f"{provider} call outcome is unknown after restart"},
         "PROVIDER_ERROR": {f"{provider} transport returned invalid data"},
         "TIMEOUT": {f"{provider} transport timed out"},
         "HTTP_ERROR": {

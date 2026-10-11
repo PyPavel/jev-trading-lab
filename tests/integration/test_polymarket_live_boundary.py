@@ -1804,8 +1804,108 @@ def test_finding_4_second_identical_observe_replays_terminal_without_provider_ca
 
     assert second == first
     assert openai.requests == [] and jev.requests == []
-    assert len(public.requests) == 2
+    assert public.requests == []
     assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 1
+
+
+def test_finding_4_adjacent_observation_slots_poll_and_record_distinct_opportunities(
+    tmp_path: Path,
+) -> None:
+    market = _market()
+    first = _observe(tmp_path, market=market)[0]
+
+    class AdjacentPublic(PublicNetwork):
+        def __call__(self, request: HttpRequest) -> HttpResponse:
+            response = super().__call__(request)
+            body = response.body
+            if "clob.polymarket.com" in request.url:
+                value = json.loads(body)
+                value["timestamp"] = str(int(value["timestamp"]) + 60_000)
+                body = json.dumps(value, separators=(",", ":")).encode()
+            return HttpResponse(
+                response.status_code,
+                response.headers,
+                body,
+                response.retrieved_at + timedelta(minutes=1),
+            )
+
+    public = AdjacentPublic(market)
+
+    second = observe_markets(
+        limit=1,
+        output_dir=tmp_path,
+        client=PolymarketClient(public),
+        openai_transport=ModelTransport("openai", _market_sha(market)),
+        jev_transport=ModelTransport("jev"),
+        now=NOW + timedelta(minutes=1),
+    )[0]
+
+    assert len(public.requests) == 3
+    assert second["opportunity_id"] != first["opportunity_id"]
+
+
+def test_provider_call_journal_is_replay_bound_and_tamper_evident(
+    tmp_path: Path,
+) -> None:
+    summary = _observe(tmp_path)[0]
+    lines = [
+        json.loads(line)
+        for line in (tmp_path / "provider_calls.jsonl").read_text().splitlines()
+    ]
+    result = next(line for line in lines if line["kind"] == "provider_call_result")
+    artifact = tmp_path / result["storage_relpath"]
+    artifact.write_bytes(artifact.read_bytes() + b" ")
+
+    with pytest.raises(StoreCorruptError, match="provider call"):
+        load_observation(tmp_path, str(summary["observation_id"]))
+
+
+def test_crash_after_provider_intent_never_retries_unknown_call(tmp_path: Path) -> None:
+    def crash(event: str) -> None:
+        if event == "openai_intent_frozen":
+            raise RuntimeError("failpoint after provider intent")
+
+    with pytest.raises(RuntimeError, match="failpoint"):
+        _observe(tmp_path, event_sink=crash)
+
+    openai = ModelTransport("openai", _market_sha())
+    jev = ModelTransport("jev")
+    summary = _observe(tmp_path, openai=openai, jev=jev)[0]
+    assert openai.requests == [] and jev.requests == []
+    assert summary["ai"]["disposition"] == "MODEL_FAILURE"
+    replay = load_observation(tmp_path, summary["observation_id"])
+    failure = json.loads(replay.artifacts["openai_failure"])
+    assert failure["code"] == "UNKNOWN_IN_FLIGHT"
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "openai_intent_frozen",
+        "openai_result_frozen",
+        "jev_intent_frozen",
+        "jev_result_frozen",
+    ],
+)
+def test_provider_failpoints_recover_without_repeating_completed_or_unknown_calls(
+    tmp_path: Path, boundary: str
+) -> None:
+    def crash(event: str) -> None:
+        if event == boundary:
+            raise RuntimeError("provider failpoint")
+
+    with pytest.raises(RuntimeError, match="provider failpoint"):
+        _observe(tmp_path, event_sink=crash)
+
+    market = _market()
+    openai = ModelTransport("openai", _market_sha(market))
+    jev = ModelTransport("jev")
+    summary = _observe(tmp_path, market=market, openai=openai, jev=jev)[0]
+
+    assert openai.requests == []
+    assert len(jev.requests) == (1 if boundary == "openai_result_frozen" else 0)
+    replay = load_observation(tmp_path, summary["observation_id"])
+    assert replay.result.model_dump(mode="json") == _single_result(tmp_path)
 
 
 _CONCURRENT_CHILD = r"""
