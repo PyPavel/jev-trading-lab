@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import socket
 from datetime import UTC, datetime, timedelta
@@ -12,7 +13,9 @@ from jev_trading_lab.polymarket.client import (
     HttpResponse,
     PolymarketClient,
     PublicDataError,
+    PublicDataTimeout,
     SecureHttpTransport,
+    normalize_gamma_identity,
 )
 
 NOW = datetime(2026, 10, 10, 12, tzinfo=UTC)
@@ -195,6 +198,74 @@ def test_malformed_timeout_redirect_and_oversize_are_bounded() -> None:
         client = PolymarketClient(CannedTransport([reply], []))
         with pytest.raises(PublicDataError):
             client.poll(limit=1, now=NOW)
+
+
+def test_precheck_transport_failures_preserve_typed_reason_and_empty_bytes() -> None:
+    for failure, reason in (
+        (TimeoutError(), "PRECHECK_TIMEOUT"),
+        (OSError("dns failed"), "BOOK_UNAVAILABLE"),
+    ):
+        result = PolymarketClient(CannedTransport([[market()]], [failure])).poll(
+            limit=1, now=NOW
+        )
+        rejection = result.rejections[0]
+        assert rejection.reason == reason
+        assert rejection.precheck_book_bytes == b""
+        assert rejection.precheck_failure_sha256 == hashlib.sha256(b"").hexdigest()
+        assert rejection.precheck_byte_length == 0
+        assert rejection.precheck_request_token_id == "yes-m1"
+        assert rejection.precheck_request_market_id == "m1"
+    with pytest.raises(PublicDataTimeout) as captured:
+        PolymarketClient(CannedTransport([], [TimeoutError()]))._get(
+            "https://clob.polymarket.com/book?token_id=yes-m1", label="CLOB"
+        )
+    assert captured.value.reason == "PRECHECK_TIMEOUT"
+
+
+def test_gamma_identity_normalization_is_deterministic_and_fail_closed() -> None:
+    normalized = normalize_gamma_identity(
+        {
+            "id": "m1",
+            "question": " Q ",
+            "description": " D ",
+            "rules": " R ",
+            "resolutionSource": " S ",
+            "endDate": "2026-10-12T12:00:00Z",
+            "tags": [
+                {"id": "id", "slug": "slug", "name": "name", "label": "label"},
+                {"name": "name-only"},
+                {"slug": "slug-only"},
+                {"id": "id-only"},
+                " text ",
+            ],
+        }
+    )
+    assert normalized["category"] == "Uncategorized"
+    assert normalized["tags"] == ["label", "name-only", "slug-only", "id-only", "text"]
+    with pytest.raises(ValueError, match="tag object"):
+        normalize_gamma_identity({**market(), "tags": [{"other": "unsafe"}]})
+
+
+def test_object_tags_and_missing_category_share_candidate_normalization() -> None:
+    raw_market = market()
+    raw_market.pop("category")
+    raw_market["tags"] = [{"slug": "public-policy"}, {"id": "tag-2"}]
+    candidate = (
+        PolymarketClient(CannedTransport([[raw_market]], [book()]))
+        .poll(limit=1, now=NOW)
+        .eligible[0]
+    )
+    assert candidate.evidence.category == "Uncategorized"
+    assert candidate.evidence.tags == ["public-policy", "tag-2"]
+
+
+def test_missing_rules_is_not_filled_from_description() -> None:
+    raw_market = market()
+    raw_market.pop("rules")
+    result = PolymarketClient(CannedTransport([[raw_market]], [])).poll(
+        limit=1, now=NOW
+    )
+    assert result.rejections[0].reason == "MISSING_EVIDENCE"
 
 
 def test_limit_and_transport_routes_are_closed_world() -> None:

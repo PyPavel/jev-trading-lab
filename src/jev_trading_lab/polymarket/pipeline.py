@@ -65,7 +65,9 @@ from jev_trading_lab.polymarket.store import (
     DecisionFrozenArtifact,
     EligibilityRejectionArtifact,
     PrecheckBookFailureArtifact,
+    StoreSecurityError,
     SuccessArtifact,
+    _screen_payload,
     failure_artifact_from_adapter,
     freeze_observation_artifacts,
     load_existing_terminal,
@@ -699,10 +701,27 @@ def _freeze_live_values(
 
 
 def _runtime_config(output_dir: str | os.PathLike[str]) -> None:
-    """Freeze non-secret endpoint, model, policy, and explicit billing configuration."""
+    """Freeze non-secret endpoints, models, policy, and normalized billing."""
 
-    root = Path(output_dir)
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    rate_names = (
+        "OPENAI_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
+        "OPENAI_CACHED_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
+        "OPENAI_OUTPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
+        "TYPESAFE_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
+        "TYPESAFE_OUTPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
+    )
+    rates: dict[str, int | None] = {}
+    for name in rate_names:
+        raw = os.environ.get(name)
+        if raw is None or raw == "":
+            rates[name] = None
+            continue
+        if not raw.isascii() or not raw.isdecimal():
+            raise ValueError("runtime configuration is invalid")
+        rate = int(raw)
+        if not 0 <= rate <= 1_000_000_000_000:
+            raise ValueError("runtime configuration is invalid")
+        rates[name] = rate
     value = {
         "endpoints": {
             "clob": CLOB_ENDPOINT,
@@ -712,18 +731,15 @@ def _runtime_config(output_dir: str | os.PathLike[str]) -> None:
         },
         "models": {"jev": JEV_MODEL_ID, "openai": OPENAI_MODEL_ID},
         "policy_version": POLICY_VERSION,
-        "rates_microdollars_per_million_tokens": {
-            name: os.environ.get(name)
-            for name in (
-                "OPENAI_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
-                "OPENAI_CACHED_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
-                "OPENAI_OUTPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
-                "TYPESAFE_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
-                "TYPESAFE_OUTPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
-            )
-        },
+        "rates_microdollars_per_million_tokens": rates,
     }
     payload = canonical_json_bytes(value) + b"\n"
+    try:
+        _screen_payload(payload, (), strict_json=True)
+    except StoreSecurityError:
+        raise ValueError("runtime configuration is invalid") from None
+    root = Path(output_dir)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = root / "runtime-config.json"
     if path.exists():
         if path.read_bytes() != payload:
@@ -766,6 +782,12 @@ def _live_artifacts(
             evidence_bytes,
             "gamma_sanitized",
             candidate.evidence.retrieved_at,
+        ),
+        (
+            "precheck_book_raw",
+            candidate.precheck_book_bytes,
+            "clob_precheck_raw",
+            candidate.precheck_book.retrieved_at,
         ),
         (
             "precheck_book",
@@ -1019,6 +1041,16 @@ def _record_rejections(
                     rejection.evidence.retrieved_at,
                 )
             )
+            if rejection.precheck_book_bytes is not None:
+                raw_at = rejection.precheck_retrieved_at or observed_at
+                rejection_values.append(
+                    (
+                        "precheck_book_raw",
+                        rejection.precheck_book_bytes,
+                        "clob_precheck_raw",
+                        raw_at,
+                    )
+                )
             if (
                 rejection.precheck_book_bytes is not None
                 and rejection.precheck_book is not None
@@ -1035,8 +1067,19 @@ def _record_rejections(
                 failure = PrecheckBookFailureArtifact(
                     market_id=rejection.market_id,
                     token_id=rejection.yes_token_id or "UNKNOWN",
+                    request_market_id=(
+                        rejection.precheck_request_market_id or rejection.market_id
+                    ),
+                    request_condition_id=rejection.precheck_request_condition_id,
+                    request_token_id=(
+                        rejection.precheck_request_token_id
+                        or rejection.yes_token_id
+                        or "UNKNOWN"
+                    ),
                     reason=rejection.reason,
                     raw_book_sha256=rejection.precheck_failure_sha256,
+                    raw_book_byte_length=rejection.precheck_byte_length,
+                    transport_failure=rejection.precheck_transport_failure,
                     retrieved_at=rejection.precheck_retrieved_at or observed_at,
                 )
                 rejection_values.append(
@@ -1102,6 +1145,12 @@ def observe_markets(
                 _model_bytes(candidate.evidence),
                 "gamma_sanitized",
                 candidate.evidence.retrieved_at,
+            ),
+            (
+                "precheck_book_raw",
+                candidate.precheck_book_bytes,
+                "clob_precheck_raw",
+                candidate.precheck_book.retrieved_at,
             ),
             (
                 "precheck_book",

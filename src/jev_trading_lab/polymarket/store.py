@@ -42,7 +42,12 @@ from jev_trading_lab.polymarket.ai import (
     has_canonical_failure_response,
     is_canonical_failure_message,
 )
-from jev_trading_lab.polymarket.client import reconstruct_book_snapshot
+from jev_trading_lab.polymarket.client import (
+    _book_snapshot,
+    _reason,
+    normalize_gamma_identity,
+    reconstruct_book_snapshot,
+)
 from jev_trading_lab.polymarket.models import (
     INT64_MAX,
     BookSnapshot,
@@ -67,9 +72,9 @@ _LABEL_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _MAX_LINE_BYTES = 1024 * 1024
 _MAX_JOURNAL_BYTES = 64 * 1024 * 1024
 _SECRET_PATTERN = re.compile(
-    r"(?i)(?:openai_api_key|typesafe_api_key|bearer\s+\S{4,}|basic\s+\S{4,}|"
-    r"(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|"
-    r"api[-_]?key)\s*[:=]\s*\S{4,})"
+    r"(?i)(?:sk-[a-z0-9_-]{8,}|openai_api_key|typesafe_api_key|"
+    r"bearer\s+\S{4,}|basic\s+\S{4,}|(?:authorization|proxy-authorization|"
+    r"cookie|set-cookie|x-api-key|api[-_]?key)\s*[:=]\s*\S{4,})"
 )
 _CREDENTIAL_KEYS = frozenset(
     {
@@ -89,6 +94,7 @@ _CREDENTIAL_KEYS = frozenset(
 class ArtifactKind(StrEnum):
     RAW_GAMMA = "raw_gamma"
     SANITIZED_EVIDENCE = "sanitized_evidence"
+    PRECHECK_BOOK_RAW = "precheck_book_raw"
     PRECHECK_BOOK = "precheck_book"
     PRECHECK_BOOK_FAILURE = "precheck_book_failure"
     CAUSAL_HISTORY = "causal_history"
@@ -222,53 +228,59 @@ _JEV_INPUT_FAILURE_PATH = (
     ArtifactKind.JEV_FAILURE,
     ArtifactKind.DECISION_FROZEN,
 )
-_UNIT6_PREFIX = (
+_LEGACY_UNIT6_PREFIX = (
     ArtifactKind.RAW_GAMMA,
     ArtifactKind.SANITIZED_EVIDENCE,
     ArtifactKind.PRECHECK_BOOK,
     ArtifactKind.CAUSAL_HISTORY,
 )
-_UNIT6_SUCCESS_BASE = (
-    *_UNIT6_PREFIX,
-    *_LEGACY_SUCCESS_PATH[2:],
-    ArtifactKind.DECISION_FROZEN,
+_UNIT6_PREFIX = (
+    ArtifactKind.RAW_GAMMA,
+    ArtifactKind.SANITIZED_EVIDENCE,
+    ArtifactKind.PRECHECK_BOOK_RAW,
+    ArtifactKind.PRECHECK_BOOK,
+    ArtifactKind.CAUSAL_HISTORY,
 )
-_UNIT6_OPENAI_FAILURE_BASE = (
-    *_UNIT6_PREFIX,
-    *_LEGACY_OPENAI_FAILURE_PATH[2:],
-    ArtifactKind.DECISION_FROZEN,
-)
-_UNIT6_OPENAI_INPUT_FAILURE_BASE = (
-    *_UNIT6_PREFIX,
-    ArtifactKind.OPENAI_FAILURE,
-    ArtifactKind.DECISION_FROZEN,
-)
-_UNIT6_JEV_FAILURE_BASE = (
-    *_UNIT6_PREFIX,
-    *_LEGACY_JEV_FAILURE_PATH[2:],
-    ArtifactKind.DECISION_FROZEN,
-)
-_UNIT6_JEV_INPUT_FAILURE_BASE = (
-    *_UNIT6_PREFIX,
-    ArtifactKind.OPENAI_REQUEST,
-    ArtifactKind.OPENAI_RESPONSE_SUCCESS,
-    ArtifactKind.OPENAI_SUCCESS_METADATA,
-    ArtifactKind.RESEARCH_BRIEF,
-    ArtifactKind.JEV_FAILURE,
-    ArtifactKind.DECISION_FROZEN,
-)
-_UNIT6_BASE_PATHS = (
-    _UNIT6_SUCCESS_BASE,
-    _UNIT6_OPENAI_FAILURE_BASE,
-    _UNIT6_OPENAI_INPUT_FAILURE_BASE,
-    _UNIT6_JEV_FAILURE_BASE,
-    _UNIT6_JEV_INPUT_FAILURE_BASE,
-)
+
+
+def _unit6_base_paths(
+    prefix: tuple[ArtifactKind, ...],
+) -> tuple[tuple[ArtifactKind, ...], ...]:
+    return (
+        (*prefix, *_LEGACY_SUCCESS_PATH[2:], ArtifactKind.DECISION_FROZEN),
+        (*prefix, *_LEGACY_OPENAI_FAILURE_PATH[2:], ArtifactKind.DECISION_FROZEN),
+        (*prefix, ArtifactKind.OPENAI_FAILURE, ArtifactKind.DECISION_FROZEN),
+        (*prefix, *_LEGACY_JEV_FAILURE_PATH[2:], ArtifactKind.DECISION_FROZEN),
+        (
+            *prefix,
+            ArtifactKind.OPENAI_REQUEST,
+            ArtifactKind.OPENAI_RESPONSE_SUCCESS,
+            ArtifactKind.OPENAI_SUCCESS_METADATA,
+            ArtifactKind.RESEARCH_BRIEF,
+            ArtifactKind.JEV_FAILURE,
+            ArtifactKind.DECISION_FROZEN,
+        ),
+    )
+
+
+_UNIT6_BASE_PATHS = _unit6_base_paths(_UNIT6_PREFIX)
+_LEGACY_UNIT6_BASE_PATHS = _unit6_base_paths(_LEGACY_UNIT6_PREFIX)
+_UNIT6_SUCCESS_BASE = _UNIT6_BASE_PATHS[0]
+_UNIT6_OPENAI_FAILURE_BASE = _UNIT6_BASE_PATHS[1]
+_UNIT6_OPENAI_INPUT_FAILURE_BASE = _UNIT6_BASE_PATHS[2]
+_UNIT6_JEV_FAILURE_BASE = _UNIT6_BASE_PATHS[3]
+_UNIT6_JEV_INPUT_FAILURE_BASE = _UNIT6_BASE_PATHS[4]
 _UNIT6_EXECUTION_PATHS = tuple(
     (*path, ArtifactKind.EXECUTION_BOOK) for path in _UNIT6_BASE_PATHS
 )
 _UNIT6_LATE_PATHS = tuple(
     (*path, ArtifactKind.BOOK_UNAVAILABLE) for path in _UNIT6_BASE_PATHS
+)
+_LEGACY_UNIT6_EXECUTION_PATHS = tuple(
+    (*path, ArtifactKind.EXECUTION_BOOK) for path in _LEGACY_UNIT6_BASE_PATHS
+)
+_LEGACY_UNIT6_LATE_PATHS = tuple(
+    (*path, ArtifactKind.BOOK_UNAVAILABLE) for path in _LEGACY_UNIT6_BASE_PATHS
 )
 _UNIT6_SUCCESS_PATH = _UNIT6_EXECUTION_PATHS[0]
 _ELIGIBILITY_REJECTION_PATH = (
@@ -278,10 +290,24 @@ _ELIGIBILITY_REJECTION_PATH = (
 _PRECHECK_REJECTION_PATH = (
     ArtifactKind.RAW_GAMMA,
     ArtifactKind.SANITIZED_EVIDENCE,
+    ArtifactKind.PRECHECK_BOOK_RAW,
     ArtifactKind.PRECHECK_BOOK,
     ArtifactKind.ELIGIBILITY_REJECTION,
 )
 _PRECHECK_FAILURE_REJECTION_PATH = (
+    ArtifactKind.RAW_GAMMA,
+    ArtifactKind.SANITIZED_EVIDENCE,
+    ArtifactKind.PRECHECK_BOOK_RAW,
+    ArtifactKind.PRECHECK_BOOK_FAILURE,
+    ArtifactKind.ELIGIBILITY_REJECTION,
+)
+_LEGACY_PRECHECK_REJECTION_PATH = (
+    ArtifactKind.RAW_GAMMA,
+    ArtifactKind.SANITIZED_EVIDENCE,
+    ArtifactKind.PRECHECK_BOOK,
+    ArtifactKind.ELIGIBILITY_REJECTION,
+)
+_LEGACY_PRECHECK_FAILURE_REJECTION_PATH = (
     ArtifactKind.RAW_GAMMA,
     ArtifactKind.SANITIZED_EVIDENCE,
     ArtifactKind.PRECHECK_BOOK_FAILURE,
@@ -292,6 +318,10 @@ _REJECTION_PATHS = {
     _PRECHECK_REJECTION_PATH,
     _PRECHECK_FAILURE_REJECTION_PATH,
 }
+_LEGACY_UNIT6_REJECTION_PATHS = {
+    _LEGACY_PRECHECK_REJECTION_PATH,
+    _LEGACY_PRECHECK_FAILURE_REJECTION_PATH,
+}
 _WRITE_BASE_PATHS = (
     _SUCCESS_PATH,
     _OPENAI_FAILURE_PATH,
@@ -299,8 +329,11 @@ _WRITE_BASE_PATHS = (
     _JEV_FAILURE_PATH,
     _JEV_INPUT_FAILURE_PATH,
     *_REJECTION_PATHS,
+    *_LEGACY_UNIT6_REJECTION_PATHS,
     *_UNIT6_BASE_PATHS,
+    *_LEGACY_UNIT6_BASE_PATHS,
     *_UNIT6_EXECUTION_PATHS,
+    *_LEGACY_UNIT6_EXECUTION_PATHS,
 )
 _LATE_PATHS = (
     (*_SUCCESS_PATH, ArtifactKind.BOOK_UNAVAILABLE),
@@ -314,6 +347,7 @@ _LATE_PATHS = (
         )
     ),
     *_UNIT6_LATE_PATHS,
+    *_LEGACY_UNIT6_LATE_PATHS,
 )
 _WRITE_STAGE_PATHS = (*_WRITE_BASE_PATHS, *_LATE_PATHS)
 _LEGACY_STAGE_PATHS = (
@@ -347,7 +381,9 @@ _RESULT_HASH_KINDS = {
 }
 Label = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
 ByteSize = Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)]
-TypedArtifact = StrictModel | Mapping[str, object] | list[CausalHistoryPoint] | None
+TypedArtifact = (
+    StrictModel | Mapping[str, object] | list[CausalHistoryPoint] | bytes | None
+)
 
 
 class SuccessArtifact(UtcModel):
@@ -388,12 +424,17 @@ class EligibilityRejectionArtifact(UtcModel):
 
 
 class PrecheckBookFailureArtifact(UtcModel):
-    """Strict metadata for malformed precheck bytes that cannot form a snapshot."""
+    """Metadata for rejected precheck bytes or a pre-response failure."""
 
     market_id: NonEmptyStr
     token_id: NonEmptyStr
+    request_market_id: NonEmptyStr | None = None
+    request_condition_id: NonEmptyStr | None = None
+    request_token_id: NonEmptyStr | None = None
     reason: NonEmptyStr
     raw_book_sha256: Sha256
+    raw_book_byte_length: ByteSize | None = None
+    transport_failure: bool = False
     retrieved_at: datetime
 
 
@@ -493,7 +534,7 @@ def _stage_path_for_result(
     result: ObservationResult, kinds: tuple[str, ...]
 ) -> tuple[ArtifactKind, ...]:
     path = _stage_path(kinds)
-    if path in _REJECTION_PATHS:
+    if path in _REJECTION_PATHS | _LEGACY_UNIT6_REJECTION_PATHS:
         if any(
             arm.disposition != "INELIGIBLE" for arm in (result.ai, result.deterministic)
         ):
@@ -507,7 +548,7 @@ def _stage_path_for_result(
             raise ValueError(
                 "late provider path requires terminal BOOK_FAILURE or COST_OVERFLOW"
             )
-    elif path in _UNIT6_EXECUTION_PATHS:
+    elif path in (*_UNIT6_EXECUTION_PATHS, *_LEGACY_UNIT6_EXECUTION_PATHS):
         if result.execution_book_sha256 is None:
             raise ValueError("execution-book path requires an observed execution book")
         if result.ai.disposition == "COST_OVERFLOW":
@@ -644,7 +685,10 @@ def _validate_success_provenance(
 
 
 def _base_path(path: tuple[ArtifactKind, ...]) -> tuple[ArtifactKind, ...]:
-    if path in _LATE_PATHS or path in _UNIT6_EXECUTION_PATHS:
+    if path in _LATE_PATHS or path in (
+        *_UNIT6_EXECUTION_PATHS,
+        *_LEGACY_UNIT6_EXECUTION_PATHS,
+    ):
         return path[:-1]
     return path
 
@@ -652,6 +696,8 @@ def _base_path(path: tuple[ArtifactKind, ...]) -> tuple[ArtifactKind, ...]:
 def _provider_shape(path: tuple[ArtifactKind, ...]) -> tuple[ArtifactKind, ...]:
     base = _base_path(path)
     if base in _UNIT6_BASE_PATHS:
+        return (ArtifactKind.RAW_GAMMA, ArtifactKind.SANITIZED_EVIDENCE, *base[5:])
+    if base in _LEGACY_UNIT6_BASE_PATHS:
         return (ArtifactKind.RAW_GAMMA, ArtifactKind.SANITIZED_EVIDENCE, *base[4:])
     return base
 
@@ -1190,6 +1236,8 @@ def _reconstruct_orphan(kind: ArtifactKind, payload: bytes) -> TypedArtifact:
         return value
     if kind is ArtifactKind.SANITIZED_EVIDENCE:
         return EvidencePacket.model_validate_json(payload)
+    if kind is ArtifactKind.PRECHECK_BOOK_RAW:
+        return payload
     if kind is ArtifactKind.CAUSAL_HISTORY:
         return TypeAdapter(list[CausalHistoryPoint]).validate_json(payload)
     if kind is ArtifactKind.PRECHECK_BOOK:
@@ -1274,16 +1322,11 @@ def _validate_reconstructed_path(
         raw_gamma = typed.get(ArtifactKind.RAW_GAMMA)
         if isinstance(raw_gamma, Mapping):
             evidence_value = evidence.model_dump(mode="json")
-            raw_bindings = {
-                "market_id": raw_gamma.get("id"),
-                "question": raw_gamma.get("question"),
-                "description": raw_gamma.get("description"),
-                "rules": raw_gamma.get("rules"),
-                "category": raw_gamma.get("category"),
-                "tags": raw_gamma.get("tags"),
-                "resolution_source_text": raw_gamma.get("resolutionSource"),
-                "closes_at": raw_gamma.get("endDate"),
-            }
+            try:
+                raw_bindings = normalize_gamma_identity(raw_gamma)
+            except ValueError:
+                fail("raw Gamma identity cannot be normalized")
+                return
             if any(
                 evidence_value[field] != value for field, value in raw_bindings.items()
             ):
@@ -1333,11 +1376,33 @@ def _validate_reconstructed_path(
         raw = envelope_by_kind.get(ArtifactKind.RAW_GAMMA)
         if raw is None or rejection.raw_gamma_sha256 != raw.sha256:
             fail("eligibility rejection does not bind raw Gamma bytes")
+        precheck_raw = typed.get(ArtifactKind.PRECHECK_BOOK_RAW)
+        precheck_raw_envelope = envelope_by_kind.get(ArtifactKind.PRECHECK_BOOK_RAW)
         precheck_rejection = typed.get(ArtifactKind.PRECHECK_BOOK)
         precheck_failure = typed.get(ArtifactKind.PRECHECK_BOOK_FAILURE)
         precheck_envelope = envelope_by_kind.get(ArtifactKind.PRECHECK_BOOK)
+        if precheck_raw is not None and not isinstance(precheck_raw, bytes):
+            fail("precheck raw artifact type is invalid")
+            return
+        if precheck_raw_envelope is not None and (
+            not isinstance(precheck_raw, bytes)
+            or precheck_raw_envelope.sha256 != hashlib.sha256(precheck_raw).hexdigest()
+            or precheck_raw_envelope.byte_size != len(precheck_raw)
+        ):
+            fail("precheck raw artifact metadata is invalid")
+        if (
+            precheck_envelope is not None
+            and precheck_raw_envelope is not None
+            and (
+                precheck_envelope.sha256 != precheck_raw_envelope.sha256
+                or precheck_envelope.byte_size != precheck_raw_envelope.byte_size
+            )
+        ):
+            fail("normalized precheck book does not bind exact raw bytes")
         frozen_precheck_sha = (
-            precheck_envelope.sha256
+            precheck_raw_envelope.sha256
+            if precheck_raw_envelope is not None
+            else precheck_envelope.sha256
             if precheck_envelope is not None
             else precheck_failure.raw_book_sha256
             if isinstance(precheck_failure, PrecheckBookFailureArtifact)
@@ -1349,8 +1414,54 @@ def _validate_reconstructed_path(
             not isinstance(precheck_failure, PrecheckBookFailureArtifact)
             or precheck_failure.market_id != rejection.market_id
             or precheck_failure.raw_book_sha256 != rejection.precheck_book_sha256
+            or (
+                precheck_failure.request_market_id is not None
+                and precheck_failure.request_market_id != rejection.market_id
+            )
+            or (
+                precheck_failure.request_token_id is not None
+                and precheck_failure.request_token_id != precheck_failure.token_id
+            )
+            or (
+                precheck_raw_envelope is not None
+                and (
+                    precheck_failure.raw_book_sha256 != precheck_raw_envelope.sha256
+                    or precheck_failure.raw_book_byte_length
+                    != precheck_raw_envelope.byte_size
+                )
+            )
         ):
             fail("precheck failure metadata does not bind rejection")
+        if isinstance(precheck_failure, PrecheckBookFailureArtifact) and isinstance(
+            precheck_raw, bytes
+        ):
+            if precheck_failure.transport_failure:
+                if precheck_raw or precheck_failure.reason not in {
+                    "PRECHECK_TIMEOUT",
+                    "BOOK_UNAVAILABLE",
+                }:
+                    fail("transport precheck failure is not canonical")
+            else:
+                try:
+                    raw_value = load_strict_json(precheck_raw)
+                    _book_snapshot(
+                        precheck_raw,
+                        raw_value,
+                        expected_market_id=precheck_failure.request_market_id
+                        or precheck_failure.market_id,
+                        expected_condition_id=precheck_failure.request_condition_id
+                        or precheck_failure.request_market_id
+                        or precheck_failure.market_id,
+                        expected_token_id=precheck_failure.request_token_id
+                        or precheck_failure.token_id,
+                        now=precheck_failure.retrieved_at,
+                    )
+                except (TypeError, ValueError) as error:
+                    replay_reason = _reason(error)
+                else:
+                    replay_reason = "VALID_BOOK"
+                if replay_reason != precheck_failure.reason:
+                    fail("precheck failure reason does not match exact raw bytes")
         if precheck_rejection is not None and not isinstance(
             precheck_rejection, BookSnapshot
         ):

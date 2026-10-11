@@ -57,6 +57,23 @@ _GAMMA_QUERY_KEYS = frozenset(
 class PublicDataError(ValueError):
     """A public response or route violated the bounded client contract."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str = "BOOK_UNAVAILABLE",
+        raw_bytes: bytes = b"",
+        retrieved_at: datetime | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.raw_bytes = raw_bytes
+        self.retrieved_at = retrieved_at
+
+
+class PublicDataTimeout(PublicDataError):
+    """A bounded public request timed out before yielding response bytes."""
+
 
 @dataclass(frozen=True, slots=True)
 class HttpRequest:
@@ -210,6 +227,11 @@ class MarketRejection:
     precheck_book: BookSnapshot | None = None
     precheck_failure_sha256: str | None = None
     precheck_retrieved_at: datetime | None = None
+    precheck_byte_length: int | None = None
+    precheck_request_token_id: str | None = None
+    precheck_request_market_id: str | None = None
+    precheck_request_condition_id: str | None = None
+    precheck_transport_failure: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,13 +361,40 @@ def _tags(value: object) -> list[str]:
         return []
     tags: list[str] = []
     for item in value:
-        if type(item) is str and item.strip():
-            tags.append(item.strip())
-        elif isinstance(item, Mapping):
-            label = _text(item.get("label")) or _text(item.get("name"))
-            if label:
-                tags.append(label)
+        if type(item) is str:
+            if item.strip():
+                tags.append(item.strip())
+            continue
+        if isinstance(item, Mapping):
+            label = next(
+                (
+                    text
+                    for key in ("label", "name", "slug", "id")
+                    if (text := _text(item.get(key)))
+                ),
+                "",
+            )
+            if not label:
+                raise ValueError("Gamma tag object has no recognized identity")
+            tags.append(label)
+            continue
+        raise ValueError("Gamma tag has unexpected shape")
     return tags
+
+
+def normalize_gamma_identity(value: Mapping[str, object]) -> dict[str, object]:
+    """Normalize the exact Gamma fields that bind sanitized evidence."""
+
+    return {
+        "market_id": _text(value.get("id")),
+        "question": _text(value.get("question")),
+        "description": _text(value.get("description")),
+        "rules": _text(value.get("rules")),
+        "category": _text(value.get("category")) or "Uncategorized",
+        "tags": _tags(value.get("tags")),
+        "resolution_source_text": _text(value.get("resolutionSource")),
+        "closes_at": value.get("endDate"),
+    }
 
 
 def _sports(category: str, tags: list[str], question: str) -> bool:
@@ -479,16 +528,24 @@ class PolymarketClient:
         try:
             response = self.transport(HttpRequest("GET", url))
         except TimeoutError as error:
-            raise PublicDataError(f"{label} transport timed out") from error
+            reason = "PRECHECK_TIMEOUT" if label == "CLOB" else "PUBLIC_DATA_TIMEOUT"
+            raise PublicDataTimeout(
+                f"{label} transport timed out", reason=reason
+            ) from error
         except PublicDataError:
             raise
         except Exception as error:
             raise PublicDataError(f"{label} transport failed") from error
-        return (
-            response.body,
-            _strict_response(response, label=label),
-            response.retrieved_at,
-        )
+        try:
+            value = _strict_response(response, label=label)
+        except PublicDataError as error:
+            raise PublicDataError(
+                str(error),
+                reason="MALFORMED_BOOK" if label == "CLOB" else error.reason,
+                raw_bytes=response.body,
+                retrieved_at=response.retrieved_at,
+            ) from error
+        return response.body, value, response.retrieved_at
 
     def poll(self, *, limit: int = 1, now: datetime | None = None) -> PollResult:
         if not 1 <= limit <= 20:
@@ -537,14 +594,29 @@ class PolymarketClient:
             if len(eligible) + len(rejected) >= limit:
                 break
             reason: str | None = None
-            question = _text(item.get("question"))
-            description = _text(item.get("description"))
-            rules = _text(item.get("rules"))
-            resolution_source = _text(item.get("resolutionSource"))
-            category = _text(item.get("category")) or "Uncategorized"
-            tags = _tags(item.get("tags"))
+            try:
+                identity = normalize_gamma_identity(item)
+            except ValueError:
+                identity = {
+                    "question": "",
+                    "description": "",
+                    "rules": "",
+                    "resolution_source_text": "",
+                    "category": "Uncategorized",
+                    "tags": [],
+                }
+                reason = "MALFORMED_MARKET"
+            question = str(identity["question"])
+            description = str(identity["description"])
+            rules = str(identity["rules"])
+            resolution_source = str(identity["resolution_source_text"])
+            category = str(identity["category"])
+            raw_tags = identity["tags"]
+            tags = [str(tag) for tag in raw_tags] if isinstance(raw_tags, list) else []
             condition_id = _text(item.get("conditionId")) or market_id
-            if item.get("active") is not True:
+            if reason is not None:
+                pass
+            elif item.get("active") is not True:
                 reason = "INACTIVE"
             elif item.get("closed") is not False:
                 reason = "CLOSED"
@@ -608,6 +680,7 @@ class PolymarketClient:
             book_url = f"{CLOB_ENDPOINT}?{urlencode({'token_id': yes_token})}"
             raw_book: bytes | None = None
             snapshot: BookSnapshot | None = None
+            transport_failure = False
             try:
                 raw_book, book_value, _ = self._get(book_url, label="CLOB")
                 snapshot = _book_snapshot(
@@ -638,17 +711,21 @@ class PolymarketClient:
                     < 5_000
                 ):
                     reason = "LOW_DEPTH"
-            except TimeoutError:
-                reason = "BOOK_TIMEOUT"
-            except (PublicDataError, TypeError, ValueError) as error:
+            except PublicDataTimeout as error:
+                raw_book = error.raw_bytes
+                reason = error.reason
+                transport_failure = True
+            except PublicDataError as error:
+                raw_book = error.raw_bytes
+                reason = error.reason
+                transport_failure = error.retrieved_at is None
+            except (TypeError, ValueError) as error:
                 reason = _reason(error)
             if reason is not None:
                 rejection_book = (
                     snapshot if reason in {"WIDE_SPREAD", "LOW_DEPTH"} else None
                 )
-                rejection_bytes = (
-                    raw_book if reason in {"WIDE_SPREAD", "LOW_DEPTH"} else None
-                )
+                rejection_bytes = raw_book
                 failure_hash = (
                     hashlib.sha256(raw_book).hexdigest()
                     if raw_book is not None and rejection_book is None
@@ -668,6 +745,15 @@ class PolymarketClient:
                         precheck_retrieved_at=(
                             snapshot.retrieved_at if snapshot is not None else cutoff
                         ),
+                        precheck_byte_length=(
+                            len(rejection_bytes)
+                            if rejection_bytes is not None
+                            else None
+                        ),
+                        precheck_request_token_id=yes_token,
+                        precheck_request_market_id=market_id,
+                        precheck_request_condition_id=condition_id,
+                        precheck_transport_failure=transport_failure,
                     )
                 )
                 continue

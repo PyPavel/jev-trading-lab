@@ -222,7 +222,7 @@ def test_provider_failure_freezes_precheck_history_and_consumed_execution_book(
     result = json.loads((tmp_path / "results.jsonl").read_text().strip())
     replay = load_observation(tmp_path, result["observation_id"])
     kinds = list(replay.artifacts)
-    assert kinds[2:4] == ["precheck_book", "causal_history"]
+    assert kinds[2:5] == ["precheck_book_raw", "precheck_book", "causal_history"]
     assert kinds[-2:] == ["decision_frozen", "execution_book"]
     assert (
         replay.artifacts["precheck_book"]
@@ -324,6 +324,53 @@ def test_fresh_book_failures_terminalize_after_one_decision_barrier(
     assert result["observed_at"] >= unavailable["terminal_model_at"]
 
 
+@pytest.mark.parametrize(
+    "value",
+    [" 1", "1 ", "1e3", "-1", "+1", "1.0", "1000000000001", "9223372036854775808"],
+)
+def test_invalid_billing_rate_fails_before_runtime_config_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: str
+) -> None:
+    monkeypatch.setenv("OPENAI_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS", value)
+    with pytest.raises(ValueError, match="runtime configuration is invalid"):
+        observe_markets(
+            limit=1,
+            output_dir=tmp_path,
+            client=PolymarketClient(PublicNetwork()),
+            now=NOW,
+        )
+    assert not (tmp_path / "runtime-config.json").exists()
+
+
+def test_runtime_config_normalizes_rates_and_rejects_secret_like_constants(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from jev_trading_lab.polymarket import pipeline
+
+    monkeypatch.setenv("OPENAI_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS", "0001")
+    pipeline._runtime_config(tmp_path)
+    config = json.loads((tmp_path / "runtime-config.json").read_bytes())
+    assert (
+        config["rates_microdollars_per_million_tokens"][
+            "OPENAI_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS"
+        ]
+        == 1
+    )
+
+    unsafe = tmp_path / "unsafe"
+    sentinel = "sk-do-not-persist-sentinel"
+    monkeypatch.setattr(pipeline, "OPENAI_MODEL_ID", sentinel)
+    with pytest.raises(
+        ValueError, match="runtime configuration is invalid"
+    ) as captured:
+        pipeline._runtime_config(unsafe)
+    assert sentinel not in str(captured.value)
+    assert not (unsafe / "runtime-config.json").exists()
+    assert sentinel.encode() not in b"".join(
+        path.read_bytes() for path in unsafe.rglob("*") if path.is_file()
+    )
+
+
 def test_missing_live_configuration_is_sanitized_terminal_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -350,6 +397,202 @@ def test_missing_live_configuration_is_sanitized_terminal_failure(
     assert b'"code":"CONFIG_FAILURE"' in blob_bytes
     assert b"OPENAI_API_KEY" not in persisted + blob_bytes
     assert b"TYPESAFE_API_KEY" not in persisted + blob_bytes
+
+
+@pytest.mark.parametrize(
+    ("reply", "reason", "expected_raw"),
+    [
+        (TimeoutError(), "PRECHECK_TIMEOUT", b""),
+        (OSError("provider unavailable"), "BOOK_UNAVAILABLE", b""),
+        (
+            HttpResponse(200, {"content-type": "application/json"}, b"", NOW),
+            "MALFORMED_BOOK",
+            b"",
+        ),
+        (
+            HttpResponse(200, {"content-type": "application/json"}, b"{", NOW),
+            "MALFORMED_BOOK",
+            b"{",
+        ),
+        (
+            HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps(
+                    _book(0)
+                    | {
+                        "timestamp": str(
+                            int((NOW - timedelta(seconds=31)).timestamp() * 1000)
+                        )
+                    },
+                    separators=(",", ":"),
+                ).encode(),
+                NOW,
+            ),
+            "STALE_BOOK",
+            json.dumps(
+                _book(0)
+                | {
+                    "timestamp": str(
+                        int((NOW - timedelta(seconds=31)).timestamp() * 1000)
+                    )
+                },
+                separators=(",", ":"),
+            ).encode(),
+        ),
+        (
+            HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps(
+                    _book(0) | {"asset_id": "wrong-token"}, separators=(",", ":")
+                ).encode(),
+                NOW,
+            ),
+            "TOKEN_DRIFT",
+            json.dumps(
+                _book(0) | {"asset_id": "wrong-token"}, separators=(",", ":")
+            ).encode(),
+        ),
+        (
+            HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps(
+                    _book(0) | {"market": "wrong-market"}, separators=(",", ":")
+                ).encode(),
+                NOW,
+            ),
+            "MARKET_DRIFT",
+            json.dumps(
+                _book(0) | {"market": "wrong-market"}, separators=(",", ":")
+            ).encode(),
+        ),
+        (
+            HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps(
+                    _book(0) | {"asks": [{"price": "0.47", "size": "5000"}]},
+                    separators=(",", ":"),
+                ).encode(),
+                NOW,
+            ),
+            "CROSSED_BOOK",
+            json.dumps(
+                _book(0) | {"asks": [{"price": "0.47", "size": "5000"}]},
+                separators=(",", ":"),
+            ).encode(),
+        ),
+    ],
+)
+def test_precheck_failure_is_content_addressed_terminal_and_idempotent(
+    tmp_path: Path, reply: object, reason: str, expected_raw: bytes
+) -> None:
+    class FailedPrecheck:
+        def __call__(self, request: HttpRequest) -> HttpResponse:
+            if "gamma-api" in request.url:
+                body = json.dumps([_market()], separators=(",", ":")).encode()
+                return HttpResponse(
+                    200, {"content-type": "application/json"}, body, NOW
+                )
+            if isinstance(reply, BaseException):
+                raise reply
+            assert isinstance(reply, HttpResponse)
+            return reply
+
+    for _ in range(2):
+        summaries = observe_markets(
+            limit=1,
+            output_dir=tmp_path,
+            client=PolymarketClient(FailedPrecheck()),
+            now=NOW,
+        )
+        assert summaries[0]["reason"] == reason
+    result = json.loads((tmp_path / "results.jsonl").read_text())
+    replay = load_observation(tmp_path, result["observation_id"])
+    assert list(replay.artifacts) == [
+        "raw_gamma",
+        "sanitized_evidence",
+        "precheck_book_raw",
+        "precheck_book_failure",
+        "eligibility_rejection",
+    ]
+    assert replay.artifacts["precheck_book_raw"] == expected_raw
+    failure = json.loads(replay.artifacts["precheck_book_failure"])
+    assert failure["reason"] == reason
+    assert failure["raw_book_sha256"] == hashlib.sha256(expected_raw).hexdigest()
+    assert failure["raw_book_byte_length"] == len(expected_raw)
+    assert failure["request_token_id"] == "yes-live-m1"
+    assert failure["request_market_id"] == "live-m1"
+    assert result["ai"]["disposition"] == "INELIGIBLE"
+    assert result["deterministic"]["disposition"] == "INELIGIBLE"
+    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 1
+
+
+def test_precheck_failure_replay_rejects_raw_corruption_and_reason_mismatch(
+    tmp_path: Path,
+) -> None:
+    malformed = HttpResponse(200, {"content-type": "application/json"}, b"{", NOW)
+
+    class FailedPrecheck:
+        def __call__(self, request: HttpRequest) -> HttpResponse:
+            if "gamma-api" in request.url:
+                body = json.dumps([_market()], separators=(",", ":")).encode()
+                return HttpResponse(
+                    200, {"content-type": "application/json"}, body, NOW
+                )
+            return malformed
+
+    summary = observe_markets(
+        limit=1,
+        output_dir=tmp_path,
+        client=PolymarketClient(FailedPrecheck()),
+        now=NOW,
+    )[0]
+    replay = load_observation(tmp_path, str(summary["observation_id"]))
+    raw_path = (
+        tmp_path / "blobs" / replay.envelopes["precheck_book_raw"].storage_relpath
+    )
+    original_raw = raw_path.read_bytes()
+    raw_path.unlink()
+    with pytest.raises(StoreCorruptError):
+        load_observation(tmp_path, str(summary["observation_id"]))
+    raw_path.write_bytes(original_raw)
+
+    journal = tmp_path / "artifacts.jsonl"
+    envelopes = [json.loads(line) for line in journal.read_text().splitlines()]
+    failure_index = next(
+        index
+        for index, envelope in enumerate(envelopes)
+        if envelope["kind"] == "precheck_book_failure"
+    )
+    failure_envelope = envelopes[failure_index]
+    failure_path = tmp_path / "blobs" / failure_envelope["storage_relpath"]
+    failure = json.loads(failure_path.read_bytes())
+    failure["reason"] = "STALE_BOOK"
+    forged = json.dumps(failure, separators=(",", ":"), sort_keys=True).encode()
+    forged_sha = hashlib.sha256(forged).hexdigest()
+    forged_path = tmp_path / "blobs" / forged_sha[:2] / forged_sha[2:4] / forged_sha
+    forged_path.parent.mkdir(parents=True, exist_ok=True)
+    forged_path.write_bytes(forged)
+    failure_envelope.update(
+        sha256=forged_sha,
+        byte_size=len(forged),
+        storage_relpath=f"{forged_sha[:2]}/{forged_sha[2:4]}/{forged_sha}",
+    )
+    predecessor = hashlib.sha256(
+        json.dumps(failure_envelope, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+    envelopes[failure_index + 1]["predecessor_stage_sha256"] = predecessor
+    journal.write_text(
+        "".join(
+            json.dumps(envelope, separators=(",", ":"), sort_keys=True) + "\n"
+            for envelope in envelopes
+        )
+    )
+    with pytest.raises(StoreCorruptError, match="missing or corrupt"):
+        load_observation(tmp_path, str(summary["observation_id"]))
 
 
 def test_eligibility_rejection_is_canonical_terminal_observation(
