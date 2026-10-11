@@ -11,6 +11,7 @@ import re
 import socket
 import ssl
 import time
+import unicodedata
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
@@ -21,6 +22,7 @@ from typing import Any, Final, Literal
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from jev_trading_lab.core.ids import canonical_json_bytes
+from jev_trading_lab.persistence.blobs import is_credential_name
 from jev_trading_lab.polymarket.models import (
     BookLevel,
     BookSnapshot,
@@ -578,10 +580,26 @@ def normalize_gamma_identity(value: Mapping[str, object]) -> dict[str, object]:
 
 
 _PUBLIC_CREDENTIAL_PATTERN = re.compile(
-    r"(?i)(?:sk-[a-z0-9_-]{8,}|openai_api_key|typesafe_api_key|"
-    r"bearer\s+\S{4,}|basic\s+\S{4,}|(?:authorization|proxy-authorization|"
-    r"cookie|set-cookie|x-api-key|api[-_]?key)\s*[:=]\s*\S{4,})"
+    r"(?i)(?:sk-[a-z0-9_-]{8,}|bearer\s+\S{4,}|basic\s+\S{4,}|"
+    r"(?:[\w.-]{0,128})(?:authorization|proxy[-_]?authorization|cookie|"
+    r"set[-_]?cookie|x[-_]?api[-_]?key|api[-_]?key|access[-_]?token|"
+    r"refresh[-_]?token|client[-_]?secret|session[-_]?token)"
+    r"(?:[-_.]?v?\d*)*\s*[:=]\s*\S{4,})"
 )
+_PUBLIC_ASSIGNMENT_PATTERN = re.compile(
+    r"(?P<name>[\w.-]{1,256})\s*[:=]\s*(?P<value>\S{4,})"
+)
+
+
+def _sanitize_public_prose(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text)
+    sanitized = _PUBLIC_CREDENTIAL_PATTERN.sub("[REDACTED]", normalized)
+    return _PUBLIC_ASSIGNMENT_PATTERN.sub(
+        lambda match: (
+            "[REDACTED]" if is_credential_name(match.group("name")) else match.group(0)
+        ),
+        sanitized,
+    )
 
 
 def sanitized_gamma_identity(value: Mapping[str, object]) -> dict[str, object]:
@@ -595,15 +613,11 @@ def sanitized_gamma_identity(value: Mapping[str, object]) -> dict[str, object]:
         "category",
         "resolution_source_text",
     ):
-        identity[name] = _PUBLIC_CREDENTIAL_PATTERN.sub(
-            "[REDACTED]", str(identity[name])
-        )
+        identity[name] = _sanitize_public_prose(str(identity[name]))
     tags = identity["tags"]
     if not isinstance(tags, list):
         raise ValueError("normalized Gamma tags are invalid")
-    identity["tags"] = [
-        _PUBLIC_CREDENTIAL_PATTERN.sub("[REDACTED]", str(tag)) for tag in tags
-    ]
+    identity["tags"] = [_sanitize_public_prose(str(tag)) for tag in tags]
     return identity
 
 
@@ -1015,16 +1029,32 @@ class PolymarketClient:
         normalized.sort(key=lambda row: (row[0], row[1], row[2]))
         unique: list[tuple[datetime, str, bytes, Mapping[str, object], datetime]] = []
         positions: dict[str, int] = {}
-        semantics: dict[str, bytes] = {}
+        semantics: dict[str, bytes | None] = {}
         conflict_rows: dict[str, list[bytes]] = {}
         malformed_rows: set[bytes] = set()
         for row in normalized:
             try:
                 market_identity, semantic = _gamma_semantic_identity(row[3])
             except (TypeError, ValueError):
-                if row[2] not in malformed_rows:
-                    malformed_rows.add(row[2])
+                market_id = row[1]
+                if not market_id:
+                    if row[2] not in malformed_rows:
+                        malformed_rows.add(row[2])
+                        unique.append(row)
+                    continue
+                position = positions.get(market_id)
+                if position is None:
+                    positions[market_id] = len(unique)
+                    semantics[market_id] = None
                     unique.append(row)
+                    continue
+                if semantics[market_id] is None:
+                    continue
+                conflict_rows.setdefault(market_id, [unique[position][2]]).append(
+                    row[2]
+                )
+                if row[2] < unique[position][2]:
+                    unique[position] = row
                 continue
             market_id = market_identity[0]
             position = positions.get(market_id)

@@ -332,8 +332,14 @@ def _is_structured_credential_name(name: str, exact: frozenset[str]) -> bool:
     )
 
 
-def _is_secret_field(name: str) -> bool:
+def is_credential_name(name: str) -> bool:
+    """Classify normalized, versioned credential field-name variants."""
+
     return _is_structured_credential_name(name, _SECRET_FIELD_COMPACT)
+
+
+def _is_secret_field(name: str) -> bool:
+    return is_credential_name(name)
 
 
 def _json_string_end(data: bytes, start: int) -> int:

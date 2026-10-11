@@ -1375,23 +1375,15 @@ def observe_markets(
         return summaries
 
 
-def _candidate_from_frozen_rejection(
-    rejection: MarketRejection,
+def _frozen_candidate_for_opportunity(
+    opportunity_id: str,
     *,
     output_dir: str | os.PathLike[str],
     slot: datetime,
+    market_id: str | None = None,
 ) -> MarketCandidate | None:
-    """Recover a started same-slot opportunity before eligibility drift wins."""
+    """Recover one started same-slot opportunity from its durable frozen inputs."""
 
-    opportunity_id = hashlib.sha256(
-        canonical_json_bytes(
-            {
-                "policy_version": POLICY_VERSION,
-                "market_id": rejection.market_id,
-                "slot_at": slot.isoformat().replace("+00:00", "Z"),
-            }
-        )
-    ).hexdigest()
     frozen = load_frozen_artifacts_for_opportunity(output_dir, opportunity_id)
     if frozen is None:
         return None
@@ -1411,7 +1403,7 @@ def _candidate_from_frozen_rejection(
     raw_gamma = load_strict_json(frozen["raw_gamma"])
     history = load_strict_json(frozen["causal_history"])
     if (
-        evidence.market_id != rejection.market_id
+        (market_id is not None and evidence.market_id != market_id)
         or not isinstance(raw_gamma, dict)
         or not isinstance(history, dict)
     ):
@@ -1545,20 +1537,30 @@ def _observe_locked(
         return _public_poll_failure(
             output_dir, error, observed_at=cutoff, config=config
         )
+    call_journal = ProviderCallJournal(output_dir)
     recovered: list[MarketCandidate] = []
-    rejections: list[MarketRejection] = []
-    for rejection in polled.rejections:
-        recovered_candidate = _candidate_from_frozen_rejection(
-            rejection, output_dir=output_dir, slot=cutoff
+    for opportunity_id in call_journal.opportunity_ids_created_at(cutoff):
+        candidate = _frozen_candidate_for_opportunity(
+            opportunity_id, output_dir=output_dir, slot=cutoff
         )
-        if recovered_candidate is None:
-            rejections.append(rejection)
-        else:
-            recovered.append(recovered_candidate)
+        if candidate is not None:
+            recovered.append(candidate)
+    recovered_markets = {candidate.market_id for candidate in recovered}
+    rejections = [
+        rejection
+        for rejection in polled.rejections
+        if rejection.market_id not in recovered_markets
+    ]
     summaries = _record_rejections(
         output_dir, tuple(rejections), observed_at=cutoff, config=config
     )
-    for candidate in (*polled.eligible, *recovered):
+    eligible_markets = {candidate.market_id for candidate in polled.eligible}
+    missing = [
+        candidate
+        for candidate in recovered
+        if candidate.market_id not in eligible_markets
+    ]
+    for candidate in (*polled.eligible, *missing):
         provisional = _identity(candidate, candidate.precheck_book.source_sha256)
         call_journal = ProviderCallJournal(output_dir)
         input_changed = False

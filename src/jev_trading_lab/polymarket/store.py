@@ -34,6 +34,7 @@ from jev_trading_lab.persistence.blobs import (
     BlobSecurityError,
     BlobStore,
     _open_or_create_root,
+    is_credential_name,
 )
 from jev_trading_lab.polymarket.ai import (
     JEV_ENDPOINT,
@@ -1013,7 +1014,9 @@ def _contains_credentials(
 ) -> bool:
     if isinstance(value, Mapping):
         for key, nested in value.items():
-            if type(key) is str and _normalized_key(key) in _CREDENTIAL_KEYS:
+            if type(key) is str and (
+                _normalized_key(key) in _CREDENTIAL_KEYS or is_credential_name(key)
+            ):
                 return True
             if _contains_credentials(nested, sentinels, patterns=patterns):
                 return True

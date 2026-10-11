@@ -472,6 +472,33 @@ def test_malformed_gamma_top_level_records_bounded_raw_failure(tmp_path: Path) -
     assert base64.b64decode(failure["raw_response_b64"], validate=True) == raw
 
 
+def test_distinct_malformed_rows_for_one_market_converge_and_replay_cleanly(
+    tmp_path: Path,
+) -> None:
+    first = _market() | {"clobTokenIds": "not-json"}
+    second = _market() | {"clobTokenIds": '["only-one"]'}
+
+    class DuplicateMalformedMarket:
+        def __call__(self, request: HttpRequest) -> HttpResponse:
+            assert "gamma-api" in request.url
+            return HttpResponse(200, JSON_HEADERS, _wire([second, first]), NOW)
+
+    client = lambda: PolymarketClient(  # noqa: E731
+        DuplicateMalformedMarket(), page_size=2, max_pages=1
+    )
+    observed = observe_markets(limit=2, output_dir=tmp_path, client=client(), now=NOW)
+    replayed = observe_markets(limit=2, output_dir=tmp_path, client=client(), now=NOW)
+
+    assert replayed == observed
+    assert len(observed) == 1
+    assert observed[0]["reason"] == "MALFORMED_MARKET"
+    assert len({item["opportunity_id"] for item in observed}) == 1
+    results = (tmp_path / "results.jsonl").read_text().splitlines()
+    assert len(results) == 1
+    assert json.loads(results[0])["market_id"] == "live-m1"
+    load_observation(tmp_path, str(observed[0]["observation_id"]))
+
+
 def test_duplicate_malformed_gamma_rows_converge_and_replay_cleanly(
     tmp_path: Path,
 ) -> None:
@@ -2259,6 +2286,56 @@ def test_crash_after_provider_intent_never_retries_unknown_call(tmp_path: Path) 
     assert failure["code"] == "UNKNOWN_IN_FLIGHT"
 
 
+def test_missing_market_cannot_strand_unknown_in_flight_provider_cost(
+    tmp_path: Path,
+) -> None:
+    market = _market()
+
+    def crash(event: str) -> None:
+        if event == "openai_intent_frozen":
+            raise RuntimeError("failpoint after provider intent")
+
+    with pytest.raises(RuntimeError, match="failpoint"):
+        _observe(tmp_path, market=market, event_sink=crash)
+
+    class EmptyGamma:
+        def __init__(self) -> None:
+            self.requests: list[HttpRequest] = []
+
+        def __call__(self, request: HttpRequest) -> HttpResponse:
+            self.requests.append(request)
+            assert "gamma-api" in request.url
+            return HttpResponse(200, JSON_HEADERS, b"[]", NOW)
+
+    public = EmptyGamma()
+    openai = ModelTransport("openai", _market_sha(market))
+    jev = ModelTransport("jev")
+    summary = _observe(tmp_path, market=market, public=public, openai=openai, jev=jev)[
+        0
+    ]
+
+    assert summary["ai"]["disposition"] == "UNKNOWN_IN_FLIGHT"
+    assert summary["ai"]["model_cost_microdollars"] is None
+    assert openai.requests == [] and jev.requests == []
+    assert len(public.requests) == 1
+    completed = json.loads((tmp_path / "completed_slots.jsonl").read_text())
+    assert completed["observation_ids"] == [summary["observation_id"]]
+
+    replay_public = EmptyGamma()
+    replay_openai = ModelTransport("openai", _market_sha(market))
+    replay_jev = ModelTransport("jev")
+    again = _observe(
+        tmp_path,
+        market=market,
+        public=replay_public,
+        openai=replay_openai,
+        jev=replay_jev,
+    )
+    assert again == [summary]
+    assert replay_public.requests == []
+    assert replay_openai.requests == [] and replay_jev.requests == []
+
+
 def test_eligibility_drift_cannot_erase_unknown_in_flight_provider_cost(
     tmp_path: Path,
 ) -> None:
@@ -2856,11 +2933,38 @@ def test_hardening_quoted_bearer_prose_in_gamma_is_recorded_exactly(
     assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 1
 
 
-def test_hardening_raw_gamma_rejects_structural_credential_fields() -> None:
+def test_hardening_gamma_access_token_prose_never_reaches_model_or_artifacts(
+    tmp_path: Path,
+) -> None:
+    secret = b"PROSE-SECRET"
+    market = _market() | {"description": "leak access_token=PROSE-SECRET"}
+    openai = ModelTransport("openai", _market_sha(market))
+
+    summary = _observe(tmp_path, market=market, openai=openai)[0]
+
+    replay = load_observation(tmp_path, str(summary["observation_id"]))
+    assert secret not in replay.artifacts["sanitized_evidence"]
+    assert secret not in replay.artifacts["openai_request"]
+    assert all(secret not in request for request in openai.requests)
+    assert replay.result.ai.disposition != "INELIGIBLE"
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "access_token",
+        "refresh-token",
+        "clientSecret",
+        "vendorSessionToken_v2",
+        "ａｃｃｅｓｓ＿ｔｏｋｅｎV3",
+    ),
+)
+def test_hardening_raw_gamma_rejects_structural_credential_fields(field: str) -> None:
     from jev_trading_lab.polymarket.store import _screen_artifact
 
+    payload = _wire({field: "STRUCTURAL-SECRET"})
     with pytest.raises(StoreSecurityError):
-        _screen_artifact("raw_gamma", b'{"authorization":"Bearer abcd1234"}', ())
+        _screen_artifact("raw_gamma", payload, ())
 
 
 def test_hardening_secret_like_hash_in_valid_public_books_does_not_abort_observe(

@@ -201,7 +201,7 @@ _APPROVED_SOURCE_HASHES = {
         "b4c2a856b006ee6bde860e8abff04c209915eb420e1c55425805e3e25042d133"
     ),
     "src/jev_trading_lab/persistence/blobs.py": (
-        "cd21305b4366471745ef764a40b17c4980c5a6cac28aa6ba202a8064c83958bd"
+        "708978037457d6656af09f6c635f34f4519f55d2e4afdec438ff28382e9a7bce"
     ),
     "src/jev_trading_lab/persistence/journal.py": (
         "74c92b09eeb9c10e713c99354df7d40e43c2d90e7de0088968e95197f1a0dce2"
@@ -234,10 +234,10 @@ _APPROVED_SOURCE_HASHES = {
         "1a7cf5592733f0fc834a8bdf6529367d01154276943cbd77cb55d975da3fee70"
     ),
     "src/jev_trading_lab/polymarket/call_journal.py": (
-        "623b04b913eeb66fb278dd3056f86dff71f122031bf6214af80d30b95c7b2774"
+        "c37158f83874d3bbc176903568a45d464871d118c6edb628f4562c653042e9ce"
     ),
     "src/jev_trading_lab/polymarket/client.py": (
-        "9d6a970be9ca89b085834ab303314104509bbc2a991a2f17caa758138b56cfd6"
+        "40befdd7ba1cb718bf1807d4fb81bc422f5b1637e610f716b94170af1af8e14e"
     ),
     "src/jev_trading_lab/polymarket/control.py": (
         "cadd87042c9293c2fd97d0017f532b06500d2afd23b07a9bd16c5e7bceef2b8d"
@@ -249,10 +249,10 @@ _APPROVED_SOURCE_HASHES = {
         "f17e8c6cef480cf1926b04999fe3097079bb473cbb32a188a335cd89e287003e"
     ),
     "src/jev_trading_lab/polymarket/pipeline.py": (
-        "61b98fb44531d519e451c7b4f28188f4557a114b847be1c334e5e3f44360064b"
+        "6e28fd55fb1c1c6937dd190ede3854d3b512b6577ec33009c81d771c8413dfa2"
     ),
     "src/jev_trading_lab/polymarket/store.py": (
-        "7582515d5c31a5e5b4b1ec5e0bcff1b8b0a9f3ae0848d62316dde520ac6bed38"
+        "98db124d8f958aaf6df8c52f36bdffaa312ad432d6b657e512c54ad995042be7"
     ),
     "src/jev_trading_lab/stocks/__init__.py": (
         "47549384d0ac5349e974d9c72796b1a48c439b574630a4b1001d6b48b17d0156"
@@ -311,10 +311,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "14d10b678bef6bd849ab2258a103c06f9e882dd59f61806778ed20f497fe9516"
+    "75cd64d79ccbc142c9220e623403dc07a30e26c6d2c269e06ee67c4400efd515"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "147897ea08c5aea22c3ff816cb4f60841702881575012f42eb445650ef288640"
+    "cddd1340fb6f271b8e0e75e7b6a93502503092c4772a34f18795f84797fe3827"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = [
     "exchange-calendars==4.11.2",

@@ -618,6 +618,24 @@ class ProviderCallJournal:
             os.close(descriptor)
             os.close(root_fd)
 
+    def opportunity_ids_created_at(self, created_at: datetime) -> tuple[str, ...]:
+        """Return deterministic durable opportunities begun at one exact slot."""
+
+        root_fd, descriptor, states = self._locked_states(fcntl.LOCK_SH)
+        try:
+            return tuple(
+                sorted(
+                    {
+                        intent.opportunity_id
+                        for intent, _result, _envelope in states.values()
+                        if intent.created_at == created_at
+                    }
+                )
+            )
+        finally:
+            os.close(descriptor)
+            os.close(root_fd)
+
     def begin(
         self,
         *,
