@@ -302,6 +302,44 @@ def test_provider_journal_completes_short_interrupted_writes(tmp_path: Path) -> 
     assert journal.state(call_id) is not None
 
 
+def test_provider_journal_truncates_only_torn_final_tail_and_recovers_intent(
+    tmp_path: Path,
+) -> None:
+    journal = ProviderCallJournal(tmp_path)
+    call_id = journal.begin(
+        provider="openai",
+        opportunity_id="1" * 64,
+        request_bytes=b"request",
+        created_at=NOW,
+    )
+    path = tmp_path / "provider_calls.jsonl"
+    durable_prefix = path.read_bytes()
+    path.write_bytes(durable_prefix + b'{"artifact_sha256":"torn')
+
+    state = ProviderCallJournal(tmp_path).state(call_id)
+
+    assert state is not None and state["kind"] == "provider_call_intent"
+    assert path.read_bytes() == durable_prefix
+
+
+def test_provider_journal_rejects_newline_terminated_or_earlier_corruption(
+    tmp_path: Path,
+) -> None:
+    journal = ProviderCallJournal(tmp_path)
+    journal.begin(
+        provider="openai",
+        opportunity_id="1" * 64,
+        request_bytes=b"request",
+        created_at=NOW,
+    )
+    path = tmp_path / "provider_calls.jsonl"
+    durable_prefix = path.read_bytes()
+    for corrupt in (durable_prefix + b"{}\n", b"{}\n" + durable_prefix + b"torn"):
+        path.write_bytes(corrupt)
+        with pytest.raises(ValueError, match="provider call journal"):
+            ProviderCallJournal(tmp_path).validate("1" * 64)
+
+
 def test_provider_journal_rejects_duplicate_keys_and_oversized_lines(
     tmp_path: Path,
 ) -> None:

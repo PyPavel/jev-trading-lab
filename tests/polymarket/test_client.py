@@ -85,7 +85,10 @@ class CannedTransport:
 def test_pagination_normalization_and_deterministic_order() -> None:
     late = market("late", endDate=(NOW + timedelta(days=3)).isoformat())
     early = market("early", endDate=(NOW + timedelta(days=1)).isoformat())
-    transport = CannedTransport([[late], [early], []], [book("early"), book("late")])
+    transport = CannedTransport(
+        [[late], [early], []],
+        [book("early"), book("late")],
+    )
     result = PolymarketClient(transport, page_size=1, max_pages=3).poll(
         limit=2, now=NOW
     )
@@ -97,6 +100,36 @@ def test_pagination_normalization_and_deterministic_order() -> None:
         "offset=0" in transport.requests[0].url,
         "offset=1" in transport.requests[1].url,
     ] == [True, True]
+
+
+def test_identical_normalized_gamma_rows_deduplicate_before_limit_and_precheck() -> (
+    None
+):
+    duplicate = market()
+    transport = CannedTransport(
+        [[duplicate, dict(duplicate)]],
+        [book()],
+    )
+
+    result = PolymarketClient(transport).poll(limit=2, now=NOW)
+
+    assert [item.market_id for item in result.eligible] == ["m1"]
+    assert result.rejections == ()
+    assert len([r for r in transport.requests if "clob.polymarket.com" in r.url]) == 1
+
+
+def test_conflicting_duplicate_market_rows_become_one_canonical_rejection() -> None:
+    first = market()
+    second = market(description="Conflicting evidence")
+    transport = CannedTransport([[second, first]], [])
+
+    result = PolymarketClient(transport).poll(limit=2, now=NOW)
+
+    assert result.eligible == ()
+    assert [(item.market_id, item.reason) for item in result.rejections] == [
+        ("m1", "DUPLICATE_MARKET_DATA")
+    ]
+    assert len(transport.requests) == 1
 
 
 @pytest.mark.parametrize(

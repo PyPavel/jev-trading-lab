@@ -101,7 +101,7 @@ def _book(second: int) -> dict[str, Any]:
 class PublicNetwork:
     def __init__(self, market: dict[str, Any] | None = None) -> None:
         self.requests: list[HttpRequest] = []
-        self.books = [_book(0), _book(3)]
+        self.books = [_book(0), _book(1), _book(3)]
         self.market = market or _market()
 
     def __call__(self, request: HttpRequest) -> HttpResponse:
@@ -191,7 +191,7 @@ def test_observe_freezes_then_calls_models_then_fresh_book_and_records_both_arms
     )
     assert len(summaries) == 1
     assert events.index("decision_frozen") < events.index("execution_book_requested")
-    assert [request.method for request in public.requests] == ["GET", "GET", "GET"]
+    assert [request.method for request in public.requests] == ["GET"] * 4
     assert all(
         "polymarket.com" not in request.decode()
         for request in openai.requests + jev.requests
@@ -244,7 +244,7 @@ def test_provider_failure_freezes_precheck_history_and_consumed_execution_book(
         now=NOW,
     )
     assert summaries[0]["ai"]["disposition"] == "MODEL_FAILURE"
-    assert summaries[0]["control"]["disposition"] == "ABSTAIN"
+    assert summaries[0]["control"]["disposition"] == "NO_EDGE"
     result = json.loads((tmp_path / "results.jsonl").read_text().strip())
     replay = load_observation(tmp_path, result["observation_id"])
     kinds = list(replay.artifacts)
@@ -275,6 +275,105 @@ def test_provider_failure_freezes_precheck_history_and_consumed_execution_book(
         load_observation(tmp_path, result["observation_id"])
 
 
+def test_operator_summary_always_includes_known_and_deterministic_model_costs(
+    tmp_path: Path,
+) -> None:
+    summary = _observe(tmp_path)[0]
+
+    assert summary["ai"]["model_cost_microdollars"] == 34
+    assert summary["control"]["model_cost_microdollars"] == 0
+
+
+def test_live_equal_price_prechecks_freeze_two_points_and_enable_control(
+    tmp_path: Path,
+) -> None:
+    summary = _observe(tmp_path)[0]
+    replay = load_observation(tmp_path, str(summary["observation_id"]))
+    history = json.loads(replay.artifacts["causal_history"])
+    points = history["points"]
+
+    assert len(points) == len(history["raw_books_b64"]) == 2
+    assert points[0]["midpoint_micros"] == points[1]["midpoint_micros"]
+    assert all(
+        datetime.fromisoformat(point["observed_at"].replace("Z", "+00:00"))
+        < replay.result.cutoff_at
+        for point in points
+    )
+    assert summary["control"]["forecast_probability_micros"] is not None
+
+
+def test_conflicting_duplicate_gamma_rows_record_one_replayable_terminal_rejection(
+    tmp_path: Path,
+) -> None:
+    market = _market()
+    conflicting = market | {"description": "Conflicting duplicate evidence."}
+
+    class ConflictingPublic(PublicNetwork):
+        def __call__(self, request: HttpRequest) -> HttpResponse:
+            assert "gamma-api" in request.url
+            self.requests.append(request)
+            return HttpResponse(200, JSON_HEADERS, _wire([conflicting, market]), NOW)
+
+    first = observe_markets(
+        limit=2,
+        output_dir=tmp_path,
+        client=PolymarketClient(ConflictingPublic(market)),
+        now=NOW,
+    )
+    second = observe_markets(
+        limit=2,
+        output_dir=tmp_path,
+        client=PolymarketClient(ConflictingPublic(market)),
+        now=NOW,
+    )
+
+    assert second == first
+    assert len(first) == 1
+    assert first[0]["reason"] == "DUPLICATE_MARKET_DATA"
+    assert first[0]["terminal_status"] == "ELIGIBILITY_REJECTION"
+    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 1
+    load_observation(tmp_path, str(first[0]["observation_id"]))
+
+
+def test_duplicate_gamma_rows_produce_one_observation_and_one_provider_pair(
+    tmp_path: Path,
+) -> None:
+    market = _market()
+
+    class DuplicatePublic(PublicNetwork):
+        def __call__(self, request: HttpRequest) -> HttpResponse:
+            if "gamma-api" in request.url:
+                self.requests.append(request)
+                return HttpResponse(
+                    200, JSON_HEADERS, _wire([market, dict(market)]), NOW
+                )
+            return super().__call__(request)
+
+    public = DuplicatePublic(market)
+    openai = ModelTransport("openai", _market_sha(market))
+    jev = ModelTransport("jev")
+    first = observe_markets(
+        limit=2,
+        output_dir=tmp_path,
+        client=PolymarketClient(public),
+        openai_transport=openai,
+        jev_transport=jev,
+        now=NOW,
+    )
+    restarted = observe_markets(
+        limit=2,
+        output_dir=tmp_path,
+        client=PolymarketClient(DuplicatePublic(market)),
+        openai_transport=ModelTransport("openai", _market_sha(market)),
+        jev_transport=ModelTransport("jev"),
+        now=NOW,
+    )
+
+    assert restarted == first
+    assert len(first) == len({item["observation_id"] for item in first}) == 1
+    assert len(openai.requests) == len(jev.requests) == 1
+
+
 def test_precheck_corruption_blocks_terminal_replay(tmp_path: Path) -> None:
     public = PublicNetwork()
     raw_market = json.dumps(_market(), separators=(",", ":")).encode()
@@ -290,7 +389,7 @@ def test_precheck_corruption_blocks_terminal_replay(tmp_path: Path) -> None:
     )[0]
     replay = load_observation(tmp_path, str(summary["observation_id"]))
     history = json.loads(replay.artifacts["causal_history"])
-    assert history == []
+    assert len(history["points"]) == len(history["raw_books_b64"]) == 2
     _corrupt_blob(tmp_path, replay, "precheck_book")
     with pytest.raises(StoreCorruptError):
         load_observation(tmp_path, str(summary["observation_id"]))
@@ -315,7 +414,7 @@ def test_fresh_book_failures_terminalize_after_one_decision_barrier(
     class FailingFreshBook(PublicNetwork):
         def __init__(self) -> None:
             super().__init__()
-            self.books[1] = fresh
+            self.books[2] = fresh  # type: ignore[assignment]
 
         def __call__(self, request: HttpRequest) -> HttpResponse:
             if "gamma-api" in request.url:
@@ -333,9 +432,7 @@ def test_fresh_book_failures_terminalize_after_one_decision_barrier(
                 200,
                 {"content-type": "application/json"},
                 json.dumps(value, separators=(",", ":")).encode(),
-                datetime.fromtimestamp(int(value["timestamp"]) / 1000, UTC)
-                if partial
-                else NOW,
+                datetime.fromtimestamp(int(value["timestamp"]) / 1000, UTC),
             )
 
     public = FailingFreshBook()
@@ -718,7 +815,7 @@ def test_cumulative_model_cost_overflow_is_barriered_without_fresh_book(
 ) -> None:
     class FreshBookTrap(PublicNetwork):
         def __call__(self, request: HttpRequest) -> HttpResponse:
-            if "clob.polymarket.com" in request.url and len(self.requests) >= 2:
+            if "clob.polymarket.com" in request.url and len(self.requests) >= 3:
                 journal = tmp_path / "artifacts.jsonl"
                 assert journal.is_file()
                 assert json.loads(journal.read_text().splitlines()[-1])["kind"] == (
@@ -741,7 +838,7 @@ def test_cumulative_model_cost_overflow_is_barriered_without_fresh_book(
     )
     result = json.loads((tmp_path / "results.jsonl").read_text())
     assert summaries[0]["ai"]["disposition"] == "COST_OVERFLOW"
-    assert len(public.requests) == 2
+    assert len(public.requests) == 3
     assert result["execution_book_sha256"] is None
     assert result["baseline_probability_micros"] is None
     assert result["ai"]["model_cost_microdollars"] is None
@@ -816,7 +913,7 @@ def test_cumulative_cost_overflow_terminalizes_all_late_branches(
 ) -> None:
     public = PublicNetwork()
     if fresh_unavailable:
-        public.books[1] = TimeoutError()
+        public.books[2] = TimeoutError()  # type: ignore[assignment]
     raw_market = json.dumps(_market(), separators=(",", ":")).encode()
     summaries = observe_markets(
         limit=1,
@@ -883,7 +980,18 @@ class ScriptedPrecheck:
         *,
         then: tuple[HttpResponse, ...] = (),
     ) -> None:
-        self.replies: list[object] = [reply, *then]
+        repeated = (
+            HttpResponse(
+                reply.status_code,
+                reply.headers,
+                reply.body,
+                reply.retrieved_at + timedelta(seconds=1),
+                reply.oversized,
+            )
+            if isinstance(reply, HttpResponse)
+            else reply
+        )
+        self.replies: list[object] = [reply, repeated, *then]
         self.market = market or _market()
         self.requests: list[HttpRequest] = []
 
@@ -1960,7 +2068,7 @@ def test_finding_4_adjacent_observation_slots_poll_and_record_distinct_opportuni
         now=NOW + timedelta(minutes=1),
     )[0]
 
-    assert len(public.requests) == 3
+    assert len(public.requests) == 4
     assert second["opportunity_id"] != first["opportunity_id"]
 
 
@@ -1978,6 +2086,36 @@ def test_provider_call_journal_is_replay_bound_and_tamper_evident(
 
     with pytest.raises(StoreCorruptError, match="provider call"):
         load_observation(tmp_path, str(summary["observation_id"]))
+
+
+@pytest.mark.parametrize("provider", ["openai", "jev"])
+def test_timeout_after_durable_intent_keeps_unknown_cost_and_never_replays_call(
+    tmp_path: Path, provider: str
+) -> None:
+    class TimeoutTransport(ModelTransport):
+        def __call__(self, request: bytes) -> TransportResponse:
+            self.requests.append(request)
+            raise TimeoutError("ambiguous timeout")
+
+    market = _market()
+    openai = (
+        TimeoutTransport("openai", _market_sha(market))
+        if provider == "openai"
+        else ModelTransport("openai", _market_sha(market))
+    )
+    jev = TimeoutTransport("jev") if provider == "jev" else ModelTransport("jev")
+    first = _observe(tmp_path, market=market, openai=openai, jev=jev)[0]
+
+    replay_openai = ModelTransport("openai", _market_sha(market))
+    replay_jev = ModelTransport("jev")
+    second = _observe(tmp_path, market=market, openai=replay_openai, jev=replay_jev)[0]
+
+    assert second == first
+    assert first["ai"]["disposition"] == "UNKNOWN_IN_FLIGHT"
+    assert first["ai"]["model_cost_microdollars"] is None
+    assert first["ai"]["economic_pnl_microdollars"] is None
+    assert first["paired_economic_pnl_delta_microdollars"] is None
+    assert replay_openai.requests == [] and replay_jev.requests == []
 
 
 def test_crash_after_provider_intent_never_retries_unknown_call(tmp_path: Path) -> None:
@@ -2057,10 +2195,14 @@ def test_same_slot_changed_evidence_after_openai_result_terminalizes_without_jev
 
     assert openai.requests == [] and jev.requests == []
     assert summary["ai"]["disposition"] == "MODEL_FAILURE"
+    assert summary["ai"]["model_cost_microdollars"] == 17
     replay = load_observation(tmp_path, summary["observation_id"])
-    failure = json.loads(replay.artifacts["openai_failure"])
+    failure = json.loads(replay.artifacts["jev_failure"])
     assert failure["code"] == "INPUT_CHANGED"
-    assert failure["message"] == "openai frozen input differs from current evidence"
+    assert failure["message"] == "jev frozen input differs from current evidence"
+    brief = json.loads(replay.artifacts["research_brief"])
+    assert brief["evidence_sha256"] == _market_sha(first_market)
+    assert replay.result.evidence_sha256 == _market_sha(first_market)
     assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 1
 
     again = _observe(
@@ -2098,10 +2240,13 @@ def test_same_slot_changed_evidence_after_jev_intent_never_calls_provider_again(
     )[0]
 
     assert openai.requests == [] and jev.requests == []
-    assert summary["ai"]["disposition"] == "MODEL_FAILURE"
+    assert summary["ai"]["disposition"] == "UNKNOWN_IN_FLIGHT"
+    assert summary["ai"]["model_cost_microdollars"] is None
+    assert summary["paired_economic_pnl_delta_microdollars"] is None
     replay = load_observation(tmp_path, summary["observation_id"])
-    failure = json.loads(replay.artifacts["openai_failure"])
-    assert failure["code"] == "INPUT_CHANGED"
+    failure = json.loads(replay.artifacts["jev_failure"])
+    assert failure["code"] == "UNKNOWN_IN_FLIGHT"
+    assert replay.result.evidence_sha256 == _market_sha(first_market)
 
 
 @pytest.mark.parametrize(
@@ -2644,7 +2789,7 @@ def test_finding_6_cost_overflow_terminalizes_before_any_execution_book(
 
     assert summary["ai"]["disposition"] == "COST_OVERFLOW"
     assert summary["control"]["disposition"] == "BOOK_FAILURE"
-    assert len(public.requests) == 2
+    assert len(public.requests) == 3
     assert result["execution_book_sha256"] is None
     assert result["baseline_probability_micros"] is None
     assert result["ai"]["model_cost_microdollars"] is None

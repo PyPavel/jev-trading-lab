@@ -1,5 +1,12 @@
 # AI-DLC Audit Log
 
+## Final whole-slice claim boundary
+
+- Status: operational paper prototype only; no wallet, signing, or order submission path.
+- Canned replay demonstrates deterministic plumbing and recovery, not predictive edge.
+- No resolved live sample exists in this repository. No promotion, alpha, or economic-performance claim is supported.
+- Feasibility conclusion remains unestablished pending the preregistered resolved live paper sample.
+
 ## 2026-10-04 — Resume
 
 - Resumed approved Jev Trading Lab implementation plan in existing isolated worktree `feature/implementation`.

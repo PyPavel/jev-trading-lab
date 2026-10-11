@@ -466,9 +466,12 @@ class ProviderCallJournal:
             chunks.append(chunk)
             remaining -= len(chunk)
         raw = b"".join(chunks)
+        complete = raw
+        torn_tail: bytes | None = None
         if raw and not raw.endswith(b"\n"):
-            raise ValueError("provider call journal is truncated")
-        lines = raw.splitlines()
+            boundary = raw.rfind(b"\n") + 1
+            complete, torn_tail = raw[:boundary], raw[boundary:]
+        lines = complete.splitlines()
         if len(lines) > _MAX_LINES or any(
             not line or len(line) > _MAX_LINE_BYTES for line in lines
         ):
@@ -481,6 +484,9 @@ class ProviderCallJournal:
             except (TypeError, ValueError) as error:
                 raise ValueError("provider call journal envelope is invalid") from error
             entries.append(envelope)
+        if torn_tail is not None:
+            os.ftruncate(descriptor, len(complete))
+            os.fsync(descriptor)
         return entries
 
     def _append(self, descriptor: int, value: _JournalEnvelope) -> None:
@@ -570,7 +576,7 @@ class ProviderCallJournal:
         return states
 
     def _locked_states(
-        self, operation: int
+        self, _operation: int
     ) -> tuple[int, int, dict[str, tuple[_Intent, _Result | None, _JournalEnvelope]]]:
         root_fd = self._root_fd()
         try:
@@ -581,7 +587,7 @@ class ProviderCallJournal:
         try:
             while True:
                 try:
-                    fcntl.flock(descriptor, operation)
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
                     break
                 except InterruptedError:
                     continue

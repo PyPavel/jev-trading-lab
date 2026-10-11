@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import errno
 import fcntl
 import hashlib
@@ -580,6 +581,29 @@ _MEDIA_TYPE_PATTERN = (
 _PRE_RESPONSE_REASONS = frozenset({"TIMEOUT", "TRANSPORT_ERROR"})
 
 
+class CausalHistoryArtifact(UtcModel):
+    """Two exact pre-cutoff CLOB snapshots and their derived midpoint points."""
+
+    points: Annotated[list[CausalHistoryPoint], Field(min_length=2, max_length=2)]
+    raw_books_b64: Annotated[list[str], Field(min_length=2, max_length=2)]
+    response_retrieved_at: Annotated[list[datetime], Field(min_length=2, max_length=2)]
+
+    @model_validator(mode="after")
+    def require_strict_history(self) -> Self:
+        times = [point.observed_at for point in self.points]
+        if times != self.response_retrieved_at or times[0] >= times[1]:
+            raise ValueError("causal history snapshots must be strictly ordered")
+        try:
+            raw = [
+                base64.b64decode(value, validate=True) for value in self.raw_books_b64
+            ]
+        except ValueError as error:
+            raise ValueError("causal history raw books are invalid") from error
+        if any(not value for value in raw):
+            raise ValueError("causal history raw books must be nonempty")
+        return self
+
+
 class PrecheckHttpArtifact(UtcModel):
     """Strict bounded metadata for one CLOB precheck response or failure."""
 
@@ -828,11 +852,15 @@ class FailureArtifact(UtcModel):
             "PROVIDER_ERROR",
             "TIMEOUT",
         }:
+            known_prior_cost = (
+                self.code == "INPUT_CHANGED"
+                and self.billed_cost_microdollars is not None
+            )
             if (
                 self.status_code is not None
                 or has_response
                 or self.retrieved_at is not None
-                or self.billed_cost_microdollars != 0
+                or (not known_prior_cost and self.billed_cost_microdollars != 0)
             ):
                 raise ValueError("pre-response failure contains response metadata")
         elif self.code == "UNKNOWN_IN_FLIGHT" and (
@@ -1735,7 +1763,12 @@ def _reconstruct_orphan(kind: ArtifactKind, payload: bytes) -> TypedArtifact:
     if kind is ArtifactKind.PRECHECK_BOOK_RAW:
         return payload
     if kind is ArtifactKind.CAUSAL_HISTORY:
-        return TypeAdapter(list[CausalHistoryPoint]).validate_json(payload)
+        try:
+            return _canonical_model(
+                CausalHistoryArtifact.model_validate_json(payload), payload
+            )
+        except ValueError:
+            return TypeAdapter(list[CausalHistoryPoint]).validate_json(payload)
     if kind is ArtifactKind.PRECHECK_BOOK:
         raise ValueError("precheck book reconstruction requires observation identity")
     if kind is ArtifactKind.RESEARCH_BRIEF:
@@ -1827,7 +1860,7 @@ def _validate_precheck_http(
     if (
         evidence.market_id != market_id
         or http.request_token_id != token_id
-        or http.attempted_at != evidence.cutoff_at
+        or http.attempted_at > evidence.cutoff_at
         or http.response_sha256 != hashlib.sha256(raw).hexdigest()
         or http.response_byte_length != len(raw)
         or http_envelope.retrieved_at != (http.retrieved_at or http.attempted_at)
@@ -2018,47 +2051,103 @@ def _validate_reconstructed_path(
             return
         raw_gamma = typed.get(ArtifactKind.RAW_GAMMA)
         if result is not None and rejection.precheck_book_sha256 is None:
-            if not isinstance(raw_gamma, Mapping):
-                fail("frozen Gamma rejection input is invalid")
-                return
-            try:
-                normalized = normalize_gamma_identity(raw_gamma)
-                expected_reason = gamma_eligibility_reason(
-                    raw_gamma, cutoff=result.cutoff_at
-                )
-            except (TypeError, ValueError):
-                if rejection.reason != "MALFORMED_MARKET":
-                    fail("eligibility rejection reason does not match frozen Gamma")
-                    return
-            else:
-                computed_reason: str | None = expected_reason
-                if expected_reason is None:
-                    try:
-                        tags = normalized["tags"]
-                        if not isinstance(tags, list):
-                            raise ValueError("normalized Gamma tags are invalid")
-                        EvidencePacket(
-                            market_id=str(normalized["market_id"]),
-                            question=str(normalized["question"]),
-                            description=str(normalized["description"]),
-                            rules=str(normalized["rules"]),
-                            category=str(normalized["category"]),
-                            tags=[str(tag) for tag in tags],
-                            resolution_source_text=str(
-                                normalized["resolution_source_text"]
-                            ),
-                            closes_at=normalize_gamma_utc(raw_gamma.get("endDate")),
-                            retrieved_at=min(raw.retrieved_at, result.cutoff_at),
-                            cutoff_at=result.cutoff_at,
-                            source_sha256=raw.sha256,
+            duplicate_rows: list[Mapping[str, object]] | None = None
+            encoded_rows = (
+                raw_gamma.get("duplicate_market_data")
+                if isinstance(raw_gamma, Mapping)
+                else None
+            )
+            if (
+                rejection.reason == "DUPLICATE_MARKET_DATA"
+                and isinstance(raw_gamma, Mapping)
+                and set(raw_gamma) == {"duplicate_market_data", "market_id"}
+                and raw_gamma.get("market_id") == rejection.market_id
+                and isinstance(encoded_rows, list)
+            ):
+                try:
+                    decoded = [
+                        load_strict_json(base64.b64decode(value, validate=True))
+                        for value in encoded_rows
+                    ]
+                    if all(isinstance(value, Mapping) for value in decoded):
+                        duplicate_rows = decoded
+                except (TypeError, ValueError):
+                    duplicate_rows = None
+            if duplicate_rows is not None:
+                try:
+                    identities = [
+                        gamma_clob_identity(value) for value in duplicate_rows
+                    ]
+                    semantics = [
+                        canonical_json_bytes(
+                            {
+                                "condition_id": identity[1],
+                                "evidence": normalize_gamma_identity(value),
+                                "market_id": identity[0],
+                                "no_token_id": identity[3],
+                                "yes_token_id": identity[2],
+                            }
                         )
-                    except (TypeError, ValueError):
-                        computed_reason = "MALFORMED_MARKET"
+                        for value, identity in zip(
+                            duplicate_rows, identities, strict=True
+                        )
+                    ]
+                except (TypeError, ValueError):
+                    fail("duplicate Gamma rejection rows are invalid")
+                    return
                 if (
-                    normalized["market_id"] != rejection.market_id
-                    or computed_reason != rejection.reason
+                    len(duplicate_rows) < 2
+                    or len({identity[0] for identity in identities}) != 1
+                    or identities[0][0] != rejection.market_id
+                    or len(set(semantics)) < 2
                 ):
-                    fail("eligibility rejection reason does not match frozen Gamma")
+                    fail("duplicate Gamma rejection rows do not conflict")
+                normalized = normalize_gamma_identity(duplicate_rows[0])
+                computed_reason: str | None = "DUPLICATE_MARKET_DATA"
+            else:
+                if not isinstance(raw_gamma, Mapping):
+                    fail("frozen Gamma rejection input is invalid")
+                    return
+                try:
+                    normalized = normalize_gamma_identity(raw_gamma)
+                    expected_reason = gamma_eligibility_reason(
+                        raw_gamma, cutoff=result.cutoff_at
+                    )
+                except (TypeError, ValueError):
+                    if rejection.reason != "MALFORMED_MARKET":
+                        fail("eligibility rejection reason does not match frozen Gamma")
+                        return
+                else:
+                    computed_reason = expected_reason
+                    if expected_reason is None:
+                        try:
+                            tags = normalized["tags"]
+                            if not isinstance(tags, list):
+                                raise ValueError("normalized Gamma tags are invalid")
+                            EvidencePacket(
+                                market_id=str(normalized["market_id"]),
+                                question=str(normalized["question"]),
+                                description=str(normalized["description"]),
+                                rules=str(normalized["rules"]),
+                                category=str(normalized["category"]),
+                                tags=[str(tag) for tag in tags],
+                                resolution_source_text=str(
+                                    normalized["resolution_source_text"]
+                                ),
+                                closes_at=normalize_gamma_utc(raw_gamma.get("endDate")),
+                                retrieved_at=min(raw.retrieved_at, result.cutoff_at),
+                                cutoff_at=result.cutoff_at,
+                                source_sha256=raw.sha256,
+                            )
+                        except (TypeError, ValueError):
+                            computed_reason = "MALFORMED_MARKET"
+                    if (
+                        normalized["market_id"] != rejection.market_id
+                        or computed_reason != rejection.reason
+                    ):
+                        fail("eligibility rejection reason does not match frozen Gamma")
+            if duplicate_rows is not None and computed_reason != rejection.reason:
+                fail("eligibility rejection reason does not match frozen Gamma")
         precheck_raw = typed.get(ArtifactKind.PRECHECK_BOOK_RAW)
         precheck_raw_envelope = envelope_by_kind.get(ArtifactKind.PRECHECK_BOOK_RAW)
         precheck_rejection = typed.get(ArtifactKind.PRECHECK_BOOK)
@@ -2179,27 +2268,66 @@ def _validate_reconstructed_path(
     causal_history = typed.get(ArtifactKind.CAUSAL_HISTORY)
     if precheck_book is not None or causal_history is not None:
         precheck_envelope = envelope_by_kind.get(ArtifactKind.PRECHECK_BOOK)
-        valid_history = path in (_REJECTION_PATHS | _LEGACY_UNIT6_REJECTION_PATHS) or (
-            isinstance(causal_history, list)
-            and all(isinstance(item, CausalHistoryPoint) for item in causal_history)
-            and isinstance(precheck_book, BookSnapshot)
+        valid_history = path in (_REJECTION_PATHS | _LEGACY_UNIT6_REJECTION_PATHS)
+        if (
+            isinstance(causal_history, CausalHistoryArtifact)
             and isinstance(evidence, EvidencePacket)
-            and causal_history
-            == (
-                [
-                    CausalHistoryPoint(
-                        midpoint_micros=(
-                            precheck_book.bids[0].price_micros
-                            + precheck_book.asks[0].price_micros
-                        )
-                        // 2,
-                        observed_at=precheck_book.retrieved_at,
+            and isinstance(precheck_book, BookSnapshot)
+        ):
+            try:
+                raw_books = [
+                    base64.b64decode(value, validate=True)
+                    for value in causal_history.raw_books_b64
+                ]
+                history_books = [
+                    reconstruct_book_snapshot(
+                        raw,
+                        market_id=evidence.market_id,
+                        response_retrieved_at=retrieved_at,
+                    )
+                    for raw, retrieved_at in zip(
+                        raw_books, causal_history.response_retrieved_at, strict=True
                     )
                 ]
-                if precheck_book.retrieved_at < evidence.cutoff_at
-                else []
+            except (TypeError, ValueError):
+                history_books = []
+            valid_history = (
+                isinstance(evidence, EvidencePacket)
+                and len(history_books) == 2
+                and all(
+                    book.token_id == precheck_book.token_id for book in history_books
+                )
+                and history_books[0] == precheck_book
+                and all(
+                    point.observed_at < evidence.cutoff_at
+                    and point.midpoint_micros
+                    == (book.bids[0].price_micros + book.asks[0].price_micros) // 2
+                    for point, book in zip(
+                        causal_history.points, history_books, strict=True
+                    )
+                )
             )
-        )
+        elif isinstance(causal_history, list):
+            valid_history = (
+                all(isinstance(item, CausalHistoryPoint) for item in causal_history)
+                and isinstance(precheck_book, BookSnapshot)
+                and isinstance(evidence, EvidencePacket)
+                and causal_history
+                == (
+                    [
+                        CausalHistoryPoint(
+                            midpoint_micros=(
+                                precheck_book.bids[0].price_micros
+                                + precheck_book.asks[0].price_micros
+                            )
+                            // 2,
+                            observed_at=precheck_book.retrieved_at,
+                        )
+                    ]
+                    if precheck_book.retrieved_at < evidence.cutoff_at
+                    else []
+                )
+            )
         if (
             not isinstance(precheck_book, BookSnapshot)
             or precheck_envelope is None
@@ -3027,6 +3155,60 @@ def load_existing_terminal(
         os.close(root_fd)
 
 
+def load_frozen_artifacts_for_opportunity(
+    output_dir: str | os.PathLike[str], opportunity_id: str
+) -> dict[str, bytes] | None:
+    """Return one validated incomplete artifact prefix for restart recovery."""
+
+    if (
+        type(opportunity_id) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", opportunity_id) is None
+    ):
+        raise ValueError("opportunity ID must be a lowercase SHA-256")
+    output = Path(output_dir)
+    if not output.exists():
+        return None
+    root_fd = _open_output(output)
+    try:
+        with BlobStore(output.absolute() / "blobs") as store:
+            results_fd = _open_journal(root_fd, "results.jsonl")
+            try:
+                _lock(results_fd, fcntl.LOCK_SH)
+                results = _parse_results(
+                    _read_journal(results_fd, label="result journal")
+                )
+                artifacts_fd = _open_journal(root_fd, "artifacts.jsonl")
+                try:
+                    _lock(artifacts_fd, fcntl.LOCK_SH)
+                    envelopes = _parse_envelopes(
+                        _read_journal(artifacts_fd, label="artifact journal")
+                    )
+                    _validate_journals_locked(store, results, envelopes)
+                    selected = [
+                        envelope
+                        for envelope in envelopes
+                        if envelope.opportunity_id == opportunity_id
+                        and envelope.observation_id not in results
+                    ]
+                    if not selected:
+                        return None
+                    observation_ids = {item.observation_id for item in selected}
+                    if len(observation_ids) != 1:
+                        raise StoreCorruptError(
+                            "opportunity has conflicting incomplete observations"
+                        )
+                    return {
+                        item.kind: store.read_verified(item.blob_ref())
+                        for item in selected
+                    }
+                finally:
+                    os.close(artifacts_fd)
+            finally:
+                os.close(results_fd)
+    finally:
+        os.close(root_fd)
+
+
 def load_existing_terminal_for_inputs(
     output_dir: str | os.PathLike[str],
     *,
@@ -3180,7 +3362,7 @@ def load_completed_slot(
     assert isinstance(ids, list)
     replays = tuple(load_observation(output, value) for value in ids)
     if any(
-        replay.result.cutoff_at != cutoff
+        replay.result.cutoff_at.replace(second=0, microsecond=0) != cutoff
         or replay.result.policy_version != policy_version
         for replay in replays
     ):

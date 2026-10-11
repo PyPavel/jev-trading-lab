@@ -47,6 +47,7 @@ from jev_trading_lab.polymarket.client import (
     PolymarketClient,
     PrecheckAttempt,
     SecureHttpTransport,
+    reconstruct_book_snapshot,
 )
 from jev_trading_lab.polymarket.models import (
     ArmResult,
@@ -89,6 +90,7 @@ from jev_trading_lab.polymarket.store import (
     load_completed_slot,
     load_existing_terminal,
     load_existing_terminal_for_inputs,
+    load_frozen_artifacts_for_opportunity,
     load_observation,
     observation_lock,
     record_completed_slot,
@@ -499,19 +501,17 @@ def _finish_book_unavailable(
 
 
 def _arm_summary(arm: ArmResult) -> dict[str, object]:
-    summary: dict[str, object] = {
+    return {
         "action": arm.signal_action,
         "brier_micros": arm.brier_micros,
         "disposition": arm.disposition,
         "economic_pnl_microdollars": arm.economic_pnl_microdollars,
         "forecast_probability_micros": arm.forecast_probability_micros,
         "forecast_status": arm.forecast_status,
+        "model_cost_microdollars": arm.model_cost_microdollars,
         "quantity": arm.quantity,
         "trading_pnl_microdollars": arm.trading_pnl_microdollars,
     }
-    if arm.model_cost_microdollars is None:
-        summary["model_cost_microdollars"] = None
-    return summary
 
 
 def _summary(
@@ -623,6 +623,11 @@ def _journaled_provider_call(
     if event_sink is not None:
         event_sink(f"{provider}_intent_frozen")
     result = invoke()
+    if isinstance(result, AdapterFailure) and result.code in {
+        "TIMEOUT",
+        "PROVIDER_ERROR",
+    }:
+        result = _unknown_provider_result(provider, result.request_bytes)
     journal.finish(
         call_id,
         outcome=adapter_outcome(result),
@@ -644,21 +649,31 @@ def _live_policy() -> Economics:
 
 
 def _live_causal_history(candidate: MarketCandidate) -> list[CausalHistoryPoint]:
-    return (
-        [
-            CausalHistoryPoint(
-                midpoint_micros=midpoint_micros(candidate.precheck_book),
-                observed_at=candidate.precheck_book.retrieved_at,
-            )
-        ]
-        if candidate.precheck_book.retrieved_at < candidate.evidence.cutoff_at
-        else []
-    )
+    return [
+        CausalHistoryPoint(
+            midpoint_micros=midpoint_micros(book),
+            observed_at=book.response_retrieved_at or book.retrieved_at,
+        )
+        for book in candidate.precheck_history
+    ]
 
 
 def _causal_history_bytes(candidate: MarketCandidate) -> bytes:
+    history = _live_causal_history(candidate)
     return canonical_json_bytes(
-        [point.model_dump(mode="json") for point in _live_causal_history(candidate)]
+        {
+            "points": [point.model_dump(mode="json") for point in history],
+            "raw_books_b64": [
+                base64.b64encode(raw).decode()
+                for raw in candidate.precheck_history_bytes
+            ],
+            "response_retrieved_at": [
+                (book.response_retrieved_at or book.retrieved_at)
+                .isoformat()
+                .replace("+00:00", "Z")
+                for book in candidate.precheck_history
+            ],
+        }
     )
 
 
@@ -1272,9 +1287,9 @@ def observe_markets(
         raise ValueError("limit must be in 1..20")
     config = _runtime_config_bytes()
     with observation_lock(output_dir):
-        cutoff = observation_slot(now or datetime.now(UTC))
+        slot = observation_slot(now or datetime.now(UTC))
         completed = load_completed_slot(
-            output_dir, cutoff=cutoff, policy_version=POLICY_VERSION, limit=limit
+            output_dir, cutoff=slot, policy_version=POLICY_VERSION, limit=limit
         )
         if completed is not None:
             return [_replay_summary(item) for item in completed]
@@ -1285,17 +1300,84 @@ def observe_markets(
             client=client,
             openai_transport=openai_transport,
             jev_transport=jev_transport,
-            now=cutoff,
+            now=slot,
             event_sink=event_sink,
         )
         record_completed_slot(
             output_dir,
-            cutoff=cutoff,
+            cutoff=slot,
             policy_version=POLICY_VERSION,
             limit=limit,
             observation_ids=[str(item["observation_id"]) for item in summaries],
         )
         return summaries
+
+
+def _frozen_candidate(
+    candidate: MarketCandidate,
+    openai_request: bytes,
+    frozen_artifacts: dict[str, bytes],
+) -> MarketCandidate:
+    """Rebind current public transport data to the original durable provider input."""
+
+    request = load_strict_json(openai_request)
+    if not isinstance(request, dict) or type(request.get("input")) is not str:
+        raise ValueError("frozen OpenAI request is invalid")
+    payload = request["input"]
+    opening, closing = "<evidence>", "</evidence>"
+    if not payload.startswith(opening) or not payload.endswith(closing):
+        raise ValueError("frozen OpenAI evidence is invalid")
+    evidence = type(candidate.evidence).model_validate_json(
+        payload[len(opening) : -len(closing)]
+    )
+    raw_gamma = frozen_artifacts.get("raw_gamma")
+    precheck_raw = frozen_artifacts.get("precheck_book_raw")
+    history_raw = frozen_artifacts.get("causal_history")
+    if (
+        evidence.market_id != candidate.market_id
+        or raw_gamma is None
+        or precheck_raw is None
+        or history_raw is None
+    ):
+        raise ValueError("frozen observation inputs are incomplete")
+    history = load_strict_json(history_raw)
+    if not isinstance(history, dict):
+        raise ValueError("frozen causal history is invalid")
+    raw_books = [
+        base64.b64decode(value, validate=True) for value in history["raw_books_b64"]
+    ]
+    retrieved = [_dt(value) for value in history["response_retrieved_at"]]
+    books = tuple(
+        reconstruct_book_snapshot(
+            raw, market_id=candidate.market_id, response_retrieved_at=at
+        )
+        for raw, at in zip(raw_books, retrieved, strict=True)
+    )
+    attempt = candidate.precheck_attempt
+    return MarketCandidate(
+        market_id=candidate.market_id,
+        condition_id=candidate.condition_id,
+        yes_token_id=candidate.yes_token_id,
+        no_token_id=candidate.no_token_id,
+        raw_gamma_bytes=raw_gamma,
+        raw_gamma_sha256=evidence.source_sha256,
+        evidence=evidence,
+        precheck_book_bytes=precheck_raw,
+        precheck_book=books[0],
+        precheck_attempt=PrecheckAttempt(
+            candidate.yes_token_id,
+            retrieved[0],
+            attempt.status_code,
+            attempt.content_type,
+            retrieved[0],
+            precheck_raw,
+            attempt.truncated,
+            attempt.transport_reason,
+        ),
+        precheck_history_bytes=(raw_books[0], raw_books[1]),
+        precheck_history=(books[0], books[1]),
+        precheck_attempts=candidate.precheck_attempts,
+    )
 
 
 def _observe_locked(
@@ -1313,12 +1395,40 @@ def _observe_locked(
     public = client or PolymarketClient(SecureHttpTransport())
     openai_sender = openai_transport or live_openai_transport()
     jev_sender = jev_transport or live_jev_transport()
-    polled = public.poll(limit=limit, now=cutoff)
+    polled = public.poll(limit=limit, now=cutoff, history_points=2)
     summaries = _record_rejections(
         output_dir, polled.rejections, observed_at=cutoff, config=config
     )
     for candidate in polled.eligible:
         provisional = _identity(candidate, candidate.precheck_book.source_sha256)
+        call_journal = ProviderCallJournal(output_dir)
+        input_changed = False
+        prior_openai = call_journal.lookup(provisional.opportunity_id, "openai")
+        if prior_openai is not None:
+            frozen_request = (
+                base64.b64decode(prior_openai["request_b64"], validate=True)
+                if prior_openai["kind"] == "provider_call_intent"
+                else base64.b64decode(
+                    prior_openai["outcome"]["request_b64"], validate=True
+                )
+            )
+            if frozen_request != build_openai_request(
+                candidate.evidence, OPENAI_MODEL_ID
+            ):
+                input_changed = True
+                frozen_artifacts = load_frozen_artifacts_for_opportunity(
+                    output_dir, provisional.opportunity_id
+                )
+                if frozen_artifacts is None:
+                    raise ValueError(
+                        "durable provider intent lacks frozen observation input"
+                    )
+                candidate = _frozen_candidate(
+                    candidate, frozen_request, frozen_artifacts
+                )
+                provisional = _identity(
+                    candidate, candidate.precheck_book.source_sha256
+                )
         existing = load_existing_terminal_for_inputs(
             output_dir,
             opportunity_id=provisional.opportunity_id,
@@ -1355,11 +1465,11 @@ def _observe_locked(
                     provider="openai",
                     code="INPUT_CHANGED",
                     message="openai frozen input differs from current evidence",
-                    request_bytes=openai.request_bytes,
+                    request_bytes=openai_success.request_bytes,
                     response_sha256=None,
                     response_byte_length=0,
                     retrieved_at=None,
-                    billed_cost_microdollars=0,
+                    billed_cost_microdollars=openai_success.billed_cost_microdollars,
                     status_code=None,
                 )
             else:
@@ -1378,24 +1488,37 @@ def _observe_locked(
                         openai_success.brief, candidate.evidence, JEV_MODEL_ID
                     )
                 )
-                jev_value = _journaled_provider_call(
-                    journal=call_journal,
-                    provider="jev",
-                    opportunity_id=provisional.opportunity_id,
-                    request_bytes=jev_request,
-                    created_at=openai_success.retrieved_at,
-                    invoke=lambda: call_jev(
-                        openai_success.brief,
-                        candidate.evidence,
-                        JEV_MODEL_ID,
-                        jev_sender,
-                    ),
-                    event_sink=event_sink,
-                )
-                assert isinstance(
-                    jev_value, (JevSuccess, AdapterFailure, AdapterCostOverflow)
-                )
-                jev = jev_value
+                if input_changed and existing_jev is None:
+                    jev = AdapterFailure(
+                        provider="jev",
+                        code="INPUT_CHANGED",
+                        message="jev frozen input differs from current evidence",
+                        request_bytes=jev_request,
+                        response_sha256=None,
+                        response_byte_length=0,
+                        retrieved_at=None,
+                        billed_cost_microdollars=0,
+                        status_code=None,
+                    )
+                else:
+                    jev_value = _journaled_provider_call(
+                        journal=call_journal,
+                        provider="jev",
+                        opportunity_id=provisional.opportunity_id,
+                        request_bytes=jev_request,
+                        created_at=openai_success.retrieved_at,
+                        invoke=lambda: call_jev(
+                            openai_success.brief,
+                            candidate.evidence,
+                            JEV_MODEL_ID,
+                            jev_sender,
+                        ),
+                        event_sink=event_sink,
+                    )
+                    assert isinstance(
+                        jev_value, (JevSuccess, AdapterFailure, AdapterCostOverflow)
+                    )
+                    jev = jev_value
         frozen_at = max(
             cutoff,
             openai.retrieved_at if openai.retrieved_at is not None else cutoff,

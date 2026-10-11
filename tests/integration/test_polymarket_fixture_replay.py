@@ -177,6 +177,7 @@ def test_replay_is_offline_ordered_and_matches_recomputed_fixture(
         "economic_pnl_microdollars": 223500000,
         "forecast_probability_micros": 700000,
         "forecast_status": "SCORED",
+        "model_cost_microdollars": 500000,
         "quantity": 500,
         "trading_pnl_microdollars": 224000000,
     }

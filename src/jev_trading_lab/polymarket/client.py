@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import http.client
 import ipaddress
@@ -19,6 +20,7 @@ from decimal import ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Any, Final, Literal
 from urllib.parse import parse_qs, urlencode, urlsplit
 
+from jev_trading_lab.core.ids import canonical_json_bytes
 from jev_trading_lab.polymarket.models import (
     BookLevel,
     BookSnapshot,
@@ -361,6 +363,28 @@ class MarketCandidate:
     precheck_book_bytes: bytes = field(repr=False)
     precheck_book: BookSnapshot
     precheck_attempt: PrecheckAttempt
+    precheck_history_bytes: tuple[bytes, bytes] = field(repr=False)
+    precheck_history: tuple[BookSnapshot, BookSnapshot]
+    precheck_attempts: tuple[PrecheckAttempt, PrecheckAttempt]
+
+
+def _gamma_semantic_identity(
+    item: Mapping[str, object],
+) -> tuple[tuple[str, str, str, str], bytes]:
+    """Return stable market identity plus canonical normalized candidate semantics."""
+
+    market_identity = gamma_clob_identity(item)
+    evidence = normalize_gamma_identity(item)
+    semantics = canonical_json_bytes(
+        {
+            "condition_id": market_identity[1],
+            "evidence": evidence,
+            "market_id": market_identity[0],
+            "no_token_id": market_identity[3],
+            "yes_token_id": market_identity[2],
+        }
+    )
+    return market_identity, semantics
 
 
 @dataclass(frozen=True, slots=True)
@@ -899,7 +923,13 @@ class PolymarketClient:
             ),
         )
 
-    def poll(self, *, limit: int = 1, now: datetime | None = None) -> PollResult:
+    def poll(
+        self,
+        *,
+        limit: int = 1,
+        now: datetime | None = None,
+        history_points: Literal[1, 2] = 1,
+    ) -> PollResult:
         if not 1 <= limit <= 20:
             raise ValueError("limit must be in 1..20")
         cutoff = now or datetime.now(UTC)
@@ -939,16 +969,52 @@ class PolymarketClient:
                 )
             if len(value) < self.page_size:
                 break
-        normalized.sort(key=lambda row: (row[0], row[1]))
+        normalized.sort(key=lambda row: (row[0], row[1], row[2]))
+        unique: list[tuple[datetime, str, bytes, Mapping[str, object], datetime]] = []
+        positions: dict[str, int] = {}
+        semantics: dict[str, bytes] = {}
+        conflict_rows: dict[str, list[bytes]] = {}
+        for row in normalized:
+            try:
+                market_identity, semantic = _gamma_semantic_identity(row[3])
+            except (TypeError, ValueError):
+                unique.append(row)
+                continue
+            market_id = market_identity[0]
+            position = positions.get(market_id)
+            if position is None:
+                positions[market_id] = len(unique)
+                semantics[market_id] = semantic
+                unique.append(row)
+                continue
+            if semantics[market_id] == semantic:
+                continue
+            conflict_rows.setdefault(market_id, [unique[position][2]]).append(row[2])
+            if row[2] < unique[position][2]:
+                unique[position] = row
         eligible: list[MarketCandidate] = []
         rejected: list[MarketRejection] = []
-        for close, market_id, raw_market, item, retrieved_at in normalized:
+        for close, market_id, raw_market, item, retrieved_at in unique:
             if len(eligible) + len(rejected) >= limit:
                 break
             reason: str | None = None
             try:
                 identity = normalize_gamma_identity(item)
-                reason = gamma_eligibility_reason(item, cutoff=cutoff)
+                reason = (
+                    "DUPLICATE_MARKET_DATA"
+                    if market_id in conflict_rows
+                    else gamma_eligibility_reason(item, cutoff=cutoff)
+                )
+                if reason == "DUPLICATE_MARKET_DATA":
+                    raw_market = canonical_json_bytes(
+                        {
+                            "duplicate_market_data": [
+                                base64.b64encode(value).decode()
+                                for value in sorted(set(conflict_rows[market_id]))
+                            ],
+                            "market_id": market_id,
+                        }
+                    )
             except ValueError:
                 identity = {
                     "question": "",
@@ -1001,16 +1067,44 @@ class PolymarketClient:
                     )
                 )
                 continue
-            attempt = self._precheck_attempt(yes_token, cutoff)
-            reason, snapshot = derive_precheck_rejection(
-                transport_reason=attempt.transport_reason,
-                body=attempt.body,
-                market_id=market_id,
-                condition_id=condition_id,
-                token_id=yes_token,
-                now=attempt.retrieved_at or cutoff,
-            )
+            attempts: list[PrecheckAttempt] = []
+            snapshots: list[BookSnapshot] = []
+            reason = None
+            for attempt_number in range(history_points):
+                attempted_at = (
+                    cutoff
+                    if not attempts
+                    else max(
+                        cutoff,
+                        attempts[-1].retrieved_at or attempts[-1].attempted_at,
+                    )
+                )
+                attempt = self._precheck_attempt(yes_token, attempted_at)
+                snapshot_reason, snapshot = derive_precheck_rejection(
+                    transport_reason=attempt.transport_reason,
+                    body=attempt.body,
+                    market_id=market_id,
+                    condition_id=condition_id,
+                    token_id=yes_token,
+                    now=attempt.retrieved_at or attempted_at,
+                )
+                attempts.append(attempt)
+                if snapshot is not None:
+                    snapshots.append(snapshot)
+                if snapshot_reason is not None:
+                    reason = snapshot_reason
+                    break
+                assert snapshot is not None
+                if attempt_number == 1:
+                    first_at = (
+                        snapshots[0].response_retrieved_at or snapshots[0].retrieved_at
+                    )
+                    second_at = snapshot.response_retrieved_at or snapshot.retrieved_at
+                    if second_at <= first_at:
+                        reason = "STALE_PRECHECK"
             if reason is not None:
+                attempt = attempts[-1]
+                snapshot = snapshots[-1] if snapshots else None
                 rejection_book = (
                     snapshot if reason in {"WIDE_SPREAD", "LOW_DEPTH"} else None
                 )
@@ -1039,7 +1133,27 @@ class PolymarketClient:
                     )
                 )
                 continue
-            assert snapshot is not None
+            assert len(attempts) == len(snapshots) == history_points
+            if history_points == 2:
+                final_cutoff = max(
+                    cutoff,
+                    *(
+                        attempt.retrieved_at or attempt.attempted_at
+                        for attempt in attempts
+                    ),
+                ) + timedelta(microseconds=1)
+                evidence = evidence.model_copy(update={"cutoff_at": final_cutoff})
+                snapshots = [
+                    book.model_copy(
+                        update={
+                            "retrieved_at": attempt.retrieved_at or book.retrieved_at
+                        }
+                    )
+                    for book, attempt in zip(snapshots, attempts, strict=True)
+                ]
+            else:
+                attempts.append(attempts[0])
+                snapshots.append(snapshots[0])
             eligible.append(
                 MarketCandidate(
                     market_id=market_id,
@@ -1049,9 +1163,12 @@ class PolymarketClient:
                     raw_gamma_bytes=raw_market,
                     raw_gamma_sha256=source_sha,
                     evidence=evidence,
-                    precheck_book_bytes=attempt.body,
-                    precheck_book=snapshot,
-                    precheck_attempt=attempt,
+                    precheck_book_bytes=attempts[0].body,
+                    precheck_book=snapshots[0],
+                    precheck_attempt=attempts[0],
+                    precheck_history_bytes=(attempts[0].body, attempts[1].body),
+                    precheck_history=(snapshots[0], snapshots[1]),
+                    precheck_attempts=(attempts[0], attempts[1]),
                 )
             )
         return PollResult(tuple(eligible), tuple(rejected))
