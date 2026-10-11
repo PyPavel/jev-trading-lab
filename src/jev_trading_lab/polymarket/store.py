@@ -8,8 +8,10 @@ import hashlib
 import os
 import re
 import stat
+import time
 import unicodedata
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -33,19 +35,33 @@ from jev_trading_lab.persistence.blobs import (
     _open_or_create_root,
 )
 from jev_trading_lab.polymarket.ai import (
+    JEV_ENDPOINT,
     JEV_MODEL_ID,
+    OPENAI_ENDPOINT,
     OPENAI_MODEL_ID,
+    AdapterCostOverflow,
     AdapterFailure,
     FailureCode,
     build_jev_request,
     build_openai_request,
     has_canonical_failure_response,
     is_canonical_failure_message,
+    is_cost_overflow_consistent,
 )
 from jev_trading_lab.polymarket.client import (
+    CLOB_ENDPOINT,
+    CLOB_HOST,
+    CLOB_PATH,
+    GAMMA_ENDPOINT,
+    MAX_CLOB_TOKEN_ID_CHARS,
+    PrecheckTransportReason,
     _book_snapshot,
     _reason,
+    derive_precheck_rejection,
+    derive_precheck_transport_reason,
+    gamma_clob_identity,
     normalize_gamma_identity,
+    precheck_eligibility_reason,
     reconstruct_book_snapshot,
 )
 from jev_trading_lab.polymarket.models import (
@@ -67,6 +83,7 @@ from jev_trading_lab.polymarket.models import (
     load_strict_json,
     openai_response_brief,
 )
+from jev_trading_lab.polymarket.paper import POLICY_VERSION
 
 _LABEL_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _MAX_LINE_BYTES = 1024 * 1024
@@ -92,9 +109,11 @@ _CREDENTIAL_KEYS = frozenset(
 
 
 class ArtifactKind(StrEnum):
+    RUNTIME_CONFIG = "runtime_config"
     RAW_GAMMA = "raw_gamma"
     SANITIZED_EVIDENCE = "sanitized_evidence"
     PRECHECK_BOOK_RAW = "precheck_book_raw"
+    PRECHECK_BOOK_HTTP = "precheck_book_http"
     PRECHECK_BOOK = "precheck_book"
     PRECHECK_BOOK_FAILURE = "precheck_book_failure"
     CAUSAL_HISTORY = "causal_history"
@@ -102,11 +121,13 @@ class ArtifactKind(StrEnum):
     OPENAI_RESPONSE_SUCCESS = "openai_response_success"
     OPENAI_SUCCESS_METADATA = "openai_success_metadata"
     OPENAI_FAILURE = "openai_failure"
+    OPENAI_COST_OVERFLOW = "openai_cost_overflow"
     RESEARCH_BRIEF = "research_brief"
     JEV_REQUEST = "jev_request"
     JEV_RESPONSE_SUCCESS = "jev_response_success"
     JEV_SUCCESS_METADATA = "jev_success_metadata"
     JEV_FAILURE = "jev_failure"
+    JEV_COST_OVERFLOW = "jev_cost_overflow"
     JEV_DECISION = "jev_decision"
     DECISION_FROZEN = "decision_frozen"
     BOOK_UNAVAILABLE = "book_unavailable"
@@ -130,12 +151,20 @@ class DecisionFrozenArtifact(UtcModel):
     jev_request_sha256: Sha256 | None
     jev_response_sha256: Sha256 | None
     jev_decision_sha256: Sha256 | None
-    openai_cost_microdollars: Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)]
-    jev_cost_microdollars: Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)]
+    openai_cost_microdollars: (
+        Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)] | None
+    )
+    jev_cost_microdollars: Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)] | None
     frozen_at: datetime
 
     @model_validator(mode="after")
     def require_state_fields(self) -> Self:
+        openai_cost = self.openai_cost_microdollars
+        jev_cost = self.jev_cost_microdollars
+        if self.terminal_model_state != "COST_OVERFLOW" and (
+            openai_cost is None or jev_cost is None
+        ):
+            raise ValueError("only cost overflow permits unavailable provider costs")
         if self.terminal_model_state == "OPENAI_FAILURE":
             if (
                 self.failure_code is None
@@ -147,7 +176,7 @@ class DecisionFrozenArtifact(UtcModel):
                         self.jev_decision_sha256,
                     )
                 )
-                or self.jev_cost_microdollars != 0
+                or jev_cost != 0
             ):
                 raise ValueError("OpenAI failure barrier fields are inconsistent")
         elif self.terminal_model_state == "JEV_FAILURE":
@@ -159,14 +188,35 @@ class DecisionFrozenArtifact(UtcModel):
             ):
                 raise ValueError("Jev failure barrier fields are inconsistent")
         elif self.terminal_model_state == "COST_OVERFLOW":
-            if (
-                self.openai_response_sha256 is None
-                or self.jev_request_sha256 is None
-                or self.jev_response_sha256 is None
-                or self.openai_cost_microdollars + self.jev_cost_microdollars
-                <= INT64_MAX
-                or (self.failure_code is None) != (self.jev_decision_sha256 is not None)
-            ):
+            if openai_cost is None and jev_cost is None:
+                raise ValueError("cost overflow barrier fields are inconsistent")
+            if openai_cost is None:
+                consistent = (
+                    self.failure_code is None
+                    and self.openai_response_sha256 is not None
+                    and self.jev_request_sha256 is None
+                    and self.jev_response_sha256 is None
+                    and self.jev_decision_sha256 is None
+                    and jev_cost == 0
+                )
+            elif jev_cost is None:
+                consistent = (
+                    self.failure_code is None
+                    and self.openai_response_sha256 is not None
+                    and self.jev_request_sha256 is not None
+                    and self.jev_response_sha256 is not None
+                    and self.jev_decision_sha256 is None
+                )
+            else:
+                consistent = (
+                    self.openai_response_sha256 is not None
+                    and self.jev_request_sha256 is not None
+                    and self.jev_response_sha256 is not None
+                    and openai_cost + jev_cost > INT64_MAX
+                    and (self.failure_code is None)
+                    == (self.jev_decision_sha256 is not None)
+                )
+            if not consistent:
                 raise ValueError("cost overflow barrier fields are inconsistent")
         elif self.failure_code is not None or any(
             value is None
@@ -283,6 +333,68 @@ _LEGACY_UNIT6_LATE_PATHS = tuple(
     (*path, ArtifactKind.BOOK_UNAVAILABLE) for path in _LEGACY_UNIT6_BASE_PATHS
 )
 _UNIT6_SUCCESS_PATH = _UNIT6_EXECUTION_PATHS[0]
+# Final Unit 6 variants: a frozen runtime configuration opens every chain, each CLOB
+# precheck persists strict HTTP metadata beside its exact bytes, and a provider whose
+# priced usage overflows int64 terminalizes through a sanitized overflow artifact.
+_UNIT6_V3_PREFIX = (
+    ArtifactKind.RUNTIME_CONFIG,
+    ArtifactKind.RAW_GAMMA,
+    ArtifactKind.SANITIZED_EVIDENCE,
+    ArtifactKind.PRECHECK_BOOK_RAW,
+    ArtifactKind.PRECHECK_BOOK_HTTP,
+    ArtifactKind.PRECHECK_BOOK,
+    ArtifactKind.CAUSAL_HISTORY,
+)
+_OPENAI_OVERFLOW_SHAPE = (
+    ArtifactKind.RAW_GAMMA,
+    ArtifactKind.SANITIZED_EVIDENCE,
+    ArtifactKind.OPENAI_REQUEST,
+    ArtifactKind.OPENAI_COST_OVERFLOW,
+    ArtifactKind.DECISION_FROZEN,
+)
+_JEV_OVERFLOW_SHAPE = (
+    ArtifactKind.RAW_GAMMA,
+    ArtifactKind.SANITIZED_EVIDENCE,
+    ArtifactKind.OPENAI_REQUEST,
+    ArtifactKind.OPENAI_RESPONSE_SUCCESS,
+    ArtifactKind.OPENAI_SUCCESS_METADATA,
+    ArtifactKind.RESEARCH_BRIEF,
+    ArtifactKind.JEV_REQUEST,
+    ArtifactKind.JEV_COST_OVERFLOW,
+    ArtifactKind.DECISION_FROZEN,
+)
+_V3_PROVIDER_BASE_PATHS = _unit6_base_paths(_UNIT6_V3_PREFIX)
+_V3_OVERFLOW_BASE_PATHS = (
+    (*_UNIT6_V3_PREFIX, *_OPENAI_OVERFLOW_SHAPE[2:]),
+    (*_UNIT6_V3_PREFIX, *_JEV_OVERFLOW_SHAPE[2:]),
+)
+_V3_BASE_PATHS = (*_V3_PROVIDER_BASE_PATHS, *_V3_OVERFLOW_BASE_PATHS)
+_V3_EXECUTION_PATHS = tuple(
+    (*path, ArtifactKind.EXECUTION_BOOK) for path in _V3_PROVIDER_BASE_PATHS
+)
+_V3_LATE_PATHS = tuple(
+    (*path, ArtifactKind.BOOK_UNAVAILABLE) for path in _V3_BASE_PATHS
+)
+_V3_ELIGIBILITY_REJECTION_PATH = (
+    ArtifactKind.RUNTIME_CONFIG,
+    ArtifactKind.RAW_GAMMA,
+    ArtifactKind.ELIGIBILITY_REJECTION,
+)
+_V3_PRECHECK_REJECTION_PATH = (
+    *_UNIT6_V3_PREFIX[:-1],
+    ArtifactKind.ELIGIBILITY_REJECTION,
+)
+_V3_PRECHECK_FAILURE_REJECTION_PATH = (
+    *_UNIT6_V3_PREFIX[:-2],
+    ArtifactKind.PRECHECK_BOOK_FAILURE,
+    ArtifactKind.ELIGIBILITY_REJECTION,
+)
+_V3_REJECTION_PATHS = {
+    _V3_ELIGIBILITY_REJECTION_PATH,
+    _V3_PRECHECK_REJECTION_PATH,
+    _V3_PRECHECK_FAILURE_REJECTION_PATH,
+}
+_COST_OVERFLOW_BASE_PATHS = (*_UNIT6_BASE_PATHS, *_V3_BASE_PATHS)
 _ELIGIBILITY_REJECTION_PATH = (
     ArtifactKind.RAW_GAMMA,
     ArtifactKind.ELIGIBILITY_REJECTION,
@@ -317,6 +429,7 @@ _REJECTION_PATHS = {
     _ELIGIBILITY_REJECTION_PATH,
     _PRECHECK_REJECTION_PATH,
     _PRECHECK_FAILURE_REJECTION_PATH,
+    *_V3_REJECTION_PATHS,
 }
 _LEGACY_UNIT6_REJECTION_PATHS = {
     _LEGACY_PRECHECK_REJECTION_PATH,
@@ -332,8 +445,10 @@ _WRITE_BASE_PATHS = (
     *_LEGACY_UNIT6_REJECTION_PATHS,
     *_UNIT6_BASE_PATHS,
     *_LEGACY_UNIT6_BASE_PATHS,
+    *_V3_BASE_PATHS,
     *_UNIT6_EXECUTION_PATHS,
     *_LEGACY_UNIT6_EXECUTION_PATHS,
+    *_V3_EXECUTION_PATHS,
 )
 _LATE_PATHS = (
     (*_SUCCESS_PATH, ArtifactKind.BOOK_UNAVAILABLE),
@@ -348,6 +463,7 @@ _LATE_PATHS = (
     ),
     *_UNIT6_LATE_PATHS,
     *_LEGACY_UNIT6_LATE_PATHS,
+    *_V3_LATE_PATHS,
 )
 _WRITE_STAGE_PATHS = (*_WRITE_BASE_PATHS, *_LATE_PATHS)
 _LEGACY_STAGE_PATHS = (
@@ -436,6 +552,196 @@ class PrecheckBookFailureArtifact(UtcModel):
     raw_book_byte_length: ByteSize | None = None
     transport_failure: bool = False
     retrieved_at: datetime
+    http_sha256: Sha256 | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+
+_MEDIA_TYPE_PATTERN = (
+    r"^(?:[a-z0-9!#$%&'*+.^_`|~-]{1,64}/[a-z0-9!#$%&'*+.^_`|~-]{1,64}|invalid)$"
+)
+_PRE_RESPONSE_REASONS = frozenset({"TIMEOUT", "TRANSPORT_ERROR"})
+
+
+class PrecheckHttpArtifact(UtcModel):
+    """Strict bounded metadata for one CLOB precheck response or failure."""
+
+    request_host: str
+    request_path: str
+    request_token_id: Annotated[
+        str, StringConstraints(min_length=1, max_length=MAX_CLOB_TOKEN_ID_CHARS)
+    ]
+    attempted_at: datetime
+    retrieved_at: datetime | None
+    status_code: Annotated[int, Field(strict=True, ge=100, le=599)] | None
+    content_type: Annotated[str, StringConstraints(pattern=_MEDIA_TYPE_PATTERN)] | None
+    response_sha256: Sha256
+    response_byte_length: ByteSize
+    response_truncated: bool
+    transport_reason: PrecheckTransportReason
+
+    @model_validator(mode="after")
+    def require_consistent_attempt(self) -> Self:
+        if self.request_host != CLOB_HOST or self.request_path != CLOB_PATH:
+            raise ValueError("precheck request must name the exact CLOB book route")
+        pre_response = self.transport_reason in _PRE_RESPONSE_REASONS
+        if (
+            pre_response != (self.status_code is None)
+            or pre_response != (self.retrieved_at is None)
+            or not has_canonical_failure_response(
+                self.response_sha256, self.response_byte_length
+            )
+        ):
+            raise ValueError("precheck HTTP metadata is inconsistent")
+        if pre_response and (
+            self.content_type is not None
+            or self.response_truncated
+            or self.response_byte_length != 0
+        ):
+            raise ValueError("pre-response precheck failure cannot carry response data")
+        return self
+
+
+_RATE_ENVIRONMENT_NAMES = (
+    "OPENAI_CACHED_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
+    "OPENAI_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
+    "OPENAI_OUTPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
+    "TYPESAFE_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
+    "TYPESAFE_OUTPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
+)
+_PROVIDER_RATE_NAMES: dict[str, tuple[str, str | None, str]] = {
+    "openai": (
+        "OPENAI_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
+        "OPENAI_CACHED_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
+        "OPENAI_OUTPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
+    ),
+    "jev": (
+        "TYPESAFE_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
+        None,
+        "TYPESAFE_OUTPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
+    ),
+}
+_RATE_MAXIMUM = 1_000_000_000_000
+RateValue = Annotated[int, Field(strict=True, ge=0, le=_RATE_MAXIMUM)]
+
+
+class RuntimeEndpoints(StrictModel):
+    """The only public and provider routes a run may name."""
+
+    clob: str
+    gamma: str
+    jev: str
+    openai: str
+
+    @model_validator(mode="after")
+    def require_exact_routes(self) -> Self:
+        if (self.clob, self.gamma, self.jev, self.openai) != (
+            CLOB_ENDPOINT,
+            GAMMA_ENDPOINT,
+            JEV_ENDPOINT,
+            OPENAI_ENDPOINT,
+        ):
+            raise ValueError("runtime endpoints differ from the approved routes")
+        return self
+
+
+class RuntimeModels(StrictModel):
+    """The approved immutable model snapshots."""
+
+    jev: str
+    openai: str
+
+    @model_validator(mode="after")
+    def require_approved_models(self) -> Self:
+        if (self.jev, self.openai) != (JEV_MODEL_ID, OPENAI_MODEL_ID):
+            raise ValueError("runtime models differ from the approved snapshots")
+        return self
+
+
+class RuntimeConfigArtifact(StrictModel):
+    """Non-secret endpoints, models, policy, and normalized billing rates for a run."""
+
+    endpoints: RuntimeEndpoints
+    models: RuntimeModels
+    policy_version: str
+    rates_microdollars_per_million_tokens: dict[str, RateValue | None]
+
+    @model_validator(mode="after")
+    def require_exact_configuration(self) -> Self:
+        if self.policy_version != POLICY_VERSION:
+            raise ValueError("runtime policy differs from the approved policy")
+        if set(self.rates_microdollars_per_million_tokens) != set(
+            _RATE_ENVIRONMENT_NAMES
+        ):
+            raise ValueError("runtime billing rates must name the exact rate set")
+        return self
+
+    def provider_rates(
+        self, provider: str
+    ) -> tuple[int | None, int | None, int | None]:
+        names = _PROVIDER_RATE_NAMES[provider]
+        rates = self.rates_microdollars_per_million_tokens
+        return (
+            rates[names[0]],
+            rates[names[1]] if names[1] is not None else None,
+            rates[names[2]],
+        )
+
+
+TokenCount = Annotated[str, StringConstraints(pattern=r"^(?:0|[1-9][0-9]{0,4299})$")]
+
+
+class CostUsage(StrictModel):
+    """Exact provider token usage behind an unrepresentable cost.
+
+    Counts are canonical decimal strings: a provider can report any integer the JSON
+    parser accepts, and canonical artifact JSON integers are limited to signed int64.
+    """
+
+    input_tokens: TokenCount
+    cached_input_tokens: TokenCount | None
+    output_tokens: TokenCount
+
+
+class CostRates(StrictModel):
+    """Exact configured per-million-token rates behind an unrepresentable cost."""
+
+    input_microdollars_per_million_tokens: RateValue
+    cached_input_microdollars_per_million_tokens: RateValue | None
+    output_microdollars_per_million_tokens: RateValue
+
+
+class CostOverflowArtifact(UtcModel):
+    """Sanitized exact usage and rates for a provider cost beyond signed int64."""
+
+    provider: Literal["openai", "jev"]
+    request_sha256: Sha256
+    response_sha256: Sha256
+    response_byte_length: ByteSize
+    retrieved_at: datetime
+    status_code: Annotated[int, Field(strict=True, ge=100, le=599)]
+    usage: CostUsage
+    rates: CostRates
+
+    @model_validator(mode="after")
+    def require_true_overflow(self) -> Self:
+        if not has_canonical_failure_response(
+            self.response_sha256, self.response_byte_length
+        ) or not is_cost_overflow_consistent(
+            self.provider,
+            input_tokens=int(self.usage.input_tokens),
+            cached_input_tokens=(
+                None
+                if self.usage.cached_input_tokens is None
+                else int(self.usage.cached_input_tokens)
+            ),
+            output_tokens=int(self.usage.output_tokens),
+            input_rate=self.rates.input_microdollars_per_million_tokens,
+            cached_input_rate=self.rates.cached_input_microdollars_per_million_tokens,
+            output_rate=self.rates.output_microdollars_per_million_tokens,
+        ):
+            raise ValueError("cost overflow metadata does not prove an int64 overflow")
+        return self
 
 
 class FailureArtifact(UtcModel):
@@ -548,7 +854,11 @@ def _stage_path_for_result(
             raise ValueError(
                 "late provider path requires terminal BOOK_FAILURE or COST_OVERFLOW"
             )
-    elif path in (*_UNIT6_EXECUTION_PATHS, *_LEGACY_UNIT6_EXECUTION_PATHS):
+    elif path in (
+        *_UNIT6_EXECUTION_PATHS,
+        *_LEGACY_UNIT6_EXECUTION_PATHS,
+        *_V3_EXECUTION_PATHS,
+    ):
         if result.execution_book_sha256 is None:
             raise ValueError("execution-book path requires an observed execution book")
         if result.ai.disposition == "COST_OVERFLOW":
@@ -628,6 +938,38 @@ def failure_artifact_from_adapter(failure: AdapterFailure) -> FailureArtifact:
     )
 
 
+def cost_overflow_artifact_from_adapter(
+    overflow: AdapterCostOverflow,
+) -> CostOverflowArtifact:
+    """Convert typed overflow metadata; the overflowing response body is never kept."""
+
+    if type(overflow) is not AdapterCostOverflow:
+        raise TypeError("overflow must be an AdapterCostOverflow")
+    evidence = overflow.evidence
+    return CostOverflowArtifact(
+        provider=overflow.provider,
+        request_sha256=hashlib.sha256(overflow.request_bytes).hexdigest(),
+        response_sha256=overflow.response_sha256,
+        response_byte_length=overflow.response_byte_length,
+        retrieved_at=overflow.retrieved_at,
+        status_code=overflow.status_code,
+        usage=CostUsage(
+            input_tokens=str(evidence.input_tokens),
+            cached_input_tokens=(
+                None
+                if evidence.cached_input_tokens is None
+                else str(evidence.cached_input_tokens)
+            ),
+            output_tokens=str(evidence.output_tokens),
+        ),
+        rates=CostRates(
+            input_microdollars_per_million_tokens=evidence.input_rate,
+            cached_input_microdollars_per_million_tokens=evidence.cached_input_rate,
+            output_microdollars_per_million_tokens=evidence.output_rate,
+        ),
+    )
+
+
 def _success_artifact(
     payload: bytes, provider: Literal["openai", "jev"]
 ) -> SuccessArtifact:
@@ -688,6 +1030,7 @@ def _base_path(path: tuple[ArtifactKind, ...]) -> tuple[ArtifactKind, ...]:
     if path in _LATE_PATHS or path in (
         *_UNIT6_EXECUTION_PATHS,
         *_LEGACY_UNIT6_EXECUTION_PATHS,
+        *_V3_EXECUTION_PATHS,
     ):
         return path[:-1]
     return path
@@ -695,6 +1038,12 @@ def _base_path(path: tuple[ArtifactKind, ...]) -> tuple[ArtifactKind, ...]:
 
 def _provider_shape(path: tuple[ArtifactKind, ...]) -> tuple[ArtifactKind, ...]:
     base = _base_path(path)
+    if base in _V3_BASE_PATHS:
+        return (
+            ArtifactKind.RAW_GAMMA,
+            ArtifactKind.SANITIZED_EVIDENCE,
+            *base[len(_UNIT6_V3_PREFIX) :],
+        )
     if base in _UNIT6_BASE_PATHS:
         return (ArtifactKind.RAW_GAMMA, ArtifactKind.SANITIZED_EVIDENCE, *base[5:])
     if base in _LEGACY_UNIT6_BASE_PATHS:
@@ -762,6 +1111,8 @@ def _expected_model_cost(
     path: tuple[ArtifactKind, ...], typed: dict[str, TypedArtifact]
 ) -> int | None:
     base = _provider_shape(path)
+    if base in {_OPENAI_OVERFLOW_SHAPE, _JEV_OVERFLOW_SHAPE}:
+        return None
     if base in {
         _OPENAI_FAILURE_PATH,
         _OPENAI_INPUT_FAILURE_PATH,
@@ -784,7 +1135,7 @@ def _expected_model_cost(
         )
     jev = typed[ArtifactKind.JEV_SUCCESS_METADATA]
     assert isinstance(jev, SuccessArtifact)
-    if _base_path(path) in _UNIT6_BASE_PATHS:
+    if _base_path(path) in _COST_OVERFLOW_BASE_PATHS:
         return _unit6_model_cost(
             openai.billed_cost_microdollars, jev.billed_cost_microdollars
         )
@@ -800,7 +1151,12 @@ def _validate_success_terminal(
     *,
     fail: Callable[[str], None],
 ) -> None:
-    if path not in {_SUCCESS_PATH, _LEGACY_SUCCESS_PATH, *_UNIT6_EXECUTION_PATHS}:
+    if path not in {
+        _SUCCESS_PATH,
+        _LEGACY_SUCCESS_PATH,
+        *_UNIT6_EXECUTION_PATHS,
+        *_V3_EXECUTION_PATHS,
+    }:
         return
     if result.deterministic.model_cost_microdollars != 0:
         fail("deterministic arm model cost must be zero")
@@ -945,6 +1301,10 @@ class StoreCorruptError(StoreError):
     """Persisted journal or artifact state cannot be replayed safely."""
 
 
+class StoreBusyError(StoreError):
+    """Another pass held the exclusive observe lock for the whole bounded wait."""
+
+
 class StoreConflictError(StoreError):
     """An immutable identity already names different canonical bytes."""
 
@@ -1029,7 +1389,7 @@ def _open_output(output_dir: Path) -> int:
         raise StoreSecurityError("output ancestor or directory is not safe") from error
 
 
-def _open_journal(root_fd: int, name: str) -> int:
+def _open_journal(root_fd: int, name: str, *, label: str = "journal") -> int:
     flags = (
         os.O_RDWR
         | os.O_APPEND
@@ -1041,7 +1401,7 @@ def _open_journal(root_fd: int, name: str) -> int:
     try:
         descriptor = os.open(name, flags, 0o600, dir_fd=root_fd)
     except OSError as error:
-        raise StoreSecurityError("journal cannot be opened safely") from error
+        raise StoreSecurityError(f"{label} cannot be opened safely") from error
     metadata = os.fstat(descriptor)
     if (
         not stat.S_ISREG(metadata.st_mode)
@@ -1050,8 +1410,46 @@ def _open_journal(root_fd: int, name: str) -> int:
         or metadata.st_nlink != 1
     ):
         os.close(descriptor)
-        raise StoreSecurityError("journal must be a private owner-only regular file")
+        raise StoreSecurityError(f"{label} must be a private owner-only regular file")
     return descriptor
+
+
+def _lock_with_deadline(descriptor: int, *, timeout_seconds: float) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except InterruptedError:
+            continue
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise StoreBusyError("observe lock is held by another pass") from None
+            time.sleep(0.02)
+
+
+@contextmanager
+def observation_lock(
+    output_dir: str | os.PathLike[str], *, timeout_seconds: float = 3600.0
+) -> Iterator[None]:
+    """Hold one exclusive descriptor-bound lock for an entire observe pass.
+
+    The lock file lives in the validated private output root, so a symlinked ancestor,
+    symlinked or FIFO lock file, foreign owner, extra link, or weak mode fails closed
+    before any public or provider request. Waiting for another pass is bounded; closing
+    the descriptor releases the lock.
+    """
+
+    root_fd = _open_output(Path(output_dir))
+    try:
+        lock_fd = _open_journal(root_fd, "observe.lock", label="observe lock")
+        try:
+            _lock_with_deadline(lock_fd, timeout_seconds=timeout_seconds)
+            yield
+        finally:
+            os.close(lock_fd)
+    finally:
+        os.close(root_fd)
 
 
 def _lock(descriptor: int, operation: int) -> None:
@@ -1193,6 +1591,7 @@ def _screen_payload(
     forbidden_secret_values: tuple[bytes, ...],
     *,
     strict_json: bool = False,
+    patterns: bool = True,
 ) -> None:
     sentinels: list[str] = []
     for value in forbidden_secret_values:
@@ -1211,7 +1610,9 @@ def _screen_payload(
         if strict_json:
             raise StoreSecurityError("structured artifact is not UTF-8") from None
         return
-    if _SECRET_PATTERN.search(text) or any(sentinel in text for sentinel in sentinels):
+    if (patterns and _SECRET_PATTERN.search(text)) or any(
+        sentinel in text for sentinel in sentinels
+    ):
         raise StoreSecurityError("artifact contains credential-like data")
     if strict_json:
         try:
@@ -1222,13 +1623,68 @@ def _screen_payload(
             raise StoreSecurityError("artifact contains credential-like data")
 
 
+_PUBLIC_RESPONSE_KINDS = frozenset(
+    {
+        ArtifactKind.PRECHECK_BOOK_RAW,
+        ArtifactKind.PRECHECK_BOOK,
+        ArtifactKind.EXECUTION_BOOK,
+    }
+)
+
+
+def _screen_artifact(
+    kind: str,
+    payload: bytes,
+    forbidden_secret_values: tuple[bytes, ...],
+) -> None:
+    """Screen one stage before it is durable.
+
+    Exact bytes from the unauthenticated public CLOB book route are arbitrary public
+    data: no credential of ours is ever sent to that host, so generic credential
+    patterns (which also match benign text) must not let a hostile or unlucky
+    response abort a pass before its terminal record. Explicit forbidden sentinel
+    values are still enforced; every other stage keeps the full screen.
+    """
+
+    public = kind in _PUBLIC_RESPONSE_KINDS
+    _screen_payload(
+        payload,
+        forbidden_secret_values,
+        strict_json=not public,
+        patterns=not public,
+    )
+
+
 def _canonical_stage_hash(envelope: ArtifactEnvelope) -> str:
     return hashlib.sha256(
         canonical_json_bytes(envelope.model_dump(mode="json"))
     ).hexdigest()
 
 
+def _canonical_model[ModelT: StrictModel](model: ModelT, payload: bytes) -> ModelT:
+    if payload != canonical_json_bytes(model.model_dump(mode="json")):
+        raise ValueError("artifact must use canonical JSON")
+    return model
+
+
 def _reconstruct_orphan(kind: ArtifactKind, payload: bytes) -> TypedArtifact:
+    if kind is ArtifactKind.RUNTIME_CONFIG:
+        return _canonical_model(
+            RuntimeConfigArtifact.model_validate_json(payload), payload
+        )
+    if kind is ArtifactKind.PRECHECK_BOOK_HTTP:
+        return _canonical_model(
+            PrecheckHttpArtifact.model_validate_json(payload), payload
+        )
+    if kind in {ArtifactKind.OPENAI_COST_OVERFLOW, ArtifactKind.JEV_COST_OVERFLOW}:
+        overflow = _canonical_model(
+            CostOverflowArtifact.model_validate_json(payload), payload
+        )
+        if overflow.provider != (
+            "openai" if kind is ArtifactKind.OPENAI_COST_OVERFLOW else "jev"
+        ):
+            raise ValueError("cost overflow artifact provider does not match stage")
+        return overflow
     if kind is ArtifactKind.RAW_GAMMA:
         value = load_strict_json(payload)
         if not isinstance(value, Mapping):
@@ -1294,6 +1750,133 @@ def _reconstruct(
         raise ValueError(f"{label} artifact violates its strict contract") from error
 
 
+def _validate_precheck_http(
+    typed: dict[str, TypedArtifact],
+    envelope_by_kind: dict[str, ArtifactEnvelope],
+    *,
+    fail: Callable[[str], None],
+) -> None:
+    """Recompute one precheck outcome from frozen metadata, exact bytes, and Gamma."""
+
+    http = typed[ArtifactKind.PRECHECK_BOOK_HTTP]
+    raw = typed.get(ArtifactKind.PRECHECK_BOOK_RAW)
+    evidence = typed.get(ArtifactKind.SANITIZED_EVIDENCE)
+    raw_gamma = typed.get(ArtifactKind.RAW_GAMMA)
+    http_envelope = envelope_by_kind[ArtifactKind.PRECHECK_BOOK_HTTP]
+    if (
+        not isinstance(http, PrecheckHttpArtifact)
+        or not isinstance(raw, bytes)
+        or not isinstance(evidence, EvidencePacket)
+        or not isinstance(raw_gamma, Mapping)
+    ):
+        fail("precheck HTTP metadata lacks its frozen inputs")
+        return
+    try:
+        market_id, condition_id, token_id, _no_token = gamma_clob_identity(raw_gamma)
+    except ValueError:
+        fail("raw Gamma identity cannot name a CLOB book")
+        return
+    if (
+        evidence.market_id != market_id
+        or http.request_token_id != token_id
+        or http.attempted_at != evidence.cutoff_at
+        or http.response_sha256 != hashlib.sha256(raw).hexdigest()
+        or http.response_byte_length != len(raw)
+        or http_envelope.retrieved_at != (http.retrieved_at or http.attempted_at)
+    ):
+        fail("precheck HTTP metadata does not bind the frozen request and bytes")
+        return
+    if http.status_code is not None and http.transport_reason != (
+        derive_precheck_transport_reason(
+            status_code=http.status_code,
+            content_type=http.content_type,
+            truncated=http.response_truncated,
+            body=raw,
+        )
+    ):
+        fail("precheck transport reason does not match the frozen response")
+        return
+    reason, book = derive_precheck_rejection(
+        transport_reason=http.transport_reason,
+        body=raw,
+        market_id=market_id,
+        condition_id=condition_id,
+        token_id=token_id,
+        now=http.attempted_at,
+    )
+    rejection = typed.get(ArtifactKind.ELIGIBILITY_REJECTION)
+    failure = typed.get(ArtifactKind.PRECHECK_BOOK_FAILURE)
+    normalized = typed.get(ArtifactKind.PRECHECK_BOOK)
+    rejected_reason = (
+        rejection.reason
+        if isinstance(rejection, EligibilityRejectionArtifact)
+        else None
+    )
+    if failure is not None:
+        if (
+            not isinstance(failure, PrecheckBookFailureArtifact)
+            or reason is None
+            or reason in {"WIDE_SPREAD", "LOW_DEPTH"}
+            or failure.reason != reason
+            or (rejection is not None and rejected_reason != reason)
+            or failure.http_sha256 != http_envelope.sha256
+            or failure.transport_failure != (http.status_code is None)
+            or failure.raw_book_sha256 != http.response_sha256
+            or failure.raw_book_byte_length != http.response_byte_length
+            or failure.market_id != market_id
+            or failure.token_id != token_id
+            or failure.request_market_id != market_id
+            or failure.request_condition_id != condition_id
+            or failure.request_token_id != token_id
+            or failure.retrieved_at != http.attempted_at
+        ):
+            fail("precheck failure does not match the recomputed response outcome")
+    elif normalized is not None:
+        if (
+            not isinstance(normalized, BookSnapshot)
+            or book is None
+            or book != normalized
+            or reason not in {None, "WIDE_SPREAD", "LOW_DEPTH"}
+            or (rejection is not None and rejected_reason != reason)
+            or (rejection is None and reason is not None)
+        ):
+            fail("precheck book does not match the recomputed response outcome")
+
+
+def _validate_cost_overflow(
+    typed: dict[str, TypedArtifact],
+    envelope_by_kind: dict[str, ArtifactEnvelope],
+    *,
+    fail: Callable[[str], None],
+) -> None:
+    """Bind each overflow artifact to its request and the frozen configured rates."""
+
+    config = typed.get(ArtifactKind.RUNTIME_CONFIG)
+    for provider, kind, request_kind in (
+        ("openai", ArtifactKind.OPENAI_COST_OVERFLOW, ArtifactKind.OPENAI_REQUEST),
+        ("jev", ArtifactKind.JEV_COST_OVERFLOW, ArtifactKind.JEV_REQUEST),
+    ):
+        overflow = typed.get(kind)
+        if overflow is None:
+            continue
+        request = envelope_by_kind.get(request_kind)
+        if (
+            not isinstance(overflow, CostOverflowArtifact)
+            or overflow.provider != provider
+            or request is None
+            or overflow.request_sha256 != request.sha256
+            or overflow.retrieved_at != envelope_by_kind[kind].retrieved_at
+            or not isinstance(config, RuntimeConfigArtifact)
+            or config.provider_rates(provider)
+            != (
+                overflow.rates.input_microdollars_per_million_tokens,
+                overflow.rates.cached_input_microdollars_per_million_tokens,
+                overflow.rates.output_microdollars_per_million_tokens,
+            )
+        ):
+            fail(f"{provider} cost overflow does not bind its request and frozen rates")
+
+
 def _validate_reconstructed_path(
     result: ObservationResult | None,
     typed: dict[str, TypedArtifact],
@@ -1337,6 +1920,14 @@ def _validate_reconstructed_path(
             or evidence.source_sha256 != result.evidence_sha256
         ):
             fail("sanitized evidence does not match observation")
+
+    config = typed.get(ArtifactKind.RUNTIME_CONFIG)
+    if config is not None and (
+        not isinstance(config, RuntimeConfigArtifact)
+        or (result is not None and config.policy_version != result.policy_version)
+    ):
+        fail("runtime configuration does not match the observation policy")
+        return
 
     if result is not None:
         for kind, field in _RESULT_HASH_KINDS.items():
@@ -1432,8 +2023,10 @@ def _validate_reconstructed_path(
             )
         ):
             fail("precheck failure metadata does not bind rejection")
-        if isinstance(precheck_failure, PrecheckBookFailureArtifact) and isinstance(
-            precheck_raw, bytes
+        if (
+            isinstance(precheck_failure, PrecheckBookFailureArtifact)
+            and isinstance(precheck_raw, bytes)
+            and ArtifactKind.PRECHECK_BOOK_HTTP not in typed
         ):
             if precheck_failure.transport_failure:
                 if precheck_raw or precheck_failure.reason not in {
@@ -1466,6 +2059,11 @@ def _validate_reconstructed_path(
             precheck_rejection, BookSnapshot
         ):
             fail("eligibility precheck book is invalid")
+        if (
+            isinstance(precheck_rejection, BookSnapshot)
+            and precheck_eligibility_reason(precheck_rejection) != rejection.reason
+        ):
+            fail("eligibility rejection reason does not match the precheck book")
         if result is not None and (
             result.market_id != rejection.market_id
             or result.evidence_sha256 != rejection.raw_gamma_sha256
@@ -1483,11 +2081,13 @@ def _validate_reconstructed_path(
         ):
             fail("terminal result does not match eligibility rejection")
 
+    if ArtifactKind.PRECHECK_BOOK_HTTP in typed:
+        _validate_precheck_http(typed, envelope_by_kind, fail=fail)
     precheck_book = typed.get(ArtifactKind.PRECHECK_BOOK)
     causal_history = typed.get(ArtifactKind.CAUSAL_HISTORY)
     if precheck_book is not None or causal_history is not None:
         precheck_envelope = envelope_by_kind.get(ArtifactKind.PRECHECK_BOOK)
-        valid_history = path == _PRECHECK_REJECTION_PATH or (
+        valid_history = path in (_REJECTION_PATHS | _LEGACY_UNIT6_REJECTION_PATHS) or (
             isinstance(causal_history, list)
             and all(isinstance(item, CausalHistoryPoint) for item in causal_history)
             and isinstance(precheck_book, BookSnapshot)
@@ -1523,6 +2123,12 @@ def _validate_reconstructed_path(
             or not valid_history
         ):
             fail("precheck book and causal history are not exactly bound")
+        if (
+            rejection is None
+            and isinstance(precheck_book, BookSnapshot)
+            and precheck_eligibility_reason(precheck_book) is not None
+        ):
+            fail("precheck book is not eligible for model access")
 
     execution_book = typed.get(ArtifactKind.EXECUTION_BOOK)
     if execution_book is not None:
@@ -1648,6 +2254,7 @@ def _validate_reconstructed_path(
         ):
             fail("terminal AI signal does not match frozen Jev decision")
 
+    _validate_cost_overflow(typed, envelope_by_kind, fail=fail)
     frozen = typed.get(ArtifactKind.DECISION_FROZEN)
     if frozen is not None:
         if not isinstance(frozen, DecisionFrozenArtifact):
@@ -1681,12 +2288,16 @@ def _validate_reconstructed_path(
         openai_response_envelope = envelope_by_kind.get(
             ArtifactKind.OPENAI_RESPONSE_SUCCESS
         )
+        openai_overflow = typed.get(ArtifactKind.OPENAI_COST_OVERFLOW)
+        jev_overflow = typed.get(ArtifactKind.JEV_COST_OVERFLOW)
         openai_failure_response = (
             openai_failure.response_sha256
             if isinstance(
                 openai_failure := typed.get(ArtifactKind.OPENAI_FAILURE),
                 FailureArtifact,
             )
+            else openai_overflow.response_sha256
+            if isinstance(openai_overflow, CostOverflowArtifact)
             else None
         )
         expected_openai_response = (
@@ -1714,6 +2325,8 @@ def _validate_reconstructed_path(
             if isinstance(
                 jev_failure := typed.get(ArtifactKind.JEV_FAILURE), FailureArtifact
             )
+            else jev_overflow.response_sha256
+            if isinstance(jev_overflow, CostOverflowArtifact)
             else None
         )
         expected_jev_response = (
@@ -1730,8 +2343,10 @@ def _validate_reconstructed_path(
             fail("decision frozen artifact does not bind the Jev decision")
         openai_metadata = typed.get(ArtifactKind.OPENAI_SUCCESS_METADATA)
         openai_failure = typed.get(ArtifactKind.OPENAI_FAILURE)
-        openai_cost = (
-            openai_metadata.billed_cost_microdollars
+        openai_cost: int | None = (
+            None
+            if openai_overflow is not None
+            else openai_metadata.billed_cost_microdollars
             if isinstance(openai_metadata, SuccessArtifact)
             else openai_failure.billed_cost_microdollars
             if isinstance(openai_failure, FailureArtifact)
@@ -1739,17 +2354,26 @@ def _validate_reconstructed_path(
         )
         jev_metadata = typed.get(ArtifactKind.JEV_SUCCESS_METADATA)
         jev_failure = typed.get(ArtifactKind.JEV_FAILURE)
-        jev_cost = (
-            jev_metadata.billed_cost_microdollars
+        jev_cost: int | None = (
+            None
+            if jev_overflow is not None
+            else jev_metadata.billed_cost_microdollars
             if isinstance(jev_metadata, SuccessArtifact)
             else jev_failure.billed_cost_microdollars
             if isinstance(jev_failure, FailureArtifact)
             else 0
         )
-        total_cost = openai_cost + jev_cost
+        total_cost = (
+            openai_cost + jev_cost
+            if openai_cost is not None and jev_cost is not None
+            else None
+        )
         expected_state = (
             "COST_OVERFLOW"
-            if total_cost > INT64_MAX and _base_path(path) in _UNIT6_BASE_PATHS
+            if total_cost is None
+            or (
+                total_cost > INT64_MAX and _base_path(path) in _COST_OVERFLOW_BASE_PATHS
+            )
             else "OPENAI_FAILURE"
             if ArtifactKind.OPENAI_FAILURE in typed
             else "JEV_FAILURE"
@@ -1797,7 +2421,13 @@ def _validate_reconstructed_path(
             if not (terminal_overflow or allow_cost_overflow_prefix):
                 fail(str(error))
     if (
-        path in {_SUCCESS_PATH, _LEGACY_SUCCESS_PATH, *_UNIT6_EXECUTION_PATHS}
+        path
+        in {
+            _SUCCESS_PATH,
+            _LEGACY_SUCCESS_PATH,
+            *_UNIT6_EXECUTION_PATHS,
+            *_V3_EXECUTION_PATHS,
+        }
         and result is not None
     ):
         _validate_success_terminal(result, path, typed, fail=fail)
@@ -1818,11 +2448,7 @@ def _prepare(
     typed: dict[str, TypedArtifact] = {}
     predecessor: str | None = None
     for artifact, kind in zip(artifacts, path, strict=True):
-        _screen_payload(
-            artifact.payload,
-            forbidden_secret_values,
-            strict_json=True,
-        )
+        _screen_artifact(kind, artifact.payload, forbidden_secret_values)
         payload_hash = hashlib.sha256(artifact.payload).hexdigest()
         envelope = ArtifactEnvelope(
             kind=kind.value,
@@ -1932,7 +2558,7 @@ def _validate_journals_locked(
         for envelope, kind in zip(selected, matching_paths[0], strict=False):
             try:
                 payload = store.read_verified(envelope.blob_ref())
-                _screen_payload(payload, forbidden_secret_values, strict_json=True)
+                _screen_artifact(kind, payload, forbidden_secret_values)
                 if kind in {ArtifactKind.PRECHECK_BOOK, ArtifactKind.EXECUTION_BOOK}:
                     evidence = typed.get(ArtifactKind.SANITIZED_EVIDENCE)
                     if not isinstance(evidence, EvidencePacket):
@@ -1993,11 +2619,7 @@ def _verify_replay_locked(
             raise StoreCorruptError("artifact envelope does not match observation hash")
         try:
             payload = store.read_verified(envelope.blob_ref())
-            _screen_payload(
-                payload,
-                forbidden_secret_values,
-                strict_json=True,
-            )
+            _screen_artifact(kind, payload, forbidden_secret_values)
             typed[kind.value] = _reconstruct(kind, payload, result)
         except StoreSecurityError:
             raise
@@ -2045,7 +2667,7 @@ def freeze_observation_artifacts(
     typed: dict[str, TypedArtifact] = {}
     predecessor: str | None = None
     for artifact, kind in zip(artifacts, path, strict=False):
-        _screen_payload(artifact.payload, forbidden_secret_values, strict_json=True)
+        _screen_artifact(kind, artifact.payload, forbidden_secret_values)
         payload_hash = hashlib.sha256(artifact.payload).hexdigest()
         envelope = ArtifactEnvelope(
             kind=kind.value,
@@ -2260,6 +2882,59 @@ def load_existing_terminal(
                         store, results, envelopes, forbidden_secret_values
                     )
                     return replays.get(observation_id)
+                finally:
+                    os.close(artifacts_fd)
+            finally:
+                os.close(results_fd)
+    finally:
+        os.close(root_fd)
+
+
+def load_existing_terminal_for_inputs(
+    output_dir: str | os.PathLike[str],
+    *,
+    opportunity_id: str,
+    evidence_sha256: str,
+    forbidden_secret_values: tuple[bytes, ...] = (),
+) -> ObservationReplay | None:
+    """Return the first verified non-rejection terminal for one frozen opportunity.
+
+    An observe pass calls this under its global lock, before any provider request, so
+    an identical input that already reached a terminal record is never billed twice.
+    """
+
+    for value in (opportunity_id, evidence_sha256):
+        if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError("opportunity and evidence IDs must be lowercase SHA-256")
+    output = Path(output_dir)
+    root_fd = _open_output(output)
+    try:
+        with BlobStore(output.absolute() / "blobs") as store:
+            results_fd = _open_journal(root_fd, "results.jsonl")
+            try:
+                _lock(results_fd, fcntl.LOCK_SH)
+                results = _parse_results(
+                    _read_journal(results_fd, label="result journal")
+                )
+                artifacts_fd = _open_journal(root_fd, "artifacts.jsonl")
+                try:
+                    _lock(artifacts_fd, fcntl.LOCK_SH)
+                    envelopes = _parse_envelopes(
+                        _read_journal(artifacts_fd, label="artifact journal")
+                    )
+                    replays = _validate_journals_locked(
+                        store, results, envelopes, forbidden_secret_values
+                    )
+                    return next(
+                        (
+                            replay
+                            for replay in replays.values()
+                            if replay.result.opportunity_id == opportunity_id
+                            and replay.result.evidence_sha256 == evidence_sha256
+                            and replay.result.ai.disposition != "INELIGIBLE"
+                        ),
+                        None,
+                    )
                 finally:
                     os.close(artifacts_fd)
             finally:

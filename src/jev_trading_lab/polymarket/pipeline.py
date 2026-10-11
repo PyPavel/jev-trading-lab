@@ -12,10 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from jev_trading_lab.core.ids import canonical_json_bytes
-from jev_trading_lab.persistence.blobs import BlobStore
 from jev_trading_lab.polymarket.ai import (
+    JEV_ENDPOINT,
     JEV_MODEL_ID,
+    OPENAI_ENDPOINT,
     OPENAI_MODEL_ID,
+    AdapterCostOverflow,
     AdapterFailure,
     FailureCode,
     JevSuccess,
@@ -29,10 +31,13 @@ from jev_trading_lab.polymarket.ai import (
 )
 from jev_trading_lab.polymarket.client import (
     CLOB_ENDPOINT,
+    CLOB_HOST,
+    CLOB_PATH,
     GAMMA_ENDPOINT,
     MarketCandidate,
     MarketRejection,
     PolymarketClient,
+    PrecheckAttempt,
     SecureHttpTransport,
 )
 from jev_trading_lab.polymarket.models import (
@@ -65,13 +70,18 @@ from jev_trading_lab.polymarket.store import (
     DecisionFrozenArtifact,
     EligibilityRejectionArtifact,
     PrecheckBookFailureArtifact,
+    PrecheckHttpArtifact,
+    RuntimeConfigArtifact,
     StoreSecurityError,
     SuccessArtifact,
     _screen_payload,
+    cost_overflow_artifact_from_adapter,
     failure_artifact_from_adapter,
     freeze_observation_artifacts,
     load_existing_terminal,
+    load_existing_terminal_for_inputs,
     load_observation,
+    observation_lock,
     record_observation,
 )
 
@@ -249,8 +259,8 @@ def _decision_barrier(
     jev_request: bytes | None,
     jev_response_sha256: str | None,
     jev_decision_sha256: str | None,
-    openai_cost: int,
-    jev_cost: int,
+    openai_cost: int | None,
+    jev_cost: int | None,
 ) -> tuple[list[tuple[str, bytes, str, datetime]], DecisionFrozenArtifact]:
     barrier = DecisionFrozenArtifact(
         opportunity_id=identity.opportunity_id,
@@ -625,83 +635,12 @@ def _live_result(
     )
 
 
-def _freeze_live_bytes(
-    output_dir: str | os.PathLike[str],
-    identity: FixtureIdentity,
-    *,
-    kind: str,
-    payload: bytes,
-    retrieved_at: datetime,
-) -> None:
-    """Freeze exact live bytes before the next causal stage."""
+def _runtime_config_bytes() -> bytes:
+    """Build the canonical non-secret runtime configuration; performs no I/O.
 
-    allowed = {
-        "raw_gamma",
-        "sanitized_evidence",
-        "precheck_book",
-        "openai_request",
-        "openai_response_success",
-        "openai_failure",
-        "research_brief",
-        "jev_request",
-        "jev_response_success",
-        "jev_failure",
-        "jev_decision",
-        "decision_frozen",
-        "execution_book",
-    }
-    if kind not in allowed:
-        raise ValueError("unsupported live artifact kind")
-    root = Path(output_dir)
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with BlobStore(root.absolute() / "blobs") as store:
-        ref = store.publish(payload)
-    line = (
-        canonical_json_bytes(
-            {
-                "byte_size": ref.byte_length,
-                "kind": kind,
-                "observation_id": identity.observation_id,
-                "opportunity_id": identity.opportunity_id,
-                "retrieved_at": retrieved_at.isoformat().replace("+00:00", "Z"),
-                "sha256": ref.sha256,
-                "source_uri_label": "live_causal_stage",
-                "storage_relpath": ref.relative_path,
-            }
-        )
-        + b"\n"
-    )
-    descriptor = os.open(
-        root / "live-artifacts.jsonl",
-        os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
-        0o600,
-    )
-    try:
-        os.write(descriptor, line)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _freeze_live_values(
-    output_dir: str | os.PathLike[str],
-    identity: FixtureIdentity,
-    values: list[tuple[str, bytes, str, datetime]],
-) -> None:
-    for kind, payload, _source, retrieved_at in values:
-        if kind in {"openai_success_metadata", "jev_success_metadata"}:
-            continue
-        _freeze_live_bytes(
-            output_dir,
-            identity,
-            kind=kind,
-            payload=payload,
-            retrieved_at=retrieved_at,
-        )
-
-
-def _runtime_config(output_dir: str | os.PathLike[str]) -> None:
-    """Freeze non-secret endpoints, models, policy, and normalized billing."""
+    The bytes become the first, content-addressed stage of every live observation
+    chain, so they are validated here before any lock, directory, or file exists.
+    """
 
     rate_names = (
         "OPENAI_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS",
@@ -726,51 +665,54 @@ def _runtime_config(output_dir: str | os.PathLike[str]) -> None:
         "endpoints": {
             "clob": CLOB_ENDPOINT,
             "gamma": GAMMA_ENDPOINT,
-            "jev": "https://api.typesafe.ai/v1/systemone",
-            "openai": "https://api.openai.com/v1/responses",
+            "jev": JEV_ENDPOINT,
+            "openai": OPENAI_ENDPOINT,
         },
         "models": {"jev": JEV_MODEL_ID, "openai": OPENAI_MODEL_ID},
         "policy_version": POLICY_VERSION,
         "rates_microdollars_per_million_tokens": rates,
     }
-    payload = canonical_json_bytes(value) + b"\n"
+    payload = canonical_json_bytes(value)
     try:
         _screen_payload(payload, (), strict_json=True)
-    except StoreSecurityError:
+        RuntimeConfigArtifact.model_validate_json(payload)
+    except (StoreSecurityError, ValueError):
         raise ValueError("runtime configuration is invalid") from None
-    root = Path(output_dir)
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path = root / "runtime-config.json"
-    if path.exists():
-        if path.read_bytes() != payload:
-            raise ValueError("runtime configuration differs from frozen artifact")
-        return
-    descriptor = os.open(
-        path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600
+    return payload
+
+
+def _precheck_http_artifact(attempt: PrecheckAttempt) -> PrecheckHttpArtifact:
+    return PrecheckHttpArtifact(
+        request_host=CLOB_HOST,
+        request_path=CLOB_PATH,
+        request_token_id=attempt.token_id,
+        attempted_at=attempt.attempted_at,
+        retrieved_at=attempt.retrieved_at,
+        status_code=attempt.status_code,
+        content_type=attempt.content_type,
+        response_sha256=hashlib.sha256(attempt.body).hexdigest(),
+        response_byte_length=len(attempt.body),
+        response_truncated=attempt.truncated,
+        transport_reason=attempt.transport_reason,
     )
-    try:
-        os.write(descriptor, payload)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
-def _live_artifacts(
-    identity: FixtureIdentity,
-    candidate: MarketCandidate,
-    openai: OpenAISuccess | AdapterFailure,
-    jev: JevSuccess | AdapterFailure | None,
-    *,
-    frozen_at: datetime,
-) -> tuple[
-    list[tuple[str, bytes, str, datetime]],
-    JevDecision | None,
-    str,
-    str,
-    int | None,
-]:
-    evidence_bytes = _model_bytes(candidate.evidence)
-    prefix: list[tuple[str, bytes, str, datetime]] = [
+def _http_stage(attempt: PrecheckAttempt) -> tuple[str, bytes, str, datetime]:
+    return (
+        "precheck_book_http",
+        _model_bytes(_precheck_http_artifact(attempt)),
+        "clob_precheck_http",
+        attempt.retrieved_at or attempt.attempted_at,
+    )
+
+
+def _precheck_values(
+    candidate: MarketCandidate, config: bytes
+) -> list[tuple[str, bytes, str, datetime]]:
+    """The frozen, price-blind prefix shared by every model-bearing observation."""
+
+    return [
+        ("runtime_config", config, "runtime_config", candidate.evidence.cutoff_at),
         (
             "raw_gamma",
             candidate.raw_gamma_bytes,
@@ -779,7 +721,7 @@ def _live_artifacts(
         ),
         (
             "sanitized_evidence",
-            evidence_bytes,
+            _model_bytes(candidate.evidence),
             "gamma_sanitized",
             candidate.evidence.retrieved_at,
         ),
@@ -789,6 +731,7 @@ def _live_artifacts(
             "clob_precheck_raw",
             candidate.precheck_book.retrieved_at,
         ),
+        _http_stage(candidate.precheck_attempt),
         (
             "precheck_book",
             candidate.precheck_book_bytes,
@@ -802,6 +745,56 @@ def _live_artifacts(
             candidate.precheck_book.retrieved_at,
         ),
     ]
+
+
+def _live_artifacts(
+    identity: FixtureIdentity,
+    candidate: MarketCandidate,
+    openai: OpenAISuccess | AdapterFailure | AdapterCostOverflow,
+    jev: JevSuccess | AdapterFailure | AdapterCostOverflow | None,
+    *,
+    config: bytes,
+    frozen_at: datetime,
+) -> tuple[
+    list[tuple[str, bytes, str, datetime]],
+    JevDecision | None,
+    str,
+    str,
+    int | None,
+]:
+    prefix = _precheck_values(candidate, config)
+    if isinstance(openai, AdapterCostOverflow):
+        prefix.extend(
+            [
+                (
+                    "openai_request",
+                    openai.request_bytes,
+                    "openai_request",
+                    candidate.evidence.retrieved_at,
+                ),
+                (
+                    "openai_cost_overflow",
+                    _model_bytes(cost_overflow_artifact_from_adapter(openai)),
+                    "openai_cost_overflow",
+                    openai.retrieved_at,
+                ),
+            ]
+        )
+        values, _ = _decision_barrier(
+            identity,
+            prefix,
+            state="COST_OVERFLOW",
+            failure_code=None,
+            frozen_at=frozen_at,
+            openai_request=openai.request_bytes,
+            openai_response_sha256=openai.response_sha256,
+            jev_request=None,
+            jev_response_sha256=None,
+            jev_decision_sha256=None,
+            openai_cost=None,
+            jev_cost=0,
+        )
+        return values, None, "0" * 64, "0" * 64, None
     if isinstance(openai, AdapterFailure):
         if openai.request_bytes:
             prefix.append(
@@ -867,6 +860,38 @@ def _live_artifacts(
         ]
     )
     assert jev is not None
+    if isinstance(jev, AdapterCostOverflow):
+        prefix.extend(
+            [
+                (
+                    "jev_request",
+                    jev.request_bytes,
+                    "jev_request",
+                    openai.retrieved_at,
+                ),
+                (
+                    "jev_cost_overflow",
+                    _model_bytes(cost_overflow_artifact_from_adapter(jev)),
+                    "jev_cost_overflow",
+                    jev.retrieved_at,
+                ),
+            ]
+        )
+        values, _ = _decision_barrier(
+            identity,
+            prefix,
+            state="COST_OVERFLOW",
+            failure_code=None,
+            frozen_at=frozen_at,
+            openai_request=openai.request_bytes,
+            openai_response_sha256=hashlib.sha256(openai.response_bytes).hexdigest(),
+            jev_request=jev.request_bytes,
+            jev_response_sha256=jev.response_sha256,
+            jev_decision_sha256=None,
+            openai_cost=openai.billed_cost_microdollars,
+            jev_cost=None,
+        )
+        return values, None, brief_hash, "0" * 64, None
     if isinstance(jev, AdapterFailure):
         if jev.request_bytes:
             prefix.append(
@@ -949,6 +974,7 @@ def _record_rejections(
     rejections: tuple[Any, ...],
     *,
     observed_at: datetime,
+    config: bytes,
 ) -> list[Summary]:
     summaries: list[Summary] = []
     for rejection in rejections:
@@ -1030,9 +1056,12 @@ def _record_rejections(
             rejected_at=observed_at,
         )
         rejection_values = [
-            ("raw_gamma", rejection.raw_gamma_bytes, "gamma_market", observed_at)
+            ("runtime_config", config, "runtime_config", observed_at),
+            ("raw_gamma", rejection.raw_gamma_bytes, "gamma_market", observed_at),
         ]
-        if rejection.evidence is not None:
+        attempt = rejection.precheck_attempt
+        if rejection.evidence is not None and attempt is not None:
+            http_stage = _http_stage(attempt)
             rejection_values.append(
                 (
                     "sanitized_evidence",
@@ -1041,29 +1070,25 @@ def _record_rejections(
                     rejection.evidence.retrieved_at,
                 )
             )
-            if rejection.precheck_book_bytes is not None:
-                raw_at = rejection.precheck_retrieved_at or observed_at
-                rejection_values.append(
-                    (
-                        "precheck_book_raw",
-                        rejection.precheck_book_bytes,
-                        "clob_precheck_raw",
-                        raw_at,
-                    )
+            rejection_values.append(
+                (
+                    "precheck_book_raw",
+                    attempt.body,
+                    "clob_precheck_raw",
+                    rejection.precheck_retrieved_at or observed_at,
                 )
-            if (
-                rejection.precheck_book_bytes is not None
-                and rejection.precheck_book is not None
-            ):
+            )
+            rejection_values.append(http_stage)
+            if rejection.precheck_book is not None:
                 rejection_values.append(
                     (
                         "precheck_book",
-                        rejection.precheck_book_bytes,
+                        attempt.body,
                         "clob_precheck_book",
                         rejection.precheck_book.retrieved_at,
                     )
                 )
-            elif rejection.precheck_failure_sha256 is not None:
+            else:
                 failure = PrecheckBookFailureArtifact(
                     market_id=rejection.market_id,
                     token_id=rejection.yes_token_id or "UNKNOWN",
@@ -1077,10 +1102,11 @@ def _record_rejections(
                         or "UNKNOWN"
                     ),
                     reason=rejection.reason,
-                    raw_book_sha256=rejection.precheck_failure_sha256,
-                    raw_book_byte_length=rejection.precheck_byte_length,
+                    raw_book_sha256=hashlib.sha256(attempt.body).hexdigest(),
+                    raw_book_byte_length=len(attempt.body),
                     transport_failure=rejection.precheck_transport_failure,
                     retrieved_at=rejection.precheck_retrieved_at or observed_at,
+                    http_sha256=hashlib.sha256(http_stage[1]).hexdigest(),
                 )
                 rejection_values.append(
                     (
@@ -1120,54 +1146,66 @@ def observe_markets(
     now: datetime | None = None,
     event_sink: EventSink | None = None,
 ) -> list[Summary]:
-    """Run one bounded, paper-only public polling pass."""
+    """Run one bounded, paper-only public polling pass.
+
+    The configuration is validated before any write. One exclusive lock inside the
+    validated private output root then spans polling, provider calls, and every
+    terminal record, so concurrent identical passes bill each provider only once.
+    "Identical" follows the observation identity: the same market, cutoff, policy, and
+    frozen evidence. Every live pass samples a fresh cutoff, so only passes sharing an
+    injected ``now`` (or duplicate markets inside one pass) deduplicate; distinct live
+    passes are distinct opportunities that the lock merely serializes.
+    """
 
     if not 1 <= limit <= 20:
         raise ValueError("limit must be in 1..20")
+    config = _runtime_config_bytes()
+    with observation_lock(output_dir):
+        return _observe_locked(
+            limit=limit,
+            output_dir=output_dir,
+            config=config,
+            client=client,
+            openai_transport=openai_transport,
+            jev_transport=jev_transport,
+            now=now,
+            event_sink=event_sink,
+        )
+
+
+def _observe_locked(
+    *,
+    limit: int,
+    output_dir: str | os.PathLike[str],
+    config: bytes,
+    client: PolymarketClient | None,
+    openai_transport: Transport | None,
+    jev_transport: Transport | None,
+    now: datetime | None,
+    event_sink: EventSink | None,
+) -> list[Summary]:
     cutoff = now or datetime.now(UTC)
     public = client or PolymarketClient(SecureHttpTransport())
     openai_sender = openai_transport or live_openai_transport()
     jev_sender = jev_transport or live_jev_transport()
-    _runtime_config(output_dir)
     polled = public.poll(limit=limit, now=cutoff)
-    summaries = _record_rejections(output_dir, polled.rejections, observed_at=cutoff)
+    summaries = _record_rejections(
+        output_dir, polled.rejections, observed_at=cutoff, config=config
+    )
     for candidate in polled.eligible:
         provisional = _identity(candidate, candidate.precheck_book.source_sha256)
-        base = [
-            (
-                "raw_gamma",
-                candidate.raw_gamma_bytes,
-                "gamma_market",
-                candidate.evidence.retrieved_at,
-            ),
-            (
-                "sanitized_evidence",
-                _model_bytes(candidate.evidence),
-                "gamma_sanitized",
-                candidate.evidence.retrieved_at,
-            ),
-            (
-                "precheck_book_raw",
-                candidate.precheck_book_bytes,
-                "clob_precheck_raw",
-                candidate.precheck_book.retrieved_at,
-            ),
-            (
-                "precheck_book",
-                candidate.precheck_book_bytes,
-                "clob_precheck_book",
-                candidate.precheck_book.retrieved_at,
-            ),
-            (
-                "causal_history",
-                _causal_history_bytes(candidate),
-                "precheck_causal_history",
-                candidate.precheck_book.retrieved_at,
-            ),
-        ]
+        existing = load_existing_terminal_for_inputs(
+            output_dir,
+            opportunity_id=provisional.opportunity_id,
+            evidence_sha256=candidate.evidence.source_sha256,
+        )
+        if existing is not None:
+            summaries.append(_summary(existing.result, existing.envelopes))
+            continue
+        base = _precheck_values(candidate, config)
         freeze_observation_artifacts(output_dir, provisional, _chain(provisional, base))
         openai = call_openai(candidate.evidence, OPENAI_MODEL_ID, openai_sender)
-        jev: JevSuccess | AdapterFailure | None = None
+        jev: JevSuccess | AdapterFailure | AdapterCostOverflow | None = None
         if isinstance(openai, OpenAISuccess):
             jev = call_jev(openai.brief, candidate.evidence, JEV_MODEL_ID, jev_sender)
         frozen_at = max(
@@ -1178,7 +1216,7 @@ def observe_markets(
             else cutoff,
         )
         provisional_values, _, _, _, provisional_cost = _live_artifacts(
-            provisional, candidate, openai, jev, frozen_at=frozen_at
+            provisional, candidate, openai, jev, config=config, frozen_at=frozen_at
         )
         freeze_observation_artifacts(
             output_dir, provisional, _chain(provisional, provisional_values)
@@ -1187,7 +1225,7 @@ def observe_markets(
             event_sink("decision_frozen")
         if provisional_cost is None:
             values, decision, brief_hash, decision_hash, _ = _live_artifacts(
-                provisional, candidate, openai, jev, frozen_at=frozen_at
+                provisional, candidate, openai, jev, config=config, frozen_at=frozen_at
             )
             summaries.append(
                 _finish_book_unavailable(
@@ -1224,7 +1262,7 @@ def observe_markets(
             }:
                 reason = "BOOK_UNAVAILABLE"
             values, decision, brief_hash, decision_hash, model_cost = _live_artifacts(
-                provisional, candidate, openai, jev, frozen_at=frozen_at
+                provisional, candidate, openai, jev, config=config, frozen_at=frozen_at
             )
             summaries.append(
                 _finish_book_unavailable(
@@ -1245,7 +1283,7 @@ def observe_markets(
             continue
         final = _identity(candidate, execution_book.source_sha256)
         values, decision, brief_hash, decision_hash, model_cost = _live_artifacts(
-            final, candidate, openai, jev, frozen_at=frozen_at
+            final, candidate, openai, jev, config=config, frozen_at=frozen_at
         )
         values.append(
             (
@@ -1380,6 +1418,8 @@ def replay_fixture(
         OPENAI_MODEL_ID,
         _publishing_transport(openai_base_transport, publish_openai_request),
     )
+    if isinstance(openai, AdapterCostOverflow):
+        raise ValueError("fixture replay cannot record a billing overflow")
     if isinstance(openai, AdapterFailure):
         failure_at = openai.retrieved_at or chronology.openai_response_at
         failure_prefix = prefix + [
@@ -1487,6 +1527,8 @@ def replay_fixture(
         JEV_MODEL_ID,
         _publishing_transport(jev_base_transport, publish_jev_request),
     )
+    if isinstance(jev, AdapterCostOverflow):
+        raise ValueError("fixture replay cannot record a billing overflow")
     if isinstance(jev, AdapterFailure):
         failure_at = jev.retrieved_at or jev_at
         failure_prefix = prefix + [

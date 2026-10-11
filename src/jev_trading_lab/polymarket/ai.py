@@ -130,16 +130,130 @@ type FailureCode = Literal[
 ]
 
 
+def priced_cost_microdollars(
+    provider: Literal["openai", "jev"],
+    *,
+    input_tokens: int,
+    cached_input_tokens: int | None,
+    output_tokens: int,
+    input_rate: int,
+    cached_input_rate: int | None,
+    output_rate: int,
+) -> int:
+    """Price exact usage at exact per-million-token rates, rounding up."""
+
+    if provider == "jev":
+        return _ceil_cost([(input_tokens, input_rate), (output_tokens, output_rate)])
+    assert cached_input_tokens is not None and cached_input_rate is not None
+    return _ceil_cost(
+        [
+            (input_tokens - cached_input_tokens, input_rate),
+            (cached_input_tokens, cached_input_rate),
+            (output_tokens, output_rate),
+        ]
+    )
+
+
+def is_cost_overflow_consistent(
+    provider: Literal["openai", "jev"],
+    *,
+    input_tokens: int,
+    cached_input_tokens: int | None,
+    output_tokens: int,
+    input_rate: int,
+    cached_input_rate: int | None,
+    output_rate: int,
+) -> bool:
+    """Whether exact usage and rates are well-formed and truly exceed signed int64."""
+
+    def exact(value: object, maximum: int) -> bool:
+        return type(value) is int and 0 <= value <= maximum
+
+    if (
+        not exact(input_tokens, MAX_USAGE_TOKENS)
+        or not exact(output_tokens, MAX_USAGE_TOKENS)
+        or not exact(input_rate, _RATE_MAX)
+        or not exact(output_rate, _RATE_MAX)
+    ):
+        return False
+    if provider == "jev":
+        if cached_input_tokens is not None or cached_input_rate is not None:
+            return False
+    elif provider == "openai":
+        if (
+            cached_input_tokens is None
+            or cached_input_rate is None
+            or not exact(cached_input_tokens, MAX_USAGE_TOKENS)
+            or not exact(cached_input_rate, _RATE_MAX)
+            or cached_input_tokens > input_tokens
+        ):
+            return False
+    else:
+        return False
+    return (
+        priced_cost_microdollars(
+            provider,
+            input_tokens=input_tokens,
+            cached_input_tokens=cached_input_tokens,
+            output_tokens=output_tokens,
+            input_rate=input_rate,
+            cached_input_rate=cached_input_rate,
+            output_rate=output_rate,
+        )
+        > INT64_MAX
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class CostOverflowEvidence:
+    """Exact usage and configured rates whose priced total exceeds signed int64."""
+
+    provider: Literal["openai", "jev"]
+    input_tokens: int
+    cached_input_tokens: int | None
+    output_tokens: int
+    input_rate: int
+    cached_input_rate: int | None
+    output_rate: int
+
+    def exact_cost_microdollars(self) -> int:
+        return priced_cost_microdollars(
+            self.provider,
+            input_tokens=self.input_tokens,
+            cached_input_tokens=self.cached_input_tokens,
+            output_tokens=self.output_tokens,
+            input_rate=self.input_rate,
+            cached_input_rate=self.cached_input_rate,
+            output_rate=self.output_rate,
+        )
+
+    def is_consistent(self) -> bool:
+        return is_cost_overflow_consistent(
+            self.provider,
+            input_tokens=self.input_tokens,
+            cached_input_tokens=self.cached_input_tokens,
+            output_tokens=self.output_tokens,
+            input_rate=self.input_rate,
+            cached_input_rate=self.cached_input_rate,
+            output_rate=self.output_rate,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class TransportResponse:
-    """One provider reply; callers discard headers and sensitive sentinels."""
+    """One provider reply; callers discard headers and sensitive sentinels.
+
+    A billed cost is either an exact signed int64 or ``None`` with typed overflow
+    evidence when the priced usage cannot be represented as int64 microdollars.
+    """
 
     status_code: int
     headers: Mapping[str, str] = field(repr=False)
     raw_bytes: bytes = field(repr=False)
     retrieved_at: datetime
-    billed_cost_microdollars: int
+    billed_cost_microdollars: int | None
     sensitive_values: tuple[bytes, ...] = field(default=(), repr=False)
+    cost_overflow: CostOverflowEvidence | None = None
 
 
 class Transport(Protocol):
@@ -168,10 +282,11 @@ class LiveHttpResponse:
 
 
 LiveNetwork = Callable[[LiveHttpRequest], LiveHttpResponse]
-_OPENAI_ENDPOINT: Final = "https://api.openai.com/v1/responses"
-_JEV_ENDPOINT: Final = "https://api.typesafe.ai/v1/systemone"
+OPENAI_ENDPOINT: Final = "https://api.openai.com/v1/responses"
+JEV_ENDPOINT: Final = "https://api.typesafe.ai/v1/systemone"
 _MAX_MODEL_RESPONSE_BYTES = 2 * 1024 * 1024
 _RATE_MAX = 1_000_000_000_000
+MAX_USAGE_TOKENS: Final = 10**4300 - 1
 
 
 def _public_addresses(host: str) -> list[str]:
@@ -269,48 +384,71 @@ def _ceil_cost(terms: list[tuple[int, int]]) -> int:
     return (numerator + 999_999) // 1_000_000
 
 
-def _usage_cost(
-    body: bytes, provider: Literal["openai", "jev"], rates: tuple[int, ...]
-) -> int:
+def _usage_terms(
+    body: bytes, provider: Literal["openai", "jev"]
+) -> tuple[int, int | None, int] | None:
+    """Return exact input, cached-input, and output token counts, if well-formed.
+
+    Any non-negative integer a JSON parser accepts is priced exactly. Usage without
+    integer input and output counts cannot be priced and is billed as zero; the strict
+    response envelope then rejects the reply as a typed failure.
+    """
+
     try:
         decoded = load_strict_json(body)
         if not isinstance(decoded, Mapping) or not isinstance(
             decoded.get("usage"), Mapping
         ):
-            return 0
+            return None
         usage = decoded["usage"]
         input_tokens = usage.get("input_tokens")
         output_tokens = usage.get("output_tokens")
         if type(input_tokens) is not int or type(output_tokens) is not int:
-            return 0
-        if input_tokens < 0 or output_tokens < 0:
-            return 0
-        if provider == "jev":
-            return _ceil_cost([(input_tokens, rates[0]), (output_tokens, rates[1])])
-        details = usage.get("input_tokens_details")
-        if (
-            not isinstance(details, Mapping)
-            or type(details.get("cached_tokens")) is not int
+            return None
+        if not (
+            0 <= input_tokens <= MAX_USAGE_TOKENS
+            and 0 <= output_tokens <= MAX_USAGE_TOKENS
         ):
-            return 0
-        cached = details["cached_tokens"]
-        if cached < 0 or cached > input_tokens:
-            return 0
-        return _ceil_cost(
-            [
-                (input_tokens - cached, rates[0]),
-                (cached, rates[1]),
-                (output_tokens, rates[2]),
-            ]
-        )
-    except (TypeError, ValueError):
-        return 0
+            return None
+        if provider == "jev":
+            return input_tokens, None, output_tokens
+        details = usage.get("input_tokens_details")
+        cached = details.get("cached_tokens") if isinstance(details, Mapping) else None
+        if type(cached) is not int or not 0 <= cached <= input_tokens:
+            # The cached split is unavailable: price every input token at the
+            # full input rate so the cost can never be under-reported.
+            cached = 0
+        return input_tokens, cached, output_tokens
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+
+def _usage_cost(
+    body: bytes, provider: Literal["openai", "jev"], rates: tuple[int, ...]
+) -> tuple[int, CostOverflowEvidence | None]:
+    """Price the response usage; unrepresentable totals become typed evidence."""
+
+    terms = _usage_terms(body, provider)
+    if terms is None:
+        return 0, None
+    input_tokens, cached, output_tokens = terms
+    evidence = CostOverflowEvidence(
+        provider=provider,
+        input_tokens=input_tokens,
+        cached_input_tokens=cached,
+        output_tokens=output_tokens,
+        input_rate=rates[0],
+        cached_input_rate=rates[1] if provider == "openai" else None,
+        output_rate=rates[-1],
+    )
+    cost = evidence.exact_cost_microdollars()
+    return cost, (evidence if cost > INT64_MAX else None)
 
 
 def _live_transport(
     *, provider: Literal["openai", "jev"], network: LiveNetwork
 ) -> Transport:
-    endpoint = _OPENAI_ENDPOINT if provider == "openai" else _JEV_ENDPOINT
+    endpoint = OPENAI_ENDPOINT if provider == "openai" else JEV_ENDPOINT
 
     def send(request_bytes: bytes) -> TransportResponse:
         if type(request_bytes) is not bytes or len(request_bytes) > 1024 * 1024:
@@ -350,13 +488,15 @@ def _live_transport(
         )
         if content_type != "application/json":
             raise ValueError("provider response content type is invalid")
+        cost, overflow = _usage_cost(response.body, provider, rates)
         return TransportResponse(
             status_code=response.status_code,
             headers=response.headers,
             raw_bytes=response.body,
             retrieved_at=response.retrieved_at,
-            billed_cost_microdollars=_usage_cost(response.body, provider, rates),
+            billed_cost_microdollars=None if overflow is not None else cost,
             sensitive_values=(secret.encode(),),
+            cost_overflow=overflow,
         )
 
     return send
@@ -429,8 +569,35 @@ class AdapterFailure:
             raise ValueError("failure response hash and length are inconsistent")
 
 
-type OpenAIResult = OpenAISuccess | AdapterFailure
-type JevResult = JevSuccess | AdapterFailure
+@dataclass(frozen=True, slots=True)
+class AdapterCostOverflow:
+    """Typed result when billed usage cannot be represented as int64 microdollars.
+
+    Only the response digest, length, status, and exact usage and configured rates
+    survive; the response body is never retained.
+    """
+
+    provider: Literal["openai", "jev"]
+    request_bytes: bytes = field(repr=False)
+    response_sha256: str
+    response_byte_length: int
+    retrieved_at: datetime
+    status_code: int
+    evidence: CostOverflowEvidence
+
+    def __post_init__(self) -> None:
+        if (
+            not has_canonical_failure_response(
+                self.response_sha256, self.response_byte_length
+            )
+            or self.evidence.provider != self.provider
+            or not self.evidence.is_consistent()
+        ):
+            raise ValueError("cost overflow metadata is inconsistent")
+
+
+type OpenAIResult = OpenAISuccess | AdapterFailure | AdapterCostOverflow
+type JevResult = JevSuccess | AdapterFailure | AdapterCostOverflow
 
 
 def is_canonical_failure_message(
@@ -516,7 +683,7 @@ def _embedded_json_values(text: str, *, label: str) -> list[object]:
             raise ValueError(f"{label} exceeds embedded JSON candidate scan limit")
         try:
             decoded, _ = decoder.raw_decode(normalized, index)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
             continue
         decoded_values.append(decoded)
     return decoded_values
@@ -691,7 +858,7 @@ def _send_once(
     provider: Literal["openai", "jev"],
     request_bytes: bytes,
     transport: Callable[[bytes], TransportResponse],
-) -> TransportResponse | AdapterFailure:
+) -> TransportResponse | AdapterFailure | AdapterCostOverflow:
     try:
         response = transport(request_bytes)
         status_code = response.status_code
@@ -699,6 +866,7 @@ def _send_once(
         raw_bytes = response.raw_bytes
         retrieved_at = response.retrieved_at
         billed_cost = response.billed_cost_microdollars
+        overflow = response.cost_overflow
         sensitive_values = response.sensitive_values
         valid_retrieval = type(retrieved_at) is datetime and retrieved_at.tzinfo is UTC
         valid_headers = isinstance(headers, Mapping) and all(
@@ -712,12 +880,21 @@ def _send_once(
                 for value in sensitive_values
             )
         )
+        valid_cost = (
+            type(billed_cost) is int
+            and 0 <= billed_cost <= INT64_MAX
+            and overflow is None
+        ) or (
+            billed_cost is None
+            and type(overflow) is CostOverflowEvidence
+            and overflow.provider == provider
+            and overflow.is_consistent()
+        )
         if (
             type(status_code) is not int
             or not (100 <= status_code <= 599)
             or type(raw_bytes) is not bytes
-            or type(billed_cost) is not int
-            or not (0 <= billed_cost <= INT64_MAX)
+            or not valid_cost
             or not valid_retrieval
             or not valid_headers
             or not valid_sensitive
@@ -751,6 +928,17 @@ def _send_once(
             message=f"{provider} transport returned invalid data",
             request_bytes=request_bytes,
         )
+    if overflow is not None:
+        return AdapterCostOverflow(
+            provider=provider,
+            request_bytes=request_bytes,
+            response_sha256=hashlib.sha256(raw_bytes).hexdigest(),
+            response_byte_length=len(raw_bytes),
+            retrieved_at=retrieved_at,
+            status_code=status_code,
+            evidence=overflow,
+        )
+    assert billed_cost is not None
     if _SECRET_PATTERN.search(raw_bytes) or any(
         sentinel in raw_bytes for sentinel in sensitive_values
     ):
@@ -778,6 +966,14 @@ def _send_once(
     return response
 
 
+def _billed(response: TransportResponse) -> int:
+    """The exact int64 cost of a response that `_send_once` already accepted."""
+
+    cost = response.billed_cost_microdollars
+    assert cost is not None
+    return cost
+
+
 def _decoded_response(
     provider: Literal["openai", "jev"],
     request_bytes: bytes,
@@ -785,7 +981,7 @@ def _decoded_response(
 ) -> Mapping[str, object] | AdapterFailure:
     try:
         decoded = load_strict_json(response.raw_bytes)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return _failure(
             provider=provider,
             code="PARSE_ERROR",
@@ -793,7 +989,7 @@ def _decoded_response(
             request_bytes=request_bytes,
             response_body=response.raw_bytes,
             retrieved_at=response.retrieved_at,
-            billed_cost_microdollars=response.billed_cost_microdollars,
+            billed_cost_microdollars=_billed(response),
             status_code=response.status_code,
         )
     if not isinstance(decoded, Mapping):
@@ -804,12 +1000,12 @@ def _decoded_response(
             request_bytes=request_bytes,
             response_body=response.raw_bytes,
             retrieved_at=response.retrieved_at,
-            billed_cost_microdollars=response.billed_cost_microdollars,
+            billed_cost_microdollars=_billed(response),
             status_code=response.status_code,
         )
     try:
         reflected = _contains_credentials(decoded, response.sensitive_values)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         reflected = True
     if reflected:
         return _failure(
@@ -819,7 +1015,7 @@ def _decoded_response(
             request_bytes=request_bytes,
             response_body=response.raw_bytes,
             retrieved_at=response.retrieved_at,
-            billed_cost_microdollars=response.billed_cost_microdollars,
+            billed_cost_microdollars=_billed(response),
             status_code=response.status_code,
         )
     return decoded
@@ -838,7 +1034,7 @@ def _parse_failure(
         request_bytes=request_bytes,
         response_body=response.raw_bytes,
         retrieved_at=response.retrieved_at,
-        billed_cost_microdollars=response.billed_cost_microdollars,
+        billed_cost_microdollars=_billed(response),
         status_code=response.status_code,
     )
 
@@ -860,7 +1056,7 @@ def call_openai(
             request_bytes=b"",
         )
     sent = _send_once("openai", request_bytes, transport)
-    if isinstance(sent, AdapterFailure):
+    if isinstance(sent, AdapterFailure | AdapterCostOverflow):
         return sent
     decoded = _decoded_response("openai", request_bytes, sent)
     if isinstance(decoded, AdapterFailure):
@@ -873,7 +1069,7 @@ def call_openai(
             request_bytes=request_bytes,
             response_body=sent.raw_bytes,
             retrieved_at=sent.retrieved_at,
-            billed_cost_microdollars=sent.billed_cost_microdollars,
+            billed_cost_microdollars=_billed(sent),
             status_code=sent.status_code,
         )
     try:
@@ -886,7 +1082,7 @@ def call_openai(
         ):
             raise ValueError("OpenAI response is not a completed success")
         raw_brief = load_strict_json(envelope.message().content[0].text)
-    except (ValidationError, TypeError, ValueError):
+    except (ValidationError, TypeError, ValueError, RecursionError):
         return _parse_failure(
             "openai",
             request_bytes,
@@ -914,12 +1110,12 @@ def call_openai(
                 request_bytes=request_bytes,
                 response_body=sent.raw_bytes,
                 retrieved_at=sent.retrieved_at,
-                billed_cost_microdollars=sent.billed_cost_microdollars,
+                billed_cost_microdollars=_billed(sent),
                 status_code=sent.status_code,
             )
     try:
         brief = openai_response_brief(envelope)
-    except (ValidationError, TypeError, ValueError):
+    except (ValidationError, TypeError, ValueError, RecursionError):
         return _parse_failure(
             "openai",
             request_bytes,
@@ -931,7 +1127,7 @@ def call_openai(
         request_bytes=request_bytes,
         response_bytes=sent.raw_bytes,
         retrieved_at=sent.retrieved_at,
-        billed_cost_microdollars=sent.billed_cost_microdollars,
+        billed_cost_microdollars=_billed(sent),
     )
 
 
@@ -953,7 +1149,7 @@ def call_jev(
             request_bytes=b"",
         )
     sent = _send_once("jev", request_bytes, transport)
-    if isinstance(sent, AdapterFailure):
+    if isinstance(sent, AdapterFailure | AdapterCostOverflow):
         return sent
     decoded = _decoded_response("jev", request_bytes, sent)
     if isinstance(decoded, AdapterFailure):
@@ -966,13 +1162,13 @@ def call_jev(
             request_bytes=request_bytes,
             response_body=sent.raw_bytes,
             retrieved_at=sent.retrieved_at,
-            billed_cost_microdollars=sent.billed_cost_microdollars,
+            billed_cost_microdollars=_billed(sent),
             status_code=sent.status_code,
         )
     try:
         envelope = JevResponse.model_validate(decoded)
         decision = jev_response_decision(envelope)
-    except (ValidationError, TypeError, ValueError):
+    except (ValidationError, TypeError, ValueError, RecursionError):
         return _parse_failure(
             "jev", request_bytes, sent, "jev response violates the strict envelope"
         )
@@ -981,5 +1177,5 @@ def call_jev(
         request_bytes=request_bytes,
         response_bytes=sent.raw_bytes,
         retrieved_at=sent.retrieved_at,
-        billed_cost_microdollars=sent.billed_cost_microdollars,
+        billed_cost_microdollars=_billed(sent),
     )

@@ -839,6 +839,210 @@ def test_transport_cost_is_authoritative_exact_int64(
     assert result.billed_cost_microdollars == INT64_MAX
 
 
+def _overflow_evidence(provider: str) -> Any:
+    from jev_trading_lab.polymarket.ai import CostOverflowEvidence
+
+    if provider == "openai":
+        return CostOverflowEvidence(
+            provider="openai",
+            input_tokens=10**13,
+            cached_input_tokens=4,
+            output_tokens=3,
+            input_rate=10**12,
+            cached_input_rate=10**11,
+            output_rate=10**12,
+        )
+    return CostOverflowEvidence(
+        provider="jev",
+        input_tokens=10**13,
+        cached_input_tokens=None,
+        output_tokens=3,
+        input_rate=10**12,
+        cached_input_rate=None,
+        output_rate=10**12,
+    )
+
+
+def _overflow_transport(
+    provider: str,
+    raw: bytes,
+    *,
+    cost: int | None = None,
+    evidence: Any = None,
+    status_code: int = 200,
+) -> FixtureTransport:
+    return FixtureTransport(
+        raw,
+        response=TransportResponse(
+            status_code=status_code,
+            headers={"content-type": "application/json"},
+            raw_bytes=raw,
+            retrieved_at=datetime(2026, 10, 3, 12, 0, 30, tzinfo=UTC),
+            billed_cost_microdollars=cost,  # type: ignore[arg-type]
+            sensitive_values=(CREDENTIAL_SENTINEL.encode(),),
+            cost_overflow=(
+                _overflow_evidence(provider) if evidence is None else evidence
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize("provider", ("openai", "jev"))
+@pytest.mark.parametrize("status_code", (200, 503))
+def test_finding_6_cost_overflow_is_a_typed_adapter_result_not_provider_error(
+    cycle: dict[str, Any],
+    evidence: EvidencePacket,
+    brief: ResearchBrief,
+    provider: str,
+    status_code: int,
+) -> None:
+    from jev_trading_lab.polymarket.ai import AdapterCostOverflow
+
+    raw = cycle["model_artifacts"][f"{provider}_response_bytes"].encode()
+    transport = _overflow_transport(provider, raw, status_code=status_code)
+
+    result = _call(provider, cycle, evidence, brief, transport)
+
+    assert isinstance(result, AdapterCostOverflow)
+    assert result.provider == provider
+    assert result.status_code == status_code
+    assert result.response_sha256 == hashlib.sha256(raw).hexdigest()
+    assert result.response_byte_length == len(raw)
+    assert result.retrieved_at == datetime(2026, 10, 3, 12, 0, 30, tzinfo=UTC)
+    assert result.evidence == _overflow_evidence(provider)
+    assert result.evidence.exact_cost_microdollars() > INT64_MAX
+    assert result.request_bytes == transport.calls[0]
+    assert len(transport.calls) == 1
+    assert raw.decode() not in repr(result)
+    assert CREDENTIAL_SENTINEL not in repr(result)
+
+
+@pytest.mark.parametrize("provider", ("openai", "jev"))
+def test_finding_6_cost_overflow_precedes_credential_reflection_and_never_keeps_body(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief, provider: str
+) -> None:
+    from jev_trading_lab.polymarket.ai import AdapterCostOverflow
+
+    reflected = f'{{"error":"Bearer {CREDENTIAL_SENTINEL}"}}'.encode()
+    transport = _overflow_transport(provider, reflected)
+
+    result = _call(provider, cycle, evidence, brief, transport)
+
+    assert isinstance(result, AdapterCostOverflow)
+    assert result.response_sha256 == hashlib.sha256(reflected).hexdigest()
+    assert CREDENTIAL_SENTINEL not in repr(result)
+    assert not hasattr(result, "response_bytes") and not hasattr(result, "raw_bytes")
+
+
+_COMMON_OVERFLOW_MUTATIONS = (
+    "missing_evidence",
+    "cost_and_evidence",
+    "non_overflowing_evidence",
+    "wrong_provider",
+    "negative_tokens",
+    "rate_out_of_range",
+)
+_OVERFLOW_MUTATIONS = [
+    (provider, mutation)
+    for provider in ("openai", "jev")
+    for mutation in _COMMON_OVERFLOW_MUTATIONS
+] + [("openai", "cached_exceeds_input"), ("jev", "jev_with_cached_fields")]
+
+
+@pytest.mark.parametrize(("provider", "mutation"), _OVERFLOW_MUTATIONS)
+def test_finding_6_inconsistent_overflow_metadata_is_provider_error(
+    cycle: dict[str, Any],
+    evidence: EvidencePacket,
+    brief: ResearchBrief,
+    provider: str,
+    mutation: str,
+) -> None:
+    from dataclasses import replace
+
+    raw = cycle["model_artifacts"][f"{provider}_response_bytes"].encode()
+    good = _overflow_evidence(provider)
+    if mutation == "missing_evidence":
+        transport = FixtureTransport(
+            raw,
+            response=TransportResponse(
+                status_code=200,
+                headers={},
+                raw_bytes=raw,
+                retrieved_at=datetime(2026, 10, 3, tzinfo=UTC),
+                billed_cost_microdollars=None,  # type: ignore[arg-type]
+            ),
+        )
+    elif mutation == "cost_and_evidence":
+        transport = _overflow_transport(provider, raw, cost=7)
+    elif mutation == "non_overflowing_evidence":
+        transport = _overflow_transport(
+            provider, raw, evidence=replace(good, input_tokens=1)
+        )
+    elif mutation == "wrong_provider":
+        other = "jev" if provider == "openai" else "openai"
+        transport = _overflow_transport(
+            provider, raw, evidence=_overflow_evidence(other)
+        )
+    elif mutation == "negative_tokens":
+        transport = _overflow_transport(
+            provider, raw, evidence=replace(good, output_tokens=-1)
+        )
+    elif mutation == "cached_exceeds_input":
+        transport = _overflow_transport(
+            provider, raw, evidence=replace(good, cached_input_tokens=10**14)
+        )
+    elif mutation == "rate_out_of_range":
+        transport = _overflow_transport(
+            provider, raw, evidence=replace(good, input_rate=10**12 + 1)
+        )
+    else:
+        transport = _overflow_transport(
+            provider, raw, evidence=replace(good, cached_input_tokens=1)
+        )
+
+    result = _call(provider, cycle, evidence, brief, transport)
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "PROVIDER_ERROR"
+    assert result.billed_cost_microdollars == 0
+
+
+@pytest.mark.parametrize("provider", ("openai", "jev"))
+def test_hardening_deeply_nested_provider_body_is_a_typed_failure_after_billing(
+    cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief, provider: str
+) -> None:
+    body = b"[" * 100_000 + b"]" * 100_000
+
+    result = _call(
+        provider,
+        cycle,
+        evidence,
+        brief,
+        FixtureTransport(body, billed_cost_microdollars=9),
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "PARSE_ERROR"
+    assert result.billed_cost_microdollars == 9
+    assert result.response_sha256 == hashlib.sha256(body).hexdigest()
+
+
+def test_hardening_deeply_nested_brief_text_is_a_typed_failure_after_billing(
+    cycle: dict[str, Any], evidence: EvidencePacket
+) -> None:
+    response = _openai_body(cycle)
+    _openai_message(response)["content"][0]["text"] = "[" * 5_000 + "]" * 5_000
+
+    result = call_openai(
+        evidence,
+        OPENAI_MODEL_ID,
+        FixtureTransport(_wire_json(response), billed_cost_microdollars=11),
+    )
+
+    assert isinstance(result, AdapterFailure)
+    assert result.billed_cost_microdollars == 11
+
+
 def test_score_to_micros_uses_deterministic_half_up_rounding(
     cycle: dict[str, Any], evidence: EvidencePacket, brief: ResearchBrief
 ) -> None:

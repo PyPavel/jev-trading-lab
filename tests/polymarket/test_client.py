@@ -7,6 +7,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from jev_trading_lab.polymarket.client import (
     HttpRequest,
@@ -17,6 +19,7 @@ from jev_trading_lab.polymarket.client import (
     SecureHttpTransport,
     normalize_gamma_identity,
 )
+from jev_trading_lab.polymarket.models import BookLevel, BookSnapshot
 
 NOW = datetime(2026, 10, 10, 12, tzinfo=UTC)
 
@@ -384,3 +387,695 @@ def test_execution_book_rejects_stale_crossed_and_token_drift() -> None:
         candidate = PolymarketClient(transport).poll(limit=1, now=NOW).eligible[0]
         with pytest.raises(PublicDataError):
             PolymarketClient(transport).execution_book(candidate, now=NOW)
+
+
+# --- Final Unit 6 adversarial review findings -------------------------------
+
+
+def _json_bytes(value: object) -> bytes:
+    return json.dumps(value, separators=(",", ":")).encode()
+
+
+_JSON_HEADERS = {"content-type": "application/json"}
+_VALID_BOOK = _json_bytes(book())
+
+
+@pytest.mark.parametrize(
+    ("label", "reply", "status", "content_type", "transport_reason", "reason"),
+    [
+        (
+            "ok",
+            HttpResponse(
+                200,
+                {"content-type": "Application/JSON; charset=UTF-8"},
+                _VALID_BOOK,
+                NOW,
+            ),
+            200,
+            "application/json",
+            "OK",
+            None,
+        ),
+        (
+            "503 with a valid JSON book",
+            HttpResponse(503, _JSON_HEADERS, _VALID_BOOK, NOW),
+            503,
+            "application/json",
+            "HTTP_STATUS",
+            "MALFORMED_BOOK",
+        ),
+        (
+            "wrong content type with a valid JSON book",
+            HttpResponse(
+                200, {"content-type": "text/html; charset=utf-8"}, _VALID_BOOK, NOW
+            ),
+            200,
+            "text/html",
+            "CONTENT_TYPE",
+            "MALFORMED_BOOK",
+        ),
+        (
+            "missing content type",
+            HttpResponse(200, {}, _VALID_BOOK, NOW),
+            200,
+            None,
+            "CONTENT_TYPE",
+            "MALFORMED_BOOK",
+        ),
+        (
+            "unparseable content type is bounded and sanitized",
+            HttpResponse(
+                200, {"content-type": "\x00 not/a media type"}, _VALID_BOOK, NOW
+            ),
+            200,
+            "invalid",
+            "CONTENT_TYPE",
+            "MALFORMED_BOOK",
+        ),
+        (
+            "redirect",
+            HttpResponse(302, {"location": "https://evil.example"}, b"", NOW),
+            302,
+            None,
+            "REDIRECT",
+            "MALFORMED_BOOK",
+        ),
+        (
+            "truncated JSON",
+            HttpResponse(200, _JSON_HEADERS, b"{", NOW),
+            200,
+            "application/json",
+            "NOT_JSON",
+            "MALFORMED_BOOK",
+        ),
+        (
+            "empty body",
+            HttpResponse(200, _JSON_HEADERS, b"", NOW),
+            200,
+            "application/json",
+            "NOT_JSON",
+            "MALFORMED_BOOK",
+        ),
+        (
+            "non UTF-8 body",
+            HttpResponse(200, _JSON_HEADERS, b"\xff\xfe\x00", NOW),
+            200,
+            "application/json",
+            "NOT_JSON",
+            "MALFORMED_BOOK",
+        ),
+        (
+            "valid book encoded as UTF-16 is not UTF-8 JSON",
+            HttpResponse(200, _JSON_HEADERS, json.dumps(book()).encode("utf-16"), NOW),
+            200,
+            "application/json",
+            "NOT_JSON",
+            "MALFORMED_BOOK",
+        ),
+        (
+            "valid book behind a UTF-8 byte-order mark",
+            HttpResponse(200, _JSON_HEADERS, b"\xef\xbb\xbf" + _VALID_BOOK, NOW),
+            200,
+            "application/json",
+            "NOT_JSON",
+            "MALFORMED_BOOK",
+        ),
+        (
+            "excessive JSON depth",
+            HttpResponse(200, _JSON_HEADERS, b"[" * 40 + b"]" * 40, NOW),
+            200,
+            "application/json",
+            "NOT_JSON",
+            "MALFORMED_BOOK",
+        ),
+        (
+            "oversized",
+            HttpResponse(200, _JSON_HEADERS, b"[]", NOW, oversized=True),
+            200,
+            "application/json",
+            "OVERSIZED",
+            "MALFORMED_BOOK",
+        ),
+        (
+            "timeout with no bytes",
+            TimeoutError(),
+            None,
+            None,
+            "TIMEOUT",
+            "PRECHECK_TIMEOUT",
+        ),
+        (
+            "transport failure with no bytes",
+            OSError("dns failed"),
+            None,
+            None,
+            "TRANSPORT_ERROR",
+            "BOOK_UNAVAILABLE",
+        ),
+        (
+            "transport policy failure with no bytes",
+            PublicDataError("unsafe peer"),
+            None,
+            None,
+            "TRANSPORT_ERROR",
+            "BOOK_UNAVAILABLE",
+        ),
+    ],
+)
+def test_finding_1_precheck_attempt_records_http_metadata_for_every_outcome(
+    label: str,
+    reply: object,
+    status: int | None,
+    content_type: str | None,
+    transport_reason: str,
+    reason: str | None,
+) -> None:
+    result = PolymarketClient(CannedTransport([[market()]], [reply])).poll(
+        limit=1, now=NOW
+    )
+    item = result.rejections[0] if reason else result.eligible[0]
+    attempt = item.precheck_attempt
+    expected_body = (
+        b"" if isinstance(reply, BaseException) else getattr(reply, "body", b"")
+    )
+    assert (item.reason if reason else None) == reason, label
+    assert attempt.token_id == "yes-m1", label
+    assert attempt.attempted_at == NOW, label
+    assert attempt.status_code == status, label
+    assert attempt.content_type == content_type, label
+    assert attempt.transport_reason == transport_reason, label
+    assert attempt.body == expected_body, label
+    assert attempt.truncated is (transport_reason == "OVERSIZED"), label
+    assert attempt.retrieved_at == (None if status is None else NOW), label
+
+
+def test_finding_1_oversized_precheck_bytes_stay_bounded() -> None:
+    from jev_trading_lab.polymarket.client import MAX_PUBLIC_BYTES
+
+    body = b"x" * (MAX_PUBLIC_BYTES + 5)
+    result = PolymarketClient(
+        CannedTransport([[market()]], [HttpResponse(200, _JSON_HEADERS, body, NOW)])
+    ).poll(limit=1, now=NOW)
+    attempt = result.rejections[0].precheck_attempt
+    assert attempt.transport_reason == "OVERSIZED"
+    assert attempt.truncated is True
+    assert attempt.body == body[:MAX_PUBLIC_BYTES]
+
+
+def test_finding_1_pathologically_deep_public_json_is_a_typed_error_not_a_crash() -> (
+    None
+):
+    deep = HttpResponse(200, _JSON_HEADERS, b"[" * 200_000 + b"]" * 200_000, NOW)
+    candidate = (
+        PolymarketClient(CannedTransport([[market()]], [book()]))
+        .poll(limit=1, now=NOW)
+        .eligible[0]
+    )
+
+    with pytest.raises(PublicDataError):
+        PolymarketClient(CannedTransport([deep], [])).poll(limit=1, now=NOW)
+    with pytest.raises(PublicDataError):
+        PolymarketClient(CannedTransport([], [deep])).execution_book(candidate, now=NOW)
+
+
+_NESTED = "[" * 100_000 + "]" * 100_000
+_HOSTILE_STRINGS = [
+    "1e999999999",
+    "-1e999999999",
+    "9" * 40,
+    "0." + "0" * 60 + "1",
+    "NaN",
+    "Infinity",
+    "",
+    "0",
+    "\ud800",
+    "[" * 100_000 + "]" * 100_000,
+]
+_PROPERTY = settings(
+    max_examples=250,
+    deadline=None,
+    derandomize=True,
+    database=None,
+    suppress_health_check=list(HealthCheck),
+)
+_SCALARS = st.one_of(
+    st.none(),
+    st.booleans(),
+    st.integers(min_value=-(10**30), max_value=10**30),
+    st.floats(),
+    st.text(max_size=40),
+    st.sampled_from(_HOSTILE_STRINGS),
+)
+_JSON = st.recursive(
+    _SCALARS,
+    lambda inner: st.one_of(
+        st.lists(inner, max_size=4),
+        st.dictionaries(st.text(max_size=8), inner, max_size=4),
+    ),
+    max_leaves=12,
+)
+_LEVELS = st.lists(
+    st.fixed_dictionaries({"price": _SCALARS, "size": _SCALARS}), max_size=3
+)
+_HOSTILE_BOOKS = st.fixed_dictionaries(
+    {
+        "market": st.one_of(st.just("condition-m1"), _SCALARS),
+        "asset_id": st.one_of(st.just("yes-m1"), _SCALARS),
+        "timestamp": st.one_of(st.just("1791633600000"), _SCALARS),
+        "bids": st.one_of(_LEVELS, _JSON),
+        "asks": st.one_of(_LEVELS, _JSON),
+    },
+    optional={"hash": _SCALARS, "tick_size": _SCALARS, "extra": _JSON},
+)
+# Encoded-array fields are parsed before any other deep gate can reject the market.
+_ENCODED_FIELDS = [
+    "outcomes",
+    "outcomePrices",
+    "clobTokenIds",
+    "volume24hr",
+    "conditionId",
+]
+_TEXT_FIELDS = [
+    "id",
+    "question",
+    "description",
+    "rules",
+    "resolutionSource",
+    "tags",
+    "category",
+    "endDate",
+]
+_HOSTILE_VALUES = st.one_of(_JSON, st.sampled_from(_HOSTILE_STRINGS))
+
+
+@_PROPERTY
+@given(_HOSTILE_BOOKS)
+def test_hardening_arbitrary_book_payloads_never_escape_the_shared_parsers(
+    hostile: dict[str, Any],
+) -> None:
+    from jev_trading_lab.polymarket.client import (
+        derive_precheck_rejection,
+        derive_precheck_transport_reason,
+        reconstruct_book_snapshot,
+    )
+
+    body = json.dumps(hostile).encode()
+    transport = derive_precheck_transport_reason(
+        status_code=200, content_type="application/json", truncated=False, body=body
+    )
+    derive_precheck_rejection(
+        transport_reason=transport,
+        body=body,
+        market_id="m1",
+        condition_id="condition-m1",
+        token_id="yes-m1",
+        now=NOW,
+    )
+    try:
+        reconstruct_book_snapshot(body, market_id="m1")
+    except PublicDataError:
+        pass
+
+
+@_PROPERTY
+@given(st.binary(max_size=300))
+def test_hardening_arbitrary_bytes_never_escape_the_precheck_derivations(
+    body: bytes,
+) -> None:
+    from jev_trading_lab.polymarket.client import (
+        derive_precheck_rejection,
+        derive_precheck_transport_reason,
+    )
+
+    for status in (200, 503):
+        transport = derive_precheck_transport_reason(
+            status_code=status,
+            content_type="application/json",
+            truncated=False,
+            body=body,
+        )
+        derive_precheck_rejection(
+            transport_reason=transport,
+            body=body,
+            market_id="m1",
+            condition_id="condition-m1",
+            token_id="yes-m1",
+            now=NOW,
+        )
+
+
+def _poll_never_raises(changes: dict[str, Any]) -> None:
+    transport = CannedTransport([[market() | changes]], [book(), book()])
+    try:
+        PolymarketClient(transport).poll(limit=1, now=NOW)
+    except PublicDataError:
+        pass
+
+
+@_PROPERTY
+@given(
+    st.fixed_dictionaries(
+        {}, optional={field: _HOSTILE_VALUES for field in _ENCODED_FIELDS}
+    )
+)
+def test_hardening_hostile_gamma_encoded_fields_are_rejected_never_raised(
+    changes: dict[str, Any],
+) -> None:
+    _poll_never_raises(changes)
+
+
+@_PROPERTY
+@given(
+    st.fixed_dictionaries(
+        {}, optional={field: _HOSTILE_VALUES for field in _TEXT_FIELDS}
+    )
+)
+def test_hardening_hostile_gamma_text_fields_are_rejected_never_raised(
+    changes: dict[str, Any],
+) -> None:
+    _poll_never_raises(changes)
+
+
+@pytest.mark.parametrize(
+    "field", ["outcomes", "outcomePrices", "clobTokenIds"], ids=lambda value: value
+)
+def test_hardening_deeply_nested_gamma_encoded_arrays_are_malformed_markets(
+    field: str,
+) -> None:
+    transport = CannedTransport([[market(**{field: _NESTED})]], [])
+
+    result = PolymarketClient(transport).poll(limit=1, now=NOW)
+
+    assert not result.eligible
+    assert result.rejections[0].reason == "MALFORMED_MARKET"
+    assert all("clob.polymarket.com" not in item.url for item in transport.requests)
+
+
+def test_hardening_gamma_clob_identity_is_total_for_hostile_encoded_arrays() -> None:
+    from jev_trading_lab.polymarket.client import gamma_clob_identity
+
+    with pytest.raises(ValueError):
+        gamma_clob_identity({"id": "m1", "clobTokenIds": _NESTED})
+
+
+def test_hardening_lone_surrogate_gamma_text_is_a_malformed_market() -> None:
+    raw = (
+        json.dumps([market()]).encode().replace(b"Will m1 happen?", b"Will \\ud800 x?")
+    )
+    page = HttpResponse(200, _JSON_HEADERS, raw, NOW)
+
+    result = PolymarketClient(CannedTransport([page], [])).poll(limit=1, now=NOW)
+
+    assert not result.eligible
+    assert result.rejections[0].reason == "MALFORMED_MARKET"
+    assert result.rejections[0].raw_gamma_bytes.count(b"\\ud800") == 1
+
+
+_HOSTILE_PARSER_SCRIPT = """
+import json, sys
+from datetime import UTC, datetime
+
+from jev_trading_lab.polymarket.client import (
+    PublicDataError,
+    derive_precheck_rejection,
+    reconstruct_book_snapshot,
+)
+
+book = {
+    "market": "condition-m1",
+    "asset_id": "yes-m1",
+    "timestamp": "1791633600000",
+    "bids": [{"price": "0.48", "size": "5000"}],
+    "asks": [{"price": "0.51", "size": "5000"}],
+}
+book.update(json.loads(sys.argv[1]))
+body = json.dumps(book).encode()
+reason, snapshot = derive_precheck_rejection(
+    transport_reason="OK",
+    body=body,
+    market_id="m1",
+    condition_id="condition-m1",
+    token_id="yes-m1",
+    now=datetime(2026, 10, 10, 12, tzinfo=UTC),
+)
+try:
+    reconstruct_book_snapshot(body, market_id="m1")
+except PublicDataError:
+    rebuilt = "rejected"
+else:
+    rebuilt = "accepted"
+print(reason, snapshot is None, rebuilt)
+"""
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        pytest.param({"timestamp": "9" * 30}, id="timestamp-beyond-platform-time"),
+        pytest.param({"timestamp": "9" * 5_000}, id="timestamp-digit-limit"),
+        pytest.param({"timestamp": 10**40}, id="timestamp-integer-beyond-float"),
+        pytest.param(
+            {"bids": [{"price": "1e999999999", "size": "5000"}]},
+            id="price-exponent-overflows-decimal-context",
+        ),
+        pytest.param(
+            {"bids": [{"price": "0.48", "size": "1e999999999"}]},
+            id="size-exponent-would-hang-integer-conversion",
+        ),
+        pytest.param(
+            {"bids": [{"price": "0.48", "size": "1e5000"}]}, id="size-exponent-5000"
+        ),
+        pytest.param(
+            {"asks": [{"price": "0.51", "size": "9" * 5_000}]}, id="size-digits-5000"
+        ),
+        pytest.param(
+            {"bids": [{"price": "0." + "0" * 100_000 + "1", "size": "5000"}]},
+            id="price-with-a-hundred-thousand-zeros",
+        ),
+    ],
+)
+def test_finding_1_hostile_book_numbers_are_malformed_never_hang_or_crash(
+    changes: dict[str, Any],
+) -> None:
+    import subprocess
+    import sys
+
+    completed = subprocess.run(
+        [sys.executable, "-B", "-c", _HOSTILE_PARSER_SCRIPT, json.dumps(changes)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr[-400:]
+    assert completed.stdout.strip() == "MALFORMED_BOOK True rejected"
+
+
+def test_finding_1_token_ids_beyond_the_artifact_bound_are_malformed_markets() -> None:
+    from jev_trading_lab.polymarket.client import MAX_CLOB_TOKEN_ID_CHARS
+
+    for token in ("9" * (MAX_CLOB_TOKEN_ID_CHARS + 1), "x" * 5_000):
+        transport = CannedTransport(
+            [[market(clobTokenIds=json.dumps([token, "no-token"]))]], []
+        )
+        result = PolymarketClient(transport).poll(limit=1, now=NOW)
+        assert not result.eligible
+        assert result.rejections[0].reason == "MALFORMED_MARKET"
+        assert all(
+            "clob.polymarket.com" not in request.url for request in transport.requests
+        )
+    boundary = "9" * MAX_CLOB_TOKEN_ID_CHARS
+    result = PolymarketClient(
+        CannedTransport(
+            [[market(clobTokenIds=json.dumps([boundary, "no-token"]))]],
+            [book(token=boundary)],
+        )
+    ).poll(limit=1, now=NOW)
+    assert result.eligible[0].yes_token_id == boundary
+
+
+def test_finding_1_replay_derivations_are_shared_pure_functions() -> None:
+    from jev_trading_lab.polymarket import client as public
+
+    assert (
+        public.derive_precheck_transport_reason(
+            status_code=503,
+            content_type="application/json",
+            truncated=False,
+            body=_VALID_BOOK,
+        )
+        == "HTTP_STATUS"
+    )
+    outcome = public.derive_precheck_rejection(
+        transport_reason="OK",
+        body=_VALID_BOOK,
+        market_id="m1",
+        condition_id="condition-m1",
+        token_id="yes-m1",
+        now=NOW,
+    )
+    assert outcome[0] is None and outcome[1] is not None
+    stale = public.derive_precheck_rejection(
+        transport_reason="OK",
+        body=_VALID_BOOK,
+        market_id="m1",
+        condition_id="condition-m1",
+        token_id="yes-m1",
+        now=NOW + timedelta(seconds=31),
+    )
+    assert stale[0] == "STALE_BOOK" and stale[1] is None
+    skipped = public.derive_precheck_rejection(
+        transport_reason="HTTP_STATUS",
+        body=_VALID_BOOK,
+        market_id="m1",
+        condition_id="condition-m1",
+        token_id="yes-m1",
+        now=NOW,
+    )
+    assert skipped == ("MALFORMED_BOOK", None)
+
+
+def _snapshot(bids: list[tuple[int, int]], asks: list[tuple[int, int]]) -> BookSnapshot:
+    return BookSnapshot(
+        market_id="m1",
+        token_id="yes-m1",
+        retrieved_at=NOW,
+        source_sha256="0" * 64,
+        bids=[BookLevel(price_micros=p, quantity=q) for p, q in bids],
+        asks=[BookLevel(price_micros=p, quantity=q) for p, q in asks],
+    )
+
+
+@pytest.mark.parametrize(
+    ("bids", "asks", "expected"),
+    [
+        ([(480_000, 5_000)], [(520_000, 5_000)], None),
+        ([(480_000, 5_000)], [(520_001, 5_000)], "WIDE_SPREAD"),
+        ([(480_000, 4_999)], [(500_000, 5_000)], "LOW_DEPTH"),
+        ([(480_000, 5_000)], [(500_000, 4_999)], "LOW_DEPTH"),
+        ([(480_000, 2_000), (460_000, 3_000)], [(500_000, 5_000)], None),
+        ([(480_000, 2_000), (459_999, 3_000)], [(500_000, 5_000)], "LOW_DEPTH"),
+        ([(480_000, 5_000)], [(500_000, 2_000), (520_000, 3_000)], None),
+        ([(480_000, 5_000)], [(500_000, 2_000), (520_001, 3_000)], "LOW_DEPTH"),
+        ([(480_000, 1)], [(530_000, 1)], "WIDE_SPREAD"),
+    ],
+)
+def test_finding_2_central_precheck_eligibility_function_thresholds(
+    bids: list[tuple[int, int]], asks: list[tuple[int, int]], expected: str | None
+) -> None:
+    from jev_trading_lab.polymarket.client import precheck_eligibility_reason
+
+    assert precheck_eligibility_reason(_snapshot(bids, asks)) == expected
+
+
+def test_finding_2_poll_delegates_to_the_central_eligibility_function(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jev_trading_lab.polymarket import client as public
+
+    monkeypatch.setattr(
+        public, "precheck_eligibility_reason", lambda _book: "LOW_DEPTH"
+    )
+    result = PolymarketClient(CannedTransport([[market()]], [book()])).poll(
+        limit=1, now=NOW
+    )
+    assert not result.eligible
+    assert result.rejections[0].reason == "LOW_DEPTH"
+    assert result.rejections[0].precheck_book is not None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "2026-10-12T12:00:00Z",
+        "2026-10-12T12:00:00+00:00",
+        "2026-10-12T12:00:00.000Z",
+        "2026-10-12T12:00:00.000000+00:00",
+    ],
+)
+def test_finding_5_gamma_utc_normalizer_accepts_z_and_zero_offset(text: str) -> None:
+    from jev_trading_lab.polymarket import client as public
+
+    parsed = public.normalize_gamma_utc(text)
+    assert parsed == datetime(2026, 10, 12, 12, tzinfo=UTC)
+    assert parsed.utcoffset() == timedelta(0)
+    assert (
+        public.normalize_gamma_identity({**market(), "endDate": text})["closes_at"]
+        == "2026-10-12T12:00:00Z"
+    )
+
+
+def test_finding_5_gamma_utc_normalizer_keeps_fractional_seconds_canonical() -> None:
+    from jev_trading_lab.polymarket import client as public
+
+    assert (
+        public.normalize_gamma_identity(
+            {**market(), "endDate": "2026-10-12T12:00:00.5+00:00"}
+        )["closes_at"]
+        == "2026-10-12T12:00:00.500000Z"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        5,
+        b"2026-10-12T12:00:00Z",
+        "",
+        "2026-10-12",
+        "2026-10-12T12:00:00",
+        "2026-10-12T14:00:00+02:00",
+        "2026-10-12T10:00:00-02:00",
+        "2026-10-12T12:00:00-00:00",
+        "2026-10-12T12:00:00+0000",
+        "2026-10-12T12:00:00z",
+        "2026-10-12 12:00:00Z",
+        "2026-10-12T12:00:00Z\n",
+        "٢٠٢٦-١٠-١٢T١٢:٠٠:٠٠Z",
+        "2026-10-12T12:00:00.1234567Z",
+        "2026-13-12T12:00:00Z",
+        "2026-10-12T25:00:00Z",
+        "not-a-date",
+        " 2026-10-12T12:00:00Z",
+        "2026-10-12T12:00:00Z ",
+    ],
+)
+def test_finding_5_gamma_utc_normalizer_rejects_invalid_and_nonzero_offsets(
+    value: object,
+) -> None:
+    from jev_trading_lab.polymarket import client as public
+
+    with pytest.raises(ValueError):
+        public.normalize_gamma_utc(value)
+    with pytest.raises(ValueError):
+        public.normalize_gamma_identity({**market(), "endDate": value})
+
+
+@pytest.mark.parametrize(
+    "end_date",
+    ["2026-10-12T14:00:00+02:00", "2026-10-12", "garbage", None, 7],
+)
+def test_finding_5_poll_rejects_invalid_or_offset_end_date_as_malformed(
+    end_date: object,
+) -> None:
+    result = PolymarketClient(CannedTransport([[market(endDate=end_date)]], [])).poll(
+        limit=1, now=NOW
+    )
+    assert not result.eligible
+    assert result.rejections[0].reason == "MALFORMED_MARKET"
+
+
+@pytest.mark.parametrize(
+    "end_date", ["2026-10-12T12:00:00+00:00", "2026-10-12T12:00:00.000Z"]
+)
+def test_finding_5_poll_evidence_uses_the_shared_normalized_close(
+    end_date: str,
+) -> None:
+    result = PolymarketClient(
+        CannedTransport([[market(endDate=end_date)]], [book()])
+    ).poll(limit=1, now=NOW)
+    assert result.eligible[0].evidence.closes_at == datetime(
+        2026, 10, 12, 12, tzinfo=UTC
+    )

@@ -6,13 +6,14 @@ import hashlib
 import http.client
 import ipaddress
 import json
+import re
 import socket
 import ssl
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal, InvalidOperation
-from typing import Any, Final
+from typing import Any, Final, Literal
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from jev_trading_lab.polymarket.models import (
@@ -24,9 +25,34 @@ from jev_trading_lab.polymarket.models import (
 
 GAMMA_ENDPOINT: Final = "https://gamma-api.polymarket.com/markets"
 CLOB_ENDPOINT: Final = "https://clob.polymarket.com/book"
+CLOB_HOST: Final = "clob.polymarket.com"
+CLOB_PATH: Final = "/book"
 MAX_PUBLIC_BYTES: Final = 2 * 1024 * 1024
+MAX_CLOB_TOKEN_ID_CHARS: Final = 512
+MAX_DECIMAL_MAGNITUDE: Final = 40
+MAX_BOOK_MILLISECONDS: Final = 253_402_300_799_999  # 9999-12-31T23:59:59.999Z
 MAX_JSON_DEPTH: Final = 16
 MAX_BOOK_AGE: Final = timedelta(seconds=30)
+MAX_PRECHECK_SPREAD_MICROS: Final = 40_000
+PRECHECK_DEPTH_WINDOW_MICROS: Final = 20_000
+MIN_PRECHECK_NEAR_DEPTH: Final = 5_000
+_GAMMA_UTC: Final = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,6})?(?:Z|\+00:00)\Z"
+)
+_MEDIA_TYPE: Final = re.compile(
+    r"[a-z0-9!#$%&'*+.^_`|~-]{1,64}/[a-z0-9!#$%&'*+.^_`|~-]{1,64}\Z"
+)
+type PrecheckTransportReason = Literal[
+    "OK",
+    "TIMEOUT",
+    "TRANSPORT_ERROR",
+    "HTTP_STATUS",
+    "REDIRECT",
+    "CONTENT_TYPE",
+    "OVERSIZED",
+    "NOT_JSON",
+]
 _SPORTS = frozenset(
     {
         "sports",
@@ -216,6 +242,20 @@ class SecureHttpTransport:
 
 
 @dataclass(frozen=True, slots=True)
+class PrecheckAttempt:
+    """One bounded CLOB precheck outcome, including failures before any response."""
+
+    token_id: str
+    attempted_at: datetime
+    status_code: int | None
+    content_type: str | None
+    retrieved_at: datetime | None
+    body: bytes = field(repr=False)
+    truncated: bool
+    transport_reason: PrecheckTransportReason
+
+
+@dataclass(frozen=True, slots=True)
 class MarketRejection:
     market_id: str
     reason: str
@@ -232,6 +272,7 @@ class MarketRejection:
     precheck_request_market_id: str | None = None
     precheck_request_condition_id: str | None = None
     precheck_transport_failure: bool = False
+    precheck_attempt: PrecheckAttempt | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +286,7 @@ class MarketCandidate:
     evidence: EvidencePacket
     precheck_book_bytes: bytes = field(repr=False)
     precheck_book: BookSnapshot
+    precheck_attempt: PrecheckAttempt
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,7 +323,7 @@ def _strict_response(response: HttpResponse, *, label: str) -> object:
         raise PublicDataError(f"{label} response is not application/json")
     try:
         value = load_strict_json(response.body)
-    except (TypeError, ValueError) as error:
+    except (TypeError, ValueError, RecursionError) as error:
         raise PublicDataError(f"{label} response is not strict JSON") from error
     _json_depth(value)
     return value
@@ -336,9 +378,38 @@ def _utc(value: object) -> datetime:
     return parsed.astimezone(UTC)
 
 
+def normalize_gamma_utc(value: object) -> datetime:
+    """Parse the only accepted Gamma UTC spellings: ``...Z`` or ``...+00:00``."""
+
+    if type(value) is not str or _GAMMA_UTC.fullmatch(value) is None:
+        raise ValueError("Gamma timestamp must be ISO-8601 UTC ending in Z or +00:00")
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    return datetime.fromisoformat(text).astimezone(UTC)
+
+
+def canonical_utc_text(value: datetime) -> str:
+    """Render a UTC instant exactly as the strict models serialize it."""
+
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def normalize_content_type(value: object) -> str | None:
+    """Return a bounded lowercase media type, ``None`` when absent, or ``invalid``."""
+
+    if type(value) is not str:
+        return None
+    media_type = value.split(";", 1)[0].strip().lower()
+    if not media_type:
+        return None
+    return media_type if _MEDIA_TYPE.fullmatch(media_type) else "invalid"
+
+
 def _encoded_array(value: object, *, label: str) -> list[object]:
     if type(value) is str:
-        value = load_strict_json(value)
+        try:
+            value = load_strict_json(value)
+        except RecursionError as error:
+            raise ValueError(f"{label} nesting is too deep") from error
     if not isinstance(value, list) or len(value) != 2:
         raise ValueError(f"{label} must contain exactly two values")
     return value
@@ -353,6 +424,8 @@ def _decimal(value: object, *, label: str) -> Decimal:
         raise ValueError(f"{label} must be decimal") from error
     if not result.is_finite():
         raise ValueError(f"{label} must be finite")
+    if not -MAX_DECIMAL_MAGNITUDE <= result.adjusted() <= MAX_DECIMAL_MAGNITUDE:
+        raise ValueError(f"{label} magnitude is out of bounds")
     return result
 
 
@@ -393,8 +466,26 @@ def normalize_gamma_identity(value: Mapping[str, object]) -> dict[str, object]:
         "category": _text(value.get("category")) or "Uncategorized",
         "tags": _tags(value.get("tags")),
         "resolution_source_text": _text(value.get("resolutionSource")),
-        "closes_at": value.get("endDate"),
+        "closes_at": canonical_utc_text(normalize_gamma_utc(value.get("endDate"))),
     }
+
+
+def gamma_clob_identity(item: Mapping[str, object]) -> tuple[str, str, str, str]:
+    """Return the market, condition, YES, and NO token IDs one Gamma item binds."""
+
+    market_id = _text(item.get("id"))
+    condition_id = _text(item.get("conditionId")) or market_id
+    tokens = _encoded_array(item.get("clobTokenIds"), label="token IDs")
+    yes_token, no_token = _text(tokens[0]), _text(tokens[1])
+    if (
+        not market_id
+        or not yes_token
+        or not no_token
+        or yes_token == no_token
+        or max(len(yes_token), len(no_token)) > MAX_CLOB_TOKEN_ID_CHARS
+    ):
+        raise ValueError("Gamma market has an invalid CLOB identity")
+    return market_id, condition_id, yes_token, no_token
 
 
 def _sports(category: str, tags: list[str], question: str) -> bool:
@@ -408,8 +499,8 @@ def _sports(category: str, tags: list[str], question: str) -> bool:
 def _book_time(value: object) -> datetime:
     if type(value) is int or (type(value) is str and value.isdigit()):
         milliseconds = int(value)
-        if milliseconds < 0:
-            raise ValueError("book timestamp must be nonnegative")
+        if not 0 <= milliseconds <= MAX_BOOK_MILLISECONDS:
+            raise ValueError("book timestamp is outside the supported range")
         return datetime.fromtimestamp(milliseconds / 1000, UTC)
     return _utc(value)
 
@@ -508,8 +599,90 @@ def reconstruct_book_snapshot(raw: bytes, *, market_id: str) -> BookSnapshot:
             expected_token_id=token_id,
             now=captured_at,
         )
-    except (TypeError, ValueError) as error:
+    except (TypeError, ValueError, ArithmeticError) as error:
         raise PublicDataError("execution book artifact is invalid") from error
+
+
+def precheck_eligibility_reason(book: BookSnapshot) -> str | None:
+    """Return the shared spread or near-depth rejection reason for a valid book.
+
+    The client and every replay validator call this one pure function: a spread above
+    40,000 micros is ``WIDE_SPREAD``; otherwise each side needs at least 5,000
+    contracts within 20,000 micros of its best price or the book is ``LOW_DEPTH``.
+    """
+
+    best_bid = book.bids[0].price_micros
+    best_ask = book.asks[0].price_micros
+    if best_ask - best_bid > MAX_PRECHECK_SPREAD_MICROS:
+        return "WIDE_SPREAD"
+    bid_depth = sum(
+        level.quantity
+        for level in book.bids
+        if best_bid - level.price_micros <= PRECHECK_DEPTH_WINDOW_MICROS
+    )
+    ask_depth = sum(
+        level.quantity
+        for level in book.asks
+        if level.price_micros - best_ask <= PRECHECK_DEPTH_WINDOW_MICROS
+    )
+    if bid_depth < MIN_PRECHECK_NEAR_DEPTH or ask_depth < MIN_PRECHECK_NEAR_DEPTH:
+        return "LOW_DEPTH"
+    return None
+
+
+def derive_precheck_transport_reason(
+    *,
+    status_code: int,
+    content_type: str | None,
+    truncated: bool,
+    body: bytes,
+) -> PrecheckTransportReason:
+    """Classify one received CLOB response; pre-response failures are typed upstream."""
+
+    if truncated or len(body) > MAX_PUBLIC_BYTES:
+        return "OVERSIZED"
+    if 300 <= status_code < 400:
+        return "REDIRECT"
+    if not 200 <= status_code < 300:
+        return "HTTP_STATUS"
+    if content_type != "application/json":
+        return "CONTENT_TYPE"
+    try:
+        _json_depth(load_strict_json(body.decode("utf-8")))
+    except (TypeError, ValueError, RecursionError):
+        return "NOT_JSON"
+    return "OK"
+
+
+def derive_precheck_rejection(
+    *,
+    transport_reason: PrecheckTransportReason,
+    body: bytes,
+    market_id: str,
+    condition_id: str,
+    token_id: str,
+    now: datetime,
+) -> tuple[str | None, BookSnapshot | None]:
+    """Recompute the rejection reason, and the valid book if one was received."""
+
+    if transport_reason == "TIMEOUT":
+        return "PRECHECK_TIMEOUT", None
+    if transport_reason == "TRANSPORT_ERROR":
+        return "BOOK_UNAVAILABLE", None
+    if transport_reason != "OK":
+        return "MALFORMED_BOOK", None
+    try:
+        snapshot = _book_snapshot(
+            body,
+            load_strict_json(body.decode("utf-8")),
+            expected_market_id=market_id,
+            expected_condition_id=condition_id,
+            expected_token_id=token_id,
+            now=now,
+        )
+    except (TypeError, ValueError, ArithmeticError) as error:
+        return _reason(error), None
+    return precheck_eligibility_reason(snapshot), snapshot
 
 
 class PolymarketClient:
@@ -547,6 +720,52 @@ class PolymarketClient:
             ) from error
         return response.body, value, response.retrieved_at
 
+    def _precheck_attempt(
+        self, token_id: str, attempted_at: datetime
+    ) -> PrecheckAttempt:
+        """Make one precheck request and keep its exact bounded outcome."""
+
+        def no_response(reason: PrecheckTransportReason) -> PrecheckAttempt:
+            return PrecheckAttempt(
+                token_id, attempted_at, None, None, None, b"", False, reason
+            )
+
+        url = f"{CLOB_ENDPOINT}?{urlencode({'token_id': token_id})}"
+        try:
+            response = self.transport(HttpRequest("GET", url))
+        except (TimeoutError, PublicDataTimeout):
+            return no_response("TIMEOUT")
+        except Exception:
+            return no_response("TRANSPORT_ERROR")
+        if (
+            not isinstance(response, HttpResponse)
+            or type(response.status_code) is not int
+            or not 100 <= response.status_code <= 599
+            or not isinstance(response.headers, Mapping)
+            or type(response.body) is not bytes
+            or type(response.retrieved_at) is not datetime
+            or response.retrieved_at.tzinfo is None
+        ):
+            return no_response("TRANSPORT_ERROR")
+        truncated = bool(response.oversized) or len(response.body) > MAX_PUBLIC_BYTES
+        body = response.body[:MAX_PUBLIC_BYTES]
+        content_type = normalize_content_type(response.headers.get("content-type"))
+        return PrecheckAttempt(
+            token_id,
+            attempted_at,
+            response.status_code,
+            content_type,
+            response.retrieved_at.astimezone(UTC),
+            body,
+            truncated,
+            derive_precheck_transport_reason(
+                status_code=response.status_code,
+                content_type=content_type,
+                truncated=truncated,
+                body=body,
+            ),
+        )
+
     def poll(self, *, limit: int = 1, now: datetime | None = None) -> PollResult:
         if not 1 <= limit <= 20:
             raise ValueError("limit must be in 1..20")
@@ -579,7 +798,7 @@ class PolymarketClient:
                 if not isinstance(item, Mapping):
                     raise PublicDataError("Gamma market must be an object")
                 try:
-                    close = _utc(item.get("endDate"))
+                    close = normalize_gamma_utc(item.get("endDate"))
                 except (TypeError, ValueError):
                     close = datetime.max.replace(tzinfo=UTC)
                 normalized.append(
@@ -633,7 +852,7 @@ class PolymarketClient:
                     prices = _encoded_array(
                         item.get("outcomePrices"), label="outcome prices"
                     )
-                    tokens = _encoded_array(item.get("clobTokenIds"), label="token IDs")
+                    _encoded_array(item.get("clobTokenIds"), label="token IDs")
                     if volume < 10_000:
                         reason = "LOW_VOLUME"
                     elif outcomes != ["Yes", "No"]:
@@ -642,13 +861,9 @@ class PolymarketClient:
                         parsed_prices = [
                             _decimal(value, label="outcome price") for value in prices
                         ]
-                        parsed_tokens = [_text(value) for value in tokens]
-                        if (
-                            any(not 0 <= value <= 1 for value in parsed_prices)
-                            or not all(parsed_tokens)
-                            or parsed_tokens[0] == parsed_tokens[1]
-                        ):
-                            raise ValueError("invalid prices or token IDs")
+                        if any(not 0 <= value <= 1 for value in parsed_prices):
+                            raise ValueError("invalid outcome prices")
+                        gamma_clob_identity(item)
                 except (TypeError, ValueError):
                     reason = "MALFORMED_MARKET"
             if reason is not None:
@@ -661,75 +876,42 @@ class PolymarketClient:
                     )
                 )
                 continue
-            assert market_id and isinstance(tokens, list)
-            yes_token, no_token = str(tokens[0]), str(tokens[1])
+            assert market_id
+            _, condition_id, yes_token, no_token = gamma_clob_identity(item)
             source_sha = hashlib.sha256(raw_market).hexdigest()
-            evidence = EvidencePacket(
-                market_id=market_id,
-                question=question,
-                description=description,
-                rules=rules,
-                category=category,
-                tags=tags,
-                resolution_source_text=resolution_source,
-                closes_at=close,
-                retrieved_at=min(retrieved_at, cutoff),
-                cutoff_at=cutoff,
-                source_sha256=source_sha,
-            )
-            book_url = f"{CLOB_ENDPOINT}?{urlencode({'token_id': yes_token})}"
-            raw_book: bytes | None = None
-            snapshot: BookSnapshot | None = None
-            transport_failure = False
             try:
-                raw_book, book_value, _ = self._get(book_url, label="CLOB")
-                snapshot = _book_snapshot(
-                    raw_book,
-                    book_value,
-                    expected_market_id=market_id,
-                    expected_condition_id=condition_id,
-                    expected_token_id=yes_token,
-                    now=cutoff,
+                evidence = EvidencePacket(
+                    market_id=market_id,
+                    question=question,
+                    description=description,
+                    rules=rules,
+                    category=category,
+                    tags=tags,
+                    resolution_source_text=resolution_source,
+                    closes_at=close,
+                    retrieved_at=min(retrieved_at, cutoff),
+                    cutoff_at=cutoff,
+                    source_sha256=source_sha,
                 )
-                if (
-                    snapshot.asks[0].price_micros - snapshot.bids[0].price_micros
-                    > 40_000
-                ):
-                    reason = "WIDE_SPREAD"
-                elif (
-                    sum(
-                        level.quantity
-                        for level in snapshot.bids
-                        if snapshot.bids[0].price_micros - level.price_micros <= 20_000
+            except ValueError:
+                rejected.append(
+                    MarketRejection(
+                        market_id, "MALFORMED_MARKET", raw_market, source_sha
                     )
-                    < 5_000
-                    or sum(
-                        level.quantity
-                        for level in snapshot.asks
-                        if level.price_micros - snapshot.asks[0].price_micros <= 20_000
-                    )
-                    < 5_000
-                ):
-                    reason = "LOW_DEPTH"
-            except PublicDataTimeout as error:
-                raw_book = error.raw_bytes
-                reason = error.reason
-                transport_failure = True
-            except PublicDataError as error:
-                raw_book = error.raw_bytes
-                reason = error.reason
-                transport_failure = error.retrieved_at is None
-            except (TypeError, ValueError) as error:
-                reason = _reason(error)
+                )
+                continue
+            attempt = self._precheck_attempt(yes_token, cutoff)
+            reason, snapshot = derive_precheck_rejection(
+                transport_reason=attempt.transport_reason,
+                body=attempt.body,
+                market_id=market_id,
+                condition_id=condition_id,
+                token_id=yes_token,
+                now=cutoff,
+            )
             if reason is not None:
                 rejection_book = (
                     snapshot if reason in {"WIDE_SPREAD", "LOW_DEPTH"} else None
-                )
-                rejection_bytes = raw_book
-                failure_hash = (
-                    hashlib.sha256(raw_book).hexdigest()
-                    if raw_book is not None and rejection_book is None
-                    else None
                 )
                 rejected.append(
                     MarketRejection(
@@ -739,25 +921,28 @@ class PolymarketClient:
                         raw_gamma_sha256=source_sha,
                         evidence=evidence,
                         yes_token_id=yes_token,
-                        precheck_book_bytes=rejection_bytes,
+                        precheck_book_bytes=attempt.body,
                         precheck_book=rejection_book,
-                        precheck_failure_sha256=failure_hash,
-                        precheck_retrieved_at=(
-                            snapshot.retrieved_at if snapshot is not None else cutoff
-                        ),
-                        precheck_byte_length=(
-                            len(rejection_bytes)
-                            if rejection_bytes is not None
+                        precheck_failure_sha256=(
+                            hashlib.sha256(attempt.body).hexdigest()
+                            if rejection_book is None
                             else None
                         ),
+                        precheck_retrieved_at=(
+                            rejection_book.retrieved_at
+                            if rejection_book is not None
+                            else cutoff
+                        ),
+                        precheck_byte_length=len(attempt.body),
                         precheck_request_token_id=yes_token,
                         precheck_request_market_id=market_id,
                         precheck_request_condition_id=condition_id,
-                        precheck_transport_failure=transport_failure,
+                        precheck_transport_failure=attempt.status_code is None,
+                        precheck_attempt=attempt,
                     )
                 )
                 continue
-            assert raw_book is not None and snapshot is not None
+            assert snapshot is not None
             eligible.append(
                 MarketCandidate(
                     market_id=market_id,
@@ -767,8 +952,9 @@ class PolymarketClient:
                     raw_gamma_bytes=raw_market,
                     raw_gamma_sha256=source_sha,
                     evidence=evidence,
-                    precheck_book_bytes=raw_book,
+                    precheck_book_bytes=attempt.body,
                     precheck_book=snapshot,
+                    precheck_attempt=attempt,
                 )
             )
         return PollResult(tuple(eligible), tuple(rejected))
@@ -792,6 +978,6 @@ class PolymarketClient:
                 expected_token_id=candidate.yes_token_id,
                 now=cutoff,
             )
-        except (TypeError, ValueError) as error:
+        except (TypeError, ValueError, ArithmeticError) as error:
             raise PublicDataError(_reason(error)) from error
         return raw, snapshot
