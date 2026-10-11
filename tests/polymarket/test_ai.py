@@ -2121,6 +2121,57 @@ def test_openai_accepts_harmless_normal_metadata_key(
     assert isinstance(result, OpenAISuccess)
 
 
+@pytest.mark.parametrize(
+    "credential_text",
+    (
+        "client_secret=abc$FULLSECRET",
+        "client_secret=abcd%FULLSECRET",
+        "missing evidence: client_secret=abc:def/ghi",
+        "access token is arbitrary$秘密",
+        "refresh_token='odd|$%^&*秘密'",
+        "session token: arbitrary value",
+        "password was arbitrary$秘密",
+        "private key = -----BEGIN秘密-----",
+        "Authorization: Basic arbitrary$秘密",
+        "cookie = arbitrary$秘密",
+    ),
+)
+def test_openai_rejects_any_semantic_credential_phrase_in_decoded_output(
+    cycle: dict[str, Any], evidence: EvidencePacket, credential_text: str
+) -> None:
+    response = _official_openai_response(cycle)
+    output = _openai_text(response)
+    output["missing_evidence"] = [credential_text]
+    _set_openai_text(response, output)
+    body = _wire_json(response)
+
+    result = call_openai(evidence, OPENAI_MODEL_ID, FixtureTransport(body))
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "CREDENTIAL_REFLECTION"
+    assert result.response_sha256 == hashlib.sha256(body).hexdigest()
+    assert not hasattr(result, "response_bytes")
+
+
+@pytest.mark.parametrize(
+    "credential_key",
+    (
+        "client_secret",
+        "access-token",
+        "refresh token",
+        "sessionToken",
+        "password",
+        "private key",
+        "authorization",
+        "cookie",
+    ),
+)
+def test_provider_scanner_rejects_semantic_credential_mapping_keys(
+    credential_key: str,
+) -> None:
+    assert _contains_credentials({credential_key: "safe"}, ())
+
+
 def test_custom_zero_offset_tzinfo_cannot_reach_result_metadata_or_repr(
     cycle: dict[str, Any], evidence: EvidencePacket
 ) -> None:

@@ -21,6 +21,7 @@ from pydantic import ValidationError
 
 from jev_trading_lab.core.ids import canonical_json_bytes
 from jev_trading_lab.polymarket.client import (
+    contains_credential_semantics,
     contains_public_credential_semantics,
     is_safe_global_ip,
     read_bounded_body,
@@ -777,7 +778,8 @@ def _contains_credentials(value: object, sensitive_values: tuple[bytes, ...]) ->
         if isinstance(nested, str):
             semantic = _semantic_bytes(nested)
             if (
-                bool(_SECRET_PATTERN.search(semantic))
+                contains_credential_semantics(nested)
+                or bool(_SECRET_PATTERN.search(semantic))
                 or (mapping_key and bool(_SECRET_PATTERN.search(semantic + b": safe")))
                 or any(sentinel in semantic for sentinel in normalized_sentinels)
             ):

@@ -17,6 +17,7 @@ from jev_trading_lab.polymarket.client import (
     PublicDataError,
     PublicDataTimeout,
     SecureHttpTransport,
+    contains_public_credential_semantics,
     normalize_gamma_identity,
     sanitized_gamma_identity,
 )
@@ -795,7 +796,9 @@ def test_gamma_credential_assignment_redacts_semantic_variants(
 
     assert isinstance(sanitized, str)
     assert secret not in sanitized
-    assert sanitized == expected
+    terminal = description[-1] if description[-1] in ".!?" else ""
+    assert sanitized == "[REDACTED]" + terminal
+    assert not contains_public_credential_semantics(sanitized)
 
 
 @pytest.mark.parametrize(
@@ -805,11 +808,9 @@ def test_gamma_credential_assignment_redacts_semantic_variants(
         "The api key was optional for client setup.",
         "The access token equals unavailable.",
         "The refresh token credential is documented in the guide.",
-        "The client secret: configured.",
+        "The client secret is configured for client setup.",
         "The session token value was needed during setup.",
-        "The bearer token rotates daily.",
-        "The bearer token value is. SentenceBoundarySecret follows.",
-        "The bearer token value was\nSentenceBoundarySecret.",
+        "The bearer token was unavailable during maintenance.",
     ),
 )
 def test_gamma_credential_assignment_preserves_harmless_near_misses(
@@ -879,7 +880,91 @@ def test_gamma_credential_assignment_fuzz_handles_token_punctuation_and_quotes(
 
     assert isinstance(sanitized, str)
     assert secret not in sanitized
-    assert sanitized == f"Before. [REDACTED]{boundary} After."
+    if boundary in ".!?":
+        assert sanitized == f"Before. [REDACTED]{boundary} After."
+    else:
+        assert sanitized == "Before. [REDACTED]."
+
+
+@pytest.mark.parametrize(
+    ("description", "secret", "expected"),
+    (
+        (
+            "Before. client_secret=abc$FULLSECRET; still secret! After.",
+            "abc$FULLSECRET",
+            "Before. [REDACTED]! After.",
+        ),
+        (
+            "Before. client_secret=abcd%FULLSECRET; still secret! After.",
+            "abcd%FULLSECRET",
+            "Before. [REDACTED]! After.",
+        ),
+        (
+            "Before. access token = «arbitrary🙂punctuation»! After.",
+            "«arbitrary🙂punctuation»",
+            "Before. [REDACTED]! After.",
+        ),
+        (
+            "Before. refresh_token = 'odd|$%^&*秘密'! After.",
+            "odd|$%^&*秘密",
+            "Before. [REDACTED]! After.",
+        ),
+        (
+            "Before. session token: value-with spaces and $punctuation! After.",
+            "value-with spaces and $punctuation",
+            "Before. [REDACTED]! After.",
+        ),
+        (
+            "Before. password was any/value%at—all! After.",
+            "any/value%at—all",
+            "Before. [REDACTED]! After.",
+        ),
+        (
+            "Before. private key = -----BEGIN秘密-----! After.",
+            "-----BEGIN秘密-----",
+            "Before. [REDACTED]! After.",
+        ),
+        (
+            "Before. Authorization: Basic arbitrary$unicode秘密! After.",
+            "arbitrary$unicode秘密",
+            "Before. [REDACTED]! After.",
+        ),
+        (
+            "Before. cookie = arbitrary$unicode秘密! After.",
+            "arbitrary$unicode秘密",
+            "Before. [REDACTED]! After.",
+        ),
+    ),
+)
+def test_gamma_credential_sentence_policy_redacts_whole_bounded_sentence(
+    description: str, secret: str, expected: str
+) -> None:
+    sanitized = sanitized_gamma_identity(market(description=description))["description"]
+
+    assert sanitized == expected
+    assert secret not in str(sanitized)
+
+
+@pytest.mark.parametrize(
+    "description",
+    (
+        "The api key is required.",
+        "The access token was optional.",
+        "The refresh token is needed.",
+        "The session token was documented.",
+        "The bearer token is available.",
+        "The client secret was unavailable.",
+        "The password is configured.",
+        "The private key was stored.",
+    ),
+)
+def test_gamma_credential_sentence_policy_preserves_only_enumerated_predicates(
+    description: str,
+) -> None:
+    assert (
+        sanitized_gamma_identity(market(description=description))["description"]
+        == description
+    )
 
 
 @_PROPERTY

@@ -3300,6 +3300,42 @@ def test_hardening_quoted_bearer_prose_in_gamma_is_recorded_exactly(
     assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 1
 
 
+def test_provider_credential_output_fails_closed_before_jev_or_persistence(
+    tmp_path: Path,
+) -> None:
+    public_secret = b"PUBLIC$FULLSECRET"
+    provider_secret = b"abc$PROVIDER-FULLSECRET"
+    market = _market() | {
+        "description": f"Before. client_secret={public_secret.decode()}! After."
+    }
+    raw_gamma = _wire(market)
+    openai = ModelTransport("openai", hashlib.sha256(raw_gamma).hexdigest())
+    envelope = json.loads(openai.raw)
+    message = next(item for item in envelope["output"] if item["type"] == "message")
+    brief = json.loads(message["content"][0]["text"])
+    brief["missing_evidence"] = [f"client_secret={provider_secret.decode()}"]
+    message["content"][0]["text"] = json.dumps(
+        brief, separators=(",", ":"), sort_keys=True
+    )
+    openai.raw = _wire(envelope)
+    jev = ModelTransport("jev")
+
+    summary = _observe(tmp_path, market=market, openai=openai, jev=jev)[0]
+
+    replay = load_observation(tmp_path, str(summary["observation_id"]))
+    assert replay.artifacts["raw_gamma"] == raw_gamma
+    assert public_secret in replay.artifacts["raw_gamma"]
+    assert all(
+        public_secret not in artifact
+        for kind, artifact in replay.artifacts.items()
+        if kind != "raw_gamma"
+    )
+    assert provider_secret not in b"".join(replay.artifacts.values())
+    assert provider_secret not in (tmp_path / "provider_calls.jsonl").read_bytes()
+    assert summary["ai"]["disposition"] == "MODEL_FAILURE"
+    assert jev.requests == []
+
+
 def test_hardening_gamma_access_token_prose_never_reaches_model_or_artifacts(
     tmp_path: Path,
 ) -> None:

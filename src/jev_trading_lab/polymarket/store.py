@@ -1029,13 +1029,9 @@ def _contains_credentials(
         )
     if isinstance(value, str):
         normalized = unicodedata.normalize("NFKC", value).casefold()
-        return (
-            patterns
-            and (
-                bool(_SECRET_PATTERN.search(normalized))
-                or _sanitize_public_prose(normalized) != normalized
-            )
-        ) or any(sentinel in normalized for sentinel in sentinels)
+        return (patterns and contains_public_credential_semantics(value)) or any(
+            sentinel in normalized for sentinel in sentinels
+        )
     return False
 
 
