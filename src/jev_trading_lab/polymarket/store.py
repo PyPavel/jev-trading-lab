@@ -96,7 +96,10 @@ _MAX_LINE_BYTES = 1024 * 1024
 _MAX_JOURNAL_BYTES = 64 * 1024 * 1024
 _SECRET_PATTERN = re.compile(
     r"(?i)(?:sk-[a-z0-9_-]{8,}|openai_api_key|typesafe_api_key|"
-    r"bearer\s+\S{4,}|basic\s+\S{4,}|(?:authorization|proxy-authorization|"
+    r"bearer\s+(?!token(?:[-_.\s]?v?\d+)*\s+is\s+(?:available|configured|"
+    r"documented|needed|optional|required|stored|unavailable|used)\b)\S{4,}|"
+    r"basic\s+\S{4,}|"
+    r"(?:authorization|proxy-authorization|"
     r"cookie|set-cookie|x-api-key|api[-_]?key)\s*[:=]\s*\S{4,})"
 )
 _CREDENTIAL_KEYS = frozenset(

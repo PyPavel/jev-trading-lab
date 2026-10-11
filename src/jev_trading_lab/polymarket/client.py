@@ -579,8 +579,14 @@ def normalize_gamma_identity(value: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+_PUBLIC_BEARER_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)(?P<name>[\w.-]{0,128}bearer[-_\s]?token"
+    r"(?:[-_.\s]?v?\d+)*)\s*(?P<connector>is\b|[:=])\s*(?P<value>\S{4,})"
+)
 _PUBLIC_CREDENTIAL_PATTERN = re.compile(
-    r"(?i)(?:sk-[a-z0-9_-]{8,}|bearer\s+\S{4,}|basic\s+\S{4,}|"
+    r"(?i)(?:sk-[a-z0-9_-]{8,}|"
+    r"bearer\s+(?!token(?:[-_.\s]?v?\d+)*\s*(?:is\b|[:=]))\S{4,}|"
+    r"basic\s+\S{4,}|"
     r"(?:[\w.-]{0,128})(?:authorization|proxy[-_\s]?authorization|cookie|"
     r"set[-_\s]?cookie|x[-_\s]?api[-_\s]?key|api[-_\s]?key|"
     r"access[-_\s]?token|refresh[-_\s]?token|client[-_\s]?secret|"
@@ -610,7 +616,17 @@ _PUBLIC_IS_PREDICATE_WORDS = frozenset(
 
 def _sanitize_public_prose(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", text)
-    sanitized = _PUBLIC_CREDENTIAL_PATTERN.sub("[REDACTED]", normalized)
+    sanitized = _PUBLIC_BEARER_ASSIGNMENT_PATTERN.sub(
+        lambda match: (
+            "[REDACTED]"
+            if match.group("connector").casefold() != "is"
+            or match.group("value").casefold().rstrip(".,;:!?")
+            not in _PUBLIC_IS_PREDICATE_WORDS
+            else match.group(0)
+        ),
+        normalized,
+    )
+    sanitized = _PUBLIC_CREDENTIAL_PATTERN.sub("[REDACTED]", sanitized)
     sanitized = _PUBLIC_IS_ASSIGNMENT_PATTERN.sub(
         lambda match: (
             "[REDACTED]"

@@ -3281,20 +3281,21 @@ def test_hardening_credential_like_public_precheck_bytes_are_recorded_exactly(
     assert http["response_sha256"] == hashlib.sha256(body).hexdigest()
 
 
+@pytest.mark.parametrize("secret", (b"abcd1234", b"AlphabeticSecret"))
 def test_hardening_quoted_bearer_prose_in_gamma_is_recorded_exactly(
-    tmp_path: Path,
+    tmp_path: Path, secret: bytes
 ) -> None:
-    market = _market() | {
-        "description": "Public report quotes Bearer abcd1234 in an incident."
-    }
+    description = b"Public report quotes Bearer " + secret + b" in an incident."
+    market = _market() | {"description": description.decode()}
     raw_gamma = _wire(market)
 
     summary = _observe(tmp_path, market=market)[0]
 
     replay = load_observation(tmp_path, str(summary["observation_id"]))
     assert replay.artifacts["raw_gamma"] == raw_gamma
-    assert b"Bearer abcd1234" not in replay.artifacts["sanitized_evidence"]
-    assert b"Bearer abcd1234" not in replay.artifacts["openai_request"]
+    assert secret in replay.artifacts["raw_gamma"]
+    assert secret not in replay.artifacts["sanitized_evidence"]
+    assert secret not in replay.artifacts["openai_request"]
     assert replay.result.ai.disposition != "INELIGIBLE"
     assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 1
 
@@ -3311,6 +3312,44 @@ def test_hardening_gamma_access_token_prose_never_reaches_model_or_artifacts(
     replay = load_observation(tmp_path, str(summary["observation_id"]))
     assert secret not in replay.artifacts["sanitized_evidence"]
     assert secret not in replay.artifacts["openai_request"]
+    assert all(secret not in request for request in openai.requests)
+    assert replay.result.ai.disposition != "INELIGIBLE"
+
+
+@pytest.mark.parametrize(
+    ("description", "secret"),
+    (
+        (
+            "The bearer token is AlphabeticSecret in the report.",
+            b"AlphabeticSecret",
+        ),
+        ("The bearer token: Mixed-123_Secret in the report.", b"Mixed-123_Secret"),
+        ("The bearer token=AlphabeticSecret in the report.", b"AlphabeticSecret"),
+        ("The BEARER TOKEN is CaseSecret in the report.", b"CaseSecret"),
+        (
+            "The ｂｅａｒｅｒ＿ｔｏｋｅｎ-v2 is UnicodeSecret in the report.",
+            b"UnicodeSecret",
+        ),
+        ("The BearerTokenV3: VersionSecret in the report.", b"VersionSecret"),
+    ),
+)
+def test_hardening_gamma_bearer_token_assignment_never_reaches_model_or_artifacts(
+    tmp_path: Path, description: str, secret: bytes
+) -> None:
+    market = _market() | {"description": description}
+    raw_gamma = _wire(market)
+    openai = ModelTransport("openai", _market_sha(market))
+
+    summary = _observe(tmp_path, market=market, openai=openai)[0]
+
+    replay = load_observation(tmp_path, str(summary["observation_id"]))
+    assert replay.artifacts["raw_gamma"] == raw_gamma
+    assert secret in replay.artifacts["raw_gamma"]
+    assert all(
+        secret not in artifact
+        for kind, artifact in replay.artifacts.items()
+        if kind != "raw_gamma"
+    )
     assert all(secret not in request for request in openai.requests)
     assert replay.result.ai.disposition != "INELIGIBLE"
 
@@ -3378,6 +3417,15 @@ def test_hardening_gamma_credential_is_prose_never_reaches_model_or_artifacts(
         "The refresh token is needed for client setup.",
         "The client secret is documented in the setup guide.",
         "The session token is unavailable during maintenance.",
+        "The bearer token is available for client setup.",
+        "The bearer token is configured for client setup.",
+        "The bearer token is documented in the setup guide.",
+        "The bearer token is needed for client setup.",
+        "The bearer token is optional for client setup.",
+        "The bearer token is required for client setup.",
+        "The bearer token is stored for client setup.",
+        "The bearer token is unavailable during maintenance.",
+        "The bearer token is used for client setup.",
     ),
 )
 def test_hardening_harmless_credential_noun_prose_is_not_redacted(
