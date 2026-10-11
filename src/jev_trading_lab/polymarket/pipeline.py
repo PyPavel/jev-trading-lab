@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import os
 import stat
@@ -9,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from jev_trading_lab.core.ids import canonical_json_bytes
 from jev_trading_lab.polymarket.ai import (
@@ -299,9 +300,13 @@ def _failure_result(
     prior_cost: int,
 ) -> ObservationResult:
     base = evaluate_fixture(fixture)
-    cost = _sum_model_cost(prior_cost, failure.billed_cost_microdollars)
+    cost = (
+        None
+        if failure.billed_cost_microdollars is None
+        else _sum_model_cost(prior_cost, failure.billed_cost_microdollars)
+    )
     if cost is None:
-        ai = _cost_overflow_arm()
+        ai = _unavailable_cost_arm()
     else:
         ai = evaluate_ai_arm(
             fixture.execution_book,
@@ -376,12 +381,14 @@ def _sum_model_cost(left: int, right: int) -> int | None:
     return total if total <= 2**63 - 1 else None
 
 
-def _cost_overflow_arm() -> ArmResult:
+def _unavailable_cost_arm(
+    disposition: Literal["COST_OVERFLOW", "UNKNOWN_IN_FLIGHT"] = "COST_OVERFLOW",
+) -> ArmResult:
     return ArmResult(
         arm="AI",
         signal_probability_micros=None,
         signal_action=None,
-        disposition="COST_OVERFLOW",
+        disposition=disposition,
         entry_side=None,
         entry_vwap_micros=None,
         entry_notional_microdollars=None,
@@ -410,9 +417,12 @@ def _book_unavailable_result(
     decision: JevDecision | None,
     decision_sha256: str,
     model_cost: int | None,
+    reason: str,
 ) -> ObservationResult:
     ai = (
-        _cost_overflow_arm()
+        _unavailable_cost_arm(
+            "UNKNOWN_IN_FLIGHT" if reason == "UNKNOWN_IN_FLIGHT" else "COST_OVERFLOW"
+        )
         if model_cost is None
         else _book_failure_arm(arm="AI", model_cost=model_cost, decision=decision)
     )
@@ -481,6 +491,7 @@ def _finish_book_unavailable(
         decision=decision,
         decision_sha256=decision_sha256,
         model_cost=model_cost,
+        reason=reason,
     )
     record_observation(output_dir, result, artifacts)
     replay = load_observation(output_dir, result.observation_id)
@@ -488,7 +499,7 @@ def _finish_book_unavailable(
 
 
 def _arm_summary(arm: ArmResult) -> dict[str, object]:
-    return {
+    summary: dict[str, object] = {
         "action": arm.signal_action,
         "brier_micros": arm.brier_micros,
         "disposition": arm.disposition,
@@ -498,6 +509,9 @@ def _arm_summary(arm: ArmResult) -> dict[str, object]:
         "quantity": arm.quantity,
         "trading_pnl_microdollars": arm.trading_pnl_microdollars,
     }
+    if arm.model_cost_microdollars is None:
+        summary["model_cost_microdollars"] = None
+    return summary
 
 
 def _summary(
@@ -573,7 +587,7 @@ def _unknown_provider_result(provider: str, request: bytes) -> AdapterFailure:
         response_sha256=None,
         response_byte_length=0,
         retrieved_at=None,
-        billed_cost_microdollars=0,
+        billed_cost_microdollars=None,
         status_code=None,
     )
 
@@ -588,27 +602,19 @@ def _journaled_provider_call(
     invoke: Callable[[], object],
     event_sink: EventSink | None,
 ) -> object:
-    call_id = hashlib.sha256(
-        canonical_json_bytes(
-            {
-                "opportunity_id": opportunity_id,
-                "provider": provider,
-                "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
-            }
-        )
-    ).hexdigest()
-    existing = journal.state(call_id)
+    existing = journal.lookup(opportunity_id, provider)  # type: ignore[arg-type]
     if existing is not None:
         if existing["kind"] == "provider_call_result":
             return adapter_from_outcome(provider, existing["outcome"])  # type: ignore[arg-type]
-        unknown = _unknown_provider_result(provider, request_bytes)
+        frozen_request = base64.b64decode(existing["request_b64"], validate=True)
+        unknown = _unknown_provider_result(provider, frozen_request)
         journal.finish(
-            call_id,
+            existing["call_id"],
             outcome=adapter_outcome(unknown),
             finished_at=created_at,
         )
         return unknown
-    journal.begin(
+    call_id = journal.begin(
         provider=provider,  # type: ignore[arg-type]
         opportunity_id=opportunity_id,
         request_bytes=request_bytes,
@@ -669,7 +675,7 @@ def _live_result(
     history = _live_causal_history(candidate)
     policy = _live_policy()
     ai = (
-        _cost_overflow_arm()
+        _unavailable_cost_arm()
         if model_cost is None
         else evaluate_ai_arm(
             execution_book,
@@ -987,13 +993,21 @@ def _live_artifacts(
                 frozen_at,
             )
         )
-        aggregate_cost = _sum_model_cost(
-            openai.billed_cost_microdollars, jev.billed_cost_microdollars
+        aggregate_cost = (
+            None
+            if jev.billed_cost_microdollars is None
+            else _sum_model_cost(
+                openai.billed_cost_microdollars, jev.billed_cost_microdollars
+            )
         )
         values, _ = _decision_barrier(
             identity,
             prefix,
-            state="JEV_FAILURE" if aggregate_cost is not None else "COST_OVERFLOW",
+            state=(
+                "JEV_FAILURE"
+                if aggregate_cost is not None or jev.code == "UNKNOWN_IN_FLIGHT"
+                else "COST_OVERFLOW"
+            ),
             failure_code=jev.code,
             frozen_at=frozen_at,
             openai_request=openai.request_bytes,
@@ -1331,24 +1345,57 @@ def _observe_locked(
         assert isinstance(openai, (OpenAISuccess, AdapterFailure, AdapterCostOverflow))
         jev: JevSuccess | AdapterFailure | AdapterCostOverflow | None = None
         if isinstance(openai, OpenAISuccess):
-            jev_request = build_jev_request(
-                openai.brief, candidate.evidence, JEV_MODEL_ID
+            openai_success = openai
+            frozen_openai_request = load_strict_json(openai.request_bytes)
+            current_openai_request = load_strict_json(
+                build_openai_request(candidate.evidence, OPENAI_MODEL_ID)
             )
-            jev_value = _journaled_provider_call(
-                journal=call_journal,
-                provider="jev",
-                opportunity_id=provisional.opportunity_id,
-                request_bytes=jev_request,
-                created_at=openai.retrieved_at,
-                invoke=lambda: call_jev(
-                    openai.brief, candidate.evidence, JEV_MODEL_ID, jev_sender
-                ),
-                event_sink=event_sink,
-            )
-            assert isinstance(
-                jev_value, (JevSuccess, AdapterFailure, AdapterCostOverflow)
-            )
-            jev = jev_value
+            if frozen_openai_request != current_openai_request:
+                openai = AdapterFailure(
+                    provider="openai",
+                    code="INPUT_CHANGED",
+                    message="openai frozen input differs from current evidence",
+                    request_bytes=openai.request_bytes,
+                    response_sha256=None,
+                    response_byte_length=0,
+                    retrieved_at=None,
+                    billed_cost_microdollars=0,
+                    status_code=None,
+                )
+            else:
+                existing_jev = call_journal.lookup(provisional.opportunity_id, "jev")
+                frozen_jev_request = (
+                    existing_jev.get("request_b64")
+                    if existing_jev is not None
+                    else None
+                )
+                if frozen_jev_request is None and existing_jev is not None:
+                    frozen_jev_request = existing_jev["outcome"]["request_b64"]
+                jev_request = (
+                    base64.b64decode(frozen_jev_request, validate=True)
+                    if frozen_jev_request is not None
+                    else build_jev_request(
+                        openai_success.brief, candidate.evidence, JEV_MODEL_ID
+                    )
+                )
+                jev_value = _journaled_provider_call(
+                    journal=call_journal,
+                    provider="jev",
+                    opportunity_id=provisional.opportunity_id,
+                    request_bytes=jev_request,
+                    created_at=openai_success.retrieved_at,
+                    invoke=lambda: call_jev(
+                        openai_success.brief,
+                        candidate.evidence,
+                        JEV_MODEL_ID,
+                        jev_sender,
+                    ),
+                    event_sink=event_sink,
+                )
+                assert isinstance(
+                    jev_value, (JevSuccess, AdapterFailure, AdapterCostOverflow)
+                )
+                jev = jev_value
         frozen_at = max(
             cutoff,
             openai.retrieved_at if openai.retrieved_at is not None else cutoff,
@@ -1376,7 +1423,18 @@ def _observe_locked(
                     planned_at=max(cutoff, frozen_at + timedelta(seconds=1)),
                     terminal_at=frozen_at,
                     observed_at=max(datetime.now(UTC), frozen_at),
-                    reason="COST_OVERFLOW",
+                    reason=(
+                        "UNKNOWN_IN_FLIGHT"
+                        if (
+                            isinstance(openai, AdapterFailure)
+                            and openai.code == "UNKNOWN_IN_FLIGHT"
+                        )
+                        or (
+                            isinstance(jev, AdapterFailure)
+                            and jev.code == "UNKNOWN_IN_FLIGHT"
+                        )
+                        else "COST_OVERFLOW"
+                    ),
                     evidence_at=candidate.evidence.retrieved_at,
                     research_brief_sha256=brief_hash,
                     decision=decision,
@@ -1708,7 +1766,11 @@ def replay_fixture(
                 planned_at=chronology.planned_execution_book_at,
                 terminal_at=frozen_at,
                 observed_at=frozen_at,
-                reason="STALE_PRECHECK",
+                reason=(
+                    "UNKNOWN_IN_FLIGHT"
+                    if jev.code == "UNKNOWN_IN_FLIGHT"
+                    else "STALE_PRECHECK"
+                ),
                 evidence_at=evidence_model.retrieved_at,
                 research_brief_sha256=hashlib.sha256(
                     _model_bytes(openai.brief)
@@ -1716,7 +1778,9 @@ def replay_fixture(
                 decision=None,
                 decision_sha256="0" * 64,
                 model_cost=(
-                    openai.billed_cost_microdollars + jev.billed_cost_microdollars
+                    None
+                    if jev.billed_cost_microdollars is None
+                    else openai.billed_cost_microdollars + jev.billed_cost_microdollars
                 ),
             )
         fixture = gate.get()

@@ -163,10 +163,24 @@ class DecisionFrozenArtifact(UtcModel):
     def require_state_fields(self) -> Self:
         openai_cost = self.openai_cost_microdollars
         jev_cost = self.jev_cost_microdollars
-        if self.terminal_model_state != "COST_OVERFLOW" and (
-            openai_cost is None or jev_cost is None
+        unknown_in_flight = self.failure_code == "UNKNOWN_IN_FLIGHT" and (
+            (
+                self.terminal_model_state == "OPENAI_FAILURE"
+                and openai_cost is None
+                and jev_cost == 0
+            )
+            or (
+                self.terminal_model_state == "JEV_FAILURE"
+                and openai_cost is not None
+                and jev_cost is None
+            )
+        )
+        if (
+            self.terminal_model_state != "COST_OVERFLOW"
+            and not unknown_in_flight
+            and (openai_cost is None or jev_cost is None)
         ):
-            raise ValueError("only cost overflow permits unavailable provider costs")
+            raise ValueError("only unknown provider cost permits unavailable cost")
         if self.terminal_model_state == "OPENAI_FAILURE":
             if (
                 self.failure_code is None
@@ -525,6 +539,7 @@ class BookUnavailableArtifact(UtcModel):
         "BOOK_UNAVAILABLE",
         "STALE_PRECHECK",
         "COST_OVERFLOW",
+        "UNKNOWN_IN_FLIGHT",
     ]
     planned_retrieved_at: datetime
     planned_source_sha256: Sha256
@@ -752,6 +767,7 @@ class FailureArtifact(UtcModel):
     provider: Literal["openai", "jev"]
     code: Literal[
         "INPUT_ERROR",
+        "INPUT_CHANGED",
         "CONFIG_FAILURE",
         "UNKNOWN_IN_FLIGHT",
         "PROVIDER_ERROR",
@@ -767,7 +783,7 @@ class FailureArtifact(UtcModel):
     response_sha256: Sha256 | None
     response_byte_length: ByteSize
     retrieved_at: datetime | None
-    billed_cost_microdollars: ByteSize
+    billed_cost_microdollars: ByteSize | None
     status_code: Annotated[int, Field(strict=True, ge=100, le=599)] | None
 
     @model_validator(mode="after")
@@ -807,6 +823,7 @@ class FailureArtifact(UtcModel):
             raise ValueError("credential-reflection metadata is inconsistent")
         elif self.code in {
             "INPUT_ERROR",
+            "INPUT_CHANGED",
             "CONFIG_FAILURE",
             "PROVIDER_ERROR",
             "TIMEOUT",
@@ -818,6 +835,13 @@ class FailureArtifact(UtcModel):
                 or self.billed_cost_microdollars != 0
             ):
                 raise ValueError("pre-response failure contains response metadata")
+        elif self.code == "UNKNOWN_IN_FLIGHT" and (
+            self.status_code is not None
+            or has_response
+            or self.retrieved_at is not None
+            or self.billed_cost_microdollars is not None
+        ):
+            raise ValueError("unknown in-flight failure must retain unknown cost")
         return self
 
 
@@ -853,7 +877,11 @@ def _stage_path_for_result(
     provider_path = _provider_shape(path)
     failure_path = provider_path in _FAILURE_PATHS
     if late:
-        if result.ai.disposition not in {"BOOK_FAILURE", "COST_OVERFLOW"}:
+        if result.ai.disposition not in {
+            "BOOK_FAILURE",
+            "COST_OVERFLOW",
+            "UNKNOWN_IN_FLIGHT",
+        }:
             raise ValueError(
                 "late provider path requires terminal BOOK_FAILURE or COST_OVERFLOW"
             )
@@ -1133,6 +1161,8 @@ def _expected_model_cost(
     }:
         failure = typed[ArtifactKind.JEV_FAILURE]
         assert isinstance(failure, FailureArtifact)
+        if failure.billed_cost_microdollars is None:
+            return None
         return _add_model_costs(
             openai.billed_cost_microdollars, failure.billed_cost_microdollars
         )
@@ -1235,6 +1265,13 @@ def _validate_late_terminal(
         if result.ai.disposition != "COST_OVERFLOW":
             raise
         expected_cost = None
+    expected_disposition = (
+        "UNKNOWN_IN_FLIGHT"
+        if unavailable.reason == "UNKNOWN_IN_FLIGHT"
+        else "COST_OVERFLOW"
+        if expected_cost is None
+        else "BOOK_FAILURE"
+    )
     if (
         unavailable.terminal_model_at != frozen.frozen_at
         or (
@@ -1242,15 +1279,15 @@ def _validate_late_terminal(
             and unavailable.terminal_model_at < unavailable.planned_retrieved_at
         )
         or (
-            unavailable.reason not in {"STALE_PRECHECK", "COST_OVERFLOW"}
+            unavailable.reason
+            not in {"STALE_PRECHECK", "COST_OVERFLOW", "UNKNOWN_IN_FLIGHT"}
             and unavailable.terminal_model_at >= unavailable.planned_retrieved_at
         )
         or result.execution_book_sha256 is not None
         or result.planned_execution_book_sha256 != unavailable.planned_source_sha256
         or result.baseline_probability_micros is not None
         or result.baseline_brier_micros is not None
-        or result.ai.disposition
-        != ("COST_OVERFLOW" if expected_cost is None else "BOOK_FAILURE")
+        or result.ai.disposition != expected_disposition
         or result.deterministic.disposition != "BOOK_FAILURE"
         or any(
             arm.quantity != 0 or arm.trading_pnl_microdollars != 0
@@ -1272,7 +1309,7 @@ def _validate_late_terminal(
         if isinstance(decision, JevDecision)
         else (None, None)
     )
-    if result.ai.disposition != "COST_OVERFLOW" and (
+    if result.ai.disposition not in {"COST_OVERFLOW", "UNKNOWN_IN_FLIGHT"} and (
         (
             result.ai.signal_probability_micros,
             result.ai.signal_action,
@@ -2217,11 +2254,22 @@ def _validate_reconstructed_path(
             fail("execution book does not bind result identity and chronology")
 
     openai_request = typed.get(ArtifactKind.OPENAI_REQUEST)
-    if isinstance(evidence, EvidencePacket) and openai_request is not None:
-        if openai_request != load_strict_json(
-            build_openai_request(evidence, OPENAI_MODEL_ID)
-        ):
-            fail("OpenAI request does not match evidence")
+    changed_input_failure = any(
+        isinstance(value, FailureArtifact)
+        and value.code in {"INPUT_ERROR", "INPUT_CHANGED", "UNKNOWN_IN_FLIGHT"}
+        for value in (
+            typed.get(ArtifactKind.OPENAI_FAILURE),
+            typed.get(ArtifactKind.JEV_FAILURE),
+        )
+    )
+    if (
+        isinstance(evidence, EvidencePacket)
+        and openai_request is not None
+        and not changed_input_failure
+        and openai_request
+        != load_strict_json(build_openai_request(evidence, OPENAI_MODEL_ID))
+    ):
+        fail("OpenAI request does not match evidence")
 
     _validate_success_provenance(typed, envelopes, fail=fail)
 
@@ -2248,11 +2296,17 @@ def _validate_reconstructed_path(
         fail("OpenAI success artifact type is invalid")
         return
     if isinstance(brief, ResearchBrief):
-        if isinstance(evidence, EvidencePacket) and (
-            brief.evidence_sha256 != evidence.source_sha256
+        if (
+            isinstance(evidence, EvidencePacket)
+            and not changed_input_failure
+            and brief.evidence_sha256 != evidence.source_sha256
         ):
             fail("research brief does not match frozen evidence")
-        if result is not None and brief.evidence_sha256 != result.evidence_sha256:
+        if (
+            result is not None
+            and not changed_input_failure
+            and brief.evidence_sha256 != result.evidence_sha256
+        ):
             fail("research brief does not match observation evidence")
         if (
             isinstance(openai_response, OpenAIResponse)
@@ -2265,6 +2319,7 @@ def _validate_reconstructed_path(
         isinstance(brief, ResearchBrief)
         and isinstance(evidence, EvidencePacket)
         and jev_request is not None
+        and not changed_input_failure
         and jev_request
         != load_strict_json(build_jev_request(brief, evidence, JEV_MODEL_ID))
     ):
@@ -2430,11 +2485,20 @@ def _validate_reconstructed_path(
             if openai_cost is not None and jev_cost is not None
             else None
         )
+        unknown_in_flight = (
+            isinstance(openai_failure, FailureArtifact)
+            and openai_failure.code == "UNKNOWN_IN_FLIGHT"
+        ) or (
+            isinstance(jev_failure, FailureArtifact)
+            and jev_failure.code == "UNKNOWN_IN_FLIGHT"
+        )
         expected_state = (
             "COST_OVERFLOW"
-            if total_cost is None
+            if (total_cost is None and not unknown_in_flight)
             or (
-                total_cost > INT64_MAX and _base_path(path) in _COST_OVERFLOW_BASE_PATHS
+                total_cost is not None
+                and total_cost > INT64_MAX
+                and _base_path(path) in _COST_OVERFLOW_BASE_PATHS
             )
             else "OPENAI_FAILURE"
             if ArtifactKind.OPENAI_FAILURE in typed

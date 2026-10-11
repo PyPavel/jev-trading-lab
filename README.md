@@ -37,7 +37,15 @@ or signing path. Each UTC-minute slot is serialized under a bounded filesystem l
 a completed slot replays before any Gamma, CLOB, or model call. Adjacent slots remain
 distinct. Provider intent is fsynced before invocation and its sanitized result is
 content-addressed immediately afterward. A restart that finds intent without result
-records terminal `UNKNOWN_IN_FLIGHT` and never retries that call.
+records terminal `UNKNOWN_IN_FLIGHT`, leaves model cost and economic P&L unavailable,
+and never retries that opportunity/provider call—even if same-slot public evidence changed.
+
+The observation and provider journals trust a private local filesystem owned by the current
+OS user and code running in that owner's process. They reject unsafe links, special files,
+weak permissions, malformed transitions, and accidental corruption, but are not
+cryptographically authenticated against deliberate same-user/process rewriting of all
+journal/blob bytes and recomputation of unkeyed hashes. Keys, signatures, and a daemon are
+outside this one-host paper-feasibility boundary.
 
 Run a no-key public smoke (model calls fail closed when credentials are absent):
 

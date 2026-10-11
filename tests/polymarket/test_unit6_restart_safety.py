@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import json
 import os
-import stat
 import threading
 import time
-from unittest.mock import patch
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
-from jev_trading_lab.polymarket.call_journal import ProviderCallJournal
+from jev_trading_lab.polymarket.ai import AdapterFailure
+from jev_trading_lab.polymarket.call_journal import (
+    ProviderCallJournal,
+    adapter_from_outcome,
+    adapter_outcome,
+)
 from jev_trading_lab.polymarket.client import (
     HttpRequest,
     HttpResponse,
@@ -24,6 +28,15 @@ from jev_trading_lab.polymarket.client import (
 from jev_trading_lab.polymarket.pipeline import observation_slot
 
 NOW = datetime(2026, 10, 10, 12, 0, 45, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def _local_journal_filesystem(monkeypatch: pytest.MonkeyPatch) -> None:
+    from jev_trading_lab.polymarket import call_journal
+
+    defaults = dict(call_journal.BlobStore.__init__.__kwdefaults__ or {})
+    defaults["filesystem_resolver"] = lambda _path: "ext4"
+    monkeypatch.setattr(call_journal.BlobStore.__init__, "__kwdefaults__", defaults)
 
 
 def _market(**changes: object) -> dict[str, object]:
@@ -289,7 +302,9 @@ def test_provider_journal_completes_short_interrupted_writes(tmp_path: Path) -> 
     assert journal.state(call_id) is not None
 
 
-def test_provider_journal_rejects_duplicate_keys_and_oversized_lines(tmp_path: Path) -> None:
+def test_provider_journal_rejects_duplicate_keys_and_oversized_lines(
+    tmp_path: Path,
+) -> None:
     journal = ProviderCallJournal(tmp_path)
     path = tmp_path / "provider_calls.jsonl"
     path.write_bytes(b'{"call_id":"a","call_id":"b"}\n')
@@ -326,6 +341,92 @@ def test_provider_journal_rejects_second_request_for_same_opportunity_provider(
     assert state["request_sha256"] == __import__("hashlib").sha256(b"first").hexdigest()
 
 
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"message": "not canonical"},
+        {"billed_cost_microdollars": -1},
+        {
+            "status_code": 504,
+            "response_sha256": "3" * 64,
+            "response_byte_length": 1,
+            "retrieved_at": "2026-10-10T12:00:45Z",
+        },
+    ],
+)
+def test_adapter_outcome_rejects_invalid_failure_semantics(
+    changes: dict[str, object],
+) -> None:
+    outcome = adapter_outcome(
+        AdapterFailure(
+            provider="openai",
+            code="TIMEOUT",
+            message="openai transport timed out",
+            request_bytes=b"request",
+            response_sha256=None,
+            response_byte_length=0,
+            retrieved_at=None,
+            billed_cost_microdollars=0,
+            status_code=None,
+        )
+    )
+    outcome.update(changes)
+
+    with pytest.raises(ValueError, match="provider call result"):
+        adapter_from_outcome("openai", outcome)
+
+
+def test_adapter_outcome_rejects_negative_success_cost() -> None:
+    from jev_trading_lab.polymarket.ai import OpenAISuccess
+    from jev_trading_lab.polymarket.models import ResearchBrief
+
+    fixture = json.loads(
+        (
+            Path(__file__).parents[1] / "fixtures/polymarket/feasibility_cycle.json"
+        ).read_text()
+    )
+    response = json.loads(fixture["model_artifacts"]["openai_response_bytes"])
+    message = next(item for item in response["output"] if item["type"] == "message")
+    brief = ResearchBrief.model_validate_json(message["content"][0]["text"])
+    outcome = adapter_outcome(OpenAISuccess(brief, b"request", b"response", NOW, -1))
+
+    with pytest.raises(ValueError, match="provider call result"):
+        adapter_from_outcome("openai", outcome)
+
+
+def test_provider_journal_rejects_append_past_entry_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from jev_trading_lab.polymarket import call_journal
+
+    journal = ProviderCallJournal(tmp_path)
+    call_id = journal.begin(
+        provider="jev",
+        opportunity_id="2" * 64,
+        request_bytes=b"request",
+        created_at=NOW,
+    )
+    outcome = adapter_outcome(
+        AdapterFailure(
+            provider="jev",
+            code="TIMEOUT",
+            message="jev transport timed out",
+            request_bytes=b"request",
+            response_sha256=None,
+            response_byte_length=0,
+            retrieved_at=None,
+            billed_cost_microdollars=0,
+            status_code=None,
+        )
+    )
+    monkeypatch.setattr(call_journal, "_MAX_LINES", 1)
+
+    with pytest.raises(ValueError, match="maximum entries"):
+        journal.finish(call_id, outcome=outcome, finished_at=NOW)
+
+    assert journal.state(call_id)["kind"] == "provider_call_intent"  # type: ignore[index]
+
+
 def test_provider_call_result_is_content_addressed_and_replayable(
     tmp_path: Path,
 ) -> None:
@@ -337,15 +438,28 @@ def test_provider_call_result_is_content_addressed_and_replayable(
         request_bytes=b"request",
         created_at=NOW,
     )
+    outcome = adapter_outcome(
+        AdapterFailure(
+            provider="jev",
+            code="TIMEOUT",
+            message="jev transport timed out",
+            request_bytes=b"request",
+            response_sha256=None,
+            response_byte_length=0,
+            retrieved_at=None,
+            billed_cost_microdollars=0,
+            status_code=None,
+        )
+    )
     journal.finish(
         call_id,
-        outcome={"status": "success", "response_sha256": "3" * 64},
+        outcome=outcome,
         finished_at=NOW + timedelta(seconds=1),
     )
     state = ProviderCallJournal(root).state(call_id)
     assert state is not None
     assert state["kind"] == "provider_call_result"
-    assert state["outcome"] == {"response_sha256": "3" * 64, "status": "success"}
+    assert state["outcome"] == outcome
     artifact = root / state["storage_relpath"]
     assert artifact.read_bytes() == state["artifact_bytes"]
 

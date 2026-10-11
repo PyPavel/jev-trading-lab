@@ -125,6 +125,7 @@ _FORBIDDEN_NAMES = frozenset(
 )
 type FailureCode = Literal[
     "INPUT_ERROR",
+    "INPUT_CHANGED",
     "CONFIG_FAILURE",
     "UNKNOWN_IN_FLIGHT",
     "PROVIDER_ERROR",
@@ -581,14 +582,16 @@ class AdapterFailure:
     response_sha256: str | None
     response_byte_length: int
     retrieved_at: datetime | None
-    billed_cost_microdollars: int
+    billed_cost_microdollars: int | None
     status_code: int | None
 
     def __post_init__(self) -> None:
         if not has_canonical_failure_response(
             self.response_sha256, self.response_byte_length
+        ) or (self.code == "UNKNOWN_IN_FLIGHT") != (
+            self.billed_cost_microdollars is None
         ):
-            raise ValueError("failure response hash and length are inconsistent")
+            raise ValueError("failure response or cost metadata is inconsistent")
 
 
 @dataclass(frozen=True, slots=True)
@@ -632,6 +635,7 @@ def is_canonical_failure_message(
 
     fixed: dict[FailureCode, set[str]] = {
         "INPUT_ERROR": {f"{provider} request input is invalid"},
+        "INPUT_CHANGED": {f"{provider} frozen input differs from current evidence"},
         "CONFIG_FAILURE": {f"{provider} live configuration is incomplete"},
         "UNKNOWN_IN_FLIGHT": {f"{provider} call outcome is unknown after restart"},
         "PROVIDER_ERROR": {f"{provider} transport returned invalid data"},

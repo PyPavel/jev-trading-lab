@@ -1992,10 +1992,116 @@ def test_crash_after_provider_intent_never_retries_unknown_call(tmp_path: Path) 
     jev = ModelTransport("jev")
     summary = _observe(tmp_path, openai=openai, jev=jev)[0]
     assert openai.requests == [] and jev.requests == []
-    assert summary["ai"]["disposition"] == "MODEL_FAILURE"
+    assert summary["ai"]["disposition"] == "UNKNOWN_IN_FLIGHT"
+    assert summary["ai"]["model_cost_microdollars"] is None
+    assert summary["ai"]["economic_pnl_microdollars"] is None
+    assert summary["paired_economic_pnl_delta_microdollars"] is None
     replay = load_observation(tmp_path, summary["observation_id"])
     failure = json.loads(replay.artifacts["openai_failure"])
     assert failure["code"] == "UNKNOWN_IN_FLIGHT"
+
+
+def test_same_slot_changed_evidence_never_calls_provider_again(
+    tmp_path: Path,
+) -> None:
+    first_market = _market()
+
+    def crash(event: str) -> None:
+        if event == "openai_intent_frozen":
+            raise RuntimeError("failpoint after provider intent")
+
+    with pytest.raises(RuntimeError, match="failpoint"):
+        _observe(tmp_path, market=first_market, event_sink=crash)
+
+    changed_market = first_market | {"description": "Changed public evidence."}
+    public = PublicNetwork(changed_market)
+    openai = ModelTransport("openai", _market_sha(changed_market))
+    jev = ModelTransport("jev")
+
+    summary = _observe(
+        tmp_path,
+        public=public,
+        openai=openai,
+        jev=jev,
+        market=changed_market,
+    )[0]
+
+    assert openai.requests == [] and jev.requests == []
+    assert summary["ai"]["disposition"] == "UNKNOWN_IN_FLIGHT"
+    assert summary["ai"]["model_cost_microdollars"] is None
+    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 1
+
+
+def test_same_slot_changed_evidence_after_openai_result_terminalizes_without_jev(
+    tmp_path: Path,
+) -> None:
+    first_market = _market()
+
+    def crash(event: str) -> None:
+        if event == "openai_result_frozen":
+            raise RuntimeError("failpoint after provider result")
+
+    with pytest.raises(RuntimeError, match="failpoint"):
+        _observe(tmp_path, market=first_market, event_sink=crash)
+
+    changed_market = first_market | {"description": "Changed public evidence."}
+    openai = ModelTransport("openai", _market_sha(changed_market))
+    jev = ModelTransport("jev")
+    summary = _observe(
+        tmp_path,
+        public=PublicNetwork(changed_market),
+        openai=openai,
+        jev=jev,
+        market=changed_market,
+    )[0]
+
+    assert openai.requests == [] and jev.requests == []
+    assert summary["ai"]["disposition"] == "MODEL_FAILURE"
+    replay = load_observation(tmp_path, summary["observation_id"])
+    failure = json.loads(replay.artifacts["openai_failure"])
+    assert failure["code"] == "INPUT_CHANGED"
+    assert failure["message"] == "openai frozen input differs from current evidence"
+    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 1
+
+    again = _observe(
+        tmp_path,
+        public=PublicNetwork(changed_market),
+        openai=openai,
+        jev=jev,
+        market=changed_market,
+    )[0]
+    assert again == summary
+    assert openai.requests == [] and jev.requests == []
+
+
+def test_same_slot_changed_evidence_after_jev_intent_never_calls_provider_again(
+    tmp_path: Path,
+) -> None:
+    first_market = _market()
+
+    def crash(event: str) -> None:
+        if event == "jev_intent_frozen":
+            raise RuntimeError("failpoint after provider intent")
+
+    with pytest.raises(RuntimeError, match="failpoint"):
+        _observe(tmp_path, market=first_market, event_sink=crash)
+
+    changed_market = first_market | {"description": "Changed public evidence."}
+    openai = ModelTransport("openai", _market_sha(changed_market))
+    jev = ModelTransport("jev")
+    summary = _observe(
+        tmp_path,
+        public=PublicNetwork(changed_market),
+        openai=openai,
+        jev=jev,
+        market=changed_market,
+    )[0]
+
+    assert openai.requests == [] and jev.requests == []
+    assert summary["ai"]["disposition"] == "MODEL_FAILURE"
+    replay = load_observation(tmp_path, summary["observation_id"])
+    failure = json.loads(replay.artifacts["openai_failure"])
+    assert failure["code"] == "INPUT_CHANGED"
 
 
 @pytest.mark.parametrize(
@@ -2024,6 +2130,9 @@ def test_provider_failpoints_recover_without_repeating_completed_or_unknown_call
 
     assert openai.requests == []
     assert len(jev.requests) == (1 if boundary == "openai_result_frozen" else 0)
+    if boundary == "jev_intent_frozen":
+        assert summary["ai"]["disposition"] == "UNKNOWN_IN_FLIGHT"
+        assert summary["ai"]["model_cost_microdollars"] is None
     replay = load_observation(tmp_path, summary["observation_id"])
     assert replay.result.model_dump(mode="json") == _single_result(tmp_path)
 

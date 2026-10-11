@@ -42,9 +42,12 @@ Disposition = Literal[
     "MODEL_FAILURE",
     "BOOK_FAILURE",
     "COST_OVERFLOW",
+    "UNKNOWN_IN_FLIGHT",
 ]
 MICROS_PER_UNIT = 1_000_000
-_UNAVAILABLE_DISPOSITIONS = frozenset({"INELIGIBLE", "MODEL_FAILURE", "COST_OVERFLOW"})
+_UNAVAILABLE_DISPOSITIONS = frozenset(
+    {"INELIGIBLE", "MODEL_FAILURE", "COST_OVERFLOW", "UNKNOWN_IN_FLIGHT"}
+)
 _FILL_DISPOSITIONS = frozenset({"FILLED", "PARTIAL_FILL"})
 
 
@@ -655,7 +658,7 @@ class ArmResult(StrictModel):
             raise ValueError("filled arm requires exactly one mark or payout")
 
     def _validate_economics(self) -> None:
-        if self.disposition == "COST_OVERFLOW":
+        if self.disposition in {"COST_OVERFLOW", "UNKNOWN_IN_FLIGHT"}:
             if (
                 self.model_cost_microdollars is not None
                 or self.economic_pnl_microdollars is not None
@@ -663,13 +666,13 @@ class ArmResult(StrictModel):
                 or self.trading_pnl_microdollars != 0
                 or self.final_cash_microdollars != self.initial_cash_microdollars
             ):
-                raise ValueError("cost overflow requires null aggregate economics")
+                raise ValueError("unknown cost requires null aggregate economics")
             return
         if (
             self.model_cost_microdollars is None
             or self.economic_pnl_microdollars is None
         ):
-            raise ValueError("only cost overflow permits null aggregate economics")
+            raise ValueError("only unavailable cost permits null aggregate economics")
         if self.quantity == 0:
             expected_trading = 0
         else:
@@ -804,7 +807,8 @@ class ObservationResult(UtcModel):
             if self.planned_execution_book_sha256 is None:
                 raise ValueError("missing execution book requires a planned book hash")
             if (
-                self.ai.disposition not in {"BOOK_FAILURE", "COST_OVERFLOW"}
+                self.ai.disposition
+                not in {"BOOK_FAILURE", "COST_OVERFLOW", "UNKNOWN_IN_FLIGHT"}
                 or self.deterministic.disposition != "BOOK_FAILURE"
             ):
                 raise ValueError(
