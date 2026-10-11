@@ -357,6 +357,7 @@ class MarketCandidate:
     condition_id: str
     yes_token_id: str
     no_token_id: str
+    slot_at: datetime
     raw_gamma_bytes: bytes = field(repr=False)
     raw_gamma_sha256: str
     evidence: EvidencePacket
@@ -366,6 +367,14 @@ class MarketCandidate:
     precheck_history_bytes: tuple[bytes, bytes] = field(repr=False)
     precheck_history: tuple[BookSnapshot, BookSnapshot]
     precheck_attempts: tuple[PrecheckAttempt, PrecheckAttempt]
+
+    def __post_init__(self) -> None:
+        if (
+            self.slot_at.tzinfo is not UTC
+            or self.slot_at.second
+            or self.slot_at.microsecond
+        ):
+            raise ValueError("candidate slot must be an exact UTC minute")
 
 
 def _gamma_semantic_identity(
@@ -1160,6 +1169,7 @@ class PolymarketClient:
                     condition_id=condition_id,
                     yes_token_id=yes_token,
                     no_token_id=no_token,
+                    slot_at=cutoff.replace(second=0, microsecond=0),
                     raw_gamma_bytes=raw_market,
                     raw_gamma_sha256=source_sha,
                     evidence=evidence,

@@ -673,12 +673,12 @@ def evaluate_fixture(fixture: FeasibilityFixture) -> ObservationResult:
     )
     deterministic = evaluate_control_arm(fixture, resolution=resolution)
     evidence = fixture.sanitized_evidence
-    cutoff_text = evidence.cutoff_at.isoformat().replace("+00:00", "Z")
+    slot_text = fixture.identity.slot_at.isoformat().replace("+00:00", "Z")
     opportunity_id = _identity_sha(
         {
             "policy_version": POLICY_VERSION,
             "market_id": evidence.market_id,
-            "cutoff_at": cutoff_text,
+            "slot_at": slot_text,
         }
     )
     observation_id = _identity_sha(
@@ -701,6 +701,7 @@ def evaluate_fixture(fixture: FeasibilityFixture) -> ObservationResult:
         opportunity_id=opportunity_id,
         market_id=evidence.market_id,
         policy_version=POLICY_VERSION,
+        slot_at=fixture.identity.slot_at,
         cutoff_at=evidence.cutoff_at,
         observed_at=observed_at,
         evidence_sha256=evidence.source_sha256,

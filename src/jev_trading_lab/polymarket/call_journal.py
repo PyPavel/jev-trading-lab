@@ -190,6 +190,7 @@ def adapter_outcome(value: object) -> dict[str, Any]:
             response_byte_length=value.response_byte_length,
             retrieved_at=_utc_text(value.retrieved_at) if value.retrieved_at else None,
             billed_cost_microdollars=value.billed_cost_microdollars,
+            cost_status=value.cost_status,
             status_code=value.status_code,
         )
     elif isinstance(value, AdapterCostOverflow):

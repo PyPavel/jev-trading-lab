@@ -260,6 +260,7 @@ class TransportResponse:
     raw_bytes: bytes = field(repr=False)
     retrieved_at: datetime
     billed_cost_microdollars: int | None
+    cost_status: Literal["KNOWN", "UNKNOWN"] = "KNOWN"
     sensitive_values: tuple[bytes, ...] = field(default=(), repr=False)
     cost_overflow: CostOverflowEvidence | None = None
 
@@ -448,12 +449,12 @@ def _usage_terms(
 
 def _usage_cost(
     body: bytes, provider: Literal["openai", "jev"], rates: tuple[int, ...]
-) -> tuple[int, CostOverflowEvidence | None]:
-    """Price the response usage; unrepresentable totals become typed evidence."""
+) -> tuple[int | None, CostOverflowEvidence | None]:
+    """Price authoritative usage; unavailable usage has unknown cost."""
 
     terms = _usage_terms(body, provider)
     if terms is None:
-        return 0, None
+        return None, None
     input_tokens, cached, output_tokens = terms
     evidence = CostOverflowEvidence(
         provider=provider,
@@ -518,6 +519,7 @@ def _live_transport(
             raw_bytes=response.body,
             retrieved_at=response.retrieved_at,
             billed_cost_microdollars=None if overflow is not None else cost,
+            cost_status=("UNKNOWN" if cost is None and overflow is None else "KNOWN"),
             sensitive_values=(secret.encode(),),
             cost_overflow=overflow,
         )
@@ -585,11 +587,17 @@ class AdapterFailure:
     billed_cost_microdollars: int | None
     status_code: int | None
 
+    @property
+    def cost_status(self) -> Literal["KNOWN", "UNKNOWN"]:
+        return "UNKNOWN" if self.billed_cost_microdollars is None else "KNOWN"
+
     def __post_init__(self) -> None:
-        if not has_canonical_failure_response(
-            self.response_sha256, self.response_byte_length
-        ) or (self.code == "UNKNOWN_IN_FLIGHT") != (
-            self.billed_cost_microdollars is None
+        if (
+            not has_canonical_failure_response(
+                self.response_sha256, self.response_byte_length
+            )
+            or self.code == "INPUT_ERROR"
+            and self.billed_cost_microdollars is None
         ):
             raise ValueError("failure response or cost metadata is inconsistent")
 
@@ -859,7 +867,7 @@ def _failure(
     request_bytes: bytes,
     response_body: bytes | None = None,
     retrieved_at: datetime | None = None,
-    billed_cost_microdollars: int = 0,
+    billed_cost_microdollars: int | None = 0,
     status_code: int | None = None,
 ) -> AdapterFailure:
     """Return safe metadata without retaining failed bodies or headers."""
@@ -908,14 +916,24 @@ def _send_once(
             )
         )
         valid_cost = (
-            type(billed_cost) is int
-            and 0 <= billed_cost <= INT64_MAX
-            and overflow is None
-        ) or (
-            billed_cost is None
-            and type(overflow) is CostOverflowEvidence
-            and overflow.provider == provider
-            and overflow.is_consistent()
+            (
+                type(billed_cost) is int
+                and 0 <= billed_cost <= INT64_MAX
+                and response.cost_status == "KNOWN"
+                and overflow is None
+            )
+            or (
+                billed_cost is None
+                and response.cost_status == "KNOWN"
+                and type(overflow) is CostOverflowEvidence
+                and overflow.provider == provider
+                and overflow.is_consistent()
+            )
+            or (
+                billed_cost is None
+                and response.cost_status == "UNKNOWN"
+                and overflow is None
+            )
         )
         if (
             type(status_code) is not int
@@ -933,6 +951,7 @@ def _send_once(
             code="TIMEOUT",
             message=f"{provider} transport timed out",
             request_bytes=request_bytes,
+            billed_cost_microdollars=None,
         )
     except ValueError as error:
         if str(error) == "provider configuration is incomplete":
@@ -947,6 +966,7 @@ def _send_once(
             code="PROVIDER_ERROR",
             message=f"{provider} transport returned invalid data",
             request_bytes=request_bytes,
+            billed_cost_microdollars=None,
         )
     except Exception:
         return _failure(
@@ -954,6 +974,7 @@ def _send_once(
             code="PROVIDER_ERROR",
             message=f"{provider} transport returned invalid data",
             request_bytes=request_bytes,
+            billed_cost_microdollars=None,
         )
     if overflow is not None:
         return AdapterCostOverflow(
@@ -965,7 +986,6 @@ def _send_once(
             status_code=status_code,
             evidence=overflow,
         )
-    assert billed_cost is not None
     if _SECRET_PATTERN.search(raw_bytes) or any(
         sentinel in raw_bytes for sentinel in sensitive_values
     ):
@@ -988,6 +1008,17 @@ def _send_once(
             response_body=raw_bytes,
             retrieved_at=retrieved_at,
             billed_cost_microdollars=billed_cost,
+            status_code=status_code,
+        )
+    if billed_cost is None:
+        return _failure(
+            provider=provider,
+            code="PARSE_ERROR",
+            message=f"{provider} response violates the strict envelope",
+            request_bytes=request_bytes,
+            response_body=raw_bytes,
+            retrieved_at=retrieved_at,
+            billed_cost_microdollars=None,
             status_code=status_code,
         )
     return response

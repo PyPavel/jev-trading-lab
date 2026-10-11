@@ -819,7 +819,8 @@ def test_malformed_transport_objects_become_provider_failure(
     assert result.code == "PROVIDER_ERROR"
     assert result.response_sha256 is None
     assert result.response_byte_length == 0
-    assert result.billed_cost_microdollars == 0
+    assert result.billed_cost_microdollars is None
+    assert result.status_code is None
 
 
 @pytest.mark.parametrize("provider", ("openai", "jev"))
@@ -1004,7 +1005,7 @@ def test_finding_6_inconsistent_overflow_metadata_is_provider_error(
 
     assert isinstance(result, AdapterFailure)
     assert result.code == "PROVIDER_ERROR"
-    assert result.billed_cost_microdollars == 0
+    assert result.billed_cost_microdollars is None
 
 
 @pytest.mark.parametrize("provider", ("openai", "jev"))

@@ -308,7 +308,11 @@ def _failure_result(
         else _sum_model_cost(prior_cost, failure.billed_cost_microdollars)
     )
     if cost is None:
-        ai = _unavailable_cost_arm()
+        ai = _unavailable_cost_arm(
+            "UNKNOWN_IN_FLIGHT"
+            if failure.code in {"TIMEOUT", "PROVIDER_ERROR", "UNKNOWN_IN_FLIGHT"}
+            else "MODEL_FAILURE"
+        )
     else:
         ai = evaluate_ai_arm(
             fixture.execution_book,
@@ -384,7 +388,9 @@ def _sum_model_cost(left: int, right: int) -> int | None:
 
 
 def _unavailable_cost_arm(
-    disposition: Literal["COST_OVERFLOW", "UNKNOWN_IN_FLIGHT"] = "COST_OVERFLOW",
+    disposition: Literal[
+        "MODEL_FAILURE", "COST_OVERFLOW", "UNKNOWN_IN_FLIGHT"
+    ] = "COST_OVERFLOW",
 ) -> ArmResult:
     return ArmResult(
         arm="AI",
@@ -423,7 +429,11 @@ def _book_unavailable_result(
 ) -> ObservationResult:
     ai = (
         _unavailable_cost_arm(
-            "UNKNOWN_IN_FLIGHT" if reason == "UNKNOWN_IN_FLIGHT" else "COST_OVERFLOW"
+            "UNKNOWN_IN_FLIGHT"
+            if reason == "UNKNOWN_IN_FLIGHT"
+            else "MODEL_FAILURE"
+            if reason == "MODEL_FAILURE"
+            else "COST_OVERFLOW"
         )
         if model_cost is None
         else _book_failure_arm(arm="AI", model_cost=model_cost, decision=decision)
@@ -434,6 +444,7 @@ def _book_unavailable_result(
         opportunity_id=identity.opportunity_id,
         market_id=identity.market_id,
         policy_version=identity.policy_version,
+        slot_at=identity.slot_at,
         cutoff_at=identity.cutoff_at,
         observed_at=max(terminal_at, evidence_at),
         evidence_sha256=identity.evidence_sha256,
@@ -539,13 +550,13 @@ def _summary(
 
 
 def _identity(candidate: MarketCandidate, execution_hash: str) -> FixtureIdentity:
-    cutoff = candidate.evidence.cutoff_at.isoformat().replace("+00:00", "Z")
+    slot = candidate.slot_at.isoformat().replace("+00:00", "Z")
     opportunity_id = hashlib.sha256(
         canonical_json_bytes(
             {
                 "policy_version": POLICY_VERSION,
                 "market_id": candidate.market_id,
-                "cutoff_at": cutoff,
+                "slot_at": slot,
             }
         )
     ).hexdigest()
@@ -562,6 +573,7 @@ def _identity(candidate: MarketCandidate, execution_hash: str) -> FixtureIdentit
     return FixtureIdentity(
         policy_version=POLICY_VERSION,
         market_id=candidate.market_id,
+        slot_at=candidate.slot_at,
         cutoff_at=candidate.evidence.cutoff_at,
         opportunity_id=opportunity_id,
         observation_id=observation_id,
@@ -712,6 +724,7 @@ def _live_result(
         opportunity_id=identity.opportunity_id,
         market_id=identity.market_id,
         policy_version=identity.policy_version,
+        slot_at=identity.slot_at,
         cutoff_at=identity.cutoff_at,
         observed_at=max(datetime.now(UTC), execution_book.retrieved_at),
         evidence_sha256=identity.evidence_sha256,
@@ -1019,9 +1032,9 @@ def _live_artifacts(
             identity,
             prefix,
             state=(
-                "JEV_FAILURE"
-                if aggregate_cost is not None or jev.code == "UNKNOWN_IN_FLIGHT"
-                else "COST_OVERFLOW"
+                "COST_OVERFLOW"
+                if aggregate_cost is None and jev.billed_cost_microdollars is not None
+                else "JEV_FAILURE"
             ),
             failure_code=jev.code,
             frozen_at=frozen_at,
@@ -1096,7 +1109,7 @@ def _record_rejections(
                 {
                     "policy_version": POLICY_VERSION,
                     "market_id": rejection.market_id,
-                    "cutoff_at": cutoff_text,
+                    "slot_at": cutoff_text,
                 }
             )
         ).hexdigest()
@@ -1140,6 +1153,7 @@ def _record_rejections(
             opportunity_id=opportunity_id,
             market_id=rejection.market_id,
             policy_version=POLICY_VERSION,
+            slot_at=observed_at,
             cutoff_at=observed_at,
             observed_at=observed_at,
             evidence_sha256=rejection.raw_gamma_sha256,
@@ -1359,6 +1373,7 @@ def _frozen_candidate(
         condition_id=candidate.condition_id,
         yes_token_id=candidate.yes_token_id,
         no_token_id=candidate.no_token_id,
+        slot_at=candidate.slot_at,
         raw_gamma_bytes=raw_gamma,
         raw_gamma_sha256=evidence.source_sha256,
         evidence=evidence,
@@ -1556,6 +1571,11 @@ def _observe_locked(
                             isinstance(jev, AdapterFailure)
                             and jev.code == "UNKNOWN_IN_FLIGHT"
                         )
+                        else "MODEL_FAILURE"
+                        if isinstance(openai, AdapterFailure)
+                        and openai.billed_cost_microdollars is None
+                        or isinstance(jev, AdapterFailure)
+                        and jev.billed_cost_microdollars is None
                         else "COST_OVERFLOW"
                     ),
                     evidence_at=candidate.evidence.retrieved_at,
@@ -1669,7 +1689,7 @@ def replay_fixture(
             {
                 "policy_version": identity.policy_version,
                 "market_id": identity.market_id,
-                "cutoff_at": identity.cutoff_at.isoformat().replace("+00:00", "Z"),
+                "slot_at": identity.slot_at.isoformat().replace("+00:00", "Z"),
             }
         )
     ).hexdigest()

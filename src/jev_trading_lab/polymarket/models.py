@@ -658,7 +658,10 @@ class ArmResult(StrictModel):
             raise ValueError("filled arm requires exactly one mark or payout")
 
     def _validate_economics(self) -> None:
-        if self.disposition in {"COST_OVERFLOW", "UNKNOWN_IN_FLIGHT"}:
+        if (
+            self.disposition in {"MODEL_FAILURE", "COST_OVERFLOW", "UNKNOWN_IN_FLIGHT"}
+            and self.model_cost_microdollars is None
+        ):
             if (
                 self.model_cost_microdollars is not None
                 or self.economic_pnl_microdollars is not None
@@ -768,8 +771,17 @@ class ObservationResult(UtcModel):
     opportunity_id: Sha256
     market_id: NonEmptyStr
     policy_version: NonEmptyStr
+    slot_at: datetime
     cutoff_at: datetime
     observed_at: datetime
+
+    @field_validator("slot_at", mode="after")
+    @classmethod
+    def validate_slot(cls, value: datetime) -> datetime:
+        if value.second or value.microsecond:
+            raise ValueError("slot_at must be aligned to an exact UTC minute")
+        return value
+
     evidence_sha256: Sha256
     execution_book_sha256: Sha256 | None
     planned_execution_book_sha256: Sha256 | None = Field(
@@ -808,7 +820,12 @@ class ObservationResult(UtcModel):
                 raise ValueError("missing execution book requires a planned book hash")
             if (
                 self.ai.disposition
-                not in {"BOOK_FAILURE", "COST_OVERFLOW", "UNKNOWN_IN_FLIGHT"}
+                not in {
+                    "BOOK_FAILURE",
+                    "MODEL_FAILURE",
+                    "COST_OVERFLOW",
+                    "UNKNOWN_IN_FLIGHT",
+                }
                 or self.deterministic.disposition != "BOOK_FAILURE"
             ):
                 raise ValueError(
@@ -1018,16 +1035,24 @@ class FixtureExpected(StrictModel):
     observation_result: ObservationResult
 
 
-class FixtureIdentity(StrictModel):
+class FixtureIdentity(UtcModel):
     """Price-free identity needed to journal pre-book model artifacts."""
 
     policy_version: NonEmptyStr
     market_id: NonEmptyStr
+    slot_at: datetime
     cutoff_at: datetime
     opportunity_id: Sha256
     observation_id: Sha256
     evidence_sha256: Sha256
     execution_book_sha256: Sha256
+
+    @field_validator("slot_at", mode="after")
+    @classmethod
+    def validate_slot(cls, value: datetime) -> datetime:
+        if value.second or value.microsecond:
+            raise ValueError("slot_at must be aligned to an exact UTC minute")
+        return value
 
 
 class PriceFreeFixturePrefix(StrictModel):
@@ -1073,15 +1098,15 @@ def _canonical_model_sha(model: StrictModel) -> str:
     ).hexdigest()
 
 
-def _opportunity_id(*, policy_version: str, market_id: str, cutoff_at: str) -> str:
-    """Hash canonical JSON of policy version, market ID, and UTC cutoff."""
+def _opportunity_id(*, policy_version: str, market_id: str, slot_at: str) -> str:
+    """Hash canonical JSON of policy version, market ID, and immutable UTC slot."""
 
     return hashlib.sha256(
         canonical_json_bytes(
             {
                 "policy_version": policy_version,
                 "market_id": market_id,
-                "cutoff_at": cutoff_at,
+                "slot_at": slot_at,
             }
         )
     ).hexdigest()
@@ -1256,10 +1281,12 @@ def validate_feasibility_fixture(fixture: dict[str, Any]) -> None:
         raise ValueError("market identity does not match evidence")
     if observation.cutoff_at != evidence.cutoff_at:
         raise ValueError("observation cutoff does not match evidence cutoff")
+    if observation.slot_at != validated.identity.slot_at:
+        raise ValueError("observation slot does not match fixture identity")
     expected_opportunity_id = _opportunity_id(
         policy_version=observation.policy_version,
         market_id=observation.market_id,
-        cutoff_at=observation.cutoff_at.isoformat().replace("+00:00", "Z"),
+        slot_at=observation.slot_at.isoformat().replace("+00:00", "Z"),
     )
     if observation.opportunity_id != expected_opportunity_id:
         raise ValueError("opportunity_id does not match structural identity")

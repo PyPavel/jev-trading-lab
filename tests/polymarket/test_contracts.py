@@ -1363,7 +1363,7 @@ def test_fixture_identity_uses_documented_minimal_formulas(
         {
             "policy_version": observation["policy_version"],
             "market_id": observation["market_id"],
-            "cutoff_at": observation["cutoff_at"],
+            "slot_at": observation["slot_at"],
         }
     )
     expected_observation_id = _identity_sha(

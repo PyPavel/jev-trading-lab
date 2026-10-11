@@ -2216,6 +2216,65 @@ def test_same_slot_changed_evidence_after_openai_result_terminalizes_without_jev
     assert openai.requests == [] and jev.requests == []
 
 
+@pytest.mark.parametrize(
+    ("boundary", "expected_jev_calls", "expected_intents"),
+    [
+        pytest.param("openai_intent_frozen", 0, 1, id="after-openai-intent"),
+        pytest.param("openai_result_frozen", 0, 1, id="after-openai-result"),
+        pytest.param("jev_intent_frozen", 0, 2, id="after-jev-intent"),
+    ],
+)
+def test_same_slot_restart_with_fresh_retrieval_times_never_repeats_provider_call(
+    tmp_path: Path,
+    boundary: str,
+    expected_jev_calls: int,
+    expected_intents: int,
+) -> None:
+    def crash(event: str) -> None:
+        if event == boundary:
+            raise RuntimeError("provider failpoint")
+
+    with pytest.raises(RuntimeError, match="provider failpoint"):
+        _observe(tmp_path, event_sink=crash)
+
+    class FreshRetrievalPublic(PublicNetwork):
+        def __call__(self, request: HttpRequest) -> HttpResponse:
+            response = super().__call__(request)
+            body = response.body
+            if "clob.polymarket.com" in request.url:
+                value = json.loads(body)
+                value["timestamp"] = str(int(value["timestamp"]) + 10_000)
+                body = _wire(value)
+            return HttpResponse(
+                response.status_code,
+                response.headers,
+                body,
+                response.retrieved_at + timedelta(seconds=10),
+            )
+
+    openai = ModelTransport("openai", _market_sha())
+    jev = ModelTransport("jev")
+    summary = _observe(
+        tmp_path,
+        public=FreshRetrievalPublic(),
+        openai=openai,
+        jev=jev,
+    )[0]
+
+    assert openai.requests == []
+    assert len(jev.requests) == expected_jev_calls
+    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 1
+    journal = [
+        json.loads(line)
+        for line in (tmp_path / "provider_calls.jsonl").read_text().splitlines()
+    ]
+    intents = [line for line in journal if line["kind"] == "provider_call_intent"]
+    assert len(intents) == expected_intents
+    assert len({line["call_id"] for line in intents}) == expected_intents
+    replay = load_observation(tmp_path, str(summary["observation_id"]))
+    assert replay.result.opportunity_id == summary["opportunity_id"]
+
+
 def test_same_slot_changed_evidence_after_jev_intent_never_calls_provider_again(
     tmp_path: Path,
 ) -> None:
@@ -2709,6 +2768,75 @@ def _overflowing_usage(provider: str, raw: bytes, input_tokens: int = 10**13) ->
     if provider == "openai":
         usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
     return json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+
+
+@pytest.mark.parametrize(
+    ("provider", "mutate"),
+    [
+        pytest.param("openai", lambda value: value.pop("usage"), id="openai-missing"),
+        pytest.param(
+            "jev",
+            lambda value: value["usage"].update(input_tokens="malformed"),
+            id="typesafe-malformed",
+        ),
+    ],
+)
+def test_unknown_provider_usage_terminalizes_without_zero_cost_and_replays_exactly(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    provider: str,
+    mutate: Callable[[dict[str, Any]], object],
+) -> None:
+    _billing_environment(monkeypatch)
+    fixture = json.loads(FIXTURE.read_text())
+    body = json.loads(fixture["model_artifacts"][f"{provider}_response_bytes"])
+    mutate(body)
+    live = ScriptedProvider(_wire(body), NOW + timedelta(seconds=2))
+    market = _market()
+    openai = (
+        live_openai_transport(network=live)
+        if provider == "openai"
+        else ModelTransport("openai", _market_sha(market))
+    )
+    jev = (
+        live_jev_transport(network=live) if provider == "jev" else ModelTransport("jev")
+    )
+
+    summary = _observe(
+        tmp_path,
+        market=market,
+        openai=openai,
+        jev=jev,
+    )[0]
+
+    assert len(live.requests) == 1
+    assert summary["ai"]["disposition"] == "MODEL_FAILURE"
+    assert summary["ai"]["model_cost_microdollars"] is None
+    assert summary["ai"]["economic_pnl_microdollars"] is None
+    assert summary["paired_economic_pnl_delta_microdollars"] is None
+    replay = load_observation(tmp_path, str(summary["observation_id"]))
+    failure = json.loads(replay.artifacts[f"{provider}_failure"])
+    assert failure["code"] == "PARSE_ERROR"
+    assert failure["cost_status"] == "UNKNOWN"
+    assert failure["billed_cost_microdollars"] is None
+    assert load_observation(tmp_path, str(summary["observation_id"])) == replay
+
+
+def test_timeout_after_intent_artifact_marks_cost_unknown(tmp_path: Path) -> None:
+    class TimeoutTransport(ModelTransport):
+        def __call__(self, request: bytes) -> TransportResponse:
+            self.requests.append(request)
+            raise TimeoutError("ambiguous timeout")
+
+    summary = _observe(tmp_path, openai=TimeoutTransport("openai"))[0]
+
+    replay = load_observation(tmp_path, str(summary["observation_id"]))
+    failure = json.loads(replay.artifacts["openai_failure"])
+    assert failure["code"] == "UNKNOWN_IN_FLIGHT"
+    assert failure["cost_status"] == "UNKNOWN"
+    assert failure["billed_cost_microdollars"] is None
+    assert replay.result.ai.model_cost_microdollars is None
+    assert replay.result.ai.economic_pnl_microdollars is None
 
 
 _OVERFLOW_TAILS = {

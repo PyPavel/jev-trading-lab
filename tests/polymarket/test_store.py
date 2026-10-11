@@ -72,7 +72,7 @@ def _result(cycle: dict[str, Any], suffix: str = "") -> ObservationResult:
                 {
                     "policy_version": value["policy_version"],
                     "market_id": value["market_id"],
-                    "cutoff_at": value["cutoff_at"],
+                    "slot_at": value["slot_at"],
                 }
             )
         ).hexdigest()
@@ -1536,7 +1536,7 @@ def _legacy_observation(
                     {
                         "policy_version": value["policy_version"],
                         "market_id": value["market_id"],
-                        "cutoff_at": value["cutoff_at"],
+                        "slot_at": value["slot_at"],
                     }
                 )
             ).hexdigest()

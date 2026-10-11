@@ -427,9 +427,9 @@ def test_openai_failure_records_both_terminal_arms(tmp_path: Path) -> None:
     )
 
     assert calls == 1
-    assert summary["ai"]["disposition"] == "MODEL_FAILURE"
+    assert summary["ai"]["disposition"] == "UNKNOWN_IN_FLIGHT"
     assert summary["ai"]["quantity"] == 0
-    assert summary["ai"]["economic_pnl_microdollars"] == 0
+    assert summary["ai"]["economic_pnl_microdollars"] is None
     assert summary["control"]["disposition"] == "NO_EDGE"
     assert summary["control"]["quantity"] == 0
     assert summary["artifact_count"] == 5
