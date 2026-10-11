@@ -55,6 +55,7 @@ from jev_trading_lab.polymarket.client import (
     CLOB_PATH,
     GAMMA_ENDPOINT,
     MAX_CLOB_TOKEN_ID_CHARS,
+    MAX_PUBLIC_BYTES,
     PrecheckTransportReason,
     _book_snapshot,
     _reason,
@@ -565,6 +566,31 @@ class EligibilityRejectionArtifact(UtcModel):
     raw_gamma_sha256: Sha256
     precheck_book_sha256: Sha256 | None = None
     rejected_at: datetime
+
+
+class PublicPollFailureArtifact(StrictModel):
+    """Sanitized bounded evidence for one terminal Gamma polling failure."""
+
+    reason: Literal["PUBLIC_DATA_TIMEOUT", "MALFORMED_PUBLIC_DATA"]
+    raw_response_b64: str
+
+    @model_validator(mode="after")
+    def require_bounded_raw_response(self) -> Self:
+        try:
+            raw = base64.b64decode(self.raw_response_b64, validate=True)
+        except ValueError as error:
+            raise ValueError("public poll failure bytes are invalid") from error
+        if len(raw) > MAX_PUBLIC_BYTES:
+            raise ValueError("public poll failure bytes exceed the public bound")
+        if self.reason == "PUBLIC_DATA_TIMEOUT" and raw:
+            raise ValueError("public timeout cannot contain response bytes")
+        return self
+
+
+class PublicPollFailureEnvelope(StrictModel):
+    """Distinct raw-Gamma shape reserved for failures before market rows exist."""
+
+    public_poll_failure: PublicPollFailureArtifact
 
 
 class PrecheckBookFailureArtifact(UtcModel):
@@ -1801,6 +1827,10 @@ def _reconstruct_orphan(kind: ArtifactKind, payload: bytes) -> TypedArtifact:
         value = load_strict_json(payload)
         if not isinstance(value, Mapping):
             raise ValueError("Gamma artifact must be a JSON object")
+        if "public_poll_failure" in value:
+            return _canonical_model(
+                PublicPollFailureEnvelope.model_validate_json(payload), payload
+            )
         return value
     if kind is ArtifactKind.SANITIZED_EVIDENCE:
         return EvidencePacket.model_validate_json(payload)
@@ -2097,6 +2127,13 @@ def _validate_reconstructed_path(
             return
         raw_gamma = typed.get(ArtifactKind.RAW_GAMMA)
         if result is not None and rejection.precheck_book_sha256 is None:
+            if isinstance(raw_gamma, PublicPollFailureEnvelope):
+                if (
+                    rejection.market_id != "PUBLIC_DATA"
+                    or rejection.reason != raw_gamma.public_poll_failure.reason
+                ):
+                    fail("public polling failure does not match frozen evidence")
+                return
             duplicate_rows: list[Mapping[str, object]] | None = None
             encoded_rows = (
                 raw_gamma.get("duplicate_market_data")

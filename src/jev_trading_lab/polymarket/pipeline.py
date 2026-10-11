@@ -42,10 +42,12 @@ from jev_trading_lab.polymarket.client import (
     CLOB_HOST,
     CLOB_PATH,
     GAMMA_ENDPOINT,
+    MAX_PUBLIC_BYTES,
     MarketCandidate,
     MarketRejection,
     PolymarketClient,
     PrecheckAttempt,
+    PublicDataError,
     SecureHttpTransport,
     reconstruct_book_snapshot,
 )
@@ -1093,6 +1095,50 @@ def _live_artifacts(
     return values, jev.decision, brief_hash, decision_hash, aggregate_cost
 
 
+def _rejection_terminal_status(reason: str) -> str:
+    return (
+        "PUBLIC_DATA_FAILURE"
+        if reason in {"PUBLIC_DATA_TIMEOUT", "MALFORMED_PUBLIC_DATA"}
+        else "ELIGIBILITY_REJECTION"
+    )
+
+
+def _public_poll_failure(
+    output_dir: str | os.PathLike[str],
+    error: PublicDataError,
+    *,
+    observed_at: datetime,
+    config: bytes,
+) -> list[Summary]:
+    reason = (
+        "PUBLIC_DATA_TIMEOUT"
+        if error.reason == "PUBLIC_DATA_TIMEOUT"
+        else "MALFORMED_PUBLIC_DATA"
+    )
+    raw = error.raw_bytes[:MAX_PUBLIC_BYTES]
+    payload = canonical_json_bytes(
+        {
+            "public_poll_failure": {
+                "raw_response_b64": base64.b64encode(raw).decode(),
+                "reason": reason,
+            }
+        }
+    )
+    return _record_rejections(
+        output_dir,
+        (
+            MarketRejection(
+                market_id="PUBLIC_DATA",
+                reason=reason,
+                raw_gamma_bytes=payload,
+                raw_gamma_sha256=hashlib.sha256(payload).hexdigest(),
+            ),
+        ),
+        observed_at=observed_at,
+        config=config,
+    )
+
+
 def _record_rejections(
     output_dir: str | os.PathLike[str],
     rejections: tuple[Any, ...],
@@ -1256,7 +1302,7 @@ def _record_rejections(
         summary = _summary(replay.result, replay.envelopes)
         summary.update(
             reason=rejection.reason,
-            terminal_status="ELIGIBILITY_REJECTION",
+            terminal_status=_rejection_terminal_status(rejection.reason),
         )
         summaries.append(summary)
     return summaries
@@ -1271,7 +1317,7 @@ def _replay_summary(replay: Any) -> Summary:
             raise ValueError("eligibility rejection replay is invalid")
         summary.update(
             reason=value["reason"],
-            terminal_status="ELIGIBILITY_REJECTION",
+            terminal_status=_rejection_terminal_status(value["reason"]),
         )
     return summary
 
@@ -1410,7 +1456,12 @@ def _observe_locked(
     public = client or PolymarketClient(SecureHttpTransport())
     openai_sender = openai_transport or live_openai_transport()
     jev_sender = jev_transport or live_jev_transport()
-    polled = public.poll(limit=limit, now=cutoff, history_points=2)
+    try:
+        polled = public.poll(limit=limit, now=cutoff, history_points=2)
+    except PublicDataError as error:
+        return _public_poll_failure(
+            output_dir, error, observed_at=cutoff, config=config
+        )
     summaries = _record_rejections(
         output_dir, polled.rejections, observed_at=cutoff, config=config
     )

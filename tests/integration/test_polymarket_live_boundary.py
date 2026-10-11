@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import fcntl
 import hashlib
 import json
@@ -28,6 +29,7 @@ from jev_trading_lab.polymarket.client import (
     HttpRequest,
     HttpResponse,
     PolymarketClient,
+    PublicDataTimeout,
 )
 from jev_trading_lab.polymarket.models import BookSnapshot
 from jev_trading_lab.polymarket.pipeline import observe_markets
@@ -372,6 +374,122 @@ def test_duplicate_gamma_rows_produce_one_observation_and_one_provider_pair(
     assert restarted == first
     assert len(first) == len({item["observation_id"] for item in first}) == 1
     assert len(openai.requests) == len(jev.requests) == 1
+
+
+def test_public_poll_timeout_records_one_replayable_failure_without_downstream_calls(
+    tmp_path: Path,
+) -> None:
+    class FailedPublic:
+        def __init__(self) -> None:
+            self.polls = 0
+            self.books = 0
+
+        def poll(self, **_kwargs: Any) -> object:
+            self.polls += 1
+            raise PublicDataTimeout(
+                "Gamma transport timed out", reason="PUBLIC_DATA_TIMEOUT"
+            )
+
+        def execution_book(self, *_args: Any, **_kwargs: Any) -> object:
+            self.books += 1
+            raise AssertionError("execution book must not be requested")
+
+    class ModelTrap:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, request_bytes: bytes) -> TransportResponse:
+            del request_bytes
+            self.calls += 1
+            raise AssertionError("model provider must not be called")
+
+    public = FailedPublic()
+    openai = ModelTrap()
+    jev = ModelTrap()
+    first = observe_markets(
+        limit=1,
+        output_dir=tmp_path,
+        client=public,  # type: ignore[arg-type]
+        openai_transport=openai,
+        jev_transport=jev,
+        now=NOW,
+    )
+    replay_public = FailedPublic()
+    second = observe_markets(
+        limit=1,
+        output_dir=tmp_path,
+        client=replay_public,  # type: ignore[arg-type]
+        openai_transport=ModelTrap(),
+        jev_transport=ModelTrap(),
+        now=NOW,
+    )
+
+    assert second == first
+    assert len(first) == 1
+    assert first[0]["reason"] == "PUBLIC_DATA_TIMEOUT"
+    assert first[0]["terminal_status"] == "PUBLIC_DATA_FAILURE"
+    assert public.polls == 1
+    assert public.books == openai.calls == jev.calls == replay_public.polls == 0
+    result = _single_result(tmp_path)
+    replay = load_observation(tmp_path, result["observation_id"])
+    failure = json.loads(replay.artifacts["raw_gamma"])
+    assert failure == {
+        "public_poll_failure": {"raw_response_b64": "", "reason": "PUBLIC_DATA_TIMEOUT"}
+    }
+
+
+def test_malformed_gamma_top_level_records_bounded_raw_failure(tmp_path: Path) -> None:
+    raw = b'{"unexpected":"object"}'
+
+    class MalformedPublic:
+        def __init__(self) -> None:
+            self.requests: list[HttpRequest] = []
+
+        def __call__(self, request: HttpRequest) -> HttpResponse:
+            self.requests.append(request)
+            assert "gamma-api" in request.url
+            return HttpResponse(200, JSON_HEADERS, raw, NOW)
+
+    public = MalformedPublic()
+    summaries = observe_markets(
+        limit=1,
+        output_dir=tmp_path,
+        client=PolymarketClient(public),
+        openai_transport=ModelTransport("openai"),
+        jev_transport=ModelTransport("jev"),
+        now=NOW,
+    )
+
+    assert len(summaries) == 1
+    assert summaries[0]["reason"] == "MALFORMED_PUBLIC_DATA"
+    assert summaries[0]["terminal_status"] == "PUBLIC_DATA_FAILURE"
+    assert len(public.requests) == 1
+    replay = load_observation(tmp_path, str(summaries[0]["observation_id"]))
+    failure = json.loads(replay.artifacts["raw_gamma"])["public_poll_failure"]
+    assert failure["reason"] == "MALFORMED_PUBLIC_DATA"
+    assert base64.b64decode(failure["raw_response_b64"], validate=True) == raw
+
+
+def test_duplicate_malformed_gamma_rows_converge_and_replay_cleanly(
+    tmp_path: Path,
+) -> None:
+    class DuplicateMalformed:
+        def __call__(self, request: HttpRequest) -> HttpResponse:
+            assert "gamma-api" in request.url
+            return HttpResponse(200, JSON_HEADERS, _wire([{"id": ""}, {"id": ""}]), NOW)
+
+    client = lambda: PolymarketClient(  # noqa: E731
+        DuplicateMalformed(), page_size=2, max_pages=1
+    )
+    first = observe_markets(limit=2, output_dir=tmp_path, client=client(), now=NOW)
+    second = observe_markets(limit=2, output_dir=tmp_path, client=client(), now=NOW)
+
+    assert second == first
+    assert len(first) == len({item["observation_id"] for item in first}) == 1
+    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 1
+    completed = json.loads((tmp_path / "completed_slots.jsonl").read_text())
+    assert completed["observation_ids"] == [first[0]["observation_id"]]
+    load_observation(tmp_path, str(first[0]["observation_id"]))
 
 
 def test_precheck_corruption_blocks_terminal_replay(tmp_path: Path) -> None:

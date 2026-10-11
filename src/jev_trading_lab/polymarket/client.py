@@ -962,7 +962,11 @@ class PolymarketClient:
                 f"{GAMMA_ENDPOINT}?{params}", label="Gamma"
             )
             if not isinstance(value, list):
-                raise PublicDataError("Gamma response must be an array")
+                raise PublicDataError(
+                    "Gamma response must be an array",
+                    raw_bytes=raw,
+                    retrieved_at=retrieved_at,
+                )
             raw_items = _market_raw_items(raw)
             if len(raw_items) != len(value):
                 raise PublicDataError("Gamma raw item count is inconsistent")
@@ -983,11 +987,14 @@ class PolymarketClient:
         positions: dict[str, int] = {}
         semantics: dict[str, bytes] = {}
         conflict_rows: dict[str, list[bytes]] = {}
+        malformed_rows: set[bytes] = set()
         for row in normalized:
             try:
                 market_identity, semantic = _gamma_semantic_identity(row[3])
             except (TypeError, ValueError):
-                unique.append(row)
+                if row[2] not in malformed_rows:
+                    malformed_rows.add(row[2])
+                    unique.append(row)
                 continue
             market_id = market_identity[0]
             position = positions.get(market_id)
