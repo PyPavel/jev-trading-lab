@@ -18,6 +18,7 @@ from jev_trading_lab.polymarket.client import (
     PublicDataTimeout,
     SecureHttpTransport,
     normalize_gamma_identity,
+    sanitized_gamma_identity,
 )
 from jev_trading_lab.polymarket.models import BookLevel, BookSnapshot
 
@@ -699,6 +700,115 @@ _TEXT_FIELDS = [
     "endDate",
 ]
 _HOSTILE_VALUES = st.one_of(_JSON, st.sampled_from(_HOSTILE_STRINGS))
+
+
+@pytest.mark.parametrize(
+    ("description", "secret", "expected"),
+    (
+        (
+            "The bearer token value is ValueSecret in the report.",
+            "ValueSecret",
+            "The [REDACTED] in the report.",
+        ),
+        (
+            "The bearer token was PastSecret in the report.",
+            "PastSecret",
+            "The [REDACTED] in the report.",
+        ),
+        (
+            "API key credential equals AlphabeticSecret!",
+            "AlphabeticSecret",
+            "[REDACTED]!",
+        ),
+        (
+            "The ACCESS_TOKEN value = Mixed-123_Secret; retain evidence.",
+            "Mixed-123_Secret",
+            "The [REDACTED]; retain evidence.",
+        ),
+        (
+            "The refresh-token credential: RefreshSecret.",
+            "RefreshSecret",
+            "The [REDACTED].",
+        ),
+        (
+            "The vendorSessionTokenV4 was SessionSecret, per report.",
+            "SessionSecret",
+            "The [REDACTED], per report.",
+        ),
+        (
+            "The client secret value equals ClientSecretValue?",
+            "ClientSecretValue",
+            "The [REDACTED]?",
+        ),
+        (
+            "The ｂｅａｒｅｒ＿ｔｏｋｅｎ-v2 credential was UnicodeSecret.",
+            "UnicodeSecret",
+            "The [REDACTED].",
+        ),
+    ),
+)
+def test_gamma_credential_assignment_redacts_semantic_variants(
+    description: str, secret: str, expected: str
+) -> None:
+    sanitized = sanitized_gamma_identity(market(description=description))["description"]
+
+    assert isinstance(sanitized, str)
+    assert secret not in sanitized
+    assert sanitized == expected
+
+
+@pytest.mark.parametrize(
+    "description",
+    (
+        "The bearer token value is required for client setup.",
+        "The api key was optional for client setup.",
+        "The access token equals unavailable.",
+        "The refresh token credential is documented in the guide.",
+        "The client secret: configured.",
+        "The session token value was needed during setup.",
+        "The bearer token rotates daily.",
+        "The bearer token value is. SentenceBoundarySecret follows.",
+        "The bearer token value was\nSentenceBoundarySecret.",
+    ),
+)
+def test_gamma_credential_assignment_preserves_harmless_near_misses(
+    description: str,
+) -> None:
+    sanitized = sanitized_gamma_identity(market(description=description))["description"]
+
+    assert sanitized == description
+
+
+_CREDENTIAL_PHRASES = st.sampled_from(
+    (
+        "bearer token",
+        "API_KEY-v2",
+        "AccessTokenV3",
+        "refresh-token",
+        "vendorSessionToken_v4",
+        "client secret",
+    )
+)
+_CREDENTIAL_CONNECTORS = st.sampled_from(
+    (" is ", " was ", " equals ", " value is ", " credential was ", ": ", " = ")
+)
+_CREDENTIAL_SECRET_VALUES = st.from_regex(
+    r"[A-Za-z][A-Za-z0-9_-]{7,31}", fullmatch=True
+).filter(lambda value: value.casefold() not in {"available", "documented", "required"})
+
+
+@_PROPERTY
+@given(_CREDENTIAL_PHRASES, _CREDENTIAL_CONNECTORS, _CREDENTIAL_SECRET_VALUES)
+def test_gamma_credential_assignment_fuzz_never_retains_candidate(
+    phrase: str, connector: str, secret: str
+) -> None:
+    description = f"Before. {phrase}{connector}{secret}! After."
+
+    sanitized = sanitized_gamma_identity(market(description=description))["description"]
+
+    assert isinstance(sanitized, str)
+    assert secret not in sanitized
+    assert sanitized == "Before. [REDACTED]! After."
 
 
 @_PROPERTY

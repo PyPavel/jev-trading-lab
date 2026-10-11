@@ -3323,6 +3323,15 @@ def test_hardening_gamma_access_token_prose_never_reaches_model_or_artifacts(
             "The bearer token is AlphabeticSecret in the report.",
             b"AlphabeticSecret",
         ),
+        (
+            "The bearer token value is ValueSecret in the report.",
+            b"ValueSecret",
+        ),
+        ("The bearer token was PastSecret in the report.", b"PastSecret"),
+        (
+            "The bearer token credential equals Mixed-123_Secret in the report.",
+            b"Mixed-123_Secret",
+        ),
         ("The bearer token: Mixed-123_Secret in the report.", b"Mixed-123_Secret"),
         ("The bearer token=AlphabeticSecret in the report.", b"AlphabeticSecret"),
         ("The BEARER TOKEN is CaseSecret in the report.", b"CaseSecret"),
@@ -3426,6 +3435,9 @@ def test_hardening_gamma_credential_is_prose_never_reaches_model_or_artifacts(
         "The bearer token is stored for client setup.",
         "The bearer token is unavailable during maintenance.",
         "The bearer token is used for client setup.",
+        "The bearer token was optional for client setup.",
+        "The bearer token value is required for client setup.",
+        "The bearer token credential equals unavailable.",
     ),
 )
 def test_hardening_harmless_credential_noun_prose_is_not_redacted(

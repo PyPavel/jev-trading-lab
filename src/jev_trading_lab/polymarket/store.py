@@ -60,6 +60,7 @@ from jev_trading_lab.polymarket.client import (
     PrecheckTransportReason,
     _book_snapshot,
     _reason,
+    _sanitize_public_prose,
     derive_precheck_rejection,
     derive_precheck_transport_reason,
     gamma_clob_identity,
@@ -96,10 +97,7 @@ _MAX_LINE_BYTES = 1024 * 1024
 _MAX_JOURNAL_BYTES = 64 * 1024 * 1024
 _SECRET_PATTERN = re.compile(
     r"(?i)(?:sk-[a-z0-9_-]{8,}|openai_api_key|typesafe_api_key|"
-    r"bearer\s+(?!token(?:[-_.\s]?v?\d+)*\s+is\s+(?:available|configured|"
-    r"documented|needed|optional|required|stored|unavailable|used)\b)\S{4,}|"
-    r"basic\s+\S{4,}|"
-    r"(?:authorization|proxy-authorization|"
+    r"basic\s+\S{4,}|(?:authorization|proxy-authorization|"
     r"cookie|set-cookie|x-api-key|api[-_]?key)\s*[:=]\s*\S{4,})"
 )
 _CREDENTIAL_KEYS = frozenset(
@@ -1030,9 +1028,13 @@ def _contains_credentials(
         )
     if isinstance(value, str):
         normalized = unicodedata.normalize("NFKC", value).casefold()
-        return (patterns and bool(_SECRET_PATTERN.search(normalized))) or any(
-            sentinel in normalized for sentinel in sentinels
-        )
+        return (
+            patterns
+            and (
+                bool(_SECRET_PATTERN.search(normalized))
+                or _sanitize_public_prose(normalized) != normalized
+            )
+        ) or any(sentinel in normalized for sentinel in sentinels)
     return False
 
 
@@ -1759,8 +1761,14 @@ def _screen_payload(
         if strict_json:
             raise StoreSecurityError("structured artifact is not UTF-8") from None
         return
-    if (patterns and _SECRET_PATTERN.search(text)) or any(
-        sentinel in text for sentinel in sentinels
+    if (
+        patterns
+        and (
+            _SECRET_PATTERN.search(text)
+            or not strict_json
+            and _sanitize_public_prose(text) != text
+        )
+        or any(sentinel in text for sentinel in sentinels)
     ):
         raise StoreSecurityError("artifact contains credential-like data")
     if strict_json:

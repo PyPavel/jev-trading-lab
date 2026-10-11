@@ -579,27 +579,37 @@ def normalize_gamma_identity(value: Mapping[str, object]) -> dict[str, object]:
     }
 
 
-_PUBLIC_BEARER_ASSIGNMENT_PATTERN = re.compile(
-    r"(?i)(?P<name>[\w.-]{0,128}bearer[-_\s]?token"
-    r"(?:[-_.\s]?v?\d+)*)\s*(?P<connector>is\b|[:=])\s*(?P<value>\S{4,})"
-)
-_PUBLIC_CREDENTIAL_PATTERN = re.compile(
+_PUBLIC_DIRECT_CREDENTIAL_PATTERN = re.compile(
     r"(?i)(?:sk-[a-z0-9_-]{8,}|"
-    r"bearer\s+(?!token(?:[-_.\s]?v?\d+)*\s*(?:is\b|[:=]))\S{4,}|"
-    r"basic\s+\S{4,}|"
-    r"(?:[\w.-]{0,128})(?:authorization|proxy[-_\s]?authorization|cookie|"
-    r"set[-_\s]?cookie|x[-_\s]?api[-_\s]?key|api[-_\s]?key|"
-    r"access[-_\s]?token|refresh[-_\s]?token|client[-_\s]?secret|"
-    r"session[-_\s]?token)"
-    r"(?:[-_.\s]?v?\d+)*\s*[:=]\s*\S{4,})"
+    r"bearer[ \t]+(?!token(?:[-_.]?(?:v)?\d+)*\b)\S{4,}|"
+    r"basic[ \t]+\S{4,})"
 )
-_PUBLIC_ASSIGNMENT_PATTERN = re.compile(
-    r"(?P<name>[\w.-]{1,256})\s*[:=]\s*(?P<value>\S{4,})"
+_PUBLIC_PROSE_WORD_PATTERN = re.compile(r"\w+")
+_PUBLIC_CREDENTIAL_NAME_STARTS = frozenset(
+    {
+        "access",
+        "api",
+        "auth",
+        "authorization",
+        "bearer",
+        "client",
+        "cookie",
+        "id",
+        "oauth",
+        "password",
+        "private",
+        "proxy",
+        "refresh",
+        "secret",
+        "security",
+        "session",
+        "set",
+        "x",
+    }
 )
-_PUBLIC_IS_ASSIGNMENT_PATTERN = re.compile(
-    r"(?i)(?P<name>[\w.-]+(?:\s+[\w.-]+){0,4})\s+is\s+(?P<value>\S{4,})"
-)
-_PUBLIC_IS_PREDICATE_WORDS = frozenset(
+_PUBLIC_CREDENTIAL_CONNECTOR_WORDS = ("equals", "was", "is")
+_PUBLIC_CREDENTIAL_QUALIFIERS = ("credential", "value")
+_PUBLIC_HARMLESS_PREDICATES = frozenset(
     {
         "available",
         "configured",
@@ -612,36 +622,142 @@ _PUBLIC_IS_PREDICATE_WORDS = frozenset(
         "used",
     }
 )
+_PUBLIC_TRAILING_PUNCTUATION = frozenset(".,;:!?")
+_PUBLIC_CANDIDATE_BOUNDARIES = frozenset(".,;:!?\"'\\()[]{}<>")
+_PUBLIC_MAX_CREDENTIAL_WORDS = 4
+_PUBLIC_MIN_CANDIDATE_CHARS = 4
+
+
+def _skip_public_horizontal_space(text: str, start: int) -> int:
+    while start < len(text) and text[start] in " \t":
+        start += 1
+    return start
+
+
+def _public_word_at(text: str, start: int, words: tuple[str, ...]) -> int | None:
+    for word in words:
+        end = start + len(word)
+        if text[start:end].casefold() == word and (
+            end == len(text) or not text[end].isalnum() and text[end] != "_"
+        ):
+            return end
+    return None
+
+
+def _public_assignment_value_start(text: str, name_end: int) -> int | None:
+    cursor = _skip_public_horizontal_space(text, name_end)
+    qualifier_end = _public_word_at(text, cursor, _PUBLIC_CREDENTIAL_QUALIFIERS)
+    if qualifier_end is not None:
+        cursor = _skip_public_horizontal_space(text, qualifier_end)
+    connector_end = _public_word_at(text, cursor, _PUBLIC_CREDENTIAL_CONNECTOR_WORDS)
+    if connector_end is not None:
+        cursor = connector_end
+    elif cursor < len(text) and text[cursor] in ":=":
+        cursor += 1
+    else:
+        return None
+    return _skip_public_horizontal_space(text, cursor)
+
+
+def _public_credential_name_end(
+    text: str, words: list[re.Match[str]], start: int
+) -> int | None:
+    first = words[start].group(0)
+    if (
+        not is_credential_name(first)
+        and first.casefold() not in _PUBLIC_CREDENTIAL_NAME_STARTS
+    ):
+        return None
+    stop = min(len(words), start + _PUBLIC_MAX_CREDENTIAL_WORDS)
+    for end in range(start + 1, stop + 1):
+        if end > start + 1:
+            separator = text[words[end - 2].end() : words[end - 1].start()]
+            if not separator or any(
+                character not in " \t._-" for character in separator
+            ):
+                break
+        name = text[words[start].start() : words[end - 1].end()]
+        if (
+            is_credential_name(name)
+            and _public_assignment_value_start(text, words[end - 1].end()) is not None
+        ):
+            return words[end - 1].end()
+    return None
+
+
+def _public_credential_assignment_spans(text: str) -> list[tuple[int, int]]:
+    words = list(_PUBLIC_PROSE_WORD_PATTERN.finditer(text))
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(words):
+        name_end = _public_credential_name_end(text, words, index)
+        value_start = (
+            _public_assignment_value_start(text, name_end)
+            if name_end is not None
+            else None
+        )
+        if (
+            value_start is None
+            or value_start >= len(text)
+            or text[value_start].isspace()
+        ):
+            index += 1
+            continue
+        value_end = value_start
+        while (
+            value_end < len(text)
+            and not text[value_end].isspace()
+            and text[value_end] not in _PUBLIC_CANDIDATE_BOUNDARIES
+        ):
+            value_end += 1
+        candidate_end = value_end
+        while (
+            candidate_end > value_start
+            and text[candidate_end - 1] in _PUBLIC_TRAILING_PUNCTUATION
+        ):
+            candidate_end -= 1
+        candidate = text[value_start:candidate_end]
+        if (
+            len(candidate) < _PUBLIC_MIN_CANDIDATE_CHARS
+            or candidate.casefold() in _PUBLIC_HARMLESS_PREDICATES
+        ):
+            index += 1
+            continue
+        spans.append((words[index].start(), candidate_end))
+        while index < len(words) and words[index].start() < value_end:
+            index += 1
+    return spans
+
+
+def _redact_public_assignments(text: str) -> str:
+    spans = _public_credential_assignment_spans(text)
+    if not spans:
+        return text
+    parts: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        parts.extend((text[cursor:start], "[REDACTED]"))
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def _redact_public_direct_credential(match: re.Match[str]) -> str:
+    value = match.group(0)
+    punctuation_start = len(value)
+    while (
+        punctuation_start > 0
+        and value[punctuation_start - 1] in _PUBLIC_TRAILING_PUNCTUATION
+    ):
+        punctuation_start -= 1
+    return "[REDACTED]" + value[punctuation_start:]
 
 
 def _sanitize_public_prose(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", text)
-    sanitized = _PUBLIC_BEARER_ASSIGNMENT_PATTERN.sub(
-        lambda match: (
-            "[REDACTED]"
-            if match.group("connector").casefold() != "is"
-            or match.group("value").casefold().rstrip(".,;:!?")
-            not in _PUBLIC_IS_PREDICATE_WORDS
-            else match.group(0)
-        ),
-        normalized,
-    )
-    sanitized = _PUBLIC_CREDENTIAL_PATTERN.sub("[REDACTED]", sanitized)
-    sanitized = _PUBLIC_IS_ASSIGNMENT_PATTERN.sub(
-        lambda match: (
-            "[REDACTED]"
-            if is_credential_name(match.group("name"))
-            and match.group("value").casefold().rstrip(".,;:!?")
-            not in _PUBLIC_IS_PREDICATE_WORDS
-            else match.group(0)
-        ),
-        sanitized,
-    )
-    return _PUBLIC_ASSIGNMENT_PATTERN.sub(
-        lambda match: (
-            "[REDACTED]" if is_credential_name(match.group("name")) else match.group(0)
-        ),
-        sanitized,
+    sanitized = _redact_public_assignments(normalized)
+    return _PUBLIC_DIRECT_CREDENTIAL_PATTERN.sub(
+        _redact_public_direct_credential, sanitized
     )
 
 
