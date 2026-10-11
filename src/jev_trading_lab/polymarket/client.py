@@ -581,19 +581,32 @@ def normalize_gamma_identity(value: Mapping[str, object]) -> dict[str, object]:
 
 _PUBLIC_CREDENTIAL_PATTERN = re.compile(
     r"(?i)(?:sk-[a-z0-9_-]{8,}|bearer\s+\S{4,}|basic\s+\S{4,}|"
-    r"(?:[\w.-]{0,128})(?:authorization|proxy[-_]?authorization|cookie|"
-    r"set[-_]?cookie|x[-_]?api[-_]?key|api[-_]?key|access[-_]?token|"
-    r"refresh[-_]?token|client[-_]?secret|session[-_]?token)"
-    r"(?:[-_.]?v?\d*)*\s*[:=]\s*\S{4,})"
+    r"(?:[\w.-]{0,128})(?:authorization|proxy[-_\s]?authorization|cookie|"
+    r"set[-_\s]?cookie|x[-_\s]?api[-_\s]?key|api[-_\s]?key|"
+    r"access[-_\s]?token|refresh[-_\s]?token|client[-_\s]?secret|"
+    r"session[-_\s]?token)"
+    r"(?:[-_.\s]?v?\d+)*\s*[:=]\s*\S{4,})"
 )
 _PUBLIC_ASSIGNMENT_PATTERN = re.compile(
     r"(?P<name>[\w.-]{1,256})\s*[:=]\s*(?P<value>\S{4,})"
+)
+_PUBLIC_IS_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)(?P<name>[\w.-]+(?:\s+[\w.-]+){0,4})\s+is\s+(?P<value>\S{4,})"
 )
 
 
 def _sanitize_public_prose(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", text)
     sanitized = _PUBLIC_CREDENTIAL_PATTERN.sub("[REDACTED]", normalized)
+    sanitized = _PUBLIC_IS_ASSIGNMENT_PATTERN.sub(
+        lambda match: (
+            "[REDACTED]"
+            if is_credential_name(match.group("name"))
+            and any(character.isdigit() for character in match.group("value"))
+            else match.group(0)
+        ),
+        sanitized,
+    )
     return _PUBLIC_ASSIGNMENT_PATTERN.sub(
         lambda match: (
             "[REDACTED]" if is_credential_name(match.group("name")) else match.group(0)

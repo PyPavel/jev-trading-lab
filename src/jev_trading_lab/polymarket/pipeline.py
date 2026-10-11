@@ -1354,7 +1354,50 @@ def observe_markets(
             output_dir, cutoff=slot, policy_version=POLICY_VERSION, limit=limit
         )
         if completed is not None:
-            return [_replay_summary(item) for item in completed]
+            completed_opportunities = {item.result.opportunity_id for item in completed}
+            journal = ProviderCallJournal(output_dir)
+            pending = [
+                opportunity_id
+                for opportunity_id in journal.pending_opportunity_ids_created_at(slot)
+                if opportunity_id not in completed_opportunities
+            ]
+            recovered: list[MarketCandidate] = []
+            for opportunity_id in pending:
+                candidate = _frozen_candidate_for_opportunity(
+                    opportunity_id, output_dir=output_dir, slot=slot
+                )
+                if candidate is None:
+                    raise ValueError(
+                        "durable provider intent lacks frozen observation input"
+                    )
+                recovered.append(candidate)
+            if not recovered:
+                return [_replay_summary(item) for item in completed]
+            summaries = [_replay_summary(item) for item in completed]
+            summaries.extend(
+                _observe_locked(
+                    limit=limit,
+                    output_dir=output_dir,
+                    config=config,
+                    client=client,
+                    openai_transport=openai_transport,
+                    jev_transport=jev_transport,
+                    now=slot,
+                    event_sink=event_sink,
+                    recovered_only=tuple(recovered),
+                )
+            )
+            observation_ids = list(
+                dict.fromkeys(str(item["observation_id"]) for item in summaries)
+            )
+            record_completed_slot(
+                output_dir,
+                cutoff=slot,
+                policy_version=POLICY_VERSION,
+                limit=limit,
+                observation_ids=observation_ids,
+            )
+            return summaries
         summaries = _observe_locked(
             limit=limit,
             output_dir=output_dir,
@@ -1467,52 +1510,58 @@ def _frozen_candidate(
     )
     raw_gamma = frozen_artifacts.get("raw_gamma")
     precheck_raw = frozen_artifacts.get("precheck_book_raw")
+    precheck_http = frozen_artifacts.get("precheck_book_http")
     history_raw = frozen_artifacts.get("causal_history")
     if (
-        evidence.market_id != candidate.market_id
-        or raw_gamma is None
+        raw_gamma is None
         or precheck_raw is None
+        or precheck_http is None
         or history_raw is None
     ):
         raise ValueError("frozen observation inputs are incomplete")
+    raw_gamma_value = load_strict_json(raw_gamma)
     history = load_strict_json(history_raw)
-    if not isinstance(history, dict):
-        raise ValueError("frozen causal history is invalid")
+    if not isinstance(raw_gamma_value, dict) or not isinstance(history, dict):
+        raise ValueError("frozen observation inputs are invalid")
+    market_id, condition_id, yes_token_id, no_token_id = gamma_clob_identity(
+        raw_gamma_value
+    )
+    if evidence.market_id != market_id:
+        raise ValueError("frozen observation inputs are invalid")
     raw_books = [
         base64.b64decode(value, validate=True) for value in history["raw_books_b64"]
     ]
     retrieved = [_dt(value) for value in history["response_retrieved_at"]]
     books = tuple(
-        reconstruct_book_snapshot(
-            raw, market_id=candidate.market_id, response_retrieved_at=at
-        )
+        reconstruct_book_snapshot(raw, market_id=market_id, response_retrieved_at=at)
         for raw, at in zip(raw_books, retrieved, strict=True)
     )
-    attempt = candidate.precheck_attempt
+    http = PrecheckHttpArtifact.model_validate_json(precheck_http)
+    attempt = PrecheckAttempt(
+        token_id=http.request_token_id,
+        attempted_at=http.attempted_at,
+        status_code=http.status_code,
+        content_type=http.content_type,
+        retrieved_at=http.retrieved_at,
+        body=precheck_raw,
+        truncated=http.response_truncated,
+        transport_reason=http.transport_reason,
+    )
     return MarketCandidate(
-        market_id=candidate.market_id,
-        condition_id=candidate.condition_id,
-        yes_token_id=candidate.yes_token_id,
-        no_token_id=candidate.no_token_id,
+        market_id=market_id,
+        condition_id=condition_id,
+        yes_token_id=yes_token_id,
+        no_token_id=no_token_id,
         slot_at=candidate.slot_at,
         raw_gamma_bytes=raw_gamma,
         raw_gamma_sha256=evidence.source_sha256,
         evidence=evidence,
         precheck_book_bytes=precheck_raw,
         precheck_book=books[0],
-        precheck_attempt=PrecheckAttempt(
-            candidate.yes_token_id,
-            retrieved[0],
-            attempt.status_code,
-            attempt.content_type,
-            retrieved[0],
-            precheck_raw,
-            attempt.truncated,
-            attempt.transport_reason,
-        ),
+        precheck_attempt=attempt,
         precheck_history_bytes=(raw_books[0], raw_books[1]),
         precheck_history=(books[0], books[1]),
-        precheck_attempts=candidate.precheck_attempts,
+        precheck_attempts=(attempt, attempt),
     )
 
 
@@ -1526,36 +1575,42 @@ def _observe_locked(
     jev_transport: Transport | None,
     now: datetime | None,
     event_sink: EventSink | None,
+    recovered_only: tuple[MarketCandidate, ...] | None = None,
 ) -> list[Summary]:
     cutoff = observation_slot(now or datetime.now(UTC))
     public = client or PolymarketClient(SecureHttpTransport())
     openai_sender = openai_transport or live_openai_transport()
     jev_sender = jev_transport or live_jev_transport()
     call_journal = ProviderCallJournal(output_dir)
-    recovered: list[MarketCandidate] = []
-    for opportunity_id in call_journal.opportunity_ids_created_at(cutoff):
-        candidate = _frozen_candidate_for_opportunity(
-            opportunity_id, output_dir=output_dir, slot=cutoff
-        )
-        if candidate is not None:
-            recovered.append(candidate)
-    try:
-        polled = public.poll(limit=limit, now=cutoff, history_points=2)
-    except PublicDataError as error:
-        if not recovered:
-            return _public_poll_failure(
-                output_dir, error, observed_at=cutoff, config=config
+    recovered: list[MarketCandidate] = list(recovered_only or ())
+    if recovered_only is None:
+        for opportunity_id in call_journal.opportunity_ids_created_at(cutoff):
+            candidate = _frozen_candidate_for_opportunity(
+                opportunity_id, output_dir=output_dir, slot=cutoff
             )
+            if candidate is not None:
+                recovered.append(candidate)
+    if recovered_only is not None:
         eligible: tuple[MarketCandidate, ...] = ()
         rejections: list[MarketRejection] = []
     else:
-        recovered_markets = {candidate.market_id for candidate in recovered}
-        eligible = polled.eligible
-        rejections = [
-            rejection
-            for rejection in polled.rejections
-            if rejection.market_id not in recovered_markets
-        ]
+        try:
+            polled = public.poll(limit=limit, now=cutoff, history_points=2)
+        except PublicDataError as error:
+            if not recovered:
+                return _public_poll_failure(
+                    output_dir, error, observed_at=cutoff, config=config
+                )
+            eligible = ()
+            rejections = []
+        else:
+            recovered_markets = {candidate.market_id for candidate in recovered}
+            eligible = polled.eligible
+            rejections = [
+                rejection
+                for rejection in polled.rejections
+                if rejection.market_id not in recovered_markets
+            ]
     summaries = _record_rejections(
         output_dir, tuple(rejections), observed_at=cutoff, config=config
     )

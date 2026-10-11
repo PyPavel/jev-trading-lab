@@ -3449,7 +3449,12 @@ def load_completed_slot(
             and value["limit"] == limit
         ):
             if selected is not None and selected != value:
-                raise StoreCorruptError("completed slot has conflicting records")
+                prior_ids = selected["observation_ids"]
+                if (
+                    not isinstance(prior_ids, list)
+                    or ids[: len(prior_ids)] != prior_ids
+                ):
+                    raise StoreCorruptError("completed slot has conflicting records")
             selected = value
     if selected is None:
         return None

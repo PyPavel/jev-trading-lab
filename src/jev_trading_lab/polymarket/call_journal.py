@@ -636,6 +636,26 @@ class ProviderCallJournal:
             os.close(descriptor)
             os.close(root_fd)
 
+    def pending_opportunity_ids_created_at(
+        self, created_at: datetime
+    ) -> tuple[str, ...]:
+        """Return same-slot opportunities with a durable unterminated provider call."""
+
+        root_fd, descriptor, states = self._locked_states(fcntl.LOCK_SH)
+        try:
+            return tuple(
+                sorted(
+                    {
+                        intent.opportunity_id
+                        for intent, result, _envelope in states.values()
+                        if intent.created_at == created_at and result is None
+                    }
+                )
+            )
+        finally:
+            os.close(descriptor)
+            os.close(root_fd)
+
     def begin(
         self,
         *,

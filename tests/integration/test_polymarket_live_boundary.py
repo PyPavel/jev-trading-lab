@@ -2286,6 +2286,115 @@ def test_crash_after_provider_intent_never_retries_unknown_call(tmp_path: Path) 
     assert failure["code"] == "UNKNOWN_IN_FLIGHT"
 
 
+def test_completed_slot_replay_terminalizes_other_same_slot_pending_intent(
+    tmp_path: Path,
+) -> None:
+    first_market = _market()
+    second_market = first_market | {
+        "id": "live-m2",
+        "conditionId": "condition-live-m2",
+        "question": "Will the second public event occur?",
+        "clobTokenIds": '["yes-live-m2","no-live-m2"]',
+        "endDate": (NOW + timedelta(days=3)).isoformat().replace("+00:00", "Z"),
+    }
+
+    class TwoMarketPublic:
+        def __init__(self) -> None:
+            self.requests: list[HttpRequest] = []
+            self.book_numbers: dict[str, int] = {}
+
+        def __call__(self, request: HttpRequest) -> HttpResponse:
+            self.requests.append(request)
+            if "gamma-api" in request.url:
+                return HttpResponse(
+                    200, JSON_HEADERS, _wire([first_market, second_market]), NOW
+                )
+            token = "yes-live-m2" if "yes-live-m2" in request.url else "yes-live-m1"
+            number = self.book_numbers.get(token, 0)
+            self.book_numbers[token] = number + 1
+            market_id = "live-m2" if token.endswith("m2") else "live-m1"
+            book = _book(number if number < 2 else 3) | {
+                "market": f"condition-{market_id}",
+                "asset_id": token,
+            }
+            retrieved_at = datetime.fromtimestamp(int(book["timestamp"]) / 1000, UTC)
+            return HttpResponse(200, JSON_HEADERS, _wire(book), retrieved_at)
+
+    first = observe_markets(
+        limit=1,
+        output_dir=tmp_path,
+        client=PolymarketClient(TwoMarketPublic(), page_size=2, max_pages=1),
+        openai_transport=ModelTransport("openai", _market_sha(first_market)),
+        jev_transport=ModelTransport("jev"),
+        now=NOW,
+    )
+    assert len(first) == 1
+
+    def crash(event: str) -> None:
+        if event == "openai_intent_frozen":
+            raise RuntimeError("second market provider intent frozen")
+
+    with pytest.raises(RuntimeError, match="second market"):
+        observe_markets(
+            limit=2,
+            output_dir=tmp_path,
+            client=PolymarketClient(TwoMarketPublic(), page_size=2, max_pages=1),
+            openai_transport=ModelTransport("openai", _market_sha(second_market)),
+            jev_transport=ModelTransport("jev"),
+            now=NOW,
+            event_sink=crash,
+        )
+
+    class NoCalls:
+        def __init__(self) -> None:
+            self.requests: list[object] = []
+
+        def __call__(self, request: object) -> Any:
+            self.requests.append(request)
+            raise AssertionError("completed-slot recovery must not call transports")
+
+    public = NoCalls()
+    recovered = observe_markets(
+        limit=1,
+        output_dir=tmp_path,
+        client=PolymarketClient(public),
+        now=NOW,
+    )
+
+    assert len(recovered) == 2
+    assert len({item["observation_id"] for item in recovered}) == 2
+    assert recovered[0] == first[0]
+    assert recovered[1]["ai"]["disposition"] == "UNKNOWN_IN_FLIGHT"
+    assert recovered[1]["ai"]["model_cost_microdollars"] is None
+    assert public.requests == []
+    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 2
+
+    completed = [
+        json.loads(line)
+        for line in (tmp_path / "completed_slots.jsonl").read_text().splitlines()
+    ]
+    assert completed[-1]["limit"] == 1
+    assert completed[-1]["observation_ids"] == [
+        item["observation_id"] for item in recovered
+    ]
+
+    replay_public = NoCalls()
+    replay_openai = NoCalls()
+    replay_jev = NoCalls()
+    assert (
+        observe_markets(
+            limit=1,
+            output_dir=tmp_path,
+            client=PolymarketClient(replay_public),
+            openai_transport=replay_openai,
+            jev_transport=replay_jev,
+            now=NOW,
+        )
+        == recovered
+    )
+    assert replay_public.requests == replay_openai.requests == replay_jev.requests == []
+
+
 def test_poll_failure_cannot_complete_slot_before_pending_provider_recovery(
     tmp_path: Path,
 ) -> None:
@@ -2507,6 +2616,64 @@ def test_same_slot_changed_evidence_never_calls_provider_again(
     assert summary["ai"]["disposition"] == "UNKNOWN_IN_FLIGHT"
     assert summary["ai"]["model_cost_microdollars"] is None
     assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 1
+
+
+def test_pending_recovery_ignores_same_market_gamma_token_drift(
+    tmp_path: Path,
+) -> None:
+    market = _market()
+
+    def crash(event: str) -> None:
+        if event == "openai_intent_frozen":
+            raise RuntimeError("failpoint after provider intent")
+
+    with pytest.raises(RuntimeError, match="failpoint"):
+        _observe(tmp_path, market=market, event_sink=crash)
+
+    drifted = market | {"clobTokenIds": '["yes-drifted","no-drifted"]'}
+
+    class DriftedPublic(PublicNetwork):
+        def __call__(self, request: HttpRequest) -> HttpResponse:
+            response = super().__call__(request)
+            if "clob.polymarket.com" not in request.url:
+                return response
+            value = json.loads(response.body)
+            value["asset_id"] = "yes-drifted"
+            return HttpResponse(
+                response.status_code,
+                response.headers,
+                _wire(value),
+                response.retrieved_at,
+            )
+
+    public = DriftedPublic(drifted)
+    openai = ModelTransport("openai", _market_sha(drifted))
+    jev = ModelTransport("jev")
+    summary = _observe(
+        tmp_path,
+        market=drifted,
+        public=public,
+        openai=openai,
+        jev=jev,
+    )[0]
+
+    assert summary["ai"]["disposition"] == "UNKNOWN_IN_FLIGHT"
+    assert summary["ai"]["model_cost_microdollars"] is None
+    assert summary["ai"]["economic_pnl_microdollars"] is None
+    assert summary["paired_economic_pnl_delta_microdollars"] is None
+    assert openai.requests == [] and jev.requests == []
+    replay = load_observation(tmp_path, str(summary["observation_id"]))
+    assert replay.result.evidence_sha256 == _market_sha(market)
+    raw_gamma = json.loads(replay.artifacts["raw_gamma"])
+    assert raw_gamma["clobTokenIds"] == market["clobTokenIds"]
+    http = json.loads(replay.artifacts["precheck_book_http"])
+    assert http["request_token_id"] == "yes-live-m1"
+    result = ProviderCallJournal(tmp_path).lookup(
+        str(summary["opportunity_id"]), "openai"
+    )
+    assert result is not None and result["kind"] == "provider_call_result"
+    assert result["outcome"]["code"] == "UNKNOWN_IN_FLIGHT"
+    assert result["outcome"]["billed_cost_microdollars"] is None
 
 
 def test_same_slot_changed_evidence_after_openai_result_terminalizes_without_jev(
@@ -3014,6 +3181,48 @@ def test_hardening_gamma_access_token_prose_never_reaches_model_or_artifacts(
     assert secret not in replay.artifacts["openai_request"]
     assert all(secret not in request for request in openai.requests)
     assert replay.result.ai.disposition != "INELIGIBLE"
+
+
+@pytest.mark.parametrize(
+    "description",
+    (
+        "The leaked api key is SUPERSECRET123 in the report.",
+        "The leaked access-token: SUPERSECRET123 in the report.",
+        "The leaked refresh_token = SUPERSECRET123 in the report.",
+        "The leaked clientSecret V2 is SUPERSECRET123 in the report.",
+        "The leaked ａｐｉ＿ｋｅｙ-v3 is SUPERSECRET123 in the report.",
+        "The leaked vendorSessionTokenV4 is SUPERSECRET123 in the report.",
+    ),
+)
+def test_hardening_gamma_credential_is_prose_never_reaches_model_or_artifacts(
+    tmp_path: Path, description: str
+) -> None:
+    secret = b"SUPERSECRET123"
+    market = _market() | {"description": description}
+    raw_gamma = _wire(market)
+    openai = ModelTransport("openai", _market_sha(market))
+
+    summary = _observe(tmp_path, market=market, openai=openai)[0]
+
+    replay = load_observation(tmp_path, str(summary["observation_id"]))
+    assert replay.artifacts["raw_gamma"] == raw_gamma
+    assert secret not in replay.artifacts["sanitized_evidence"]
+    assert secret not in replay.artifacts["openai_request"]
+    assert all(secret not in request for request in openai.requests)
+    assert replay.result.ai.disposition != "INELIGIBLE"
+
+
+def test_hardening_harmless_credential_noun_prose_is_not_redacted(
+    tmp_path: Path,
+) -> None:
+    description = "The api key is required for client setup."
+    market = _market() | {"description": description}
+
+    summary = _observe(tmp_path, market=market)[0]
+
+    replay = load_observation(tmp_path, str(summary["observation_id"]))
+    evidence = json.loads(replay.artifacts["sanitized_evidence"])
+    assert evidence["description"] == description
 
 
 @pytest.mark.parametrize(
