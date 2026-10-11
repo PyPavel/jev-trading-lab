@@ -2395,6 +2395,138 @@ def test_completed_slot_replay_terminalizes_other_same_slot_pending_intent(
     assert replay_public.requests == replay_openai.requests == replay_jev.requests == []
 
 
+@pytest.mark.parametrize("boundary", ("openai_result_frozen", "jev_result_frozen"))
+def test_completed_slot_replay_terminalizes_same_slot_frozen_provider_results(
+    tmp_path: Path, boundary: str
+) -> None:
+    first_market = _market()
+    second_market = first_market | {
+        "id": "live-m2",
+        "conditionId": "condition-live-m2",
+        "question": "Will the second public event occur?",
+        "clobTokenIds": '["yes-live-m2","no-live-m2"]',
+        "endDate": (NOW + timedelta(days=3)).isoformat().replace("+00:00", "Z"),
+    }
+
+    class TwoMarketPublic:
+        def __init__(self) -> None:
+            self.requests: list[HttpRequest] = []
+            self.book_numbers: dict[str, int] = {}
+
+        def __call__(self, request: HttpRequest) -> HttpResponse:
+            self.requests.append(request)
+            if "gamma-api" in request.url:
+                return HttpResponse(
+                    200, JSON_HEADERS, _wire([first_market, second_market]), NOW
+                )
+            token = "yes-live-m2" if "yes-live-m2" in request.url else "yes-live-m1"
+            number = self.book_numbers.get(token, 0)
+            self.book_numbers[token] = number + 1
+            market_id = "live-m2" if token.endswith("m2") else "live-m1"
+            book = _book(number if number < 2 else 3) | {
+                "market": f"condition-{market_id}",
+                "asset_id": token,
+            }
+            retrieved_at = datetime.fromtimestamp(int(book["timestamp"]) / 1000, UTC)
+            return HttpResponse(200, JSON_HEADERS, _wire(book), retrieved_at)
+
+    first = observe_markets(
+        limit=1,
+        output_dir=tmp_path,
+        client=PolymarketClient(TwoMarketPublic(), page_size=2, max_pages=1),
+        openai_transport=ModelTransport("openai", _market_sha(first_market)),
+        jev_transport=ModelTransport("jev"),
+        now=NOW,
+    )
+
+    def crash(event: str) -> None:
+        if event == boundary:
+            raise RuntimeError("second market provider result frozen")
+
+    with pytest.raises(RuntimeError, match="second market"):
+        observe_markets(
+            limit=2,
+            output_dir=tmp_path,
+            client=PolymarketClient(TwoMarketPublic(), page_size=2, max_pages=1),
+            openai_transport=ModelTransport("openai", _market_sha(second_market)),
+            jev_transport=ModelTransport("jev"),
+            now=NOW,
+            event_sink=crash,
+        )
+
+    journal = ProviderCallJournal(tmp_path)
+    opportunity_ids = journal.opportunity_ids_created_at(NOW)
+    stranded = next(
+        value for value in opportunity_ids if value != first[0]["opportunity_id"]
+    )
+    frozen_openai = journal.lookup(stranded, "openai")
+    frozen_jev = journal.lookup(stranded, "jev")
+    assert frozen_openai is not None and frozen_openai["kind"] == "provider_call_result"
+    assert frozen_openai["outcome"]["billed_cost_microdollars"] == 17
+    assert (frozen_jev is not None) == (boundary == "jev_result_frozen")
+
+    public = TwoMarketPublic()
+    openai = ModelTransport("openai", _market_sha(second_market), cost=999)
+    jev = ModelTransport("jev", cost=23)
+    recovered = observe_markets(
+        limit=1,
+        output_dir=tmp_path,
+        client=PolymarketClient(public, page_size=2, max_pages=1),
+        openai_transport=openai,
+        jev_transport=jev,
+        now=NOW,
+    )
+
+    assert len(recovered) == 2
+    assert len({item["observation_id"] for item in recovered}) == 2
+    assert recovered[0] == first[0]
+    assert recovered[1]["opportunity_id"] == stranded
+    assert recovered[1]["ai"]["model_cost_microdollars"] == (
+        34 if boundary == "jev_result_frozen" else 40
+    )
+    assert openai.requests == []
+    assert len(jev.requests) == (0 if boundary == "jev_result_frozen" else 1)
+    assert len(public.requests) == 1
+    assert journal.lookup(stranded, "openai") == frozen_openai
+    if frozen_jev is not None:
+        assert journal.lookup(stranded, "jev") == frozen_jev
+
+    completed = [
+        json.loads(line)
+        for line in (tmp_path / "completed_slots.jsonl").read_text().splitlines()
+    ]
+    assert completed[-1]["limit"] == 1
+    assert completed[-1]["observation_ids"] == [
+        item["observation_id"] for item in recovered
+    ]
+
+    class NoCalls:
+        def __init__(self) -> None:
+            self.requests: list[object] = []
+
+        def __call__(self, request: object) -> Any:
+            self.requests.append(request)
+            raise AssertionError(
+                "stable completed-slot replay must not call transports"
+            )
+
+    replay_public = NoCalls()
+    replay_openai = NoCalls()
+    replay_jev = NoCalls()
+    assert (
+        observe_markets(
+            limit=1,
+            output_dir=tmp_path,
+            client=PolymarketClient(replay_public),
+            openai_transport=replay_openai,
+            jev_transport=replay_jev,
+            now=NOW,
+        )
+        == recovered
+    )
+    assert replay_public.requests == replay_openai.requests == replay_jev.requests == []
+
+
 def test_poll_failure_cannot_complete_slot_before_pending_provider_recovery(
     tmp_path: Path,
 ) -> None:
@@ -3184,20 +3316,46 @@ def test_hardening_gamma_access_token_prose_never_reaches_model_or_artifacts(
 
 
 @pytest.mark.parametrize(
-    "description",
+    ("description", "secret"),
     (
-        "The leaked api key is SUPERSECRET123 in the report.",
-        "The leaked access-token: SUPERSECRET123 in the report.",
-        "The leaked refresh_token = SUPERSECRET123 in the report.",
-        "The leaked clientSecret V2 is SUPERSECRET123 in the report.",
-        "The leaked ａｐｉ＿ｋｅｙ-v3 is SUPERSECRET123 in the report.",
-        "The leaked vendorSessionTokenV4 is SUPERSECRET123 in the report.",
+        ("The leaked api key is SUPERSECRET123 in the report.", b"SUPERSECRET123"),
+        ("The leaked access-token: SUPERSECRET123 in the report.", b"SUPERSECRET123"),
+        ("The leaked refresh_token = SUPERSECRET123 in the report.", b"SUPERSECRET123"),
+        (
+            "The leaked clientSecret V2 is SUPERSECRET123 in the report.",
+            b"SUPERSECRET123",
+        ),
+        (
+            "The leaked ａｐｉ＿ｋｅｙ-v3 is SUPERSECRET123 in the report.",
+            b"SUPERSECRET123",
+        ),
+        (
+            "The leaked vendorSessionTokenV4 is SUPERSECRET123 in the report.",
+            b"SUPERSECRET123",
+        ),
+        ("The leaked API KEY is SUPERSECRETVALUE in the report.", b"SUPERSECRETVALUE"),
+        (
+            "The leaked Access-Token is AlphabeticToken in the report.",
+            b"AlphabeticToken",
+        ),
+        (
+            "The leaked refresh_token is AlphabeticRefresh in the report.",
+            b"AlphabeticRefresh",
+        ),
+        (
+            "The leaked clientSecretV2 is AlphabeticClient in the report.",
+            b"AlphabeticClient",
+        ),
+        (
+            "The leaked ｓｅｓｓｉｏｎ＿ｔｏｋｅｎ-v3 is "
+            "AlphabeticSession in the report.",
+            b"AlphabeticSession",
+        ),
     ),
 )
 def test_hardening_gamma_credential_is_prose_never_reaches_model_or_artifacts(
-    tmp_path: Path, description: str
+    tmp_path: Path, description: str, secret: bytes
 ) -> None:
-    secret = b"SUPERSECRET123"
     market = _market() | {"description": description}
     raw_gamma = _wire(market)
     openai = ModelTransport("openai", _market_sha(market))
@@ -3212,10 +3370,19 @@ def test_hardening_gamma_credential_is_prose_never_reaches_model_or_artifacts(
     assert replay.result.ai.disposition != "INELIGIBLE"
 
 
+@pytest.mark.parametrize(
+    "description",
+    (
+        "The api key is required for client setup.",
+        "The access token is optional for client setup.",
+        "The refresh token is needed for client setup.",
+        "The client secret is documented in the setup guide.",
+        "The session token is unavailable during maintenance.",
+    ),
+)
 def test_hardening_harmless_credential_noun_prose_is_not_redacted(
-    tmp_path: Path,
+    tmp_path: Path, description: str
 ) -> None:
-    description = "The api key is required for client setup."
     market = _market() | {"description": description}
 
     summary = _observe(tmp_path, market=market)[0]

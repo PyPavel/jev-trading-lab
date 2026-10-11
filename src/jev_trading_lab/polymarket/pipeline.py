@@ -1358,7 +1358,7 @@ def observe_markets(
             journal = ProviderCallJournal(output_dir)
             pending = [
                 opportunity_id
-                for opportunity_id in journal.pending_opportunity_ids_created_at(slot)
+                for opportunity_id in journal.opportunity_ids_created_at(slot)
                 if opportunity_id not in completed_opportunities
             ]
             recovered: list[MarketCandidate] = []

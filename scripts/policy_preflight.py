@@ -109,7 +109,7 @@ EXPECTED_SOURCE_HASHES = {
         "530a5c905ea3cb3beb3e42e80670622403a1729fa4d4151ec9c781e14139f9a6"
     ),
     "src/jev_trading_lab/polymarket/client.py": (
-        "e583ce4e57295a3c417b3906deb3048254cb7f27261ce57fb3b4fe3f9acf2258"
+        "bda5b6188e48c08f11e13662f3c7d1db9f518e030e94bf943f9ecb994184dd7e"
     ),
     "src/jev_trading_lab/polymarket/control.py": (
         "cadd87042c9293c2fd97d0017f532b06500d2afd23b07a9bd16c5e7bceef2b8d"
@@ -121,7 +121,7 @@ EXPECTED_SOURCE_HASHES = {
         "f17e8c6cef480cf1926b04999fe3097079bb473cbb32a188a335cd89e287003e"
     ),
     "src/jev_trading_lab/polymarket/pipeline.py": (
-        "0063a12365d27cf5df7aa5bd19324a2815f8562d8d2b858965614b2ecfce4c2a"
+        "2f362f017c05c5bebe816f310f7e4bfdae4e4566ea07d8536dc245950bc18a62"
     ),
     "src/jev_trading_lab/polymarket/store.py": (
         "e52b9189684c85d5871b8bfda7d2ae131077c882d6f4de65a792e7059781d5f1"

@@ -593,6 +593,19 @@ _PUBLIC_ASSIGNMENT_PATTERN = re.compile(
 _PUBLIC_IS_ASSIGNMENT_PATTERN = re.compile(
     r"(?i)(?P<name>[\w.-]+(?:\s+[\w.-]+){0,4})\s+is\s+(?P<value>\S{4,})"
 )
+_PUBLIC_IS_PREDICATE_WORDS = frozenset(
+    {
+        "available",
+        "configured",
+        "documented",
+        "needed",
+        "optional",
+        "required",
+        "stored",
+        "unavailable",
+        "used",
+    }
+)
 
 
 def _sanitize_public_prose(text: str) -> str:
@@ -602,7 +615,8 @@ def _sanitize_public_prose(text: str) -> str:
         lambda match: (
             "[REDACTED]"
             if is_credential_name(match.group("name"))
-            and any(character.isdigit() for character in match.group("value"))
+            and match.group("value").casefold().rstrip(".,;:!?")
+            not in _PUBLIC_IS_PREDICATE_WORDS
             else match.group(0)
         ),
         sanitized,
