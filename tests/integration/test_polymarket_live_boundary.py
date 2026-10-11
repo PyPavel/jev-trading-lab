@@ -25,6 +25,7 @@ from jev_trading_lab.polymarket.ai import (
     live_jev_transport,
     live_openai_transport,
 )
+from jev_trading_lab.polymarket.call_journal import ProviderCallJournal
 from jev_trading_lab.polymarket.client import (
     HttpRequest,
     HttpResponse,
@@ -32,6 +33,7 @@ from jev_trading_lab.polymarket.client import (
     PublicDataTimeout,
 )
 from jev_trading_lab.polymarket.models import BookSnapshot
+from jev_trading_lab.polymarket.paper import POLICY_VERSION
 from jev_trading_lab.polymarket.pipeline import observe_markets
 from jev_trading_lab.polymarket.store import (
     StoreCorruptError,
@@ -2257,6 +2259,81 @@ def test_crash_after_provider_intent_never_retries_unknown_call(tmp_path: Path) 
     assert failure["code"] == "UNKNOWN_IN_FLIGHT"
 
 
+def test_eligibility_drift_cannot_erase_unknown_in_flight_provider_cost(
+    tmp_path: Path,
+) -> None:
+    market = _market()
+
+    def crash(event: str) -> None:
+        if event == "openai_intent_frozen":
+            raise RuntimeError("failpoint after provider intent")
+
+    with pytest.raises(RuntimeError, match="failpoint"):
+        _observe(tmp_path, market=market, event_sink=crash)
+
+    journal_store = ProviderCallJournal(tmp_path)
+    opportunity_id = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "market_id": market["id"],
+                "policy_version": POLICY_VERSION,
+                "slot_at": NOW.isoformat().replace("+00:00", "Z"),
+            }
+        )
+    ).hexdigest()
+    intent = journal_store.lookup(opportunity_id, "openai")
+    assert intent is not None and intent["kind"] == "provider_call_intent"
+    original_opportunity_id = str(intent["opportunity_id"])
+
+    inactive = market | {"active": False}
+    public = PublicNetwork(inactive)
+    openai = ModelTransport("openai", _market_sha(inactive))
+    jev = ModelTransport("jev")
+    summary = _observe(
+        tmp_path,
+        market=inactive,
+        public=public,
+        openai=openai,
+        jev=jev,
+    )[0]
+
+    assert summary["opportunity_id"] == original_opportunity_id
+    assert summary["ai"]["disposition"] == "UNKNOWN_IN_FLIGHT"
+    assert summary["ai"]["model_cost_microdollars"] is None
+    assert summary["ai"]["economic_pnl_microdollars"] is None
+    assert summary["paired_economic_pnl_delta_microdollars"] is None
+    assert openai.requests == [] and jev.requests == []
+    assert len(public.requests) == 1
+    replay = load_observation(tmp_path, str(summary["observation_id"]))
+    assert replay.result.evidence_sha256 == _market_sha(market)
+    failure = json.loads(replay.artifacts["openai_failure"])
+    assert failure["code"] == "UNKNOWN_IN_FLIGHT"
+    results = (tmp_path / "results.jsonl").read_text().splitlines()
+    assert len(results) == 1
+    result_state = journal_store.lookup(original_opportunity_id, "openai")
+    assert result_state is not None and result_state["kind"] == "provider_call_result"
+    outcome = result_state["outcome"]
+    assert outcome["code"] == "UNKNOWN_IN_FLIGHT"
+    assert outcome["billed_cost_microdollars"] is None
+    lines = (tmp_path / "provider_calls.jsonl").read_text().splitlines()
+    assert len(lines) == 2
+
+    replay_public = PublicNetwork(inactive)
+    replay_openai = ModelTransport("openai", _market_sha(inactive))
+    replay_jev = ModelTransport("jev")
+    again = _observe(
+        tmp_path,
+        market=inactive,
+        public=replay_public,
+        openai=replay_openai,
+        jev=replay_jev,
+    )[0]
+    assert again == summary
+    assert replay_public.requests == []
+    assert replay_openai.requests == [] and replay_jev.requests == []
+    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 1
+
+
 def test_same_slot_changed_evidence_never_calls_provider_again(
     tmp_path: Path,
 ) -> None:
@@ -2761,6 +2838,31 @@ def test_hardening_credential_like_public_precheck_bytes_are_recorded_exactly(
     assert http["response_sha256"] == hashlib.sha256(body).hexdigest()
 
 
+def test_hardening_quoted_bearer_prose_in_gamma_is_recorded_exactly(
+    tmp_path: Path,
+) -> None:
+    market = _market() | {
+        "description": "Public report quotes Bearer abcd1234 in an incident."
+    }
+    raw_gamma = _wire(market)
+
+    summary = _observe(tmp_path, market=market)[0]
+
+    replay = load_observation(tmp_path, str(summary["observation_id"]))
+    assert replay.artifacts["raw_gamma"] == raw_gamma
+    assert b"Bearer abcd1234" not in replay.artifacts["sanitized_evidence"]
+    assert b"Bearer abcd1234" not in replay.artifacts["openai_request"]
+    assert replay.result.ai.disposition != "INELIGIBLE"
+    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 1
+
+
+def test_hardening_raw_gamma_rejects_structural_credential_fields() -> None:
+    from jev_trading_lab.polymarket.store import _screen_artifact
+
+    with pytest.raises(StoreSecurityError):
+        _screen_artifact("raw_gamma", b'{"authorization":"Bearer abcd1234"}', ())
+
+
 def test_hardening_secret_like_hash_in_valid_public_books_does_not_abort_observe(
     tmp_path: Path,
 ) -> None:
@@ -2787,7 +2889,8 @@ def test_hardening_public_book_kinds_still_screen_explicit_secret_sentinels() ->
         _screen_artifact(kind, b'{"hash":"sk-aaaaaaaaaaaa"}', ())
         with pytest.raises(StoreSecurityError):
             _screen_artifact(kind, b"prefix unit6-secret-sentinel suffix", sentinel)
-    for kind in ("raw_gamma", "openai_request", "runtime_config", "jev_request"):
+    _screen_artifact("raw_gamma", b'{"a":"Bearer abcd1234"}', ())
+    for kind in ("openai_request", "runtime_config", "jev_request"):
         with pytest.raises(StoreSecurityError):
             _screen_artifact(kind, b'{"a":"Bearer abcd1234"}', ())
 

@@ -49,12 +49,14 @@ from jev_trading_lab.polymarket.client import (
     PrecheckAttempt,
     PublicDataError,
     SecureHttpTransport,
+    gamma_clob_identity,
     reconstruct_book_snapshot,
 )
 from jev_trading_lab.polymarket.models import (
     ArmResult,
     CausalHistoryPoint,
     Economics,
+    EvidencePacket,
     FeasibilityFixture,
     FixtureIdentity,
     JevDecision,
@@ -1373,6 +1375,87 @@ def observe_markets(
         return summaries
 
 
+def _candidate_from_frozen_rejection(
+    rejection: MarketRejection,
+    *,
+    output_dir: str | os.PathLike[str],
+    slot: datetime,
+) -> MarketCandidate | None:
+    """Recover a started same-slot opportunity before eligibility drift wins."""
+
+    opportunity_id = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "policy_version": POLICY_VERSION,
+                "market_id": rejection.market_id,
+                "slot_at": slot.isoformat().replace("+00:00", "Z"),
+            }
+        )
+    ).hexdigest()
+    frozen = load_frozen_artifacts_for_opportunity(output_dir, opportunity_id)
+    if frozen is None:
+        return None
+    intent = ProviderCallJournal(output_dir).lookup(opportunity_id, "openai")
+    if intent is None:
+        return None
+    required = {
+        "raw_gamma",
+        "sanitized_evidence",
+        "precheck_book_raw",
+        "precheck_book_http",
+        "causal_history",
+    }
+    if not required <= frozen.keys():
+        raise ValueError("frozen observation inputs are incomplete")
+    evidence = EvidencePacket.model_validate_json(frozen["sanitized_evidence"])
+    raw_gamma = load_strict_json(frozen["raw_gamma"])
+    history = load_strict_json(frozen["causal_history"])
+    if (
+        evidence.market_id != rejection.market_id
+        or not isinstance(raw_gamma, dict)
+        or not isinstance(history, dict)
+    ):
+        raise ValueError("frozen observation inputs are invalid")
+    market_id, condition_id, yes_token_id, no_token_id = gamma_clob_identity(raw_gamma)
+    raw_books = [
+        base64.b64decode(value, validate=True) for value in history["raw_books_b64"]
+    ]
+    retrieved = [_dt(value) for value in history["response_retrieved_at"]]
+    if len(raw_books) != 2 or len(retrieved) != 2:
+        raise ValueError("frozen causal history is invalid")
+    books = tuple(
+        reconstruct_book_snapshot(raw, market_id=market_id, response_retrieved_at=at)
+        for raw, at in zip(raw_books, retrieved, strict=True)
+    )
+    http = PrecheckHttpArtifact.model_validate_json(frozen["precheck_book_http"])
+    attempt = PrecheckAttempt(
+        token_id=http.request_token_id,
+        attempted_at=http.attempted_at,
+        status_code=http.status_code,
+        content_type=http.content_type,
+        retrieved_at=http.retrieved_at,
+        body=frozen["precheck_book_raw"],
+        truncated=http.response_truncated,
+        transport_reason=http.transport_reason,
+    )
+    return MarketCandidate(
+        market_id=market_id,
+        condition_id=condition_id,
+        yes_token_id=yes_token_id,
+        no_token_id=no_token_id,
+        slot_at=slot,
+        raw_gamma_bytes=frozen["raw_gamma"],
+        raw_gamma_sha256=evidence.source_sha256,
+        evidence=evidence,
+        precheck_book_bytes=frozen["precheck_book_raw"],
+        precheck_book=books[0],
+        precheck_attempt=attempt,
+        precheck_history_bytes=(raw_books[0], raw_books[1]),
+        precheck_history=(books[0], books[1]),
+        precheck_attempts=(attempt, attempt),
+    )
+
+
 def _frozen_candidate(
     candidate: MarketCandidate,
     openai_request: bytes,
@@ -1462,10 +1545,20 @@ def _observe_locked(
         return _public_poll_failure(
             output_dir, error, observed_at=cutoff, config=config
         )
+    recovered: list[MarketCandidate] = []
+    rejections: list[MarketRejection] = []
+    for rejection in polled.rejections:
+        recovered_candidate = _candidate_from_frozen_rejection(
+            rejection, output_dir=output_dir, slot=cutoff
+        )
+        if recovered_candidate is None:
+            rejections.append(rejection)
+        else:
+            recovered.append(recovered_candidate)
     summaries = _record_rejections(
-        output_dir, polled.rejections, observed_at=cutoff, config=config
+        output_dir, tuple(rejections), observed_at=cutoff, config=config
     )
-    for candidate in polled.eligible:
+    for candidate in (*polled.eligible, *recovered):
         provisional = _identity(candidate, candidate.precheck_book.source_sha256)
         call_journal = ProviderCallJournal(output_dir)
         input_changed = False

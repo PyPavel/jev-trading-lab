@@ -577,6 +577,36 @@ def normalize_gamma_identity(value: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+_PUBLIC_CREDENTIAL_PATTERN = re.compile(
+    r"(?i)(?:sk-[a-z0-9_-]{8,}|openai_api_key|typesafe_api_key|"
+    r"bearer\s+\S{4,}|basic\s+\S{4,}|(?:authorization|proxy-authorization|"
+    r"cookie|set-cookie|x-api-key|api[-_]?key)\s*[:=]\s*\S{4,})"
+)
+
+
+def sanitized_gamma_identity(value: Mapping[str, object]) -> dict[str, object]:
+    """Redact credential-like public prose before it reaches provider artifacts."""
+
+    identity = normalize_gamma_identity(value)
+    for name in (
+        "question",
+        "description",
+        "rules",
+        "category",
+        "resolution_source_text",
+    ):
+        identity[name] = _PUBLIC_CREDENTIAL_PATTERN.sub(
+            "[REDACTED]", str(identity[name])
+        )
+    tags = identity["tags"]
+    if not isinstance(tags, list):
+        raise ValueError("normalized Gamma tags are invalid")
+    identity["tags"] = [
+        _PUBLIC_CREDENTIAL_PATTERN.sub("[REDACTED]", str(tag)) for tag in tags
+    ]
+    return identity
+
+
 def gamma_clob_identity(item: Mapping[str, object]) -> tuple[str, str, str, str]:
     """Return the market, condition, YES, and NO token IDs one Gamma item binds."""
 
@@ -1015,7 +1045,7 @@ class PolymarketClient:
                 break
             reason: str | None = None
             try:
-                identity = normalize_gamma_identity(item)
+                normalize_gamma_identity(item)
                 reason = (
                     "DUPLICATE_MARKET_DATA"
                     if market_id in conflict_rows
@@ -1032,22 +1062,7 @@ class PolymarketClient:
                         }
                     )
             except ValueError:
-                identity = {
-                    "question": "",
-                    "description": "",
-                    "rules": "",
-                    "resolution_source_text": "",
-                    "category": "Uncategorized",
-                    "tags": [],
-                }
                 reason = "MALFORMED_MARKET"
-            question = str(identity["question"])
-            description = str(identity["description"])
-            rules = str(identity["rules"])
-            resolution_source = str(identity["resolution_source_text"])
-            category = str(identity["category"])
-            raw_tags = identity["tags"]
-            tags = [str(tag) for tag in raw_tags] if isinstance(raw_tags, list) else []
             condition_id = _text(item.get("conditionId")) or market_id
             if reason is not None:
                 rejected.append(
@@ -1062,15 +1077,19 @@ class PolymarketClient:
             assert market_id
             _, condition_id, yes_token, no_token = gamma_clob_identity(item)
             source_sha = hashlib.sha256(raw_market).hexdigest()
+            safe_identity = sanitized_gamma_identity(item)
+            safe_tags = safe_identity["tags"]
+            if not isinstance(safe_tags, list):
+                raise ValueError("sanitized Gamma tags are invalid")
             try:
                 evidence = EvidencePacket(
                     market_id=market_id,
-                    question=question,
-                    description=description,
-                    rules=rules,
-                    category=category,
-                    tags=tags,
-                    resolution_source_text=resolution_source,
+                    question=str(safe_identity["question"]),
+                    description=str(safe_identity["description"]),
+                    rules=str(safe_identity["rules"]),
+                    category=str(safe_identity["category"]),
+                    tags=[str(tag) for tag in safe_tags],
+                    resolution_source_text=str(safe_identity["resolution_source_text"]),
                     closes_at=close,
                     retrieved_at=min(retrieved_at, cutoff),
                     cutoff_at=cutoff,

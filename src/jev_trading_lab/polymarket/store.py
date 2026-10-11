@@ -67,6 +67,7 @@ from jev_trading_lab.polymarket.client import (
     normalize_gamma_utc,
     precheck_eligibility_reason,
     reconstruct_book_snapshot,
+    sanitized_gamma_identity,
 )
 from jev_trading_lab.polymarket.models import (
     INT64_MAX,
@@ -1007,19 +1008,23 @@ def _normalized_key(value: str) -> str:
     )
 
 
-def _contains_credentials(value: object, sentinels: tuple[str, ...]) -> bool:
+def _contains_credentials(
+    value: object, sentinels: tuple[str, ...], *, patterns: bool = True
+) -> bool:
     if isinstance(value, Mapping):
         for key, nested in value.items():
             if type(key) is str and _normalized_key(key) in _CREDENTIAL_KEYS:
                 return True
-            if _contains_credentials(nested, sentinels):
+            if _contains_credentials(nested, sentinels, patterns=patterns):
                 return True
         return False
     if isinstance(value, list | tuple):
-        return any(_contains_credentials(item, sentinels) for item in value)
+        return any(
+            _contains_credentials(item, sentinels, patterns=patterns) for item in value
+        )
     if isinstance(value, str):
         normalized = unicodedata.normalize("NFKC", value).casefold()
-        return bool(_SECRET_PATTERN.search(normalized)) or any(
+        return (patterns and bool(_SECRET_PATTERN.search(normalized))) or any(
             sentinel in normalized for sentinel in sentinels
         )
     return False
@@ -1757,7 +1762,7 @@ def _screen_payload(
             decoded = load_strict_json(payload)
         except (TypeError, ValueError):
             return
-        if _contains_credentials(decoded, tuple(sentinels)):
+        if _contains_credentials(decoded, tuple(sentinels), patterns=patterns):
             raise StoreSecurityError("artifact contains credential-like data")
 
 
@@ -1777,19 +1782,21 @@ def _screen_artifact(
 ) -> None:
     """Screen one stage before it is durable.
 
-    Exact bytes from the unauthenticated public CLOB book route are arbitrary public
-    data: no credential of ours is ever sent to that host, so generic credential
-    patterns (which also match benign text) must not let a hostile or unlucky
-    response abort a pass before its terminal record. Explicit forbidden sentinel
-    values are still enforced; every other stage keeps the full screen.
+    Exact bytes from unauthenticated public Gamma and CLOB routes are arbitrary public
+    data: no credential of ours is ever sent to those hosts, so generic credential
+    patterns (which also match benign text) must not let a hostile or unlucky response
+    abort a pass before its terminal record. Gamma JSON still rejects structural
+    credential fields. Explicit forbidden sentinel values remain enforced, and every
+    provider/model stage keeps the full screen.
     """
 
     public = kind in _PUBLIC_RESPONSE_KINDS
+    public_gamma = kind == ArtifactKind.RAW_GAMMA
     _screen_payload(
         payload,
         forbidden_secret_values,
-        strict_json=not public,
-        patterns=not public,
+        strict_json=public_gamma or not public,
+        patterns=not (public or public_gamma),
     )
 
 
@@ -2061,7 +2068,7 @@ def _validate_reconstructed_path(
         if isinstance(raw_gamma, Mapping):
             evidence_value = evidence.model_dump(mode="json")
             try:
-                raw_bindings = normalize_gamma_identity(raw_gamma)
+                raw_bindings = sanitized_gamma_identity(raw_gamma)
             except ValueError:
                 fail("raw Gamma identity cannot be normalized")
                 return
