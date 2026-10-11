@@ -685,7 +685,8 @@ def _book_snapshot(
     if raw_market not in {expected_market_id, expected_condition_id}:
         raise ValueError("MARKET_DRIFT")
     retrieved_at = _book_time(value.get("timestamp"))
-    if retrieved_at > now + timedelta(seconds=5) or now - retrieved_at > MAX_BOOK_AGE:
+    age = now - retrieved_at
+    if not timedelta(0) <= age <= MAX_BOOK_AGE:
         raise ValueError("STALE_BOOK")
     bids = _levels(value.get("bids"), descending=True)
     asks = _levels(value.get("asks"), descending=False)
@@ -697,6 +698,7 @@ def _book_snapshot(
             source_sha256=hashlib.sha256(raw).hexdigest(),
             bids=bids,
             asks=asks,
+            response_retrieved_at=now,
         )
     except ValueError as error:
         raise ValueError("CROSSED_BOOK") from error
@@ -710,7 +712,9 @@ def _reason(error: Exception) -> str:
     return "MALFORMED_BOOK"
 
 
-def reconstruct_book_snapshot(raw: bytes, *, market_id: str) -> BookSnapshot:
+def reconstruct_book_snapshot(
+    raw: bytes, *, market_id: str, response_retrieved_at: datetime | None = None
+) -> BookSnapshot:
     """Reconstruct a strict normalized book from authoritative raw CLOB bytes."""
 
     try:
@@ -726,7 +730,7 @@ def reconstruct_book_snapshot(raw: bytes, *, market_id: str) -> BookSnapshot:
             expected_market_id=market_id,
             expected_condition_id=condition_id,
             expected_token_id=token_id,
-            now=captured_at,
+            now=response_retrieved_at or captured_at,
         )
     except (TypeError, ValueError, ArithmeticError) as error:
         raise PublicDataError("execution book artifact is invalid") from error
@@ -1025,11 +1029,7 @@ class PolymarketClient:
                             if rejection_book is None
                             else None
                         ),
-                        precheck_retrieved_at=(
-                            rejection_book.retrieved_at
-                            if rejection_book is not None
-                            else cutoff
-                        ),
+                        precheck_retrieved_at=(attempt.retrieved_at or cutoff),
                         precheck_byte_length=len(attempt.body),
                         precheck_request_token_id=yes_token,
                         precheck_request_market_id=market_id,
@@ -1062,7 +1062,7 @@ class PolymarketClient:
         cutoff = now or datetime.now(UTC)
         if cutoff.tzinfo is not UTC:
             cutoff = cutoff.astimezone(UTC)
-        raw, value, _ = self._get(
+        raw, value, retrieved_at = self._get(
             f"{CLOB_ENDPOINT}?{urlencode({'token_id': candidate.yes_token_id})}",
             label="CLOB",
         )
@@ -1073,7 +1073,7 @@ class PolymarketClient:
                 expected_market_id=candidate.market_id,
                 expected_condition_id=candidate.condition_id,
                 expected_token_id=candidate.yes_token_id,
-                now=cutoff,
+                now=retrieved_at,
             )
         except (TypeError, ValueError, ArithmeticError) as error:
             raise PublicDataError(_reason(error)) from error

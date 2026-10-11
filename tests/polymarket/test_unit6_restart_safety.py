@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import threading
 import time
+from unittest.mock import patch
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -13,6 +16,7 @@ from jev_trading_lab.polymarket.client import (
     HttpRequest,
     HttpResponse,
     PolymarketClient,
+    PublicDataError,
     gamma_eligibility_reason,
     read_bounded_body,
     resolve_public_addresses,
@@ -111,6 +115,87 @@ def test_precheck_freshness_uses_http_retrieved_at_inclusive() -> None:
     assert result.eligible[0].precheck_attempt.retrieved_at == NOW
 
 
+def _book(at: datetime) -> bytes:
+    return json.dumps(
+        {
+            "market": "c1",
+            "asset_id": "yes",
+            "timestamp": str(int(at.timestamp() * 1000)),
+            "bids": [{"price": "0.49", "size": "5000"}],
+            "asks": [{"price": "0.51", "size": "5000"}],
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
+def _candidate_with_execution_response(response: HttpResponse):
+    gamma = json.dumps([_market()], separators=(",", ":")).encode()
+    replies = iter(
+        [
+            HttpResponse(200, {"content-type": "application/json"}, gamma, NOW),
+            HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                _book(NOW),
+                NOW,
+            ),
+            response,
+        ]
+    )
+
+    class Transport:
+        def __call__(self, _request: HttpRequest) -> HttpResponse:
+            return next(replies)
+
+    client = PolymarketClient(Transport(), page_size=20, max_pages=1)
+    candidate = client.poll(now=NOW).eligible[0]
+    return client, candidate
+
+
+def test_execution_freshness_counts_request_delay_and_existing_age() -> None:
+    client, candidate = _candidate_with_execution_response(
+        HttpResponse(
+            200,
+            {"content-type": "application/json"},
+            _book(NOW - timedelta(seconds=20)),
+            NOW + timedelta(seconds=20),
+        )
+    )
+
+    with pytest.raises(PublicDataError, match="STALE_BOOK"):
+        client.execution_book(candidate, now=NOW)
+
+
+def test_execution_freshness_accepts_exactly_thirty_seconds() -> None:
+    retrieved_at = NOW + timedelta(seconds=20)
+    client, candidate = _candidate_with_execution_response(
+        HttpResponse(
+            200,
+            {"content-type": "application/json"},
+            _book(NOW - timedelta(seconds=10)),
+            retrieved_at,
+        )
+    )
+
+    _, snapshot = client.execution_book(candidate, now=NOW)
+
+    assert snapshot.response_retrieved_at == retrieved_at
+
+
+def test_execution_freshness_rejects_future_book_timestamp() -> None:
+    client, candidate = _candidate_with_execution_response(
+        HttpResponse(
+            200,
+            {"content-type": "application/json"},
+            _book(NOW + timedelta(seconds=1)),
+            NOW,
+        )
+    )
+
+    with pytest.raises(PublicDataError, match="STALE_BOOK"):
+        client.execution_book(candidate, now=NOW)
+
+
 def test_provider_call_intent_is_durable_and_unknown_is_never_retryable(
     tmp_path: Path,
 ) -> None:
@@ -128,6 +213,117 @@ def test_provider_call_intent_is_durable_and_unknown_is_never_retryable(
     assert state["kind"] == "provider_call_intent"
     assert state["retryable"] is False
     assert (root / "provider_calls.jsonl").read_bytes().endswith(b"\n")
+
+
+@pytest.mark.parametrize("attack", ["symlink", "hardlink", "fifo", "weak_mode"])
+def test_provider_journal_rejects_unsafe_file_before_read_or_write(
+    tmp_path: Path, attack: str
+) -> None:
+    root = tmp_path / "out"
+    root.mkdir(mode=0o700)
+    journal_path = root / "provider_calls.jsonl"
+    target = tmp_path / "target"
+    if attack == "symlink":
+        target.write_bytes(b"sentinel")
+        journal_path.symlink_to(target)
+    elif attack == "hardlink":
+        target.write_bytes(b"sentinel")
+        os.chmod(target, 0o600)
+        os.link(target, journal_path)
+    elif attack == "fifo":
+        os.mkfifo(journal_path, 0o600)
+    else:
+        journal_path.write_bytes(b"")
+        os.chmod(journal_path, 0o644)
+
+    with pytest.raises(ValueError, match="provider call journal"):
+        ProviderCallJournal(root).begin(
+            provider="openai",
+            opportunity_id="1" * 64,
+            request_bytes=b"request",
+            created_at=NOW,
+        )
+
+    if target.exists():
+        assert target.read_bytes() == b"sentinel"
+
+
+def test_provider_journal_rejects_unsafe_blob_ancestor(tmp_path: Path) -> None:
+    root = tmp_path / "out"
+    root.mkdir(mode=0o700)
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    (root / "provider-call-blobs").symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="provider call"):
+        ProviderCallJournal(root).begin(
+            provider="openai",
+            opportunity_id="1" * 64,
+            request_bytes=b"request",
+            created_at=NOW,
+        )
+
+    assert list(target.iterdir()) == []
+
+
+def test_provider_journal_completes_short_interrupted_writes(tmp_path: Path) -> None:
+    journal = ProviderCallJournal(tmp_path)
+    real_write = os.write
+    interrupted = False
+
+    def short_write(descriptor: int, payload: bytes | memoryview) -> int:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise InterruptedError
+        return real_write(descriptor, payload[: max(1, len(payload) // 2)])
+
+    with patch("jev_trading_lab.polymarket.call_journal.os.write", short_write):
+        call_id = journal.begin(
+            provider="openai",
+            opportunity_id="1" * 64,
+            request_bytes=b"request",
+            created_at=NOW,
+        )
+
+    assert journal.state(call_id) is not None
+
+
+def test_provider_journal_rejects_duplicate_keys_and_oversized_lines(tmp_path: Path) -> None:
+    journal = ProviderCallJournal(tmp_path)
+    path = tmp_path / "provider_calls.jsonl"
+    path.write_bytes(b'{"call_id":"a","call_id":"b"}\n')
+    os.chmod(path, 0o600)
+    with pytest.raises(ValueError, match="provider call journal"):
+        journal.validate("1" * 64)
+
+    path.write_bytes(b"{" + b"x" * (1024 * 1024) + b"}\n")
+    with pytest.raises(ValueError, match="provider call journal"):
+        journal.validate("1" * 64)
+
+
+def test_provider_journal_rejects_second_request_for_same_opportunity_provider(
+    tmp_path: Path,
+) -> None:
+    journal = ProviderCallJournal(tmp_path)
+    first = journal.begin(
+        provider="openai",
+        opportunity_id="1" * 64,
+        request_bytes=b"first",
+        created_at=NOW,
+    )
+
+    same = journal.begin(
+        provider="openai",
+        opportunity_id="1" * 64,
+        request_bytes=b"second",
+        created_at=NOW,
+    )
+
+    assert same == first
+    state = journal.state(first)
+    assert state is not None
+    assert state["request_sha256"] == __import__("hashlib").sha256(b"first").hexdigest()
 
 
 def test_provider_call_result_is_content_addressed_and_replayable(

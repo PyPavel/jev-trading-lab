@@ -809,14 +809,16 @@ def _precheck_values(
             "precheck_book_raw",
             candidate.precheck_book_bytes,
             "clob_precheck_raw",
-            candidate.precheck_book.retrieved_at,
+            candidate.precheck_book.response_retrieved_at
+            or candidate.precheck_book.retrieved_at,
         ),
         _http_stage(candidate.precheck_attempt),
         (
             "precheck_book",
             candidate.precheck_book_bytes,
             "clob_precheck_book",
-            candidate.precheck_book.retrieved_at,
+            candidate.precheck_book.response_retrieved_at
+            or candidate.precheck_book.retrieved_at,
         ),
         (
             "causal_history",
@@ -1165,7 +1167,8 @@ def _record_rejections(
                         "precheck_book",
                         attempt.body,
                         "clob_precheck_book",
-                        rejection.precheck_book.retrieved_at,
+                        rejection.precheck_book.response_retrieved_at
+                        or rejection.precheck_book.retrieved_at,
                     )
                 )
             else:
@@ -1388,7 +1391,9 @@ def _observe_locked(
             raw_execution, execution_book = public.execution_book(
                 candidate, now=max(cutoff, frozen_at + timedelta(seconds=1))
             )
-            if execution_book.retrieved_at <= frozen_at:
+            if (
+                execution_book.response_retrieved_at or execution_book.retrieved_at
+            ) <= frozen_at:
                 raise ValueError("STALE_BOOK")
         except Exception as error:
             reason = str(error)
@@ -1428,7 +1433,7 @@ def _observe_locked(
                 "execution_book",
                 raw_execution,
                 "clob_execution_book",
-                execution_book.retrieved_at,
+                execution_book.response_retrieved_at or execution_book.retrieved_at,
             )
         )
         artifacts = _chain(final, values)

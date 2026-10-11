@@ -164,6 +164,9 @@ class BookSnapshot(UtcModel):
     source_sha256: Sha256
     bids: Annotated[list[BookLevel], Field(min_length=1)]
     asks: Annotated[list[BookLevel], Field(min_length=1)]
+    response_retrieved_at: datetime | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def validate_book(self) -> Self:

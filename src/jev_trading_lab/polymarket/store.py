@@ -60,7 +60,9 @@ from jev_trading_lab.polymarket.client import (
     derive_precheck_rejection,
     derive_precheck_transport_reason,
     gamma_clob_identity,
+    gamma_eligibility_reason,
     normalize_gamma_identity,
+    normalize_gamma_utc,
     precheck_eligibility_reason,
     reconstruct_book_snapshot,
 )
@@ -1740,11 +1742,19 @@ def _reconstruct_orphan(kind: ArtifactKind, payload: bytes) -> TypedArtifact:
 
 
 def _reconstruct(
-    kind: ArtifactKind, payload: bytes, result: ObservationResult | FixtureIdentity
+    kind: ArtifactKind,
+    payload: bytes,
+    result: ObservationResult | FixtureIdentity,
+    *,
+    retrieved_at: datetime,
 ) -> TypedArtifact:
     try:
         if kind in {ArtifactKind.PRECHECK_BOOK, ArtifactKind.EXECUTION_BOOK}:
-            return reconstruct_book_snapshot(payload, market_id=result.market_id)
+            return reconstruct_book_snapshot(
+                payload,
+                market_id=result.market_id,
+                response_retrieved_at=retrieved_at,
+            )
         return _reconstruct_orphan(kind, payload)
     except (TypeError, ValueError) as error:
         label = "Gamma" if kind is ArtifactKind.RAW_GAMMA else kind.value
@@ -1803,7 +1813,7 @@ def _validate_precheck_http(
         market_id=market_id,
         condition_id=condition_id,
         token_id=token_id,
-        now=http.attempted_at,
+        now=http.retrieved_at or http.attempted_at,
     )
     rejection = typed.get(ArtifactKind.ELIGIBILITY_REJECTION)
     failure = typed.get(ArtifactKind.PRECHECK_BOOK_FAILURE)
@@ -1829,7 +1839,7 @@ def _validate_precheck_http(
             or failure.request_market_id != market_id
             or failure.request_condition_id != condition_id
             or failure.request_token_id != token_id
-            or failure.retrieved_at != http.attempted_at
+            or failure.retrieved_at != (http.retrieved_at or http.attempted_at)
         ):
             fail("precheck failure does not match the recomputed response outcome")
     elif normalized is not None:
@@ -1968,6 +1978,50 @@ def _validate_reconstructed_path(
         raw = envelope_by_kind.get(ArtifactKind.RAW_GAMMA)
         if raw is None or rejection.raw_gamma_sha256 != raw.sha256:
             fail("eligibility rejection does not bind raw Gamma bytes")
+            return
+        raw_gamma = typed.get(ArtifactKind.RAW_GAMMA)
+        if result is not None and rejection.precheck_book_sha256 is None:
+            if not isinstance(raw_gamma, Mapping):
+                fail("frozen Gamma rejection input is invalid")
+                return
+            try:
+                normalized = normalize_gamma_identity(raw_gamma)
+                expected_reason = gamma_eligibility_reason(
+                    raw_gamma, cutoff=result.cutoff_at
+                )
+            except (TypeError, ValueError):
+                if rejection.reason != "MALFORMED_MARKET":
+                    fail("eligibility rejection reason does not match frozen Gamma")
+                    return
+            else:
+                computed_reason: str | None = expected_reason
+                if expected_reason is None:
+                    try:
+                        tags = normalized["tags"]
+                        if not isinstance(tags, list):
+                            raise ValueError("normalized Gamma tags are invalid")
+                        EvidencePacket(
+                            market_id=str(normalized["market_id"]),
+                            question=str(normalized["question"]),
+                            description=str(normalized["description"]),
+                            rules=str(normalized["rules"]),
+                            category=str(normalized["category"]),
+                            tags=[str(tag) for tag in tags],
+                            resolution_source_text=str(
+                                normalized["resolution_source_text"]
+                            ),
+                            closes_at=normalize_gamma_utc(raw_gamma.get("endDate")),
+                            retrieved_at=min(raw.retrieved_at, result.cutoff_at),
+                            cutoff_at=result.cutoff_at,
+                            source_sha256=raw.sha256,
+                        )
+                    except (TypeError, ValueError):
+                        computed_reason = "MALFORMED_MARKET"
+                if (
+                    normalized["market_id"] != rejection.market_id
+                    or computed_reason != rejection.reason
+                ):
+                    fail("eligibility rejection reason does not match frozen Gamma")
         precheck_raw = typed.get(ArtifactKind.PRECHECK_BOOK_RAW)
         precheck_raw_envelope = envelope_by_kind.get(ArtifactKind.PRECHECK_BOOK_RAW)
         precheck_rejection = typed.get(ArtifactKind.PRECHECK_BOOK)
@@ -2113,7 +2167,8 @@ def _validate_reconstructed_path(
             not isinstance(precheck_book, BookSnapshot)
             or precheck_envelope is None
             or precheck_book.source_sha256 != precheck_envelope.sha256
-            or precheck_book.retrieved_at != precheck_envelope.retrieved_at
+            or (precheck_book.response_retrieved_at or precheck_book.retrieved_at)
+            != precheck_envelope.retrieved_at
             or (
                 isinstance(evidence, EvidencePacket)
                 and (
@@ -2142,14 +2197,20 @@ def _validate_reconstructed_path(
             envelope is None
             or not isinstance(frozen, DecisionFrozenArtifact)
             or execution_book.source_sha256 != envelope.sha256
-            or execution_book.retrieved_at != envelope.retrieved_at
-            or execution_book.retrieved_at <= frozen.frozen_at
+            or (execution_book.response_retrieved_at or execution_book.retrieved_at)
+            != envelope.retrieved_at
+            or (execution_book.response_retrieved_at or execution_book.retrieved_at)
+            <= frozen.frozen_at
             or (
                 result is not None
                 and (
                     execution_book.market_id != result.market_id
                     or result.execution_book_sha256 != envelope.sha256
-                    or result.observed_at < execution_book.retrieved_at
+                    or result.observed_at
+                    < (
+                        execution_book.response_retrieved_at
+                        or execution_book.retrieved_at
+                    )
                 )
             )
         ):
@@ -2464,7 +2525,9 @@ def _prepare(
         )
         if envelope.predecessor_stage_sha256 != predecessor:
             raise ValueError("artifact predecessor chain is invalid")
-        typed[kind.value] = _reconstruct(kind, artifact.payload, result)
+        typed[kind.value] = _reconstruct(
+            kind, artifact.payload, result, retrieved_at=envelope.retrieved_at
+        )
         envelopes.append(envelope)
         predecessor = _canonical_stage_hash(envelope)
     for kind, field in _RESULT_HASH_KINDS.items():
@@ -2565,7 +2628,9 @@ def _validate_journals_locked(
                     if not isinstance(evidence, EvidencePacket):
                         raise ValueError("book reconstruction requires frozen evidence")
                     typed[kind.value] = reconstruct_book_snapshot(
-                        payload, market_id=evidence.market_id
+                        payload,
+                        market_id=evidence.market_id,
+                        response_retrieved_at=envelope.retrieved_at,
                     )
                 else:
                     typed[kind.value] = _reconstruct_orphan(kind, payload)
@@ -2621,7 +2686,9 @@ def _verify_replay_locked(
         try:
             payload = store.read_verified(envelope.blob_ref())
             _screen_artifact(kind, payload, forbidden_secret_values)
-            typed[kind.value] = _reconstruct(kind, payload, result)
+            typed[kind.value] = _reconstruct(
+                kind, payload, result, retrieved_at=envelope.retrieved_at
+            )
         except StoreSecurityError:
             raise
         except (BlobError, TypeError, ValueError) as error:
@@ -2683,7 +2750,12 @@ def freeze_observation_artifacts(
         )
         if envelope.predecessor_stage_sha256 != predecessor:
             raise ValueError("artifact predecessor chain is invalid")
-        typed[kind.value] = _reconstruct(kind, artifact.payload, verified_identity)
+        typed[kind.value] = _reconstruct(
+            kind,
+            artifact.payload,
+            verified_identity,
+            retrieved_at=envelope.retrieved_at,
+        )
         envelopes.append(envelope)
         predecessor = _canonical_stage_hash(envelope)
     _validate_reconstructed_path(

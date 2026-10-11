@@ -107,11 +107,16 @@ class PublicNetwork:
     def __call__(self, request: HttpRequest) -> HttpResponse:
         self.requests.append(request)
         body = [self.market] if "gamma-api" in request.url else self.books.pop(0)
+        retrieved_at = (
+            NOW
+            if isinstance(body, list)
+            else datetime.fromtimestamp(int(body["timestamp"]) / 1000, UTC)
+        )
         return HttpResponse(
             200,
             {"content-type": "application/json"},
             json.dumps(body, separators=(",", ":")).encode(),
-            NOW,
+            retrieved_at,
         )
 
 
@@ -318,7 +323,8 @@ def test_fresh_book_failures_terminalize_after_one_decision_barrier(
             value = self.books.pop(0)
             if isinstance(value, BaseException):
                 raise value
-            if isinstance(value, dict) and set(value) != set(_book(0)):
+            partial = isinstance(value, dict) and set(value) != set(_book(0))
+            if partial:
                 merged = _book(3)
                 merged.update(value)
                 value = merged
@@ -327,7 +333,9 @@ def test_fresh_book_failures_terminalize_after_one_decision_barrier(
                 200,
                 {"content-type": "application/json"},
                 json.dumps(value, separators=(",", ":")).encode(),
-                NOW,
+                datetime.fromtimestamp(int(value["timestamp"]) / 1000, UTC)
+                if partial
+                else NOW,
             )
 
     public = FailingFreshBook()
@@ -642,6 +650,69 @@ def test_eligibility_rejection_is_canonical_terminal_observation(
     assert not (tmp_path / "rejections.jsonl").exists()
 
 
+@pytest.mark.parametrize(
+    ("changes", "reason", "forged"),
+    [
+        ({"active": False}, "INACTIVE", "CLOSED"),
+        ({"active": False}, "INACTIVE", "MALFORMED_MARKET"),
+        ({"closed": True}, "CLOSED", "SPORTS"),
+        ({"category": "Sports"}, "SPORTS", "NON_BINARY"),
+        ({"outcomes": '["A","B"]'}, "NON_BINARY", "MISSING_EVIDENCE"),
+        ({"rules": ""}, "MISSING_EVIDENCE", "CLOSE_WINDOW"),
+        (
+            {"endDate": (NOW + timedelta(minutes=30)).isoformat()},
+            "CLOSE_WINDOW",
+            "LOW_VOLUME",
+        ),
+        ({"volume24hr": "9999"}, "LOW_VOLUME", "INACTIVE"),
+    ],
+)
+def test_gamma_rejection_replay_recomputes_exact_reason(
+    tmp_path: Path, changes: dict[str, Any], reason: str, forged: str
+) -> None:
+    market = _market() | changes
+    summary = _observe(tmp_path, market=market)[0]
+    observation_id = str(summary["observation_id"])
+    assert summary["reason"] == reason
+    load_observation(tmp_path, observation_id)
+
+    _forge(tmp_path, observation_id, "eligibility_rejection", _field(reason=forged))
+
+    _assert_replay_rejected(
+        tmp_path,
+        observation_id,
+        "eligibility rejection reason does not match frozen Gamma",
+    )
+
+
+def test_gamma_rejection_replay_binds_utc_spelling_and_exact_raw_bytes(
+    tmp_path: Path,
+) -> None:
+    market = _market() | {
+        "endDate": (NOW + timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
+    }
+    summary = _observe(tmp_path, market=market)[0]
+    observation_id = str(summary["observation_id"])
+    replacement = dict(market)
+    replacement["endDate"] = str(replacement["endDate"]).replace("Z", "+00:00")
+    replacement_bytes = _wire(replacement)
+    replacement_sha = hashlib.sha256(replacement_bytes).hexdigest()
+
+    _forge(tmp_path, observation_id, "raw_gamma", lambda _payload: replacement_bytes)
+    _forge(
+        tmp_path,
+        observation_id,
+        "eligibility_rejection",
+        _field(raw_gamma_sha256=replacement_sha),
+    )
+
+    _assert_replay_rejected(
+        tmp_path,
+        observation_id,
+        "artifact envelope does not match observation hash",
+    )
+
+
 def test_cumulative_model_cost_overflow_is_barriered_without_fresh_book(
     tmp_path: Path,
 ) -> None:
@@ -871,6 +942,31 @@ def _forge(
     entries[index].update(
         sha256=ref.sha256, byte_size=ref.byte_length, storage_relpath=ref.relative_path
     )
+    previous = entries[index]
+    for later in entries[index + 1 :]:
+        if later["observation_id"] != observation_id:
+            continue
+        later["predecessor_stage_sha256"] = hashlib.sha256(
+            canonical_json_bytes(previous)
+        ).hexdigest()
+        previous = later
+    journal = output / "artifacts.jsonl"
+    journal.write_bytes(
+        b"".join(canonical_json_bytes(entry) + b"\n" for entry in entries)
+    )
+    os.chmod(journal, 0o600)
+
+
+def _forge_envelope_retrieved_at(
+    output: Path, observation_id: str, kind: str, retrieved_at: datetime
+) -> None:
+    entries = _journal(output)
+    index = next(
+        position
+        for position, entry in enumerate(entries)
+        if entry["observation_id"] == observation_id and entry["kind"] == kind
+    )
+    entries[index]["retrieved_at"] = retrieved_at.isoformat().replace("+00:00", "Z")
     previous = entries[index]
     for later in entries[index + 1 :]:
         if later["observation_id"] != observation_id:
@@ -1431,6 +1527,30 @@ def test_finding_1_replay_rejects_raw_bytes_swapped_without_updating_http_metada
     )
 
     _assert_replay_rejected(tmp_path, observation_id, _HTTP_BINDING)
+
+
+def test_replay_recomputes_precheck_age_from_response_retrieved_at(
+    tmp_path: Path,
+) -> None:
+    summary = _observe(tmp_path)[0]
+    observation_id = str(summary["observation_id"])
+    delayed = NOW + timedelta(seconds=31)
+
+    _forge(
+        tmp_path,
+        observation_id,
+        "precheck_book_http",
+        _field(retrieved_at=delayed.isoformat().replace("+00:00", "Z")),
+    )
+    _forge_envelope_retrieved_at(
+        tmp_path, observation_id, "precheck_book_http", delayed
+    )
+
+    _assert_replay_rejected(
+        tmp_path,
+        observation_id,
+        "precheck book does not match the recomputed response outcome",
+    )
 
 
 @pytest.mark.parametrize(
@@ -2217,7 +2337,7 @@ def test_hardening_secret_like_hash_in_valid_public_books_does_not_abort_observe
     execution = _book_bytes(3, hash="Bearer abcdefgh12345678")
     public = ScriptedPrecheck(
         HttpResponse(200, JSON_HEADERS, precheck, NOW),
-        then=(HttpResponse(200, JSON_HEADERS, execution, NOW),),
+        then=(HttpResponse(200, JSON_HEADERS, execution, NOW + timedelta(seconds=3)),),
     )
 
     summary = _observe(tmp_path, public=public)[0]
