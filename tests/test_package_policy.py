@@ -249,7 +249,7 @@ _APPROVED_SOURCE_HASHES = {
         "f17e8c6cef480cf1926b04999fe3097079bb473cbb32a188a335cd89e287003e"
     ),
     "src/jev_trading_lab/polymarket/pipeline.py": (
-        "6e28fd55fb1c1c6937dd190ede3854d3b512b6577ec33009c81d771c8413dfa2"
+        "9795f35d69c3b0962cfbb7943fb4e13686b88304491f43f1b5502fde39426a2a"
     ),
     "src/jev_trading_lab/polymarket/store.py": (
         "98db124d8f958aaf6df8c52f36bdffaa312ad432d6b657e512c54ad995042be7"
@@ -311,10 +311,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "75cd64d79ccbc142c9220e623403dc07a30e26c6d2c269e06ee67c4400efd515"
+    "8a851a0345fdc630122517d4c54cd4d805537bac14b59d6bd01256dde3b13265"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "cddd1340fb6f271b8e0e75e7b6a93502503092c4772a34f18795f84797fe3827"
+    "9ec1da040babebbd4b2d3789ca735262902e2874c9fe4feda6c117076a2c043d"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = [
     "exchange-calendars==4.11.2",

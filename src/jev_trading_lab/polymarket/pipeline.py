@@ -1531,12 +1531,6 @@ def _observe_locked(
     public = client or PolymarketClient(SecureHttpTransport())
     openai_sender = openai_transport or live_openai_transport()
     jev_sender = jev_transport or live_jev_transport()
-    try:
-        polled = public.poll(limit=limit, now=cutoff, history_points=2)
-    except PublicDataError as error:
-        return _public_poll_failure(
-            output_dir, error, observed_at=cutoff, config=config
-        )
     call_journal = ProviderCallJournal(output_dir)
     recovered: list[MarketCandidate] = []
     for opportunity_id in call_journal.opportunity_ids_created_at(cutoff):
@@ -1545,22 +1539,33 @@ def _observe_locked(
         )
         if candidate is not None:
             recovered.append(candidate)
-    recovered_markets = {candidate.market_id for candidate in recovered}
-    rejections = [
-        rejection
-        for rejection in polled.rejections
-        if rejection.market_id not in recovered_markets
-    ]
+    try:
+        polled = public.poll(limit=limit, now=cutoff, history_points=2)
+    except PublicDataError as error:
+        if not recovered:
+            return _public_poll_failure(
+                output_dir, error, observed_at=cutoff, config=config
+            )
+        eligible: tuple[MarketCandidate, ...] = ()
+        rejections: list[MarketRejection] = []
+    else:
+        recovered_markets = {candidate.market_id for candidate in recovered}
+        eligible = polled.eligible
+        rejections = [
+            rejection
+            for rejection in polled.rejections
+            if rejection.market_id not in recovered_markets
+        ]
     summaries = _record_rejections(
         output_dir, tuple(rejections), observed_at=cutoff, config=config
     )
-    eligible_markets = {candidate.market_id for candidate in polled.eligible}
+    eligible_markets = {candidate.market_id for candidate in eligible}
     missing = [
         candidate
         for candidate in recovered
         if candidate.market_id not in eligible_markets
     ]
-    for candidate in (*polled.eligible, *missing):
+    for candidate in (*eligible, *missing):
         provisional = _identity(candidate, candidate.precheck_book.source_sha256)
         call_journal = ProviderCallJournal(output_dir)
         input_changed = False

@@ -2286,6 +2286,73 @@ def test_crash_after_provider_intent_never_retries_unknown_call(tmp_path: Path) 
     assert failure["code"] == "UNKNOWN_IN_FLIGHT"
 
 
+def test_poll_failure_cannot_complete_slot_before_pending_provider_recovery(
+    tmp_path: Path,
+) -> None:
+    market = _market()
+
+    def crash(event: str) -> None:
+        if event == "openai_intent_frozen":
+            raise RuntimeError("failpoint after provider intent")
+
+    with pytest.raises(RuntimeError, match="failpoint"):
+        _observe(tmp_path, market=market, event_sink=crash)
+
+    journal = ProviderCallJournal(tmp_path)
+    opportunity_id = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "market_id": market["id"],
+                "policy_version": POLICY_VERSION,
+                "slot_at": NOW.isoformat().replace("+00:00", "Z"),
+            }
+        )
+    ).hexdigest()
+    intent = journal.lookup(opportunity_id, "openai")
+    assert intent is not None and intent["kind"] == "provider_call_intent"
+
+    class FailedGamma(PublicNetwork):
+        def __call__(self, request: HttpRequest) -> HttpResponse:
+            if "gamma-api" in request.url:
+                self.requests.append(request)
+                return HttpResponse(500, JSON_HEADERS, b'{"error":"failed"}', NOW)
+            return super().__call__(request)
+
+    public = FailedGamma(market)
+    openai = ModelTransport("openai", _market_sha(market))
+    jev = ModelTransport("jev")
+    summary = _observe(tmp_path, market=market, public=public, openai=openai, jev=jev)[
+        0
+    ]
+
+    assert summary["opportunity_id"] == opportunity_id
+    assert summary["ai"]["disposition"] == "UNKNOWN_IN_FLIGHT"
+    assert summary["ai"]["model_cost_microdollars"] is None
+    assert summary["ai"]["economic_pnl_microdollars"] is None
+    assert summary["paired_economic_pnl_delta_microdollars"] is None
+    assert len(public.requests) == 1
+    assert openai.requests == [] and jev.requests == []
+    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 1
+    result = journal.lookup(opportunity_id, "openai")
+    assert result is not None and result["kind"] == "provider_call_result"
+    assert result["outcome"]["code"] == "UNKNOWN_IN_FLIGHT"
+    assert result["outcome"]["billed_cost_microdollars"] is None
+
+    replay_public = FailedGamma(market)
+    replay_openai = ModelTransport("openai", _market_sha(market))
+    replay_jev = ModelTransport("jev")
+    again = _observe(
+        tmp_path,
+        market=market,
+        public=replay_public,
+        openai=replay_openai,
+        jev=replay_jev,
+    )
+    assert again == [summary]
+    assert replay_public.requests == []
+    assert replay_openai.requests == [] and replay_jev.requests == []
+
+
 def test_missing_market_cannot_strand_unknown_in_flight_provider_cost(
     tmp_path: Path,
 ) -> None:

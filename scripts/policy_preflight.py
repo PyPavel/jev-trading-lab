@@ -121,7 +121,7 @@ EXPECTED_SOURCE_HASHES = {
         "f17e8c6cef480cf1926b04999fe3097079bb473cbb32a188a335cd89e287003e"
     ),
     "src/jev_trading_lab/polymarket/pipeline.py": (
-        "6e28fd55fb1c1c6937dd190ede3854d3b512b6577ec33009c81d771c8413dfa2"
+        "9795f35d69c3b0962cfbb7943fb4e13686b88304491f43f1b5502fde39426a2a"
     ),
     "src/jev_trading_lab/polymarket/store.py": (
         "98db124d8f958aaf6df8c52f36bdffaa312ad432d6b657e512c54ad995042be7"
