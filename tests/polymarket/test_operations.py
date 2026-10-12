@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+import subprocess
+import sys
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, fields
@@ -26,10 +28,14 @@ from jev_trading_lab.polymarket.operations import (
     OperationSecurityError,
     ProcessSample,
     append_operation,
+    build_identity_exact_values,
+    build_identity_from_exact_values,
     capture_build_identity,
     load_operation_cut,
     operation_event_id,
     package_version_code,
+    process_sample_exact_values,
+    process_sample_from_exact_values,
     sample_process,
 )
 
@@ -109,12 +115,27 @@ def event(**changes: Any) -> OperationEvent:
         "elapsed_nanoseconds": 10
         if kind in {OperationKind.RUN_TERMINAL, OperationKind.STAGE_TERMINAL}
         else None,
-        "exact_values": {"discarded_bytes": 1}
-        if kind is OperationKind.RECOVERY
-        else {},
+        "exact_values": {
+            OperationKind.STARTUP: {
+                "build_version_code": 1000,
+                "build_identity_status_code": 3,
+            },
+            OperationKind.RECOVERY: {"discarded_bytes": 1},
+            OperationKind.PROCESS_SAMPLE: {
+                "user_cpu_nanoseconds": 0,
+                "system_cpu_nanoseconds": 0,
+                "probe_available": 0,
+            },
+        }.get(kind, {}),
         "evidence": None,
     }
     defaults.update(changes)
+    if (
+        kind is OperationKind.PROCESS_SAMPLE
+        and defaults["status"] == "failure"
+        and "exact_values" not in changes
+    ):
+        defaults["exact_values"] = {}
     defaults["kind"] = kind
     if isinstance(defaults["occurred_at"], str):
         defaults["occurred_at"] = datetime.fromisoformat(
@@ -236,7 +257,11 @@ def test_operation_kind_is_closed_to_all_nine_approved_values() -> None:
             "kind": "process_sample",
             "run_id": SHA,
             "status": "success",
-            "exact_values": {},
+            "exact_values": {
+                "user_cpu_nanoseconds": 0,
+                "system_cpu_nanoseconds": 0,
+                "probe_available": 0,
+            },
         },
         {
             "kind": "metrics_generation",
@@ -259,10 +284,19 @@ def test_all_kind_contracts_round_trip(tmp_path: Path, changes: dict[str, Any]) 
                 kind="run_started",
                 run_id=value.run_id,
                 status="started",
-                occurred_at="2026-10-12T11:59:59Z",
+                occurred_at="2026-10-12T11:59:58Z",
             ),
         )
-        append_operation(root, prerequisites[0])
+        if value.kind is OperationKind.RUN_TERMINAL:
+            prerequisites += (
+                event(
+                    kind="process_sample",
+                    run_id=value.run_id,
+                    occurred_at="2026-10-12T11:59:59Z",
+                ),
+            )
+        for prerequisite in prerequisites:
+            append_operation(root, prerequisite)
 
     append_operation(root, value)
     cut = load_operation_cut(root)
@@ -402,6 +436,7 @@ def test_run_transition_requires_one_started_event_before_terminal(
         append_operation(root, terminal)
 
     append_operation(root, event(kind="run_started", run_id=SHA, status="started"))
+    append_operation(root, event(kind="process_sample", run_id=SHA))
     append_operation(root, terminal)
     with pytest.raises(OperationCorruptError, match="transition"):
         append_operation(
@@ -1059,6 +1094,12 @@ def test_conflicting_blob_reference_metadata_is_corruption(tmp_path: Path) -> No
     )
     reference = blob_ref(payload)
     started = event(kind="run_started", run_id=SHA, status="started")
+    other_started = event(
+        kind="run_started",
+        run_id="b" * 64,
+        status="started",
+        occurred_at="2026-10-12T12:00:01Z",
+    )
     wrong = event(
         kind="process_sample",
         run_id=SHA,
@@ -1068,17 +1109,24 @@ def test_conflicting_blob_reference_metadata_is_corruption(tmp_path: Path) -> No
     )
     correct = event(
         kind="process_sample",
-        run_id=SHA,
+        run_id="b" * 64,
         status="failure",
         reason="process",
         evidence=reference.model_dump(),
-        occurred_at="2026-10-12T12:00:01Z",
+        occurred_at="2026-10-12T12:00:02Z",
     )
-    append_operation(root, started)
+    first_terminal = event(
+        kind="run_terminal", run_id=SHA, occurred_at="2026-10-12T12:00:01Z"
+    )
+    append_operation(root, other_started)
     append_operation(root, correct, payload)
     journal = root / "operations.jsonl"
     journal.write_bytes(
-        journal_line(started) + journal_line(wrong) + journal_line(correct)
+        journal_line(started)
+        + journal_line(wrong)
+        + journal_line(first_terminal)
+        + journal_line(other_started)
+        + journal_line(correct)
     )
 
     with pytest.raises(OperationCorruptError, match="conflicting.*reference"):
@@ -1097,6 +1145,9 @@ def test_identical_blob_references_are_verified_once(
     )
     reference = blob_ref(payload)
     started = event(kind="run_started", run_id=SHA, status="started")
+    other_started = event(
+        kind="run_started", run_id="b" * 64, occurred_at="2026-10-12T12:00:01Z"
+    )
     first = event(
         kind="process_sample",
         run_id=SHA,
@@ -1106,15 +1157,18 @@ def test_identical_blob_references_are_verified_once(
     )
     second = event(
         kind="process_sample",
-        run_id=SHA,
+        run_id="b" * 64,
         status="failure",
         reason="process",
         evidence=reference.model_dump(),
-        occurred_at="2026-10-12T12:00:01Z",
+        occurred_at="2026-10-12T12:00:02Z",
+    )
+    first_terminal = event(
+        kind="run_terminal", run_id=SHA, occurred_at="2026-10-12T12:00:01Z"
     )
     append_operation(root, started)
     append_operation(root, first, payload)
-    append_raw_lines(root, started, first, second)
+    append_raw_lines(root, started, first, first_terminal, other_started, second)
     calls = 0
     original = operations.BlobStore.read_verified
 
@@ -1625,8 +1679,8 @@ def _git_runner(
 ) -> Any:
     values = {
         ("rev-parse", "HEAD"): commit,
-        ("show", "-s", "--format=%ct", "HEAD"): timestamp,
-        ("status", "--porcelain"): dirty,
+        ("show", "-s", "--format=%at", "HEAD"): timestamp,
+        ("ls-files", "--others", "--exclude-standard"): dirty,
     }
 
     def run(arguments: tuple[str, ...]) -> str:
@@ -1642,7 +1696,7 @@ def _git_runner(
         (GIT_COMMIT, GIT_COMMIT, " M source.py", "dirty", True),
         ("b" * 40, GIT_COMMIT, "", "mismatch", False),
         ("b" * 40, GIT_COMMIT, " M source.py", "dirty", True),
-        (None, GIT_COMMIT, "", "unknown", False),
+        (None, GIT_COMMIT, "", "unknown", None),
     ),
 )
 def test_build_identity_statuses_are_mutually_exclusive(
@@ -1656,6 +1710,7 @@ def test_build_identity_statuses_are_mutually_exclusive(
     from jev_trading_lab.polymarket import operations
 
     monkeypatch.setattr(operations, "_run_git", _git_runner(commit=commit, dirty=dirty))
+    monkeypatch.setattr(operations, "_git_dirty", lambda: bool(dirty))
 
     value = capture_build_identity(expected_commit)
 
@@ -1715,6 +1770,7 @@ def test_process_sample_exact_values_round_trip(tmp_path: Path) -> None:
         "user_cpu_nanoseconds": 10,
         "system_cpu_nanoseconds": 20,
         "open_fds": 3,
+        "probe_available": 1,
     }
     root = tmp_path / "audit"
     started = event(kind="run_started", run_id=SHA, status="started")
@@ -1774,6 +1830,327 @@ def test_process_and_build_dataclasses_reject_invalid_builtin_values() -> None:
         BuildIdentity(1000, None, 0, "unknown")  # type: ignore[arg-type]
     with pytest.raises((TypeError, ValueError)):
         BuildIdentity(1000, None, None, "other")  # type: ignore[arg-type]
+
+
+def test_build_identity_uses_author_timestamp_from_real_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(("git", "init", "-q"), cwd=repository, check=True)
+    subprocess.run(("git", "config", "user.name", "Test"), cwd=repository, check=True)
+    subprocess.run(
+        ("git", "config", "user.email", "test@example.invalid"),
+        cwd=repository,
+        check=True,
+    )
+    (repository / "tracked").write_text("fact\n", encoding="utf-8")
+    subprocess.run(("git", "add", "tracked"), cwd=repository, check=True)
+    environment = os.environ | {
+        "GIT_AUTHOR_DATE": "2001-01-01T00:00:00+00:00",
+        "GIT_COMMITTER_DATE": "2020-01-01T00:00:00+00:00",
+    }
+    subprocess.run(
+        ("git", "commit", "-q", "-m", "timestamp fixture"),
+        cwd=repository,
+        env=environment,
+        check=True,
+    )
+    commit = subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    author_timestamp = int(
+        subprocess.run(
+            ("git", "show", "-s", "--format=%at", "HEAD"),
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
+    committer_timestamp = int(
+        subprocess.run(
+            ("git", "show", "-s", "--format=%ct", "HEAD"),
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
+    assert author_timestamp != committer_timestamp
+    monkeypatch.chdir(repository)
+
+    assert capture_build_identity(commit).commit_timestamp_seconds == author_timestamp
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        BuildIdentity(1000, 1, False, "valid"),
+        BuildIdentity(1000, 1, True, "dirty"),
+        BuildIdentity(1000, 1, False, "mismatch"),
+        BuildIdentity(1000, None, None, "unknown"),
+        BuildIdentity(1000, 1, None, "unknown"),
+    ),
+)
+def test_build_identity_accepts_only_consistent_states(value: BuildIdentity) -> None:
+    assert value.status in {"valid", "dirty", "mismatch", "unknown"}
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        (1000, None, False, "valid"),
+        (1000, 1, True, "valid"),
+        (1000, None, True, "dirty"),
+        (1000, 1, False, "dirty"),
+        (1000, None, False, "mismatch"),
+        (1000, 1, True, "mismatch"),
+        (1000, 1, False, "unknown"),
+        (1000, None, True, "unknown"),
+    ),
+)
+def test_build_identity_rejects_contradictory_states(
+    arguments: tuple[Any, ...],
+) -> None:
+    with pytest.raises((TypeError, ValueError), match="status|state"):
+        BuildIdentity(*arguments)  # type: ignore[arg-type]
+
+
+def test_capture_git_failure_returns_sanitized_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    monkeypatch.setattr(
+        operations,
+        "_run_git",
+        lambda _arguments: (_ for _ in ()).throw(ValueError("/private SECRET")),
+    )
+    value = capture_build_identity(GIT_COMMIT)
+    assert value == BuildIdentity(1000, None, None, "unknown")
+    assert "/private" not in repr(value)
+    assert "SECRET" not in repr(value)
+
+
+def test_capture_without_expected_commit_has_unknown_dirty_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    monkeypatch.setattr(operations, "_run_git", _git_runner(dirty=" M tracked"))
+    monkeypatch.setattr(operations, "_git_dirty", lambda: True)
+    value = capture_build_identity(None)
+    assert value == BuildIdentity(1000, 1_700_000_000, None, "unknown")
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"probe_available": True},
+        {"resident_memory_bytes": 1, "probe_available": True},
+        {
+            "resident_memory_bytes": 1,
+            "peak_resident_memory_bytes": 2,
+            "probe_available": True,
+        },
+    ),
+)
+def test_process_sample_rejects_available_with_missing_optional_probe(
+    changes: dict[str, Any],
+) -> None:
+    defaults: dict[str, Any] = {
+        "resident_memory_bytes": None,
+        "peak_resident_memory_bytes": None,
+        "user_cpu_nanoseconds": 0,
+        "system_cpu_nanoseconds": 0,
+        "open_fds": None,
+        "probe_available": False,
+    }
+    with pytest.raises((TypeError, ValueError), match="probe_available"):
+        ProcessSample(**(defaults | changes))
+
+
+def test_process_sample_available_requires_all_optional_probes() -> None:
+    value = ProcessSample(1, 2, 3, 4, 5, True)
+    assert value.probe_available
+    with pytest.raises((TypeError, ValueError), match="probe_available"):
+        ProcessSample(1, 2, 3, 4, 5, False)
+
+
+def test_process_and_build_exact_values_round_trip_without_free_text() -> None:
+    samples = (
+        ProcessSample(1, 2, 3, 4, 5, True),
+        ProcessSample(None, 2, 3, 4, None, False),
+    )
+    identities = (
+        BuildIdentity(1000, 10, False, "valid"),
+        BuildIdentity(1000, 10, True, "dirty"),
+        BuildIdentity(1000, 10, False, "mismatch"),
+        BuildIdentity(1000, None, None, "unknown"),
+        BuildIdentity(1000, 10, None, "unknown"),
+    )
+    for sample in samples:
+        exact_values = process_sample_exact_values(sample)
+        assert process_sample_from_exact_values(exact_values) == sample
+        assert set(exact_values) <= {
+            "resident_memory_bytes",
+            "peak_resident_memory_bytes",
+            "user_cpu_nanoseconds",
+            "system_cpu_nanoseconds",
+            "open_fds",
+            "probe_available",
+        }
+    for identity in identities:
+        exact_values = build_identity_exact_values(identity)
+        assert build_identity_from_exact_values(exact_values) == identity
+        assert set(exact_values) <= {
+            "build_version_code",
+            "build_commit_timestamp_seconds",
+            "build_dirty",
+            "build_identity_status_code",
+        }
+
+
+def test_exact_value_inverse_helpers_reject_non_builtin_values() -> None:
+    class TaggedInt(int):
+        pass
+
+    for values in (
+        {
+            "user_cpu_nanoseconds": True,
+            "system_cpu_nanoseconds": 0,
+            "probe_available": 0,
+        },
+        {
+            "user_cpu_nanoseconds": 0,
+            "system_cpu_nanoseconds": TaggedInt(0),
+            "probe_available": 0,
+        },
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            process_sample_from_exact_values(values)
+    for values in (
+        {"build_version_code": True, "build_identity_status_code": 3},
+        {"build_version_code": 1000, "build_identity_status_code": TaggedInt(3)},
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            build_identity_from_exact_values(values)
+
+
+def test_process_sample_event_contract_requires_reconstructable_success() -> None:
+    for values in (
+        {},
+        {"user_cpu_nanoseconds": 1},
+        {"user_cpu_nanoseconds": 1, "system_cpu_nanoseconds": 2},
+        {
+            "user_cpu_nanoseconds": 1,
+            "system_cpu_nanoseconds": 2,
+            "probe_available": 1,
+        },
+    ):
+        with pytest.raises(ValidationError, match="process sample"):
+            event(kind="process_sample", status="success", exact_values=values)
+
+
+def test_process_sample_failure_has_no_fabricated_values() -> None:
+    failed = event(
+        kind="process_sample",
+        status="failure",
+        reason="process",
+        exact_values={},
+        evidence=blob_ref(evidence_payload()).model_dump(),
+    )
+    assert failed.exact_values == {}
+    defaults = {
+        "kind": "process_sample",
+        "status": "failure",
+        "reason": "process",
+        "exact_values": {},
+        "evidence": blob_ref(evidence_payload()).model_dump(),
+    }
+    for changes in ({"exact_values": {"user_cpu_nanoseconds": 0}}, {"evidence": None}):
+        with pytest.raises(ValidationError, match="process sample"):
+            event(**(defaults | changes))
+
+
+def test_startup_event_requires_reconstructable_build_identity() -> None:
+    for values in (
+        {},
+        {"build_version_code": 1000},
+        {"build_version_code": 1000, "build_identity_status_code": 0},
+        {
+            "build_version_code": 1000,
+            "build_identity_status_code": 0,
+            "build_dirty": 1,
+            "build_commit_timestamp_seconds": 1,
+        },
+    ):
+        with pytest.raises(ValidationError, match="build identity"):
+            event(kind="startup", exact_values=values)
+
+
+def test_process_sample_is_exactly_once_immediately_before_terminal(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "valid"
+    started = event(kind="run_started")
+    stage = event(kind="stage_terminal")
+    sampled = event(kind="process_sample")
+    terminal = event(kind="run_terminal")
+    for value in (started, stage, sampled, terminal):
+        append_operation(root, value)
+    assert load_operation_cut(root).events == (started, stage, sampled, terminal)
+
+    later_sample = event(kind="process_sample", occurred_at="2026-10-12T12:00:01Z")
+    invalid_sequences = (
+        (started, terminal),
+        (started, sampled, later_sample),
+        (started, sampled, stage),
+        (started, sampled, event(), terminal),
+        (started, sampled, terminal, later_sample),
+        (started, event(kind="process_sample", run_id="b" * 64)),
+    )
+    for index, sequence in enumerate(invalid_sequences):
+        invalid_root = tmp_path / f"invalid-{index}"
+        with pytest.raises(OperationCorruptError, match="transition"):
+            for value in sequence:
+                append_operation(invalid_root, value)
+
+
+def test_bounded_runner_rejects_oversize_malformed_and_nonzero_output() -> None:
+    from jev_trading_lab.polymarket import operations
+
+    cases = (
+        ("import sys; sys.stdout.buffer.write(b'x' * 5000)", "bound"),
+        ("import sys; sys.stdout.buffer.write(b'\\xff')", "UTF-8"),
+        ("import sys; sys.exit(7)", "status"),
+    )
+    for source, message in cases:
+        with pytest.raises((OSError, UnicodeError, ValueError), match=message):
+            operations._run_bounded((sys.executable, "-c", source), timeout=1.0)
+
+
+def test_bounded_runner_times_out_kills_process_group_and_reaps(
+    tmp_path: Path,
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    pid_path = tmp_path / "pid"
+    source = (
+        "import os,time,pathlib; "
+        f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
+        "time.sleep(30)"
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        operations._run_bounded((sys.executable, "-c", source), timeout=0.2)
+    pid = int(pid_path.read_text(encoding="ascii"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
 
 
 def test_blob_reference_schema_metadata_is_strict() -> None:

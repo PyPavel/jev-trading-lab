@@ -7,8 +7,11 @@ import hashlib
 import os
 import re
 import resource
+import selectors
+import signal
 import stat
 import subprocess
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -244,23 +247,33 @@ _EVENT_STATUSES = {
     OperationKind.PROCESS_SAMPLE: frozenset({"success", "failure"}),
     OperationKind.METRICS_GENERATION: frozenset({"success", "failure", "skipped"}),
 }
+_BUILD_IDENTITY_KEYS = frozenset(
+    {
+        "build_version_code",
+        "build_commit_timestamp_seconds",
+        "build_dirty",
+        "build_identity_status_code",
+    }
+)
+_PROCESS_SAMPLE_KEYS = frozenset(
+    {
+        "resident_memory_bytes",
+        "peak_resident_memory_bytes",
+        "user_cpu_nanoseconds",
+        "system_cpu_nanoseconds",
+        "open_fds",
+        "probe_available",
+    }
+)
 _EVENT_EXACT_KEYS = {
-    OperationKind.STARTUP: frozenset(),
+    OperationKind.STARTUP: _BUILD_IDENTITY_KEYS,
     OperationKind.RUN_STARTED: frozenset(),
     OperationKind.RUN_TERMINAL: frozenset(),
     OperationKind.STAGE_TERMINAL: frozenset(),
     OperationKind.RECOVERY: frozenset({"discarded_bytes"}),
     OperationKind.DEDUPLICATION: frozenset(),
     OperationKind.STORAGE_FAILURE: frozenset(),
-    OperationKind.PROCESS_SAMPLE: frozenset(
-        {
-            "resident_memory_bytes",
-            "peak_resident_memory_bytes",
-            "user_cpu_nanoseconds",
-            "system_cpu_nanoseconds",
-            "open_fds",
-        }
-    ),
+    OperationKind.PROCESS_SAMPLE: _PROCESS_SAMPLE_KEYS,
     OperationKind.METRICS_GENERATION: frozenset(),
 }
 
@@ -320,6 +333,16 @@ class ProcessSample:
         _bounded_int(self.system_cpu_nanoseconds, "system_cpu_nanoseconds")
         if type(self.probe_available) is not bool:
             raise TypeError("probe_available must be a built-in bool")
+        all_probes = all(
+            value is not None
+            for value in (
+                self.resident_memory_bytes,
+                self.peak_resident_memory_bytes,
+                self.open_fds,
+            )
+        )
+        if self.probe_available != all_probes:
+            raise ValueError("probe_available contradicts optional probes")
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,6 +360,107 @@ class BuildIdentity:
             raise TypeError("dirty must be a built-in bool or None")
         if type(self.status) is not str or self.status not in _BUILD_STATUSES:
             raise ValueError("status must be an approved build status")
+        expected = {
+            "valid": (False, True),
+            "dirty": (True, True),
+            "mismatch": (False, True),
+            "unknown": (None, self.commit_timestamp_seconds is not None),
+        }[self.status]
+        if self.dirty is not expected[0] or (
+            self.status != "unknown"
+            and (self.commit_timestamp_seconds is not None) is not expected[1]
+        ):
+            raise ValueError("build identity state contradicts status")
+
+
+def process_sample_exact_values(sample: ProcessSample) -> dict[str, int]:
+    """Encode one process sample as closed raw journal facts."""
+
+    if type(sample) is not ProcessSample:
+        raise TypeError("sample must be a ProcessSample")
+    values = {
+        "user_cpu_nanoseconds": sample.user_cpu_nanoseconds,
+        "system_cpu_nanoseconds": sample.system_cpu_nanoseconds,
+        "probe_available": int(sample.probe_available),
+    }
+    for name in ("resident_memory_bytes", "peak_resident_memory_bytes", "open_fds"):
+        value = getattr(sample, name)
+        if value is not None:
+            values[name] = value
+    return values
+
+
+def process_sample_from_exact_values(values: Mapping[str, int]) -> ProcessSample:
+    """Validate and reconstruct closed process sample facts."""
+
+    if type(values) is not dict:
+        raise TypeError("process sample exact values must be a built-in dict")
+    if any(
+        type(key) is not str or type(value) is not int for key, value in values.items()
+    ):
+        raise TypeError(
+            "process sample exact values require built-in string and int values"
+        )
+    if set(values) - _PROCESS_SAMPLE_KEYS:
+        raise ValueError("process sample exact values are invalid")
+    required = {"user_cpu_nanoseconds", "system_cpu_nanoseconds", "probe_available"}
+    if not required <= set(values) or values["probe_available"] not in {0, 1}:
+        raise ValueError("process sample exact values are incomplete")
+    return ProcessSample(
+        resident_memory_bytes=values.get("resident_memory_bytes"),
+        peak_resident_memory_bytes=values.get("peak_resident_memory_bytes"),
+        user_cpu_nanoseconds=values["user_cpu_nanoseconds"],
+        system_cpu_nanoseconds=values["system_cpu_nanoseconds"],
+        open_fds=values.get("open_fds"),
+        probe_available=bool(values["probe_available"]),
+    )
+
+
+_BUILD_STATUS_CODES = {"valid": 0, "dirty": 1, "mismatch": 2, "unknown": 3}
+_BUILD_STATUS_BY_CODE = {value: key for key, value in _BUILD_STATUS_CODES.items()}
+
+
+def build_identity_exact_values(identity: BuildIdentity) -> dict[str, int]:
+    """Encode one build identity as closed raw startup facts."""
+
+    if type(identity) is not BuildIdentity:
+        raise TypeError("identity must be a BuildIdentity")
+    values = {
+        "build_version_code": identity.version_code,
+        "build_identity_status_code": _BUILD_STATUS_CODES[identity.status],
+    }
+    if identity.commit_timestamp_seconds is not None:
+        values["build_commit_timestamp_seconds"] = identity.commit_timestamp_seconds
+    if identity.dirty is not None:
+        values["build_dirty"] = int(identity.dirty)
+    return values
+
+
+def build_identity_from_exact_values(values: Mapping[str, int]) -> BuildIdentity:
+    """Validate and reconstruct closed startup build facts."""
+
+    if type(values) is not dict:
+        raise TypeError("build identity exact values must be a built-in dict")
+    if any(
+        type(key) is not str or type(value) is not int for key, value in values.items()
+    ):
+        raise TypeError(
+            "build identity exact values require built-in string and int values"
+        )
+    if set(values) - _BUILD_IDENTITY_KEYS:
+        raise ValueError("build identity exact values are invalid")
+    if not {"build_version_code", "build_identity_status_code"} <= set(values):
+        raise ValueError("build identity exact values are incomplete")
+    status = _BUILD_STATUS_BY_CODE.get(values["build_identity_status_code"])
+    dirty_code = values.get("build_dirty")
+    if status is None or dirty_code not in {None, 0, 1}:
+        raise ValueError("build identity exact values are invalid")
+    return BuildIdentity(
+        version_code=values["build_version_code"],
+        commit_timestamp_seconds=values.get("build_commit_timestamp_seconds"),
+        dirty=None if dirty_code is None else bool(dirty_code),
+        status=cast(Literal["valid", "dirty", "mismatch", "unknown"], status),
+    )
 
 
 def _read_proc_statm() -> str:
@@ -395,7 +519,9 @@ def sample_process() -> ProcessSample:
         user_cpu_nanoseconds=_cpu_nanoseconds(usage.ru_utime),
         system_cpu_nanoseconds=_cpu_nanoseconds(usage.ru_stime),
         open_fds=open_fds,
-        probe_available=resident is not None and open_fds is not None,
+        probe_available=resident is not None
+        and peak is not None
+        and open_fds is not None,
     )
 
 
@@ -412,20 +538,78 @@ def package_version_code(version: str) -> int:
     return _bounded_int(major * 1_000_000 + minor * 1_000 + patch, "version code")
 
 
-def _run_git(arguments: tuple[str, ...]) -> str:
-    completed = subprocess.run(
-        ("git", "-c", "color.ui=false", *arguments),
-        check=True,
+def _run_bounded(command: tuple[str, ...], *, timeout: float) -> str:
+    """Read 4096 bytes max; kill and reap the process group on failure."""
+
+    process = subprocess.Popen(
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
-        text=True,
-        encoding="utf-8",
-        errors="strict",
+        start_new_session=True,
+    )
+    assert process.stdout is not None
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            ready = selector.select(remaining)
+            if not ready:
+                raise subprocess.TimeoutExpired(command, timeout)
+            chunk = os.read(process.stdout.fileno(), 4097 - len(output))
+            if not chunk:
+                selector.unregister(process.stdout)
+                break
+            output.extend(chunk)
+            if len(output) > 4096:
+                raise ValueError("command output exceeds bound")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(command, timeout)
+        status = process.wait(timeout=remaining)
+        if status != 0:
+            raise ValueError("command returned nonzero status")
+        try:
+            return output.decode("utf-8", errors="strict").strip()
+        except UnicodeDecodeError:
+            raise UnicodeError("command output is not valid UTF-8") from None
+    except BaseException:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
+
+
+def _run_git(arguments: tuple[str, ...]) -> str:
+    return _run_bounded(("git", "-c", "color.ui=false", *arguments), timeout=5.0)
+
+
+def _git_changed(arguments: tuple[str, ...]) -> bool:
+    completed = subprocess.run(
+        ("git", "-c", "color.ui=false", *arguments),
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         timeout=5,
     )
-    if len(completed.stdout) > 4096:
-        raise ValueError("git output exceeds bound")
-    return completed.stdout.strip()
+    if completed.returncode not in {0, 1}:
+        raise ValueError("git diff returned invalid status")
+    return completed.returncode == 1
+
+
+def _git_dirty() -> bool:
+    return (
+        _git_changed(("diff", "--quiet", "--ignore-submodules", "--"))
+        or _git_changed(("diff", "--cached", "--quiet", "--ignore-submodules", "--"))
+        or bool(_run_git(("ls-files", "--others", "--exclude-standard")))
+    )
 
 
 def capture_build_identity(expected_commit: str | None) -> BuildIdentity:
@@ -439,22 +623,21 @@ def capture_build_identity(expected_commit: str | None) -> BuildIdentity:
     version_code = package_version_code(__version__)
     try:
         commit = _run_git(("rev-parse", "HEAD"))
-        timestamp_text = _run_git(("show", "-s", "--format=%ct", "HEAD"))
-        dirty_text = _run_git(("status", "--porcelain"))
+        timestamp_text = _run_git(("show", "-s", "--format=%at", "HEAD"))
+        dirty = _git_dirty()
         if (
             _GIT_COMMIT_PATTERN.fullmatch(commit) is None
             or not timestamp_text.isdecimal()
         ):
             raise ValueError
         timestamp = _bounded_int(int(timestamp_text), "commit_timestamp_seconds")
-        dirty = bool(dirty_text)
     except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
         return BuildIdentity(version_code, None, None, "unknown")
 
     if expected_commit is None:
-        status: Literal["valid", "dirty", "mismatch", "unknown"] = "unknown"
-    elif dirty:
-        status = "dirty"
+        return BuildIdentity(version_code, timestamp, None, "unknown")
+    if dirty:
+        status: Literal["valid", "dirty", "mismatch"] = "dirty"
     elif commit != expected_commit:
         status = "mismatch"
     else:
@@ -564,6 +747,19 @@ class OperationEvent(StrictModel):
             raise ValueError("operation stage is not approved")
         if set(self.exact_values) - _EVENT_EXACT_KEYS[self.kind]:
             raise ValueError("exact_values keys are invalid for event kind")
+        if self.kind is OperationKind.STARTUP:
+            try:
+                build_identity_from_exact_values(self.exact_values)
+            except (TypeError, ValueError):
+                raise ValueError("startup build identity facts are invalid") from None
+        if self.kind is OperationKind.PROCESS_SAMPLE:
+            if self.status == "success":
+                try:
+                    process_sample_from_exact_values(self.exact_values)
+                except (TypeError, ValueError):
+                    raise ValueError("process sample facts are invalid") from None
+            elif self.exact_values or self.evidence is None:
+                raise ValueError("failed process sample requires only evidence")
         if (
             self.kind is OperationKind.RECOVERY
             and self.reason == "partial_tail"
@@ -786,27 +982,34 @@ def _parse_events(raw: bytes) -> tuple[OperationEvent, ...]:
 
 
 def _validate_transitions(events: tuple[OperationEvent, ...]) -> None:
-    runs: dict[str, bool] = {}
+    runs: dict[str, Literal["started", "sampled", "terminal"]] = {}
     for event in events:
+        pending = next(
+            (run_id for run_id, state in runs.items() if state == "sampled"), None
+        )
+        if pending is not None and not (
+            event.kind is OperationKind.RUN_TERMINAL and event.run_id == pending
+        ):
+            raise OperationCorruptError("operation run transition is invalid")
         if event.kind is OperationKind.RUN_STARTED:
             assert event.run_id is not None
             if event.run_id in runs:
                 raise OperationCorruptError("operation run transition is invalid")
-            runs[event.run_id] = False
-        elif event.kind in {
-            OperationKind.RUN_TERMINAL,
-            OperationKind.STAGE_TERMINAL,
-        }:
+            runs[event.run_id] = "started"
+        elif event.kind is OperationKind.STAGE_TERMINAL:
             assert event.run_id is not None
-            terminal = runs.get(event.run_id)
-            if terminal is None or terminal:
+            if runs.get(event.run_id) != "started":
                 raise OperationCorruptError("operation run transition is invalid")
-            if event.kind is OperationKind.RUN_TERMINAL:
-                runs[event.run_id] = True
         elif event.kind is OperationKind.PROCESS_SAMPLE:
             assert event.run_id is not None
-            if event.run_id not in runs:
+            if runs.get(event.run_id) != "started":
                 raise OperationCorruptError("operation run transition is invalid")
+            runs[event.run_id] = "sampled"
+        elif event.kind is OperationKind.RUN_TERMINAL:
+            assert event.run_id is not None
+            if runs.get(event.run_id) != "sampled":
+                raise OperationCorruptError("operation run transition is invalid")
+            runs[event.run_id] = "terminal"
 
 
 def _verify_blobs(root: Path, events: tuple[OperationEvent, ...]) -> int:
