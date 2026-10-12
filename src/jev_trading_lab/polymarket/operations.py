@@ -538,21 +538,61 @@ def package_version_code(version: str) -> int:
     return _bounded_int(major * 1_000_000 + minor * 1_000 + patch, "version code")
 
 
-def _run_bounded(command: tuple[str, ...], *, timeout: float) -> str:
-    """Read 4096 bytes max; kill and reap the process group on failure."""
+@dataclass(frozen=True, slots=True)
+class _CommandResult:
+    status: int
+    output: bytes
 
+
+def _kill_process_group(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _close_quietly(resource: object) -> None:
+    try:
+        getattr(resource, "close")()
+    except BaseException:
+        pass
+
+
+def _cleanup_failed_command(
+    process: subprocess.Popen[bytes], selector: selectors.BaseSelector | None
+) -> None:
+    try:
+        _kill_process_group(process.pid)
+    except BaseException:
+        pass
+    if selector is not None:
+        _close_quietly(selector)
+    if process.stdout is not None:
+        _close_quietly(process.stdout)
+    try:
+        process.wait()
+    except BaseException:
+        pass
+
+
+def _run_bounded(command: tuple[str, ...], *, timeout: float) -> _CommandResult:
+    """Run one trusted command in a new session with bounded output and lifetime."""
+
+    # Same-session descendants are contained. Fixed Git commands are trusted not to call
+    # setsid(2); a descendant that deliberately escapes is outside this boundary.
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    assert process.stdout is not None
-    output = bytearray()
-    deadline = time.monotonic() + timeout
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
+    selector: selectors.BaseSelector | None = None
     try:
+        assert process.stdout is not None
+        output = bytearray()
+        deadline = time.monotonic() + timeout
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -571,37 +611,35 @@ def _run_bounded(command: tuple[str, ...], *, timeout: float) -> str:
         if remaining <= 0:
             raise subprocess.TimeoutExpired(command, timeout)
         status = process.wait(timeout=remaining)
-        if status != 0:
-            raise ValueError("command returned nonzero status")
-        try:
-            return output.decode("utf-8", errors="strict").strip()
-        except UnicodeDecodeError:
-            raise UnicodeError("command output is not valid UTF-8") from None
     except BaseException:
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
+        _cleanup_failed_command(process, selector)
         raise
+    else:
+        _kill_process_group(process.pid)
+        return _CommandResult(status, bytes(output))
     finally:
-        selector.close()
-        process.stdout.close()
+        if selector is not None:
+            _close_quietly(selector)
+        _close_quietly(process.stdout)
 
 
 def _run_git(arguments: tuple[str, ...]) -> str:
-    return _run_bounded(("git", "-c", "color.ui=false", *arguments), timeout=5.0)
+    result = _run_bounded(("git", "-c", "color.ui=false", *arguments), timeout=5.0)
+    if result.status != 0:
+        raise ValueError("git command returned nonzero status")
+    try:
+        return result.output.decode("utf-8", errors="strict").strip()
+    except UnicodeDecodeError:
+        raise UnicodeError("git output is not valid UTF-8") from None
 
 
 def _git_changed(arguments: tuple[str, ...]) -> bool:
-    completed = subprocess.run(
-        ("git", "-c", "color.ui=false", *arguments),
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=5,
-    )
-    if completed.returncode not in {0, 1}:
+    result = _run_bounded(("git", "-c", "color.ui=false", *arguments), timeout=5.0)
+    if result.output:
+        raise ValueError("git diff returned unexpected output")
+    if result.status not in {0, 1}:
         raise ValueError("git diff returned invalid status")
-    return completed.returncode == 1
+    return result.status == 1
 
 
 def _git_dirty() -> bool:

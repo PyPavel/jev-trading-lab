@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+import signal
 import stat
 import subprocess
 import sys
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, fields
@@ -2122,17 +2124,191 @@ def test_process_sample_is_exactly_once_immediately_before_terminal(
                 append_operation(invalid_root, value)
 
 
-def test_bounded_runner_rejects_oversize_malformed_and_nonzero_output() -> None:
+def _pid_is_running(pid: int) -> bool:
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text(encoding="ascii").split()[2]
+    except FileNotFoundError:
+        return False
+    return state != "Z"
+
+
+def _wait_until_process_stops(pid: int) -> None:
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        if not _pid_is_running(pid):
+            return
+        time.sleep(0.01)
+    pytest.fail(f"process {pid} survived bounded command cleanup")
+
+
+def test_bounded_runner_returns_structured_status_and_bounded_bytes() -> None:
     from jev_trading_lab.polymarket import operations
 
-    cases = (
-        ("import sys; sys.stdout.buffer.write(b'x' * 5000)", "bound"),
-        ("import sys; sys.stdout.buffer.write(b'\\xff')", "UTF-8"),
-        ("import sys; sys.exit(7)", "status"),
+    result = operations._run_bounded(
+        (sys.executable, "-c", "import sys; sys.stdout.buffer.write(b' ok ')"),
+        timeout=1.0,
     )
-    for source, message in cases:
-        with pytest.raises((OSError, UnicodeError, ValueError), match=message):
-            operations._run_bounded((sys.executable, "-c", source), timeout=1.0)
+    changed = operations._run_bounded(
+        (sys.executable, "-c", "import sys; sys.exit(1)"), timeout=1.0
+    )
+
+    assert (result.status, result.output) == (0, b" ok ")
+    assert (changed.status, changed.output) == (1, b"")
+
+
+def test_bounded_runner_rejects_oversize_output_without_buffering_unbounded() -> None:
+    from jev_trading_lab.polymarket import operations
+
+    with pytest.raises(ValueError, match="bound"):
+        operations._run_bounded(
+            (sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x' * 5000)"),
+            timeout=1.0,
+        )
+
+
+def test_bounded_runner_closes_descriptors_without_leaking() -> None:
+    from jev_trading_lab.polymarket import operations
+
+    before = len(tuple(Path("/proc/self/fd").iterdir()))
+    for _ in range(20):
+        operations._run_bounded((sys.executable, "-c", "pass"), timeout=1.0)
+    after = len(tuple(Path("/proc/self/fd").iterdir()))
+
+    assert after <= before
+
+
+@pytest.mark.parametrize("failure_point", ("setup", "selector", "read", "wait"))
+def test_bounded_runner_preserves_base_exception_while_cleaning_up(
+    monkeypatch: pytest.MonkeyPatch, failure_point: str
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    class Pipe:
+        closed = False
+
+        def fileno(self) -> int:
+            return 9
+
+        def close(self) -> None:
+            self.closed = True
+
+    class Process:
+        pid = 12345
+        stdout = Pipe()
+        wait_calls = 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_calls += 1
+            if failure_point == "wait" and self.wait_calls == 1:
+                raise KeyboardInterrupt("original")
+            return 0
+
+    class Selector:
+        closed = False
+        registered = True
+
+        def register(self, fileobj: object, events: int) -> None:
+            pass
+
+        def get_map(self) -> dict[int, int]:
+            return {9: 1} if self.registered else {}
+
+        def select(self, timeout: float | None = None) -> list[tuple[object, object]]:
+            return [(object(), object())]
+
+        def unregister(self, fileobj: object) -> None:
+            self.registered = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    process = Process()
+    selector = Selector()
+    killed: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(operations.subprocess, "Popen", lambda *args, **kwargs: process)
+    if failure_point == "setup":
+        process.stdout = None  # type: ignore[assignment]
+    if failure_point == "selector":
+        monkeypatch.setattr(
+            operations.selectors,
+            "DefaultSelector",
+            lambda: (_ for _ in ()).throw(KeyboardInterrupt("original")),
+        )
+    else:
+        monkeypatch.setattr(operations.selectors, "DefaultSelector", lambda: selector)
+    monkeypatch.setattr(
+        operations.os,
+        "read",
+        lambda fd, size: (
+            (_ for _ in ()).throw(KeyboardInterrupt("original"))
+            if failure_point == "read"
+            else b""
+        ),
+    )
+    monkeypatch.setattr(
+        operations.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+    )
+
+    expected_exception = (
+        AssertionError if failure_point == "setup" else KeyboardInterrupt
+    )
+    with pytest.raises(
+        expected_exception, match=None if failure_point == "setup" else "original"
+    ):
+        operations._run_bounded(("trusted",), timeout=1.0)
+
+    assert killed == [(process.pid, signal.SIGKILL)]
+    expected_wait_calls = 1 if failure_point != "wait" else 2
+    assert process.wait_calls == expected_wait_calls
+    assert failure_point == "setup" or process.stdout.closed
+    assert failure_point in {"setup", "selector"} or selector.closed
+
+
+def test_git_helpers_accept_expected_statuses_and_reject_malformed_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    results = iter(
+        (
+            operations._CommandResult(0, b""),
+            operations._CommandResult(1, b""),
+            operations._CommandResult(2, b""),
+            operations._CommandResult(0, b"unexpected"),
+        )
+    )
+    monkeypatch.setattr(
+        operations, "_run_bounded", lambda command, timeout: next(results)
+    )
+
+    assert not operations._git_changed(("diff", "--quiet", "--"))
+    assert operations._git_changed(("diff", "--quiet", "--"))
+    with pytest.raises(ValueError, match="invalid status"):
+        operations._git_changed(("diff", "--quiet", "--"))
+    with pytest.raises(ValueError, match="unexpected output"):
+        operations._git_changed(("diff", "--quiet", "--"))
+
+
+def test_git_output_helper_rejects_nonzero_and_malformed_utf8(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    results = iter(
+        (
+            operations._CommandResult(7, b""),
+            operations._CommandResult(0, b"\xff"),
+        )
+    )
+    monkeypatch.setattr(
+        operations, "_run_bounded", lambda command, timeout: next(results)
+    )
+
+    with pytest.raises(ValueError, match="nonzero"):
+        operations._run_git(("rev-parse", "HEAD"))
+    with pytest.raises(UnicodeError, match="UTF-8"):
+        operations._run_git(("rev-parse", "HEAD"))
 
 
 def test_bounded_runner_times_out_kills_process_group_and_reaps(
@@ -2151,6 +2327,125 @@ def test_bounded_runner_times_out_kills_process_group_and_reaps(
     pid = int(pid_path.read_text(encoding="ascii"))
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
+
+
+def test_bounded_runner_handles_child_already_exited_during_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    real_killpg = operations.os.killpg
+
+    def kill_after_probe(pid: int, sig: int) -> None:
+        real_killpg(pid, sig)
+        raise ProcessLookupError
+
+    monkeypatch.setattr(operations.os, "killpg", kill_after_probe)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        operations._run_bounded(
+            (sys.executable, "-c", "import time; time.sleep(30)"), timeout=0.1
+        )
+
+
+def test_bounded_runner_success_kills_same_group_descendant_without_pipe(
+    tmp_path: Path,
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    pid_path = tmp_path / "detached-pipe-descendant-pid"
+    descendant = (
+        "import os,time,pathlib; "
+        f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
+        "os.close(1); "
+        "time.sleep(30)"
+    )
+    parent = (
+        "import pathlib,subprocess,sys,time; "
+        f"path=subprocess.Popen((sys.executable, '-c', {descendant!r})); "
+        f"marker=pathlib.Path({str(pid_path)!r}); "
+        "[(time.sleep(0.01)) for _ in range(100) if not marker.exists()]; "
+        "sys.exit(0)"
+    )
+
+    try:
+        result = operations._run_bounded((sys.executable, "-c", parent), timeout=2.0)
+        assert (result.status, result.output) == (0, b"")
+        pid = int(pid_path.read_text(encoding="ascii"))
+        _wait_until_process_stops(pid)
+    finally:
+        if pid_path.exists():
+            pid = int(pid_path.read_text(encoding="ascii"))
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_bounded_runner_boundary_excludes_descendants_that_call_setsid(
+    tmp_path: Path,
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    pid_path = tmp_path / "escaped-descendant-pid"
+    descendant = (
+        "import os,time,pathlib; "
+        f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
+        "os.close(1); "
+        "time.sleep(30)"
+    )
+    parent = (
+        "import pathlib,subprocess,sys,time; "
+        f"subprocess.Popen((sys.executable, '-c', {descendant!r}), "
+        "start_new_session=True); "
+        f"marker=pathlib.Path({str(pid_path)!r}); "
+        "[(time.sleep(0.01)) for _ in range(100) if not marker.exists()]; "
+        "sys.exit(0)"
+    )
+
+    try:
+        result = operations._run_bounded((sys.executable, "-c", parent), timeout=2.0)
+        assert (result.status, result.output) == (0, b"")
+        pid = int(pid_path.read_text(encoding="ascii"))
+        assert _pid_is_running(pid)
+    finally:
+        if pid_path.exists():
+            pid = int(pid_path.read_text(encoding="ascii"))
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_bounded_runner_kills_same_group_descendant_after_parent_exits(
+    tmp_path: Path,
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    pid_path = tmp_path / "descendant-pid"
+    descendant = (
+        "import os,time,pathlib; "
+        f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
+        "time.sleep(30)"
+    )
+    parent = (
+        "import subprocess,sys; "
+        f"subprocess.Popen((sys.executable, '-c', {descendant!r})); "
+        "sys.exit(0)"
+    )
+
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            operations._run_bounded((sys.executable, "-c", parent), timeout=0.2)
+        pid = int(pid_path.read_text(encoding="ascii"))
+        _wait_until_process_stops(pid)
+    finally:
+        if pid_path.exists():
+            pid = int(pid_path.read_text(encoding="ascii"))
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def test_blob_reference_schema_metadata_is_strict() -> None:
