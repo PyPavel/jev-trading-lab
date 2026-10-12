@@ -157,6 +157,7 @@ class MetricFamily:
     buckets: tuple[Decimal, ...] = ()
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "labels", tuple(self.labels))
         object.__setattr__(
             self,
             "label_values",
@@ -167,6 +168,7 @@ class MetricFamily:
                 }
             ),
         )
+        object.__setattr__(self, "buckets", tuple(self.buckets))
 
 
 _LABELS: dict[str, tuple[str, ...]] = {
@@ -593,6 +595,88 @@ _LABEL_VALUES: dict[str, Mapping[str, frozenset[str]]] = {
     "unrealized_pnl_usd": {
         "arm": ARMS,
     },
+}
+
+_CROSS_LABEL_VALUES: dict[str, frozenset[tuple[str, ...]]] = {
+    "market_eligibility_total": frozenset(
+        {("eligible", "none")}
+        | {("rejected", reason) for reason in TRADING_REASONS if reason != "none"}
+    ),
+    "pipeline_terminal_results_total": frozenset(
+        {("filled", "none"), ("unknown", "other")}
+        | {
+            ("no_fill", reason)
+            for reason in {
+                "capacity",
+                "risk",
+                "no_edge",
+                "abstain",
+                "insufficient",
+                "ambiguous",
+                "control_unavailable",
+                "other",
+            }
+        }
+        | {
+            ("rejected", reason)
+            for reason in {
+                "inactive",
+                "closed",
+                "sports",
+                "non_binary",
+                "missing_evidence",
+                "close_window",
+                "low_volume",
+                "wide_spread",
+                "low_depth",
+                "other",
+            }
+        }
+        | {
+            ("failed", reason)
+            for reason in {
+                "book_failure",
+                "model_failure",
+                "public_data_failure",
+                "other",
+            }
+        }
+    ),
+    "reliability_recovery_actions_total": frozenset(
+        {
+            (stage, status, reason)
+            for stage in STAGES
+            for status in {"success", "failure"}
+            for reason in RELIABILITY_REASONS
+            if (
+                (reason == "partial_tail" and stage == "recovery")
+                or (
+                    reason == "reused_result"
+                    and status == "success"
+                    and stage in {"openai", "jev", "completed_slot", "replay"}
+                )
+                or (
+                    reason == "unknown_in_flight"
+                    and status == "success"
+                    and stage in {"openai", "jev"}
+                )
+                or (
+                    reason == "stale_temporary"
+                    and stage in {"startup", "recovery", "metrics_render"}
+                )
+                or (
+                    reason
+                    not in {
+                        "partial_tail",
+                        "reused_result",
+                        "unknown_in_flight",
+                        "stale_temporary",
+                    }
+                    and status == "failure"
+                )
+            )
+        }
+    ),
 }
 
 _BUCKETS = {
@@ -1159,6 +1243,9 @@ def _build_registry() -> tuple[MetricFamily, ...]:
         raise RuntimeError("metric registry must contain 105 unique families")
     if names != tuple(sorted(names)):
         raise RuntimeError("metric registry must be lexically sorted")
+    short_names = {family.name.removeprefix(_PREFIX) for family in families}
+    if not set(_CROSS_LABEL_VALUES) <= short_names:
+        raise RuntimeError("cross-label constraint names must be registered")
     for family in families:
         if not _METRIC_NAME.fullmatch(family.name):
             raise RuntimeError(f"invalid metric name: {family.name}")
@@ -1168,6 +1255,19 @@ def _build_registry() -> tuple[MetricFamily, ...]:
             raise RuntimeError(f"duplicate labels: {family.name}")
         if set(family.labels) != set(family.label_values):
             raise RuntimeError(f"label allowlist mismatch: {family.name}")
+        cross_values = _CROSS_LABEL_VALUES.get(family.name.removeprefix(_PREFIX))
+        if cross_values is not None and (
+            not cross_values
+            or any(
+                len(values) != len(family.labels)
+                or any(
+                    value not in family.label_values[label]
+                    for label, value in zip(family.labels, values, strict=True)
+                )
+                for values in cross_values
+            )
+        ):
+            raise RuntimeError(f"invalid cross-label constraint: {family.name}")
         is_counter = family.type is MetricType.COUNTER
         if family.name.endswith("_total") is not is_counter:
             raise RuntimeError(f"counter suffix/type mismatch: {family.name}")
@@ -1202,7 +1302,8 @@ def metric_family(name: str) -> MetricFamily:
 def validate_labels(
     family: MetricFamily, labels: Mapping[str, str]
 ) -> tuple[tuple[str, str], ...]:
-    """Validate one complete bounded label set and return canonical ordering."""
+    """Validate one complete bounded label set against the registered contract."""
+    family = metric_family(family.name)
     expected = set(family.labels)
     actual = set(labels)
     unexpected = actual - expected
@@ -1215,11 +1316,12 @@ def validate_labels(
         pair = (labels["provider"], labels["model_snapshot"])
         if pair not in PROVIDER_MODEL_PAIRS:
             raise ValueError(f"invalid provider/model_snapshot pair: {pair!r}")
-    if family.name == _PREFIX + "market_eligibility_total":
-        pair = (labels["status"], labels["reason"])
-        if (pair[0] == "eligible") is not (pair[1] == "none"):
-            raise ValueError(f"invalid status/reason pair: {pair!r}")
     for label, value in labels.items():
         if value not in family.label_values[label]:
             raise ValueError(f"invalid {label} for {family.name}: {value!r}")
+    cross_values = _CROSS_LABEL_VALUES.get(family.name.removeprefix(_PREFIX))
+    values = tuple(labels[label] for label in family.labels)
+    if cross_values is not None and values not in cross_values:
+        dimensions = "/".join(family.labels)
+        raise ValueError(f"invalid {dimensions} combination: {values!r}")
     return tuple(sorted(labels.items()))

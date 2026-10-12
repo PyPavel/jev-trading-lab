@@ -334,24 +334,83 @@ def test_histogram_bucket_vectors_are_exact_finite_decimals() -> None:
     assert all(value.is_finite() for buckets in actual.values() for value in buckets)
 
 
-def test_metric_family_and_nested_label_values_are_immutable() -> None:
+def test_metric_family_defensively_freezes_all_collection_inputs() -> None:
+    mutable_labels: Any = ["arm"]
     mutable_values: Any = {"arm": {"ai", "deterministic"}}
+    mutable_buckets: Any = [Decimal("1"), Decimal("2")]
     family = MetricFamily(
-        name="jev_polymarket_test_total",
+        name="jev_polymarket_test_histogram",
         help="Test family.",
-        type=MetricType.COUNTER,
-        labels=("arm",),
+        type=MetricType.HISTOGRAM,
+        labels=mutable_labels,
         label_values=mutable_values,
+        buckets=mutable_buckets,
     )
 
+    mutable_labels.append("status")
     mutable_values["arm"].add("changed")
+    mutable_values["status"] = {"changed"}
+    mutable_buckets.append(Decimal("3"))
 
+    assert family.labels == ("arm",)
     assert isinstance(family.label_values, MappingProxyType)
-    assert family.label_values["arm"] == frozenset({"ai", "deterministic"})
+    assert family.label_values == {"arm": frozenset({"ai", "deterministic"})}
+    assert family.buckets == (Decimal("1"), Decimal("2"))
     with pytest.raises(FrozenInstanceError):
         family.name = "changed"  # type: ignore[misc]
     with pytest.raises(TypeError):
         family.label_values["arm"] = frozenset({"changed"})  # type: ignore[index]
+
+
+def test_validate_labels_uses_registered_contract_for_forged_family() -> None:
+    forged = MetricFamily(
+        name=_full("fills_total"),
+        help="Forged family.",
+        type=MetricType.COUNTER,
+        labels=("market_id", "provider", "status"),
+        label_values={
+            "market_id": frozenset({"attacker-market"}),
+            "provider": frozenset({"attacker-provider"}),
+            "status": frozenset({"attacker-status"}),
+        },
+    )
+
+    with pytest.raises(ValueError, match="unexpected labels"):
+        validate_labels(
+            forged,
+            {
+                "market_id": "attacker-market",
+                "provider": "attacker-provider",
+                "status": "attacker-status",
+            },
+        )
+
+
+def test_validate_labels_rejects_forged_allowlist_value() -> None:
+    forged = MetricFamily(
+        name=_full("fills_total"),
+        help="Forged family.",
+        type=MetricType.COUNTER,
+        labels=("arm", "status"),
+        label_values={
+            "arm": frozenset({"attacker-arm"}),
+            "status": frozenset({"attacker-status"}),
+        },
+    )
+
+    with pytest.raises(ValueError, match="invalid arm"):
+        validate_labels(forged, {"arm": "attacker-arm", "status": "attacker-status"})
+
+
+def test_validate_labels_rejects_unregistered_forged_family() -> None:
+    forged = MetricFamily(
+        name=_full("attacker_total"),
+        help="Forged family.",
+        type=MetricType.COUNTER,
+    )
+
+    with pytest.raises(ValueError, match="unknown metric family"):
+        validate_labels(forged, {})
 
 
 def test_build_registry_rejects_duplicate_labels(
@@ -385,6 +444,26 @@ def test_build_registry_rejects_invalid_histogram_buckets(
     monkeypatch.setattr(metrics_schema, "_BUCKETS", mutated_buckets)
 
     with pytest.raises(RuntimeError, match="histogram buckets"):
+        metrics_schema._build_registry()
+
+
+@pytest.mark.parametrize(
+    ("metric", "values"),
+    (
+        ("not_registered_total", frozenset({("success",)})),
+        ("market_eligibility_total", frozenset({("eligible", "attacker")})),
+    ),
+)
+def test_build_registry_rejects_invalid_cross_label_constraints(
+    monkeypatch: pytest.MonkeyPatch,
+    metric: str,
+    values: frozenset[tuple[str, ...]],
+) -> None:
+    constraints = dict(metrics_schema._CROSS_LABEL_VALUES)
+    constraints[metric] = values
+    monkeypatch.setattr(metrics_schema, "_CROSS_LABEL_VALUES", constraints)
+
+    with pytest.raises(RuntimeError, match="cross-label constraint"):
         metrics_schema._build_registry()
 
 
@@ -471,6 +550,89 @@ def test_validate_labels_accepts_valid_market_eligibility_pairs(
     labels: dict[str, str],
 ) -> None:
     assert validate_labels(_family("market_eligibility_total"), labels)
+
+
+def test_validate_labels_enforces_pipeline_terminal_status_reason_matrix() -> None:
+    allowed = {
+        ("filled", "none"),
+        ("unknown", "other"),
+        *(
+            ("no_fill", reason)
+            for reason in {
+                "capacity",
+                "risk",
+                "no_edge",
+                "abstain",
+                "insufficient",
+                "ambiguous",
+                "control_unavailable",
+                "other",
+            }
+        ),
+        *(
+            ("rejected", reason)
+            for reason in {
+                "inactive",
+                "closed",
+                "sports",
+                "non_binary",
+                "missing_evidence",
+                "close_window",
+                "low_volume",
+                "wide_spread",
+                "low_depth",
+                "other",
+            }
+        ),
+        *(
+            ("failed", reason)
+            for reason in {
+                "book_failure",
+                "model_failure",
+                "public_data_failure",
+                "other",
+            }
+        ),
+    }
+    family = _family("pipeline_terminal_results_total")
+
+    for status in family.label_values["status"]:
+        for reason in family.label_values["reason"]:
+            labels = {"status": status, "reason": reason}
+            if (status, reason) in allowed:
+                assert validate_labels(family, labels)
+            else:
+                with pytest.raises(ValueError, match="status/reason"):
+                    validate_labels(family, labels)
+
+
+def test_validate_labels_enforces_recovery_stage_status_reason_matrix() -> None:
+    successful_recovery_stages = {
+        "partial_tail": {"recovery"},
+        "reused_result": {"openai", "jev", "completed_slot", "replay"},
+        "unknown_in_flight": {"openai", "jev"},
+        "stale_temporary": {"startup", "recovery", "metrics_render"},
+    }
+    family = _family("reliability_recovery_actions_total")
+
+    for stage in family.label_values["stage"]:
+        for status in family.label_values["status"]:
+            for reason in family.label_values["reason"]:
+                allowed_stages = successful_recovery_stages.get(reason)
+                allowed = (
+                    allowed_stages is not None
+                    and stage in allowed_stages
+                    and (
+                        status == "success"
+                        or reason in {"partial_tail", "stale_temporary"}
+                    )
+                ) or (status == "failure" and allowed_stages is None)
+                labels = {"stage": stage, "status": status, "reason": reason}
+                if allowed:
+                    assert validate_labels(family, labels)
+                else:
+                    with pytest.raises(ValueError, match="stage/status/reason"):
+                        validate_labels(family, labels)
 
 
 @pytest.mark.parametrize(
