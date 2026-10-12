@@ -16,6 +16,9 @@ from jev_trading_lab.polymarket.metrics_schema import (
 )
 
 _MAX_SERIES = 800
+_MAX_HISTOGRAM_OBSERVATIONS = 800
+_MAX_DECIMAL_DIGITS = 128
+_MAX_DECIMAL_TEXT_LENGTH = _MAX_DECIMAL_DIGITS + 3
 _VALUE = re.compile(r"(?:0|-?[1-9][0-9]*(?:\.[0-9]*[1-9])?|-?0\.[0-9]*[1-9])\Z")
 _SAMPLE = re.compile(
     r"(?P<name>[a-z_:][a-z0-9_:]*)(?:\{(?P<labels>.*)\})? (?P<value>\S+)\Z"
@@ -34,11 +37,32 @@ class Sample:
 class Histogram:
     family: str
     labels: tuple[tuple[str, str], ...]
-    observations: tuple[Decimal, ...]
+    observations: Iterable[Decimal]
 
 
 class ExpositionError(ValueError):
     """The supported strict Prometheus exposition contract was violated."""
+
+
+def _exact_decimal_sum(values: list[Decimal]) -> Decimal:
+    """Add finite decimals by integer coefficients without using decimal context."""
+    if not values:
+        return Decimal(0)
+    parts: list[tuple[int, tuple[int, ...], int]] = []
+    for value in values:
+        sign, digits, exponent = value.as_tuple()
+        assert isinstance(exponent, int)
+        parts.append((sign, digits, exponent))
+    common_exponent = min(exponent for _, _, exponent in parts)
+    total = 0
+    for sign, digits, exponent in parts:
+        coefficient = int("".join(map(str, digits))) if digits else 0
+        total += (-coefficient if sign else coefficient) * 10 ** (
+            exponent - common_exponent
+        )
+    sign = int(total < 0)
+    digits = tuple(map(int, str(abs(total))))
+    return Decimal((sign, digits, common_exponent))
 
 
 def canonical_decimal(value: int | Decimal) -> str:
@@ -48,6 +72,14 @@ def canonical_decimal(value: int | Decimal) -> str:
     decimal = Decimal(value)
     if not decimal.is_finite():
         raise ExpositionError("metric values must be finite")
+    _, digits, exponent = decimal.as_tuple()
+    assert isinstance(exponent, int)
+    if (
+        len(digits) > _MAX_DECIMAL_DIGITS
+        or abs(exponent) > _MAX_DECIMAL_DIGITS
+        or abs(decimal.adjusted()) > _MAX_DECIMAL_DIGITS
+    ):
+        raise ExpositionError("metric value exceeds decimal size limits")
     if decimal.is_zero():
         return "0"
     rendered = format(decimal, "f")
@@ -107,6 +139,11 @@ def _declarations() -> list[str]:
     return lines
 
 
+def _check_series_budget(prospective_count: int) -> None:
+    if prospective_count > _MAX_SERIES:
+        raise ExpositionError(f"exposition exceeds {_MAX_SERIES} unique series")
+
+
 def render_exposition(
     samples: Iterable[Sample], histograms: Iterable[Histogram]
 ) -> bytes:
@@ -127,8 +164,12 @@ def render_exposition(
             raise ExpositionError(
                 f"duplicate series: {family.name}{_format_labels(labels)}"
             )
+        _check_series_budget(len(series) + 1)
         keys.add(key)
-        series.append((family.name, labels, canonical_decimal(sample.value)))
+        value = canonical_decimal(sample.value)
+        if family.type is MetricType.COUNTER and Decimal(value) < 0:
+            raise ExpositionError(f"counter must be nonnegative: {family.name}")
+        series.append((family.name, labels, value))
 
     for histogram in histograms:
         if not isinstance(histogram, Histogram):
@@ -142,13 +183,22 @@ def render_exposition(
             raise ExpositionError(
                 f"duplicate histogram: {family.name}{_format_labels(labels)}"
             )
+        histogram_series_count = len(family.buckets) + 3
+        _check_series_budget(len(series) + histogram_series_count)
         histogram_groups.add(group)
         observations: list[Decimal] = []
         for observation in histogram.observations:
+            if len(observations) == _MAX_HISTOGRAM_OBSERVATIONS:
+                raise ExpositionError(
+                    "histogram exceeds 800 observations per exposition"
+                )
             if not isinstance(observation, Decimal) or not observation.is_finite():
                 raise ExpositionError(
                     "histogram observations must be finite Decimal values"
                 )
+            if observation < 0:
+                raise ExpositionError("histogram observations must be nonnegative")
+            canonical_decimal(observation)
             observations.append(observation)
         for bucket in (*family.buckets, None):
             count = (
@@ -164,7 +214,7 @@ def render_exposition(
             (
                 family.name + "_sum",
                 labels,
-                canonical_decimal(sum(observations, start=Decimal(0))),
+                canonical_decimal(_exact_decimal_sum(observations)),
             )
         )
 
@@ -234,7 +284,7 @@ def _parse_labels(text: str | None) -> tuple[tuple[str, str], ...]:
 
 
 def _parse_value(text: str) -> Decimal:
-    if not _VALUE.fullmatch(text):
+    if len(text) > _MAX_DECIMAL_TEXT_LENGTH or not _VALUE.fullmatch(text):
         raise ExpositionError(f"noncanonical or nonfinite metric value: {text!r}")
     try:
         value = Decimal(text)
@@ -321,6 +371,8 @@ def _validate_histograms(
             or ordered_counts[-1] != count
         ):
             raise ExpositionError(f"histogram count mismatch: {family_name}")
+        if total < 0:
+            raise ExpositionError(f"histogram sum must be nonnegative: {family_name}")
 
 
 def validate_exposition(payload: bytes) -> int:
@@ -355,6 +407,8 @@ def validate_exposition(payload: bytes) -> int:
         labels = _parse_labels(match.group("labels"))
         value = _parse_value(match.group("value"))
         family, component = _sample_family(name)
+        if component == "sample" and family.type is MetricType.COUNTER and value < 0:
+            raise ExpositionError(f"counter must be nonnegative: {family.name}")
         base_labels = _validate_series_labels(family, component, labels)
         key = (name, labels)
         if key in keys:
