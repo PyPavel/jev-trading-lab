@@ -70,6 +70,19 @@ def test_canonical_decimal_rejects_nonfinite_or_inexact_types(value: object) -> 
         canonical_decimal(value)  # type: ignore[arg-type]
 
 
+def test_canonical_decimal_rejects_numeric_subclasses_before_using_them() -> None:
+    class HostileInt(int):
+        pass
+
+    class HostileDecimal(Decimal):
+        def is_finite(self) -> bool:
+            raise AssertionError("Decimal subclass was inspected")
+
+    for value in (HostileInt(1), HostileDecimal("1")):
+        with pytest.raises(ExpositionError, match="int or Decimal"):
+            canonical_decimal(value)
+
+
 @pytest.mark.parametrize(
     "value",
     (
@@ -165,6 +178,79 @@ def test_renderer_does_not_trust_sample_family_or_labels(sample: Sample) -> None
         render_exposition([sample], [])
 
 
+def test_renderer_rejects_non_tuple_labels_without_consuming_them() -> None:
+    class HostileLabels:
+        def __iter__(self) -> Iterator[tuple[str, str]]:
+            raise AssertionError("labels were consumed")
+
+    labels: object = HostileLabels()
+    cases = (
+        labels,
+        [("arm", "ai"), ("status", "full")],
+        (("arm", "ai"), ("status", "full")) * 401,
+    )
+
+    for supplied in cases:
+        sample = Sample("jev_polymarket_fills_total", (), 1)
+        object.__setattr__(sample, "labels", supplied)
+        with pytest.raises(ExpositionError, match="labels have invalid structure"):
+            render_exposition((sample,), ())
+
+
+def test_renderer_rejects_hostile_label_subclasses_before_using_them() -> None:
+    class HostileTuple(tuple[object, ...]):
+        def __iter__(self) -> Iterator[object]:
+            raise AssertionError("tuple subclass was consumed")
+
+        def __len__(self) -> int:
+            raise AssertionError("tuple subclass length was read")
+
+    class HostileStr(str):
+        def __hash__(self) -> int:
+            raise AssertionError("string subclass was hashed")
+
+        def __eq__(self, other: object) -> bool:
+            raise AssertionError("string subclass was compared")
+
+    cases = (
+        HostileTuple((("arm", "ai"), ("status", "full"))),
+        (HostileTuple(("arm", "ai")), ("status", "full")),
+        ((HostileStr("arm"), "ai"), ("status", "full")),
+        (("arm", HostileStr("ai")), ("status", "full")),
+    )
+
+    for supplied in cases:
+        sample = Sample("jev_polymarket_fills_total", (), 1)
+        object.__setattr__(sample, "labels", supplied)
+        with pytest.raises(ExpositionError, match="labels have invalid structure"):
+            render_exposition((sample,), ())
+
+
+def test_renderer_label_errors_do_not_reflect_unbounded_values() -> None:
+    unbounded = "x" * 100_000
+    sample = Sample(
+        "jev_polymarket_fills_total",
+        (("arm", unbounded), ("status", "full")),
+        1,
+    )
+
+    with pytest.raises(ExpositionError) as caught:
+        render_exposition((sample,), ())
+
+    assert unbounded not in str(caught.value)
+    assert len(str(caught.value)) < 100
+
+
+def test_renderer_family_errors_do_not_reflect_unbounded_values() -> None:
+    unbounded = "x" * 100_000
+
+    with pytest.raises(ExpositionError) as caught:
+        render_exposition((Sample(unbounded, (), 1),), ())
+
+    assert unbounded not in str(caught.value)
+    assert len(str(caught.value)) < 100
+
+
 @pytest.mark.parametrize(
     "histogram",
     (
@@ -192,6 +278,113 @@ def test_renderer_does_not_trust_histogram_family_labels_or_values(
 ) -> None:
     with pytest.raises(ExpositionError):
         render_exposition([], [histogram])
+
+
+def test_renderer_requires_exact_sample_and_histogram_objects() -> None:
+    class SampleSubclass(Sample):
+        pass
+
+    class HistogramSubclass(Histogram):
+        pass
+
+    class HostileStr(str):
+        def __hash__(self) -> int:
+            raise AssertionError("family subclass was hashed")
+
+    with pytest.raises(ExpositionError, match="Sample"):
+        render_exposition((SampleSubclass("jev_polymarket_metrics_series", (), 1),), ())
+    with pytest.raises(ExpositionError, match="family"):
+        render_exposition(
+            (Sample(HostileStr("jev_polymarket_metrics_series"), (), 1),), ()
+        )
+    with pytest.raises(ExpositionError, match="Histogram"):
+        render_exposition(
+            (),
+            (
+                HistogramSubclass(
+                    "jev_polymarket_market_data_call_duration_seconds",
+                    (("provider", "gamma"),),
+                    (),
+                ),
+            ),
+        )
+    with pytest.raises(ExpositionError, match="family"):
+        render_exposition(
+            (),
+            (
+                Histogram(
+                    HostileStr("jev_polymarket_market_data_call_duration_seconds"),
+                    (("provider", "gamma"),),
+                    (),
+                ),
+            ),
+        )
+
+
+def test_renderer_requires_exact_sample_value_types() -> None:
+    class IntSubclass(int):
+        pass
+
+    class DecimalSubclass(Decimal):
+        def is_finite(self) -> bool:
+            raise AssertionError("Decimal subclass was inspected")
+
+    for value in (True, IntSubclass(1), DecimalSubclass("1")):
+        sample = Sample("jev_polymarket_metrics_series", (), 0)
+        object.__setattr__(sample, "value", value)
+        with pytest.raises(ExpositionError, match="int or Decimal"):
+            render_exposition((sample,), ())
+
+
+def test_renderer_requires_exact_histogram_observation_tuple() -> None:
+    class HostileObservations:
+        def __iter__(self) -> Iterator[Decimal]:
+            raise AssertionError("observations were consumed")
+
+    class TupleSubclass(tuple[Decimal, ...]):
+        def __iter__(self) -> Iterator[Decimal]:
+            raise AssertionError("tuple subclass was consumed")
+
+    cases = (
+        HostileObservations(),
+        [Decimal("1")],
+        TupleSubclass((Decimal("1"),)),
+        (Decimal("1"),) * 801,
+    )
+
+    for observations in cases:
+        histogram = Histogram(
+            "jev_polymarket_market_data_call_duration_seconds",
+            (("provider", "gamma"),),
+            (),
+        )
+        object.__setattr__(histogram, "observations", observations)
+        with pytest.raises(ExpositionError, match="observation tuple"):
+            render_exposition((), (histogram,))
+
+
+def test_renderer_rejects_hostile_decimal_observation_before_operations() -> None:
+    class HostileDecimal(Decimal):
+        def is_finite(self) -> bool:
+            raise AssertionError("Decimal subclass was inspected")
+
+        def __lt__(self, other: object) -> bool:
+            raise AssertionError("Decimal subclass was compared")
+
+        def __le__(self, other: object) -> bool:
+            raise AssertionError("Decimal subclass was compared")
+
+        def as_tuple(self):  # type: ignore[no-untyped-def]
+            raise AssertionError("Decimal subclass arithmetic was used")
+
+    histogram = Histogram(
+        "jev_polymarket_market_data_call_duration_seconds",
+        (("provider", "gamma"),),
+        (HostileDecimal("0"),),
+    )
+
+    with pytest.raises(ExpositionError, match="finite Decimal values"):
+        render_exposition((), (histogram,))
 
 
 def test_renderer_rejects_duplicate_series() -> None:
@@ -248,6 +441,23 @@ def test_renderer_rejects_negative_counter_and_histogram_observation() -> None:
                 )
             ],
         )
+
+
+def test_histogram_accepts_800_exact_decimal_observations() -> None:
+    observations = (Decimal("0"),) * 800
+
+    payload = render_exposition(
+        (),
+        (
+            Histogram(
+                "jev_polymarket_market_data_call_duration_seconds",
+                (("provider", "gamma"),),
+                observations,
+            ),
+        ),
+    )
+
+    assert b'_count{provider="gamma"} 800\n' in payload
 
 
 def test_histogram_has_fixed_cumulative_buckets_exact_sum_and_count() -> None:
@@ -363,26 +573,25 @@ def test_histogram_structural_budget_is_checked_before_observations() -> None:
         render_exposition(_bounded_samples(789), [histogram])
 
 
-def test_histogram_observation_generator_has_bounded_consumption() -> None:
+def test_histogram_observation_generator_is_rejected_without_consumption() -> None:
     consumed = 0
 
     def observations() -> Iterator[Decimal]:
         nonlocal consumed
         while True:
             consumed += 1
-            if consumed > 801:
-                raise AssertionError("renderer consumed beyond rejection point")
             yield Decimal(0)
 
     histogram = Histogram(
         "jev_polymarket_market_data_call_duration_seconds",
         (("provider", "gamma"),),
-        observations(),
+        (),
     )
+    object.__setattr__(histogram, "observations", observations())
 
-    with pytest.raises(ExpositionError, match="800"):
+    with pytest.raises(ExpositionError, match="observation tuple"):
         render_exposition([], [histogram])
-    assert consumed == 801
+    assert consumed == 0
 
 
 def test_render_validates_complete_result_before_returning(
@@ -485,6 +694,24 @@ def test_validator_accepts_semantic_histogram_sum_without_observations() -> None
     )
 
     assert validate_exposition(changed_sum) == 13
+
+
+def test_validator_rejects_nonzero_sum_for_empty_histogram() -> None:
+    payload = render_exposition(
+        [],
+        [
+            Histogram(
+                "jev_polymarket_market_data_call_duration_seconds",
+                (("provider", "gamma"),),
+                (),
+            )
+        ],
+    )
+
+    with pytest.raises(ExpositionError, match="empty histogram sum"):
+        validate_exposition(
+            payload.replace(b'_sum{provider="gamma"} 0', b'_sum{provider="gamma"} 0.1')
+        )
 
 
 def test_validator_rejects_negative_nonnegative_histogram_sum() -> None:

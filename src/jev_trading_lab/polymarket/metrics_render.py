@@ -37,7 +37,7 @@ class Sample:
 class Histogram:
     family: str
     labels: tuple[tuple[str, str], ...]
-    observations: Iterable[Decimal]
+    observations: tuple[Decimal, ...]
 
 
 class ExpositionError(ValueError):
@@ -67,7 +67,7 @@ def _exact_decimal_sum(values: list[Decimal]) -> Decimal:
 
 def canonical_decimal(value: int | Decimal) -> str:
     """Return an exact finite plain decimal, normalizing trailing and negative zero."""
-    if isinstance(value, bool) or not isinstance(value, (int, Decimal)):
+    if type(value) not in (int, Decimal):
         raise ExpositionError("metric values must be int or Decimal")
     decimal = Decimal(value)
     if not decimal.is_finite():
@@ -100,28 +100,28 @@ def _family(name: str) -> MetricFamily:
     try:
         return metric_family(name)
     except (TypeError, ValueError) as error:
-        raise ExpositionError(str(error)) from error
+        raise ExpositionError("metric family is invalid") from error
 
 
 def _labels(
     family: MetricFamily, supplied: tuple[tuple[str, str], ...]
 ) -> tuple[tuple[str, str], ...]:
+    if type(supplied) is not tuple or len(supplied) != len(family.labels):
+        raise ExpositionError("labels have invalid structure")
+    if any(
+        type(pair) is not tuple
+        or len(pair) != 2
+        or type(pair[0]) is not str
+        or type(pair[1]) is not str
+        for pair in supplied
+    ):
+        raise ExpositionError("labels have invalid structure")
+    if len({name for name, _ in supplied}) != len(supplied):
+        raise ExpositionError("labels have invalid structure")
     try:
-        pairs = tuple(supplied)
-        if any(
-            not isinstance(pair, tuple)
-            or len(pair) != 2
-            or not all(isinstance(item, str) for item in pair)
-            for pair in pairs
-        ):
-            raise ExpositionError("labels must be string pairs")
-        if len({name for name, _ in pairs}) != len(pairs):
-            raise ExpositionError(f"duplicate labels for {family.name}")
-        return validate_labels(family, dict(pairs))
+        return validate_labels(family, dict(supplied))
     except (TypeError, ValueError) as error:
-        if isinstance(error, ExpositionError):
-            raise
-        raise ExpositionError(str(error)) from error
+        raise ExpositionError("labels are invalid for metric family") from error
 
 
 def _format_labels(labels: tuple[tuple[str, str], ...]) -> str:
@@ -153,8 +153,10 @@ def render_exposition(
     histogram_groups: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
 
     for sample in samples:
-        if not isinstance(sample, Sample):
-            raise ExpositionError("samples must contain Sample values")
+        if type(sample) is not Sample:
+            raise ExpositionError("samples must contain exact Sample values")
+        if type(sample.family) is not str:
+            raise ExpositionError("sample family must be str")
         family = _family(sample.family)
         if family.type is MetricType.HISTOGRAM:
             raise ExpositionError(f"histogram requires observations: {family.name}")
@@ -172,8 +174,10 @@ def render_exposition(
         series.append((family.name, labels, value))
 
     for histogram in histograms:
-        if not isinstance(histogram, Histogram):
-            raise ExpositionError("histograms must contain Histogram values")
+        if type(histogram) is not Histogram:
+            raise ExpositionError("histograms must contain exact Histogram values")
+        if type(histogram.family) is not str:
+            raise ExpositionError("histogram family must be str")
         family = _family(histogram.family)
         if family.type is not MetricType.HISTOGRAM:
             raise ExpositionError(f"family is not a histogram: {family.name}")
@@ -186,20 +190,20 @@ def render_exposition(
         histogram_series_count = len(family.buckets) + 3
         _check_series_budget(len(series) + histogram_series_count)
         histogram_groups.add(group)
+        if type(histogram.observations) is not tuple:
+            raise ExpositionError("histogram requires a bounded observation tuple")
+        if len(histogram.observations) > _MAX_HISTOGRAM_OBSERVATIONS:
+            raise ExpositionError("histogram observation tuple exceeds 800 values")
         observations: list[Decimal] = []
         for observation in histogram.observations:
-            if len(observations) == _MAX_HISTOGRAM_OBSERVATIONS:
-                raise ExpositionError(
-                    "histogram exceeds 800 observations per exposition"
-                )
-            if not isinstance(observation, Decimal) or not observation.is_finite():
+            if type(observation) is not Decimal or not observation.is_finite():
                 raise ExpositionError(
                     "histogram observations must be finite Decimal values"
                 )
             if observation < 0:
                 raise ExpositionError("histogram observations must be nonnegative")
             canonical_decimal(observation)
-            observations.append(observation)
+            observations.append(Decimal(observation))
         for bucket in (*family.buckets, None):
             count = (
                 len(observations)
@@ -373,6 +377,8 @@ def _validate_histograms(
             raise ExpositionError(f"histogram count mismatch: {family_name}")
         if total < 0:
             raise ExpositionError(f"histogram sum must be nonnegative: {family_name}")
+        if count == 0 and total != 0:
+            raise ExpositionError(f"empty histogram sum must be zero: {family_name}")
 
 
 def validate_exposition(payload: bytes) -> int:
