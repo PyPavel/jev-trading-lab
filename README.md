@@ -70,6 +70,28 @@ uv run jev-lab polymarket replay \
   --output-dir /tmp/jev-offline-replay
 ```
 
+## Stock paper observation
+
+Replay the committed three-arm fixture without network access or credentials:
+
+```console
+uv run jev-lab stocks replay \
+  --fixture tests/fixtures/stocks/observation.json \
+  --output-dir /tmp/jev-stocks-replay
+```
+
+Observe one public Yahoo chart v8 snapshot. Missing model credentials fail only the
+corresponding arm closed; the deterministic arm still reaches a terminal row:
+
+```console
+uv run jev-lab stocks observe --output-dir /tmp/jev-stocks-observe
+```
+
+Both commands append one terminal JSONL row per arm and atomically replace a bounded-label
+Prometheus textfile. Every arm has separate $10,000 paper capital and simulated long-only
+fills with a deterministic 10 bps round-trip slippage assumption. No brokerage or order
+surface exists.
+
 Clean-wheel migration and report-render smoke checks are deferred until those resources exist; they become mandatory release checks when introduced.
 
 ## Project documents

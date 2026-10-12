@@ -1,0 +1,25 @@
+# HELP jev_stocks_terminal Terminal stock paper observations.
+# TYPE jev_stocks_terminal gauge
+# HELP jev_stocks_equity_microdollars Paper equity by arm.
+# TYPE jev_stocks_equity_microdollars gauge
+# HELP jev_stocks_cycle_duration_milliseconds Observation cycle duration.
+# TYPE jev_stocks_cycle_duration_milliseconds gauge
+# HELP jev_stocks_failures Terminal failures by arm.
+# TYPE jev_stocks_failures gauge
+# HELP jev_stocks_abstentions Terminal abstentions by arm.
+# TYPE jev_stocks_abstentions gauge
+jev_stocks_terminal{arm="deterministic",status="completed"} 1
+jev_stocks_equity_microdollars{arm="deterministic"} 9999050000
+jev_stocks_cycle_duration_milliseconds{arm="deterministic"} 0
+jev_stocks_failures{arm="deterministic"} 0
+jev_stocks_abstentions{arm="deterministic"} 0
+jev_stocks_terminal{arm="jev",status="abstained"} 1
+jev_stocks_equity_microdollars{arm="jev"} 10000000000
+jev_stocks_cycle_duration_milliseconds{arm="jev"} 0
+jev_stocks_failures{arm="jev"} 0
+jev_stocks_abstentions{arm="jev"} 1
+jev_stocks_terminal{arm="openai",status="completed"} 1
+jev_stocks_equity_microdollars{arm="openai"} 9999250000
+jev_stocks_cycle_duration_milliseconds{arm="openai"} 0
+jev_stocks_failures{arm="openai"} 0
+jev_stocks_abstentions{arm="openai"} 0

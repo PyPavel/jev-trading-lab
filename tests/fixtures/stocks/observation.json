@@ -1,0 +1,61 @@
+{
+  "fixture_decisions": {
+    "jev": {
+      "action": "HOLD",
+      "called": true,
+      "confidence_micros": 620000,
+      "cost_microdollars": 50,
+      "input_tokens": 160,
+      "latency_ms": 98,
+      "model": "jev-1.13.0",
+      "output_tokens": 12,
+      "provider": "jev",
+      "status": "success",
+      "symbol": null
+    },
+    "openai": {
+      "action": "BUY",
+      "called": true,
+      "confidence_micros": 810000,
+      "cost_microdollars": 90,
+      "input_tokens": 180,
+      "latency_ms": 125,
+      "model": "gpt-5-2025-08-07",
+      "output_tokens": 18,
+      "provider": "openai",
+      "status": "success",
+      "symbol": "AAPL"
+    }
+  },
+  "observation_id": "stocks-fixture-2026-10-09",
+  "observed_at": "2026-10-09T20:00:00Z",
+  "quotes": [
+    {
+      "age_seconds": 0,
+      "previous_close_micros": 245000000,
+      "price_micros": 250000000,
+      "request_latency_ms": 42,
+      "request_status": "success",
+      "symbol": "AAPL",
+      "timestamp": "2026-10-09T20:00:00Z"
+    },
+    {
+      "age_seconds": 0,
+      "previous_close_micros": 522000000,
+      "price_micros": 520000000,
+      "request_latency_ms": 44,
+      "request_status": "success",
+      "symbol": "MSFT",
+      "timestamp": "2026-10-09T20:00:00Z"
+    },
+    {
+      "age_seconds": 0,
+      "previous_close_micros": 185000000,
+      "price_micros": 190000000,
+      "request_latency_ms": 41,
+      "request_status": "success",
+      "symbol": "NVDA",
+      "timestamp": "2026-10-09T20:00:00Z"
+    }
+  ]
+}
