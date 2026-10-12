@@ -281,6 +281,25 @@ def test_provider_journal_rejects_unsafe_blob_ancestor(tmp_path: Path) -> None:
     assert list(target.iterdir()) == []
 
 
+def test_provider_journal_read_uses_shared_journal_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from jev_trading_lab.polymarket import call_journal
+
+    journal = ProviderCallJournal(tmp_path)
+    operations: list[int] = []
+    real_flock = call_journal.fcntl.flock
+
+    def record_flock(descriptor: int, operation: int) -> None:
+        operations.append(operation)
+        real_flock(descriptor, operation)
+
+    monkeypatch.setattr(call_journal.fcntl, "flock", record_flock)
+
+    assert journal.state("0" * 64) is None
+    assert operations == [call_journal.fcntl.LOCK_SH, call_journal.fcntl.LOCK_SH]
+
+
 def test_provider_journal_completes_short_interrupted_writes(tmp_path: Path) -> None:
     journal = ProviderCallJournal(tmp_path)
     real_write = os.write

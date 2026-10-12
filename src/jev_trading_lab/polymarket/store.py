@@ -4003,7 +4003,8 @@ def _finish_recovery_audit(
             pass
         else:
             raise StoreCorruptError("recovery intent pathname was replaced")
-        os.unlink(quarantine, dir_fd=root_fd)
+        # Keep the completed intent under its random quarantine name: unlinking a
+        # pathname cannot prove it still names the inode checked above.
         _recovery_failpoint("marker_unlink")
         os.fsync(root_fd)
     except BaseException:

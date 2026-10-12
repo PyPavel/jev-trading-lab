@@ -627,7 +627,7 @@ class ProviderCallJournal:
         return states
 
     def _locked_states(
-        self, _operation: int
+        self, operation: int
     ) -> tuple[int, int, dict[str, tuple[_Intent, _Result | None, _JournalEnvelope]]]:
         root_fd = self._root_fd()
         try:
@@ -638,7 +638,7 @@ class ProviderCallJournal:
         try:
             while True:
                 try:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                    fcntl.flock(descriptor, operation)
                     break
                 except InterruptedError:
                     continue

@@ -189,6 +189,31 @@ def test_replay_is_offline_ordered_and_matches_recomputed_fixture(
     artifact_lines = (output / "artifacts.jsonl").read_text().splitlines()
     assert len(result_lines) == 1
     assert len(artifact_lines) == 11
+    metrics = (output / "polymarket.prom").read_text()
+    assert (
+        'jev_polymarket_arm_dispositions_total{arm="ai",status="filled"} 1' in metrics
+    )
+    assert 'jev_polymarket_fills_total{arm="ai",status="full"} 1' in metrics
+    assert 'jev_polymarket_fill_quantity_contracts_total{arm="ai"} 500' in metrics
+    assert 'jev_polymarket_fees_usd_total{arm="ai"} 5' in metrics
+    assert 'jev_polymarket_slippage_usd_total{arm="ai"} 0' in metrics
+    assert 'jev_polymarket_capital_cash_usd{arm="ai"} 10224' in metrics
+    assert 'jev_polymarket_capital_gross_exposure_usd{arm="ai"} 0' in metrics
+    assert 'jev_polymarket_capital_equity_usd{arm="ai"} 10224' in metrics
+    assert 'jev_polymarket_realized_pnl_usd{arm="ai"} 224' in metrics
+    assert (
+        'jev_polymarket_llm_calls_total{model_snapshot="gpt-5-2025-08-07",'
+        'provider="openai",status="success"} 1' in metrics
+    )
+    assert (
+        'jev_polymarket_llm_calls_total{model_snapshot="jev-1.13.0",'
+        'provider="jev",status="success"} 1' in metrics
+    )
+    assert (
+        'jev_polymarket_pipeline_terminal_results_total{reason="none",'
+        'status="filled"} 1' in metrics
+    )
+    assert not tuple(output.glob(".polymarket.prom.*"))
     assert [json.loads(line)["kind"] for line in artifact_lines] == [
         "raw_gamma",
         "sanitized_evidence",

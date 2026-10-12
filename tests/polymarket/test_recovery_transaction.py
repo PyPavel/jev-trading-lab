@@ -506,6 +506,31 @@ def test_marker_path_replacement_before_unlink_fails_closed(
     assert foreign.read_bytes() == b"foreign"
 
 
+def test_marker_replacement_after_quarantine_check_is_not_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "output"
+    target = _tail(output)
+
+    def replace(name: str) -> None:
+        if name != "marker_quarantine":
+            return
+        quarantine = next(output.glob(".recovery-owned-results-*"))
+        replacement = output / "replacement"
+        replacement.write_bytes(b"replacement")
+        replacement.chmod(0o600)
+        replacement.replace(quarantine)
+
+    monkeypatch.setattr(store, "_recovery_failpoint", replace)
+    recover_store_tails(output)
+
+    assert target.read_bytes() == b""
+    assert any(
+        path.read_bytes() == b"replacement"
+        for path in output.glob(".recovery-owned-results-*")
+    )
+
+
 def test_marker_replacement_in_final_quarantine_window_is_not_deleted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

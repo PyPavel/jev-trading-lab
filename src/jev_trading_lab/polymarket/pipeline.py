@@ -1324,7 +1324,7 @@ def _replay_summary(replay: Any) -> Summary:
     return summary
 
 
-def observe_markets(
+def _observe_markets(
     *,
     limit: int,
     output_dir: str | os.PathLike[str],
@@ -1859,7 +1859,7 @@ def _observe_locked(
     return summaries
 
 
-def replay_fixture(
+def _replay_fixture(
     fixture_path: str | os.PathLike[str],
     output_dir: str | os.PathLike[str],
     *,
@@ -2208,3 +2208,53 @@ def replay_fixture(
     record_observation(output_dir, result, artifacts)
     replay = load_observation(output_dir, result.observation_id)
     return _summary(replay.result, replay.envelopes)
+
+
+def observe_markets(
+    *,
+    limit: int,
+    output_dir: str | os.PathLike[str],
+    client: PolymarketClient | None = None,
+    openai_transport: Transport | None = None,
+    jev_transport: Transport | None = None,
+    now: datetime | None = None,
+    event_sink: EventSink | None = None,
+) -> list[Summary]:
+    """Run one paper pass and refresh metrics from committed results."""
+
+    from jev_trading_lab.polymarket.metrics_export import render_paper_metrics
+
+    summaries = _observe_markets(
+        limit=limit,
+        output_dir=output_dir,
+        client=client,
+        openai_transport=openai_transport,
+        jev_transport=jev_transport,
+        now=now,
+        event_sink=event_sink,
+    )
+    render_paper_metrics(output_dir)
+    return summaries
+
+
+def replay_fixture(
+    fixture_path: str | os.PathLike[str],
+    output_dir: str | os.PathLike[str],
+    *,
+    event_sink: EventSink | None = None,
+    openai_transport: Transport | None = None,
+    jev_transport: Transport | None = None,
+) -> Summary:
+    """Replay one fixture and refresh metrics from committed results."""
+
+    from jev_trading_lab.polymarket.metrics_export import render_paper_metrics
+
+    summary = _replay_fixture(
+        fixture_path,
+        output_dir,
+        event_sink=event_sink,
+        openai_transport=openai_transport,
+        jev_transport=jev_transport,
+    )
+    render_paper_metrics(output_dir)
+    return summary
