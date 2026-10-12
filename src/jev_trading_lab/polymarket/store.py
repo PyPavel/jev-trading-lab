@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import os
 import re
+import secrets
 import stat
 import time
 import unicodedata
@@ -17,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal, Self, cast
 
 from pydantic import (
     Field,
@@ -92,10 +93,13 @@ from jev_trading_lab.polymarket.models import (
     openai_response_brief,
 )
 from jev_trading_lab.polymarket.operations import (
+    JournalKind,
     JournalRecovery,
+    OperationCorruptError,
+    OperationEvent,
+    _parse_events,
+    _verify_blobs,
     append_operation,
-    inspect_operation_tail,
-    recover_operation_tail,
     recovery_event,
 )
 from jev_trading_lab.polymarket.paper import POLICY_VERSION
@@ -1546,12 +1550,18 @@ class ObservationReplay:
     typed_artifacts: dict[str, TypedArtifact]
 
 
-def _open_output(output_dir: Path) -> int:
+def _open_output(output_dir: Path, *, lock_operation: int = fcntl.LOCK_SH) -> int:
     path = output_dir.absolute()
     try:
-        return _open_or_create_root(path)
+        descriptor = _open_or_create_root(path)
     except BlobSecurityError as error:
         raise StoreSecurityError("output ancestor or directory is not safe") from error
+    try:
+        _lock(descriptor, lock_operation)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _open_journal(root_fd: int, name: str, *, label: str = "journal") -> int:
@@ -3570,164 +3580,505 @@ def load_completed_slot(
     return replays
 
 
-_STORE_RECOVERY_JOURNALS: tuple[
-    tuple[str, Literal["results", "artifacts", "completed_slots"]], ...
-] = (
-    ("results.jsonl", "results"),
-    ("artifacts.jsonl", "artifacts"),
-    ("completed_slots.jsonl", "completed_slots"),
+_RECOVERY_JOURNALS: tuple[tuple[str, JournalKind, str], ...] = (
+    ("operations.jsonl", "operations", "operation journal"),
+    ("results.jsonl", "results", "result journal"),
+    ("artifacts.jsonl", "artifacts", "artifact journal"),
+    ("provider_calls.jsonl", "provider_calls", "provider call journal"),
+    ("completed_slots.jsonl", "completed_slots", "completed slot journal"),
 )
+_RECOVERY_MARKER_MAX_BYTES = 16 * 1024
 
 
-def _store_recovery_candidate(
+@dataclass(frozen=True, slots=True)
+class _RecoveryCandidate:
+    name: str
+    kind: JournalKind
+    device: int
+    inode: int
+    raw_size: int
+    raw_sha256: str
+    prefix_size: int
+    prefix_sha256: str
+    discarded_bytes: int
+    event: OperationEvent
+
+    @property
+    def recovery(self) -> JournalRecovery:
+        return JournalRecovery(self.kind, self.discarded_bytes)
+
+
+def _recovery_failpoint(_name: str) -> None:
+    """Test-only crash boundary hook; production never changes recovery behavior."""
+
+
+def _marker_name(kind: JournalKind) -> str:
+    return f".recovery-{kind}.json"
+
+
+def _candidate(
+    name: str, kind: JournalKind, raw: bytes, metadata: os.stat_result
+) -> _RecoveryCandidate | None:
+    boundary = len(raw) if not raw or raw.endswith(b"\n") else raw.rfind(b"\n") + 1
+    discarded = len(raw) - boundary
+    if not discarded:
+        return None
+    recovery = JournalRecovery(kind, discarded)
+    event = recovery_event(recovery)
+    prefix = raw[:boundary]
+    return _RecoveryCandidate(
+        name=name,
+        kind=kind,
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        raw_size=len(raw),
+        raw_sha256=hashlib.sha256(raw).hexdigest(),
+        prefix_size=len(prefix),
+        prefix_sha256=hashlib.sha256(prefix).hexdigest(),
+        discarded_bytes=discarded,
+        event=event,
+    )
+
+
+def _candidate_document(candidate: _RecoveryCandidate) -> dict[str, object]:
+    return {
+        "device": candidate.device,
+        "discarded_bytes": candidate.discarded_bytes,
+        "event": candidate.event.model_dump(mode="json"),
+        "inode": candidate.inode,
+        "journal_kind": candidate.kind,
+        "journal_name": candidate.name,
+        "prefix_sha256": candidate.prefix_sha256,
+        "prefix_size": candidate.prefix_size,
+        "raw_sha256": candidate.raw_sha256,
+        "raw_size": candidate.raw_size,
+        "schema_version": 1,
+    }
+
+
+def _candidate_from_document(document: object) -> _RecoveryCandidate:
+    expected_keys = {
+        "device",
+        "discarded_bytes",
+        "event",
+        "inode",
+        "journal_kind",
+        "journal_name",
+        "prefix_sha256",
+        "prefix_size",
+        "raw_sha256",
+        "raw_size",
+        "schema_version",
+    }
+    try:
+        if type(document) is not dict or set(document) != expected_keys:
+            raise ValueError
+        values = cast(dict[str, object], document)
+        kind = cast(JournalKind, values["journal_kind"])
+        mapping = {item_kind: name for name, item_kind, _label in _RECOVERY_JOURNALS}
+        if (
+            values["schema_version"] != 1
+            or type(kind) is not str
+            or kind not in mapping
+            or values["journal_name"] != mapping[kind]
+            or any(
+                type(values[key]) is not int
+                for key in (
+                    "device",
+                    "discarded_bytes",
+                    "inode",
+                    "prefix_size",
+                    "raw_size",
+                )
+            )
+            or any(
+                type(values[key]) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", cast(str, values[key])) is None
+                for key in ("prefix_sha256", "raw_sha256")
+            )
+        ):
+            raise ValueError
+        event = OperationEvent.model_validate_json(
+            canonical_json_bytes(values["event"])
+        )
+        candidate = _RecoveryCandidate(
+            name=cast(str, values["journal_name"]),
+            kind=kind,
+            device=cast(int, values["device"]),
+            inode=cast(int, values["inode"]),
+            raw_size=cast(int, values["raw_size"]),
+            raw_sha256=cast(str, values["raw_sha256"]),
+            prefix_size=cast(int, values["prefix_size"]),
+            prefix_sha256=cast(str, values["prefix_sha256"]),
+            discarded_bytes=cast(int, values["discarded_bytes"]),
+            event=event,
+        )
+        if (
+            candidate.device < 0
+            or candidate.inode <= 0
+            or candidate.prefix_size < 0
+            or candidate.raw_size != candidate.prefix_size + candidate.discarded_bytes
+            or candidate.event
+            != recovery_event(
+                candidate.recovery, occurred_at=candidate.event.occurred_at
+            )
+        ):
+            raise ValueError
+        return candidate
+    except (KeyError, TypeError, ValueError):
+        raise StoreCorruptError("recovery intent is invalid") from None
+
+
+def _open_existing_recovery_journals(
     root_fd: int,
-    name: str,
-    kind: Literal["results", "artifacts", "completed_slots"],
-) -> tuple[JournalRecovery | None, bytes]:
-    label = {
-        "results": "result journal",
-        "artifacts": "artifact journal",
-        "completed_slots": "completed slot journal",
-    }[kind]
+) -> dict[JournalKind, tuple[int, str]]:
+    opened: dict[JournalKind, tuple[int, str]] = {}
     try:
-        os.stat(name, dir_fd=root_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return None, b""
-    descriptor = _open_journal(root_fd, name, label=label)
+        for name, kind, label in _RECOVERY_JOURNALS:
+            try:
+                os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            descriptor = _open_journal(root_fd, name, label=label)
+            _lock(descriptor, fcntl.LOCK_EX)
+            opened[kind] = (descriptor, label)
+        return opened
+    except BaseException:
+        for descriptor, _label in opened.values():
+            os.close(descriptor)
+        raise
+
+
+def _read_recovery_journals(
+    opened: dict[JournalKind, tuple[int, str]],
+) -> dict[JournalKind, bytes]:
+    return {
+        kind: _read_journal_bytes(descriptor, label=label)
+        for kind, (descriptor, label) in opened.items()
+    }
+
+
+def _accepted_prefixes(raws: Mapping[JournalKind, bytes]) -> dict[JournalKind, bytes]:
+    prefixes: dict[JournalKind, bytes] = {}
+    labels = {kind: label for _name, kind, label in _RECOVERY_JOURNALS}
+    for kind, raw in raws.items():
+        prefixes[kind] = _complete_prefix(raw, label=labels[kind])[0]
+    return prefixes
+
+
+def _validate_recovery_cut(output: Path, prefixes: Mapping[JournalKind, bytes]) -> None:
+    operation_events = _parse_events(prefixes.get("operations", b""))
+    _verify_blobs(output, operation_events)
+    results = _parse_results(
+        _journal_lines(prefixes.get("results", b""), label="result journal")
+    )
+    envelopes = _parse_envelopes(
+        _journal_lines(prefixes.get("artifacts", b""), label="artifact journal")
+    )
+    if results or envelopes:
+        with BlobStore(output / "blobs") as blob_store:
+            _validate_journals_locked(blob_store, results, envelopes)
+    slots = _parse_completed_slots(
+        _journal_lines(
+            prefixes.get("completed_slots", b""), label="completed slot journal"
+        )
+    )
+    for slot in slots:
+        ids = slot["observation_ids"]
+        assert isinstance(ids, list)
+        for observation_id in ids:
+            found = results.get(observation_id)
+            if found is None:
+                raise StoreCorruptError("completed slot observation binding is invalid")
+            result = found[0]
+            if (
+                result.cutoff_at.replace(second=0, microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+                != slot["cutoff_at"]
+                or result.policy_version != slot["policy_version"]
+            ):
+                raise StoreCorruptError("completed slot observation binding is invalid")
+    provider_raw = prefixes.get("provider_calls", b"")
+    if provider_raw:
+        from jev_trading_lab.polymarket.call_journal import ProviderCallJournal
+
+        provider = ProviderCallJournal(output)
+        provider._states(provider._parse_entries(provider_raw))
+
+
+def _write_recovery_marker(root_fd: int, candidate: _RecoveryCandidate) -> None:
+    name = _marker_name(candidate.kind)
+    payload = canonical_json_bytes(_candidate_document(candidate))
+    if len(payload) > _RECOVERY_MARKER_MAX_BYTES:
+        raise StoreCorruptError("recovery intent exceeds maximum size")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open(name, flags, 0o600, dir_fd=root_fd)
     try:
-        _lock(descriptor, fcntl.LOCK_SH)
-        raw = _read_journal_bytes(descriptor, label=label)
-        complete, discarded = _complete_prefix(raw, label=label)
-        lines = _journal_lines(complete, label=label)
-        if kind == "results":
-            _parse_results(lines)
-        elif kind == "artifacts":
-            _parse_envelopes(lines)
-        else:
-            _parse_completed_slots(lines)
-        return (JournalRecovery(kind, discarded) if discarded else None), complete
+        _append_raw(descriptor, payload)
+        os.fsync(descriptor)
     finally:
         os.close(descriptor)
+    os.fsync(root_fd)
+    _recovery_failpoint("marker_create")
+
+
+def _read_recovery_marker(
+    root_fd: int, kind: JournalKind
+) -> tuple[_RecoveryCandidate, tuple[int, int]]:
+    name = _marker_name(kind)
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        descriptor = os.open(name, flags, dir_fd=root_fd)
+    except OSError:
+        raise StoreCorruptError("recovery intent cannot be opened safely") from None
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+            or metadata.st_size <= 0
+            or metadata.st_size > _RECOVERY_MARKER_MAX_BYTES
+        ):
+            raise StoreCorruptError("recovery intent must be a private regular file")
+        raw = os.read(descriptor, _RECOVERY_MARKER_MAX_BYTES + 1)
+        if len(raw) != metadata.st_size:
+            raise StoreCorruptError("recovery intent changed while locked")
+        document = load_strict_json(raw)
+        if canonical_json_bytes(document) != raw:
+            raise StoreCorruptError("recovery intent is noncanonical")
+        candidate = _candidate_from_document(document)
+        if candidate.kind != kind:
+            raise StoreCorruptError("recovery intent identity is invalid")
+        return candidate, (metadata.st_dev, metadata.st_ino)
+    except (TypeError, ValueError):
+        raise StoreCorruptError("recovery intent is invalid") from None
+    finally:
+        os.close(descriptor)
+
+
+def _existing_marker_kinds(root_fd: int) -> list[JournalKind]:
+    kinds: list[JournalKind] = []
+    for _name, kind, _label in _RECOVERY_JOURNALS:
+        try:
+            os.stat(_marker_name(kind), dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise StoreCorruptError(
+                "recovery intent cannot be inspected safely"
+            ) from None
+        kinds.append(kind)
+    return kinds
 
 
 def _recover_store_journal(
     root_fd: int,
-    name: str,
-    expected: JournalRecovery,
-) -> JournalRecovery:
-    kind = expected.journal_kind
-    assert kind in {"results", "artifacts", "completed_slots"}
-    label = {
-        "results": "result journal",
-        "artifacts": "artifact journal",
-        "completed_slots": "completed slot journal",
-    }[kind]
-    descriptor = _open_journal(root_fd, name, label=label)
+    opened: dict[JournalKind, tuple[int, str]],
+    expected: _RecoveryCandidate,
+    output: Path,
+) -> tuple[JournalRecovery, tuple[int, int]]:
+    selected = opened.get(expected.kind)
+    if selected is None:
+        raise StoreCorruptError("recovery journal identity changed")
+    descriptor, label = selected
+    metadata = os.fstat(descriptor)
     try:
-        _lock(descriptor, fcntl.LOCK_EX)
-        raw = _read_journal_bytes(descriptor, label=label)
-        complete, discarded = _complete_prefix(raw, label=label)
-        candidate = JournalRecovery(kind, discarded)
-        if candidate != expected:
-            raise StoreCorruptError(f"{label} changed during recovery")
-        _truncate_durable(descriptor, root_fd, complete=complete, original=raw)
-        return candidate
-    finally:
-        os.close(descriptor)
+        path_metadata = os.stat(expected.name, dir_fd=root_fd, follow_symlinks=False)
+    except OSError:
+        raise StoreCorruptError(f"{label} identity changed during recovery") from None
+    raw = _read_journal_bytes(descriptor, label=label)
+    if (
+        (path_metadata.st_dev, path_metadata.st_ino)
+        != (metadata.st_dev, metadata.st_ino)
+        or (metadata.st_dev, metadata.st_ino) != (expected.device, expected.inode)
+        or len(raw) != expected.raw_size
+        or hashlib.sha256(raw).hexdigest() != expected.raw_sha256
+    ):
+        raise StoreCorruptError(f"{label} changed during recovery")
+    prefix = raw[: expected.prefix_size]
+    if hashlib.sha256(prefix).hexdigest() != expected.prefix_sha256:
+        raise StoreCorruptError(f"{label} prefix changed during recovery")
+    prefixes = _accepted_prefixes(_read_recovery_journals(opened))
+    if prefixes[expected.kind] != prefix:
+        raise StoreCorruptError(f"{label} accepted prefix changed during recovery")
+    _validate_recovery_cut(output, prefixes)
+    _write_recovery_marker(root_fd, expected)
+    marker_metadata = os.stat(
+        _marker_name(expected.kind), dir_fd=root_fd, follow_symlinks=False
+    )
+    marker_identity = (marker_metadata.st_dev, marker_metadata.st_ino)
+    os.ftruncate(descriptor, expected.prefix_size)
+    _recovery_failpoint("truncate")
+    os.fsync(descriptor)
+    _recovery_failpoint("journal_fsync")
+    os.fsync(root_fd)
+    _recovery_failpoint("parent_fsync")
+    return expected.recovery, marker_identity
 
 
-def recover_store_tails(output_dir: Path) -> tuple[JournalRecovery, ...]:
-    """Validate all journals, recover tails, then audit every completed action."""
+def _reconcile_recovery_marker(
+    root_fd: int,
+    opened: dict[JournalKind, tuple[int, str]],
+    output: Path,
+    candidate: _RecoveryCandidate,
+) -> JournalRecovery:
+    selected = opened.get(candidate.kind)
+    if selected is None:
+        raise StoreCorruptError("recovery journal identity changed")
+    descriptor, label = selected
+    metadata = os.fstat(descriptor)
+    try:
+        path_metadata = os.stat(candidate.name, dir_fd=root_fd, follow_symlinks=False)
+    except OSError:
+        raise StoreCorruptError("recovery journal identity changed") from None
+    if (path_metadata.st_dev, path_metadata.st_ino) != (
+        metadata.st_dev,
+        metadata.st_ino,
+    ) or (metadata.st_dev, metadata.st_ino) != (candidate.device, candidate.inode):
+        raise StoreCorruptError("recovery journal identity changed")
+    raw = _read_journal_bytes(descriptor, label=label)
+    raw_digest = hashlib.sha256(raw).hexdigest()
+    original = len(raw) == candidate.raw_size and raw_digest == candidate.raw_sha256
+    prefix = len(raw) == candidate.prefix_size and raw_digest == candidate.prefix_sha256
+    audit_present = False
+    if (
+        candidate.kind == "operations"
+        and len(raw) >= candidate.prefix_size
+        and hashlib.sha256(raw[: candidate.prefix_size]).hexdigest()
+        == candidate.prefix_sha256
+    ):
+        try:
+            events = _parse_events(raw)
+            audit_present = any(
+                event.event_id == candidate.event.event_id for event in events
+            )
+        except (OperationCorruptError, ValueError):
+            audit_present = False
+    if not (original or prefix or audit_present):
+        raise StoreCorruptError("recovery journal conflicts with durable intent")
+    prefixes = _accepted_prefixes(_read_recovery_journals(opened))
+    prefixes[candidate.kind] = raw[: candidate.prefix_size]
+    _validate_recovery_cut(output, prefixes)
+    if original:
+        os.ftruncate(descriptor, candidate.prefix_size)
+        _recovery_failpoint("truncate")
+    os.fsync(descriptor)
+    _recovery_failpoint("journal_fsync")
+    os.fsync(root_fd)
+    _recovery_failpoint("parent_fsync")
+    return candidate.recovery
+
+
+def _finish_recovery_audit(
+    root_fd: int,
+    output: Path,
+    candidate: _RecoveryCandidate,
+    marker_identity: tuple[int, int],
+) -> None:
+    append_operation(output, candidate.event, _locked_root_fd=root_fd)
+    _recovery_failpoint("audit_append")
+    _recovery_failpoint("audit_fsync")
+    try:
+        metadata = os.stat(
+            _marker_name(candidate.kind), dir_fd=root_fd, follow_symlinks=False
+        )
+    except OSError:
+        raise StoreCorruptError("recovery intent identity changed") from None
+    if (metadata.st_dev, metadata.st_ino) != marker_identity:
+        raise StoreCorruptError("recovery intent identity changed")
+    canonical = _marker_name(candidate.kind)
+    quarantine = f".recovery-owned-{candidate.kind}-{secrets.token_hex(16)}"
+    os.rename(canonical, quarantine, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+    try:
+        owned = os.stat(quarantine, dir_fd=root_fd, follow_symlinks=False)
+        if (owned.st_dev, owned.st_ino) != marker_identity:
+            raise StoreCorruptError("recovery intent identity changed")
+        _recovery_failpoint("marker_quarantine")
+        try:
+            os.stat(canonical, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise StoreCorruptError("recovery intent pathname was replaced")
+        os.unlink(quarantine, dir_fd=root_fd)
+        _recovery_failpoint("marker_unlink")
+        os.fsync(root_fd)
+    except BaseException:
+        try:
+            os.stat(canonical, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            try:
+                os.rename(quarantine, canonical, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+            except OSError:
+                pass
+        except OSError:
+            pass
+        raise
+
+
+def recover_store_tails(
+    output_dir: Path, *, _only_kind: JournalKind | None = None
+) -> tuple[JournalRecovery, ...]:
+    """Recover exact validated tails through durable, restartable audit intents."""
 
     if not isinstance(output_dir, Path):
         raise TypeError("output_dir must be a Path")
     output = output_dir if output_dir.is_absolute() else output_dir.absolute()
-    root_fd = _open_output(output)
+    root_fd = _open_output(output, lock_operation=fcntl.LOCK_EX)
     recovered: list[JournalRecovery] = []
     try:
-        operation = inspect_operation_tail(output)
-        candidates: list[tuple[str, JournalRecovery]] = []
-        parsed: dict[str, object] = {}
-        for name, kind in _STORE_RECOVERY_JOURNALS:
-            item, complete = _store_recovery_candidate(root_fd, name, kind)
-            lines = _journal_lines(
-                complete,
-                label={
-                    "results": "result journal",
-                    "artifacts": "artifact journal",
-                    "completed_slots": "completed slot journal",
-                }[kind],
-            )
-            if kind == "results":
-                parsed[kind] = _parse_results(lines)
-            elif kind == "artifacts":
-                parsed[kind] = _parse_envelopes(lines)
-            if item is not None:
-                candidates.append((name, item))
-        results = parsed.get("results", {})
-        envelopes = parsed.get("artifacts", [])
-        assert isinstance(results, dict) and isinstance(envelopes, list)
-        if results or envelopes:
-            with BlobStore(output / "blobs") as blob_store:
-                _validate_journals_locked(blob_store, results, envelopes)
-        for slot in _parse_completed_slots(
-            _journal_lines(
-                _store_recovery_candidate(
-                    root_fd, "completed_slots.jsonl", "completed_slots"
-                )[1],
-                label="completed slot journal",
-            )
-        ):
-            ids = slot["observation_ids"]
-            assert isinstance(ids, list)
-            for observation_id in ids:
-                found = results.get(observation_id)
-                if found is None:
-                    raise StoreCorruptError(
-                        "completed slot observation binding is invalid"
-                    )
-                result = found[0]
-                cutoff = result.cutoff_at.replace(second=0, microsecond=0)
-                if (
-                    cutoff.isoformat().replace("+00:00", "Z") != slot["cutoff_at"]
-                    or result.policy_version != slot["policy_version"]
-                ):
-                    raise StoreCorruptError(
-                        "completed slot observation binding is invalid"
-                    )
-        from jev_trading_lab.polymarket.call_journal import ProviderCallJournal
-
-        provider_journal = ProviderCallJournal(output)
-        provider = provider_journal.recovery_candidate()
-        if operation is not None:
-            current = recover_operation_tail(output)
-            assert current is not None
-            recovered.append(current)
-            append_operation(output, recovery_event(current))
-        completed: tuple[str, JournalRecovery] | None = None
-        for name, item in candidates:
-            if item.journal_kind == "completed_slots":
-                completed = (name, item)
-                continue
-            current = _recover_store_journal(root_fd, name, item)
-            recovered.append(current)
-            append_operation(output, recovery_event(current))
-        if provider is not None:
-            current = provider_journal.recover_tail()
-            assert current is not None
-            recovered.append(current)
-            append_operation(output, recovery_event(current))
-        if completed is not None:
-            current = _recover_store_journal(root_fd, *completed)
-            recovered.append(current)
-            append_operation(output, recovery_event(current))
+        marker_kinds = _existing_marker_kinds(root_fd)
+        if _only_kind is not None and any(kind != _only_kind for kind in marker_kinds):
+            raise StoreCorruptError("another journal recovery intent is pending")
+        for kind in marker_kinds:
+            candidate, marker_identity = _read_recovery_marker(root_fd, kind)
+            opened = _open_existing_recovery_journals(root_fd)
+            try:
+                recovered.append(
+                    _reconcile_recovery_marker(root_fd, opened, output, candidate)
+                )
+            finally:
+                for descriptor, _label in opened.values():
+                    os.close(descriptor)
+            _finish_recovery_audit(root_fd, output, candidate, marker_identity)
+        opened = _open_existing_recovery_journals(root_fd)
+        try:
+            raws = _read_recovery_journals(opened)
+            prefixes = _accepted_prefixes(raws)
+            _validate_recovery_cut(output, prefixes)
+            candidates: list[_RecoveryCandidate] = []
+            names = {kind: name for name, kind, _label in _RECOVERY_JOURNALS}
+            for kind, raw in raws.items():
+                if _only_kind is not None and kind != _only_kind:
+                    continue
+                descriptor, _label = opened[kind]
+                item = _candidate(names[kind], kind, raw, os.fstat(descriptor))
+                if item is not None:
+                    candidates.append(item)
+            order = {
+                kind: index
+                for index, (_name, kind, _label) in enumerate(_RECOVERY_JOURNALS)
+            }
+            candidates.sort(key=lambda item: order[item.kind])
+            created: list[tuple[_RecoveryCandidate, tuple[int, int]]] = []
+            for candidate in candidates:
+                recovery, marker_identity = _recover_store_journal(
+                    root_fd, opened, candidate, output
+                )
+                recovered.append(recovery)
+                created.append((candidate, marker_identity))
+        finally:
+            for descriptor, _label in opened.values():
+                os.close(descriptor)
+        for candidate, marker_identity in created:
+            _finish_recovery_audit(root_fd, output, candidate, marker_identity)
     finally:
         os.close(root_fd)
     order = {
-        kind: index
-        for index, kind in enumerate(
-            ("operations", "results", "artifacts", "provider_calls", "completed_slots")
-        )
+        kind: index for index, (_name, kind, _label) in enumerate(_RECOVERY_JOURNALS)
     }
     return tuple(sorted(recovered, key=lambda item: order[item.journal_kind]))
 

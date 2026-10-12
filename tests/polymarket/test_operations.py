@@ -680,22 +680,25 @@ def test_tail_recovery_uses_last_lf_and_never_parses_discarded_cr_bytes(
     recovery = recover_operation_tail(root)
 
     assert recovery == JournalRecovery("operations", len(tail))
-    assert load_operation_cut(root).events == (value,)
-    assert journal.read_bytes() == journal_line(value)
+    events = load_operation_cut(root).events
+    assert events[0] == value
+    assert len(events) == 2 and events[1].journal_kind == "operations"
+    assert journal.read_bytes().startswith(journal_line(value))
 
 
 def test_bare_cr_without_any_lf_is_one_discarded_tail_candidate(tmp_path: Path) -> None:
     root = tmp_path / "audit"
     raw = journal_line(event()).rstrip(b"\n") + b"\rSUPERSECRET"
-    journal = append_raw_lines(root, tail=raw)
+    append_raw_lines(root, tail=raw)
 
     with pytest.raises(OperationCorruptError, match="truncated tail"):
         load_operation_cut(root)
     recovery = recover_operation_tail(root)
 
     assert recovery == JournalRecovery("operations", len(raw))
-    assert load_operation_cut(root).events == ()
-    assert journal.read_bytes() == b""
+    events = load_operation_cut(root).events
+    assert len(events) == 1 and events[0].journal_kind == "operations"
+    assert events[0].exact_values == {"discarded_bytes": len(raw)}
 
 
 def test_complete_corruption_is_fatal_but_torn_tail_is_explicitly_recovered(
@@ -713,8 +716,10 @@ def test_complete_corruption_is_fatal_but_torn_tail_is_explicitly_recovered(
         load_operation_cut(root)
     assert journal.read_bytes() == original
     assert recover_operation_tail(root) == JournalRecovery("operations", len(tail))
-    assert load_operation_cut(root).events == (value,)
-    assert journal.read_bytes() == journal_line(value)
+    events = load_operation_cut(root).events
+    assert events[0] == value
+    assert len(events) == 2 and events[1].journal_kind == "operations"
+    assert journal.read_bytes().startswith(journal_line(value))
     assert recover_operation_tail(root) is None
 
     journal.write_bytes(journal_line(value) + b"{}\n")
@@ -1309,7 +1314,6 @@ def test_tail_recovery_retry_reestablishes_file_and_parent_durability(
         recover_operation_tail(root)
     assert journal.read_bytes() == journal_line(value)
 
-    journal.write_bytes(journal_line(value) + b'{"torn":')
     journal_fsyncs = 0
     root_fsyncs = 0
 
@@ -1326,8 +1330,10 @@ def test_tail_recovery_retry_reestablishes_file_and_parent_durability(
     assert recover_operation_tail(root) == JournalRecovery(
         "operations", len(b'{"torn":')
     )
-    assert load_operation_cut(root).events == (value,)
-    assert journal_fsyncs == 1
+    events = load_operation_cut(root).events
+    assert events[0] == value
+    assert len(events) == 2 and events[1].journal_kind == "operations"
+    assert journal_fsyncs >= 1
     assert root_fsyncs >= 1
 
 

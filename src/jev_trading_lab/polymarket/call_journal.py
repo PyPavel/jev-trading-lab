@@ -417,8 +417,18 @@ class ProviderCallJournal:
         descriptor = _open_or_create_root(self.root)
         os.close(descriptor)
 
-    def _root_fd(self) -> int:
-        return _open_or_create_root(self.root)
+    def _root_fd(self, *, lock_operation: int = fcntl.LOCK_SH) -> int:
+        descriptor = _open_or_create_root(self.root)
+        try:
+            while True:
+                try:
+                    fcntl.flock(descriptor, lock_operation)
+                    return descriptor
+                except InterruptedError:
+                    continue
+        except BaseException:
+            os.close(descriptor)
+            raise
 
     def _open(self, root_fd: int) -> int:
         flags = (
@@ -505,49 +515,12 @@ class ProviderCallJournal:
             os.close(root_fd)
 
     def recover_tail(self) -> JournalRecovery | None:
-        """Validate the complete prefix, then explicitly discard one torn final line."""
+        """Transactionally recover and self-audit one torn provider journal tail."""
 
-        expected = self.recovery_candidate()
-        if expected is None:
-            return None
-        root_fd = self._root_fd()
-        try:
-            descriptor = self._open(root_fd)
-            try:
-                while True:
-                    try:
-                        fcntl.flock(descriptor, fcntl.LOCK_EX)
-                        break
-                    except InterruptedError:
-                        continue
-                raw = self._read_raw(descriptor)
-                boundary = raw.rfind(b"\n") + 1
-                complete = raw[:boundary]
-                self._states(self._parse_entries(complete))
-                recovery = JournalRecovery("provider_calls", len(raw) - boundary)
-                if recovery != expected:
-                    raise ValueError("provider call journal changed during recovery")
-                truncated = False
-                try:
-                    os.ftruncate(descriptor, len(complete))
-                    truncated = True
-                    os.fsync(descriptor)
-                    os.fsync(root_fd)
-                except BaseException:
-                    if truncated:
-                        try:
-                            os.lseek(descriptor, 0, os.SEEK_END)
-                            _write_all(descriptor, raw[len(complete) :])
-                            os.fsync(descriptor)
-                            os.fsync(root_fd)
-                        except BaseException:
-                            pass
-                    raise
-                return recovery
-            finally:
-                os.close(descriptor)
-        finally:
-            os.close(root_fd)
+        from jev_trading_lab.polymarket.store import recover_store_tails
+
+        recovered = recover_store_tails(self.root, _only_kind="provider_calls")
+        return recovered[0] if recovered else None
 
     def _read_raw(self, descriptor: int) -> bytes:
         metadata = os.fstat(descriptor)

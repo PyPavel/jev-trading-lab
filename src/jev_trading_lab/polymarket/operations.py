@@ -915,12 +915,18 @@ class OperationCut:
     discarded_tail_bytes: int = 0
 
 
-def _open_root(root: Path) -> int:
+def _open_root(root: Path, *, lock_operation: int = fcntl.LOCK_SH) -> int:
     path = root if root.is_absolute() else root.absolute()
     try:
-        return _open_or_create_root(path)
+        descriptor = _open_or_create_root(path)
     except BlobSecurityError:
         raise OperationSecurityError("operation root is unsafe") from None
+    try:
+        _lock(descriptor, lock_operation)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _open_journal(root_fd: int) -> tuple[int, bool]:
@@ -1157,7 +1163,11 @@ def recovery_event(
 
 
 def append_operation(
-    root: Path, event: OperationEvent, evidence: bytes | None = None
+    root: Path,
+    event: OperationEvent,
+    evidence: bytes | None = None,
+    *,
+    _locked_root_fd: int | None = None,
 ) -> None:
     """Durably append one unique canonical event after any evidence blob is durable."""
 
@@ -1181,7 +1191,9 @@ def append_operation(
             raise ValueError("operation evidence does not match its reference")
         _parse_evidence(evidence, event.kind)
     root_path = root if root.is_absolute() else root.absolute()
-    root_fd = _open_root(root_path)
+    owns_root = _locked_root_fd is None
+    root_fd = _open_root(root_path) if owns_root else _locked_root_fd
+    assert root_fd is not None
     try:
         descriptor, _created = _open_journal(root_fd)
         try:
@@ -1241,7 +1253,8 @@ def append_operation(
         finally:
             os.close(descriptor)
     finally:
-        os.close(root_fd)
+        if owns_root:
+            os.close(root_fd)
 
 
 def inspect_operation_tail(root: Path) -> JournalRecovery | None:
@@ -1274,33 +1287,14 @@ def inspect_operation_tail(root: Path) -> JournalRecovery | None:
 
 
 def recover_operation_tail(root: Path) -> JournalRecovery | None:
-    """Explicitly validate and discard only an operations journal torn final line."""
+    """Transactionally recover and self-audit one torn operations tail."""
 
-    expected = inspect_operation_tail(root)
-    if expected is None:
-        return None
-    root_path = root if root.is_absolute() else root.absolute()
-    root_fd = _open_root(root_path)
-    try:
-        descriptor, _created = _open_journal(root_fd)
-        try:
-            _lock(descriptor, fcntl.LOCK_EX)
-            raw = _read_bytes(descriptor)
-            boundary = raw.rfind(b"\n") + 1
-            candidate = raw[:boundary]
-            events = _parse_events(candidate)
-            _verify_blobs(root_path, events)
-            recovery = JournalRecovery("operations", len(raw) - boundary)
-            if recovery != expected:
-                raise OperationCorruptError("operation journal changed during recovery")
-            os.ftruncate(descriptor, len(candidate))
-            os.fsync(descriptor)
-            _fsync_root(root_fd)
-            return recovery
-        finally:
-            os.close(descriptor)
-    finally:
-        os.close(root_fd)
+    if not isinstance(root, Path):
+        raise TypeError("operation root must be a Path")
+    from jev_trading_lab.polymarket.store import recover_store_tails
+
+    recovered = recover_store_tails(root, _only_kind="operations")
+    return recovered[0] if recovered else None
 
 
 def load_operation_cut(root: Path) -> OperationCut:
