@@ -245,6 +245,9 @@ _APPROVED_SOURCE_HASHES = {
     "src/jev_trading_lab/polymarket/models.py": (
         "4aa32a806efa5f6e8a02c1db7d62f93fa9a57c34ec89728384613367affd8ed7"
     ),
+    "src/jev_trading_lab/polymarket/metrics_schema.py": (
+        "8d4f425847d325a918d7625b3045f5e41440779ddd373658c71f66bcf6035c8d"
+    ),
     "src/jev_trading_lab/polymarket/paper.py": (
         "f17e8c6cef480cf1926b04999fe3097079bb473cbb32a188a335cd89e287003e"
     ),
@@ -311,10 +314,10 @@ _ALLOWED_BUILD_SYSTEM = {
     "build-backend": "hatchling.build",
 }
 _APPROVED_WORKFLOW_HASH = (
-    "e2fefe26cda7ad830d0f1b0c6044396bd9085ccbaa31cbed83905ed8bbcf9ea0"
+    "ff91cb443bf784bacd169659dd89a7cfac1b37582f1a6d6e70e8acfd01f51ab3"
 )
 _APPROVED_PREFLIGHT_HASH = (
-    "a995bae7441eac03369239eaa20ad8029fbb845833339a4a671980b0169e0139"
+    "5b2e6e80e170667c21f6f245a7d9125a773fdf6e5bec0dce8ba0dfa5142a1e75"
 )
 _ALLOWED_RUNTIME_REQUIREMENTS = [
     "exchange-calendars==4.11.2",
@@ -1637,6 +1640,7 @@ def test_built_artifacts_exclude_repository_and_host_junk(tmp_path: Path) -> Non
         "jev_trading_lab/polymarket/call_journal.py",
         "jev_trading_lab/polymarket/client.py",
         "jev_trading_lab/polymarket/control.py",
+        "jev_trading_lab/polymarket/metrics_schema.py",
         "jev_trading_lab/polymarket/models.py",
         "jev_trading_lab/polymarket/paper.py",
         "jev_trading_lab/polymarket/pipeline.py",

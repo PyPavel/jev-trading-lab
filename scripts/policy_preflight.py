@@ -117,6 +117,9 @@ EXPECTED_SOURCE_HASHES = {
     "src/jev_trading_lab/polymarket/models.py": (
         "4aa32a806efa5f6e8a02c1db7d62f93fa9a57c34ec89728384613367affd8ed7"
     ),
+    "src/jev_trading_lab/polymarket/metrics_schema.py": (
+        "8d4f425847d325a918d7625b3045f5e41440779ddd373658c71f66bcf6035c8d"
+    ),
     "src/jev_trading_lab/polymarket/paper.py": (
         "f17e8c6cef480cf1926b04999fe3097079bb473cbb32a188a335cd89e287003e"
     ),
