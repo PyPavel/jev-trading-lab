@@ -158,7 +158,14 @@ class MetricFamily:
 
     def __post_init__(self) -> None:
         object.__setattr__(
-            self, "label_values", MappingProxyType(dict(self.label_values))
+            self,
+            "label_values",
+            MappingProxyType(
+                {
+                    label: frozenset(values)
+                    for label, values in self.label_values.items()
+                }
+            ),
         )
 
 
@@ -1157,6 +1164,8 @@ def _build_registry() -> tuple[MetricFamily, ...]:
             raise RuntimeError(f"invalid metric name: {family.name}")
         if not family.help or "\n" in family.help:
             raise RuntimeError(f"invalid HELP text: {family.name}")
+        if len(family.labels) != len(set(family.labels)):
+            raise RuntimeError(f"duplicate labels: {family.name}")
         if set(family.labels) != set(family.label_values):
             raise RuntimeError(f"label allowlist mismatch: {family.name}")
         is_counter = family.type is MetricType.COUNTER
@@ -1166,8 +1175,15 @@ def _build_registry() -> tuple[MetricFamily, ...]:
             raise RuntimeError(f"histogram bucket/type mismatch: {family.name}")
         if any(not bucket.is_finite() for bucket in family.buckets):
             raise RuntimeError(f"histogram buckets must be finite: {family.name}")
-        if tuple(sorted(family.buckets)) != family.buckets:
-            raise RuntimeError(f"histogram buckets must increase: {family.name}")
+        if any(bucket <= 0 for bucket in family.buckets):
+            raise RuntimeError(f"histogram buckets must be positive: {family.name}")
+        if any(
+            current >= following
+            for current, following in zip(family.buckets, family.buckets[1:])
+        ):
+            raise RuntimeError(
+                f"histogram buckets must strictly increase: {family.name}"
+            )
     return tuple(sorted(families, key=lambda family: family.name))
 
 
@@ -1199,6 +1215,10 @@ def validate_labels(
         pair = (labels["provider"], labels["model_snapshot"])
         if pair not in PROVIDER_MODEL_PAIRS:
             raise ValueError(f"invalid provider/model_snapshot pair: {pair!r}")
+    if family.name == _PREFIX + "market_eligibility_total":
+        pair = (labels["status"], labels["reason"])
+        if (pair[0] == "eligible") is not (pair[1] == "none"):
+            raise ValueError(f"invalid status/reason pair: {pair!r}")
     for label, value in labels.items():
         if value not in family.label_values[label]:
             raise ValueError(f"invalid {label} for {family.name}: {value!r}")

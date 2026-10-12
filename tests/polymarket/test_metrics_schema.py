@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 from decimal import Decimal
 from types import MappingProxyType
+from typing import Any
 
 import pytest
 
+from jev_trading_lab.polymarket import metrics_schema
 from jev_trading_lab.polymarket.metrics_schema import (
     METRIC_FAMILIES,
     MetricFamily,
@@ -333,13 +335,57 @@ def test_histogram_bucket_vectors_are_exact_finite_decimals() -> None:
 
 
 def test_metric_family_and_nested_label_values_are_immutable() -> None:
-    family = _family("fills_total")
+    mutable_values: Any = {"arm": {"ai", "deterministic"}}
+    family = MetricFamily(
+        name="jev_polymarket_test_total",
+        help="Test family.",
+        type=MetricType.COUNTER,
+        labels=("arm",),
+        label_values=mutable_values,
+    )
+
+    mutable_values["arm"].add("changed")
 
     assert isinstance(family.label_values, MappingProxyType)
+    assert family.label_values["arm"] == frozenset({"ai", "deterministic"})
     with pytest.raises(FrozenInstanceError):
         family.name = "changed"  # type: ignore[misc]
     with pytest.raises(TypeError):
         family.label_values["arm"] = frozenset({"changed"})  # type: ignore[index]
+
+
+def test_build_registry_rejects_duplicate_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    labels = dict(metrics_schema._LABELS)
+    labels["metrics_regenerations_total"] = ("status", "status")
+    monkeypatch.setattr(metrics_schema, "_LABELS", labels)
+
+    with pytest.raises(RuntimeError, match="duplicate labels"):
+        metrics_schema._build_registry()
+
+
+@pytest.mark.parametrize(
+    "buckets",
+    (
+        (Decimal("1"), Decimal("1")),
+        (Decimal("2"), Decimal("1")),
+        (Decimal("0"), Decimal("1")),
+        (Decimal("-1"), Decimal("1")),
+        (Decimal("NaN"), Decimal("1")),
+        (Decimal("Infinity"),),
+    ),
+)
+def test_build_registry_rejects_invalid_histogram_buckets(
+    monkeypatch: pytest.MonkeyPatch, buckets: tuple[Decimal, ...]
+) -> None:
+    metric = "llm_call_duration_seconds"
+    mutated_buckets = dict(metrics_schema._BUCKETS)
+    mutated_buckets[metric] = buckets
+    monkeypatch.setattr(metrics_schema, "_BUCKETS", mutated_buckets)
+
+    with pytest.raises(RuntimeError, match="histogram buckets"):
+        metrics_schema._build_registry()
 
 
 def test_metric_family_rejects_an_unknown_name() -> None:
@@ -392,6 +438,39 @@ def test_validate_labels_rejects_unbounded_dimensions(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         validate_labels(_family(metric), labels)
+
+
+@pytest.mark.parametrize(
+    "labels",
+    (
+        *(
+            {"status": "eligible", "reason": reason}
+            for reason in sorted(metrics_schema.TRADING_REASONS - {"none"})
+        ),
+        {"status": "rejected", "reason": "none"},
+    ),
+)
+def test_validate_labels_rejects_invalid_market_eligibility_cross_products(
+    labels: dict[str, str],
+) -> None:
+    with pytest.raises(ValueError, match="status/reason"):
+        validate_labels(_family("market_eligibility_total"), labels)
+
+
+@pytest.mark.parametrize(
+    "labels",
+    (
+        {"status": "eligible", "reason": "none"},
+        *(
+            {"status": "rejected", "reason": reason}
+            for reason in sorted(metrics_schema.TRADING_REASONS - {"none"})
+        ),
+    ),
+)
+def test_validate_labels_accepts_valid_market_eligibility_pairs(
+    labels: dict[str, str],
+) -> None:
+    assert validate_labels(_family("market_eligibility_total"), labels)
 
 
 @pytest.mark.parametrize(
