@@ -127,6 +127,7 @@ class HttpResponse:
 
 ByteTransport = Callable[[HttpRequest], HttpResponse]
 AttemptSink = Callable[[str, str, str, str | None, int], None]
+ResponseValidator = Callable[[bytes, object, datetime], None]
 Resolver = Callable[..., list[tuple[Any, ...]]]
 _RESOLVERS = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bounded-dns")
 
@@ -1159,7 +1160,9 @@ class PolymarketClient:
                 provider, stage, status, reason, time.monotonic_ns() - started_ns
             )
 
-    def _get(self, url: str, *, label: str) -> tuple[bytes, object, datetime]:
+    def _get(
+        self, url: str, *, label: str, validate: ResponseValidator | None = None
+    ) -> tuple[bytes, object, datetime]:
         provider = "gamma" if label == "Gamma" else "clob"
         stage = "gamma_poll" if label == "Gamma" else "execution_book"
         started_ns = time.monotonic_ns()
@@ -1179,11 +1182,16 @@ class PolymarketClient:
             raise PublicDataError(f"{label} transport failed") from error
         try:
             value = _strict_response(response, label=label)
-        except PublicDataError as error:
+            if validate is not None:
+                validate(response.body, value, response.retrieved_at)
+        except (PublicDataError, TypeError, ValueError, ArithmeticError) as error:
             self._record_attempt(provider, stage, "failure", "malformed", started_ns)
+            message = _reason(error) if label == "CLOB" else str(error)
             raise PublicDataError(
-                str(error),
-                reason="MALFORMED_BOOK" if label == "CLOB" else error.reason,
+                message,
+                reason="MALFORMED_BOOK"
+                if label == "CLOB"
+                else getattr(error, "reason", "BOOK_UNAVAILABLE"),
                 raw_bytes=response.body,
                 retrieved_at=response.retrieved_at,
             ) from error
@@ -1285,18 +1293,20 @@ class PolymarketClient:
                     "offset": page * self.page_size,
                 }
             )
+
+            def validate_gamma(
+                raw: bytes, value: object, _retrieved_at: datetime
+            ) -> None:
+                if not isinstance(value, list):
+                    raise PublicDataError("Gamma response must be an array")
+                if len(_market_raw_items(raw)) != len(value):
+                    raise PublicDataError("Gamma raw item count is inconsistent")
+
             raw, value, retrieved_at = self._get(
-                f"{GAMMA_ENDPOINT}?{params}", label="Gamma"
+                f"{GAMMA_ENDPOINT}?{params}", label="Gamma", validate=validate_gamma
             )
-            if not isinstance(value, list):
-                raise PublicDataError(
-                    "Gamma response must be an array",
-                    raw_bytes=raw,
-                    retrieved_at=retrieved_at,
-                )
+            assert isinstance(value, list)
             raw_items = _market_raw_items(raw)
-            if len(raw_items) != len(value):
-                raise PublicDataError("Gamma raw item count is inconsistent")
             for item_raw, item in zip(raw_items, value, strict=True):
                 if not isinstance(item, Mapping):
                     raise PublicDataError("Gamma market must be an object")
@@ -1535,9 +1545,21 @@ class PolymarketClient:
         cutoff = now or datetime.now(UTC)
         if cutoff.tzinfo is not UTC:
             cutoff = cutoff.astimezone(UTC)
+
+        def validate_book(raw: bytes, value: object, retrieved_at: datetime) -> None:
+            _book_snapshot(
+                raw,
+                value,
+                expected_market_id=candidate.market_id,
+                expected_condition_id=candidate.condition_id,
+                expected_token_id=candidate.yes_token_id,
+                now=retrieved_at,
+            )
+
         raw, value, retrieved_at = self._get(
             f"{CLOB_ENDPOINT}?{urlencode({'token_id': candidate.yes_token_id})}",
             label="CLOB",
+            validate=validate_book,
         )
         try:
             snapshot = _book_snapshot(

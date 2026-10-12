@@ -834,7 +834,13 @@ class OperationEvent(StrictModel):
         }
         if requires_run != (self.run_id is not None):
             raise ValueError("run_id presence is invalid for event kind")
-        if (self.kind is OperationKind.DEDUPLICATION) != (self.semantic_id is not None):
+        provider_recovery = self.kind is OperationKind.RECOVERY and self.reason in {
+            "reused_result",
+            "unknown_in_flight",
+        }
+        if (self.kind is OperationKind.DEDUPLICATION or provider_recovery) != (
+            self.semantic_id is not None
+        ):
             raise ValueError("semantic_id presence is invalid for event kind")
         requires_stage = self.kind in {
             OperationKind.STARTUP,
@@ -848,7 +854,6 @@ class OperationEvent(StrictModel):
             raise ValueError("stage presence is invalid for event kind")
         expected_stage = {
             OperationKind.STARTUP: "startup",
-            OperationKind.RECOVERY: "recovery",
             OperationKind.METRICS_GENERATION: "metrics_render",
         }.get(self.kind)
         if expected_stage is not None and self.stage != expected_stage:
@@ -857,8 +862,18 @@ class OperationEvent(StrictModel):
             self.stage not in _DEDUPLICATION_STAGES
         ):
             raise ValueError("operation stage is invalid for deduplication")
-        if self.provider is not None and self.kind is not OperationKind.STAGE_TERMINAL:
-            raise ValueError("provider is valid only for a terminal stage")
+        if self.provider is not None and self.kind not in {
+            OperationKind.STAGE_TERMINAL,
+            OperationKind.RECOVERY,
+        }:
+            raise ValueError("provider is invalid for event kind")
+        if self.kind is OperationKind.RECOVERY:
+            if provider_recovery != (self.provider in {"openai", "jev"}):
+                raise ValueError("operation provider is invalid for recovery")
+            if provider_recovery and self.stage != self.provider:
+                raise ValueError("operation stage is invalid for provider recovery")
+            if not provider_recovery and self.stage != "recovery":
+                raise ValueError("operation stage is invalid for recovery")
         if self.journal_kind is not None and self.kind is not OperationKind.RECOVERY:
             raise ValueError("journal_kind presence is invalid for event kind")
         if self.kind is OperationKind.STAGE_TERMINAL:

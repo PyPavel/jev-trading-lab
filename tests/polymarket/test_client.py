@@ -238,6 +238,53 @@ def test_malformed_timeout_redirect_and_oversize_are_bounded() -> None:
             client.poll(limit=1, now=NOW)
 
 
+def test_gamma_attempt_records_failure_only_after_endpoint_validation() -> None:
+    attempts: list[tuple[str, str, str, str | None, int]] = []
+    client = PolymarketClient(
+        CannedTransport([{}], []),
+        attempt_sink=lambda *attempt: attempts.append(attempt),
+    )
+
+    with pytest.raises(PublicDataError, match="must be an array"):
+        client.poll(limit=1, now=NOW)
+
+    assert [attempt[:4] for attempt in attempts] == [
+        ("gamma", "gamma_poll", "failure", "malformed")
+    ]
+
+
+def test_execution_attempt_records_failure_only_for_malformed_clob_payload() -> None:
+    client = PolymarketClient(CannedTransport([[market()]], [book(), []]))
+    candidate = client.poll(limit=1, now=NOW).eligible[0]
+    attempts: list[tuple[str, str, str, str | None, int]] = []
+    client.attempt_sink = lambda *attempt: attempts.append(attempt)
+
+    with pytest.raises(PublicDataError, match="MALFORMED_BOOK"):
+        client.execution_book(candidate, now=NOW)
+
+    assert [attempt[:4] for attempt in attempts] == [
+        ("clob", "execution_book", "failure", "malformed")
+    ]
+
+
+def test_validated_attempt_records_one_success_with_monotonic_latency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts: list[tuple[str, str, str, str | None, int]] = []
+    ticks = iter((100, 175))
+    monkeypatch.setattr(
+        "jev_trading_lab.polymarket.client.time.monotonic_ns", lambda: next(ticks)
+    )
+
+    result = PolymarketClient(
+        CannedTransport([[]], []),
+        attempt_sink=lambda *attempt: attempts.append(attempt),
+    ).poll(limit=1, now=NOW)
+
+    assert result.eligible == result.rejections == ()
+    assert attempts == [("gamma", "gamma_poll", "success", None, 75)]
+
+
 def test_precheck_transport_failures_preserve_typed_reason_and_empty_bytes() -> None:
     for failure, reason in (
         (TimeoutError(), "PRECHECK_TIMEOUT"),

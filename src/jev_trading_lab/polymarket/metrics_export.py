@@ -190,6 +190,14 @@ def _provider_metrics(output: Path) -> tuple[list[Sample], list[Histogram]]:
     unknown_usage: Counter[str] = Counter()
     unknown_cost: Counter[str] = Counter()
     pending: Counter[str] = Counter()
+    recoveries: Counter[tuple[str, str]] = Counter()
+    for event in load_operation_cut(output).events:
+        if (
+            event.kind is OperationKind.RECOVERY
+            and event.provider in _MODELS
+            and event.reason in {"reused_result", "unknown_in_flight"}
+        ):
+            recoveries[(event.provider, event.reason)] += 1
     for record in ProviderCallJournal(output).snapshot():
         provider = cast(str, record.get("provider"))
         if provider not in _MODELS:
@@ -248,7 +256,11 @@ def _provider_metrics(output: Path) -> tuple[list[Sample], list[Histogram]]:
         if type(elapsed) is int:
             durations[provider].append(Decimal(elapsed) / Decimal(1_000_000_000))
     histograms: list[Histogram] = []
-    active = set(provider for provider, _status in calls) | set(pending)
+    active = (
+        set(provider for provider, _status in calls)
+        | set(pending)
+        | set(provider for provider, _status in recoveries)
+    )
     for provider in sorted(active):
         model = _MODELS[provider]
         base = _labels(provider=provider, model_snapshot=model)
@@ -260,6 +272,15 @@ def _provider_metrics(output: Path) -> tuple[list[Sample], list[Histogram]]:
                         "jev_polymarket_llm_calls_total",
                         _labels(provider=provider, model_snapshot=model, status=status),
                         count,
+                    )
+                )
+        for status in ("reused_result", "unknown_in_flight"):
+            if recoveries[(provider, status)]:
+                samples.append(
+                    Sample(
+                        "jev_polymarket_llm_restart_recoveries_total",
+                        _labels(provider=provider, model_snapshot=model, status=status),
+                        recoveries[(provider, status)],
                     )
                 )
         if pending[provider]:

@@ -33,6 +33,7 @@ from jev_trading_lab.polymarket.client import (
     PublicDataTimeout,
 )
 from jev_trading_lab.polymarket.models import BookSnapshot
+from jev_trading_lab.polymarket.operations import OperationKind, load_operation_cut
 from jev_trading_lab.polymarket.paper import POLICY_VERSION
 from jev_trading_lab.polymarket.pipeline import observe_markets
 from jev_trading_lab.polymarket.store import (
@@ -2284,6 +2285,33 @@ def test_crash_after_provider_intent_never_retries_unknown_call(tmp_path: Path) 
     replay = load_observation(tmp_path, summary["observation_id"])
     failure = json.loads(replay.artifacts["openai_failure"])
     assert failure["code"] == "UNKNOWN_IN_FLIGHT"
+    recoveries = [
+        event
+        for event in load_operation_cut(tmp_path).events
+        if event.kind is OperationKind.RECOVERY and event.reason == "unknown_in_flight"
+    ]
+    assert [(event.provider, event.stage) for event in recoveries] == [
+        ("openai", "openai")
+    ]
+    metrics = (tmp_path / "polymarket.prom").read_text()
+    assert (
+        "jev_polymarket_llm_restart_recoveries_total{"
+        'model_snapshot="gpt-5-2025-08-07",provider="openai",'
+        'status="unknown_in_flight"} 1' in metrics
+    )
+
+    assert _observe(tmp_path) == [summary]
+    assert (
+        len(
+            [
+                event
+                for event in load_operation_cut(tmp_path).events
+                if event.kind is OperationKind.RECOVERY
+                and event.reason == "unknown_in_flight"
+            ]
+        )
+        == 1
+    )
 
 
 def test_completed_slot_replay_terminalizes_other_same_slot_pending_intent(
@@ -2852,6 +2880,20 @@ def test_same_slot_changed_evidence_after_openai_result_terminalizes_without_jev
     )[0]
     assert again == summary
     assert openai.requests == [] and jev.requests == []
+    recoveries = [
+        event
+        for event in load_operation_cut(tmp_path).events
+        if event.kind is OperationKind.RECOVERY and event.reason == "reused_result"
+    ]
+    assert [(event.provider, event.stage) for event in recoveries] == [
+        ("openai", "openai")
+    ]
+    metrics = (tmp_path / "polymarket.prom").read_text()
+    assert (
+        "jev_polymarket_llm_restart_recoveries_total{"
+        'model_snapshot="gpt-5-2025-08-07",provider="openai",'
+        'status="reused_result"} 1' in metrics
+    )
 
 
 @pytest.mark.parametrize(
