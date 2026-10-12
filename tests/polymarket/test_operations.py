@@ -5,8 +5,11 @@ import os
 import stat
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, fields
 from datetime import UTC, datetime, timedelta, timezone
+from decimal import MAX_PREC, localcontext
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -15,18 +18,24 @@ from pydantic import ValidationError
 from jev_trading_lab.core.ids import canonical_json_bytes
 from jev_trading_lab.polymarket.operations import (
     BlobRefModel,
+    BuildIdentity,
     OperationConflictError,
     OperationCorruptError,
     OperationEvent,
     OperationKind,
     OperationSecurityError,
+    ProcessSample,
     append_operation,
+    capture_build_identity,
     load_operation_cut,
     operation_event_id,
+    package_version_code,
+    sample_process,
 )
 
 NOW = datetime(2026, 10, 12, 12, 0, tzinfo=UTC)
 SHA = "a" * 64
+GIT_COMMIT = "a" * 40
 
 
 @pytest.fixture(autouse=True)
@@ -1437,6 +1446,334 @@ def test_exact_values_reject_bool_and_subclasses() -> None:
                 reason="partial_tail",
                 exact_values=values,
             )
+
+
+def test_process_sample_normalizes_linux_units_and_exact_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    monkeypatch.setattr(operations, "_read_proc_statm", lambda: "99 3 0 0 0 0 0\n")
+    monkeypatch.setattr(operations.os, "sysconf", lambda name: 4096)
+    monkeypatch.setattr(
+        operations.resource,
+        "getrusage",
+        lambda who: SimpleNamespace(
+            ru_maxrss=7,
+            ru_utime=0.1234567899,
+            ru_stime=0.9876543219,
+        ),
+    )
+    monkeypatch.setattr(operations, "_count_open_fds", lambda: 11)
+
+    with localcontext() as context:
+        context.prec = MAX_PREC
+        value = sample_process()
+
+    assert value == ProcessSample(
+        resident_memory_bytes=12_288,
+        peak_resident_memory_bytes=7_168,
+        user_cpu_nanoseconds=123_456_789,
+        system_cpu_nanoseconds=987_654_321,
+        open_fds=11,
+        probe_available=True,
+    )
+    assert value.__dataclass_params__.frozen
+    with pytest.raises((AttributeError, TypeError)):
+        value.open_fds = 12  # type: ignore[misc]
+
+
+def test_process_sample_does_not_use_wall_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    monkeypatch.setattr(operations, "_read_proc_statm", lambda: "1 1\n")
+    monkeypatch.setattr(operations.os, "sysconf", lambda name: 1024)
+    monkeypatch.setattr(
+        operations.resource,
+        "getrusage",
+        lambda who: SimpleNamespace(ru_maxrss=1, ru_utime=1.25, ru_stime=2.5),
+    )
+    monkeypatch.setattr(operations, "_count_open_fds", lambda: 1)
+    monkeypatch.setattr(
+        operations,
+        "datetime",
+        SimpleNamespace(now=lambda *_args: pytest.fail("wall clock used")),
+    )
+
+    first = sample_process()
+    second = sample_process()
+
+    assert first.user_cpu_nanoseconds == second.user_cpu_nanoseconds == 1_250_000_000
+    system_values = (first.system_cpu_nanoseconds, second.system_cpu_nanoseconds)
+    assert system_values == (2_500_000_000, 2_500_000_000)
+
+
+@pytest.mark.parametrize(
+    ("statm", "page_size"),
+    (("", 4096), ("1", 4096), ("1 x", 4096), ("1 -1", 4096), ("1 1", 0)),
+)
+def test_malformed_statm_or_sysconf_is_an_unsupported_probe(
+    monkeypatch: pytest.MonkeyPatch, statm: str, page_size: int
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    monkeypatch.setattr(operations, "_read_proc_statm", lambda: statm)
+    monkeypatch.setattr(operations.os, "sysconf", lambda name: page_size)
+    monkeypatch.setattr(
+        operations.resource,
+        "getrusage",
+        lambda who: SimpleNamespace(ru_maxrss=1, ru_utime=0.0, ru_stime=0.0),
+    )
+    monkeypatch.setattr(operations, "_count_open_fds", lambda: 1)
+
+    value = sample_process()
+
+    assert value.resident_memory_bytes is None
+    assert not value.probe_available
+
+
+def test_unsupported_proc_and_open_fd_race_return_none_not_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    monkeypatch.setattr(
+        operations,
+        "_read_proc_statm",
+        lambda: (_ for _ in ()).throw(FileNotFoundError()),
+    )
+    monkeypatch.setattr(
+        operations,
+        "_count_open_fds",
+        lambda: (_ for _ in ()).throw(OSError("fd raced")),
+    )
+    monkeypatch.setattr(
+        operations.resource,
+        "getrusage",
+        lambda who: SimpleNamespace(ru_maxrss=2, ru_utime=0.0, ru_stime=0.0),
+    )
+
+    value = sample_process()
+
+    assert value.resident_memory_bytes is None
+    assert value.open_fds is None
+    assert value.peak_resident_memory_bytes == 2048
+    assert not value.probe_available
+
+
+def test_open_fd_probe_counts_entries_without_stat_or_follow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    class Entry:
+        def stat(self, *, follow_symlinks: bool = True) -> None:
+            pytest.fail(f"fd entry followed: {follow_symlinks}")
+
+    class Entries:
+        def __enter__(self) -> Entries:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def __iter__(self) -> Any:
+            return iter((Entry(), Entry(), Entry()))
+
+    monkeypatch.setattr(operations.os, "scandir", lambda path: Entries())
+    assert operations._count_open_fds() == 3
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    (("0.1.0", 1000), ("1.2.3", 1_002_003), ("999.999.999", 999_999_999)),
+)
+def test_package_version_code_encodes_supported_semver(
+    version: str, expected: int
+) -> None:
+    assert package_version_code(version) == expected
+
+
+@pytest.mark.parametrize(
+    "version",
+    (
+        "1.2",
+        "1.2.3.4",
+        "01.2.3",
+        "1.02.3",
+        "1.2.03",
+        "1.2.3-alpha",
+        "1.2.3+build",
+        "1.1000.0",
+        "1.0.1000",
+        "9223372036855.0.0",
+        "",
+        True,
+    ),
+)
+def test_package_version_code_rejects_unsupported_or_overflow_formats(
+    version: Any,
+) -> None:
+    with pytest.raises((TypeError, ValueError), match="version"):
+        package_version_code(version)
+
+
+def _git_runner(
+    *, commit: str = GIT_COMMIT, timestamp: str = "1700000000", dirty: str = ""
+) -> Any:
+    values = {
+        ("rev-parse", "HEAD"): commit,
+        ("show", "-s", "--format=%ct", "HEAD"): timestamp,
+        ("status", "--porcelain"): dirty,
+    }
+
+    def run(arguments: tuple[str, ...]) -> str:
+        return values[arguments]
+
+    return run
+
+
+@pytest.mark.parametrize(
+    ("expected_commit", "commit", "dirty", "status", "dirty_value"),
+    (
+        (GIT_COMMIT, GIT_COMMIT, "", "valid", False),
+        (GIT_COMMIT, GIT_COMMIT, " M source.py", "dirty", True),
+        ("b" * 40, GIT_COMMIT, "", "mismatch", False),
+        ("b" * 40, GIT_COMMIT, " M source.py", "dirty", True),
+        (None, GIT_COMMIT, "", "unknown", False),
+    ),
+)
+def test_build_identity_statuses_are_mutually_exclusive(
+    monkeypatch: pytest.MonkeyPatch,
+    expected_commit: str | None,
+    commit: str,
+    dirty: str,
+    status: str,
+    dirty_value: bool,
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    monkeypatch.setattr(operations, "_run_git", _git_runner(commit=commit, dirty=dirty))
+
+    value = capture_build_identity(expected_commit)
+
+    assert value == BuildIdentity(1000, 1_700_000_000, dirty_value, status)
+    statuses = ("valid", "dirty", "mismatch", "unknown")
+    assert sum(value.status == item for item in statuses) == 1
+
+
+def test_build_identity_unknown_on_unavailable_or_malformed_git(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    for runner in (
+        lambda arguments: (_ for _ in ()).throw(OSError("/private/path SECRET")),
+        _git_runner(timestamp="not-a-timestamp"),
+    ):
+        monkeypatch.setattr(operations, "_run_git", runner)
+        value = capture_build_identity(GIT_COMMIT)
+        assert value == BuildIdentity(1000, None, None, "unknown")
+        assert "/private/path" not in repr(value)
+        assert "SECRET" not in repr(value)
+
+
+def test_build_identity_rejects_noncanonical_expected_commit() -> None:
+    for value in ("abc", "A" * 64, True, 1):
+        with pytest.raises((TypeError, ValueError), match="expected_commit"):
+            capture_build_identity(value)  # type: ignore[arg-type]
+
+
+def test_metric_facing_build_identity_has_no_commit_path_or_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    marker = "/home/private/repository"
+    monkeypatch.setattr(operations, "_run_git", _git_runner())
+    value = capture_build_identity(GIT_COMMIT)
+    rendered = repr(value)
+
+    assert tuple(field.name for field in fields(value)) == (
+        "version_code",
+        "commit_timestamp_seconds",
+        "dirty",
+        "status",
+    )
+    assert GIT_COMMIT not in rendered
+    assert marker not in rendered
+    assert str(os.getpid()) not in asdict(value).values()
+    assert len(rendered) < 200
+
+
+def test_process_sample_exact_values_round_trip(tmp_path: Path) -> None:
+    exact_values = {
+        "resident_memory_bytes": 4096,
+        "peak_resident_memory_bytes": 8192,
+        "user_cpu_nanoseconds": 10,
+        "system_cpu_nanoseconds": 20,
+        "open_fds": 3,
+    }
+    root = tmp_path / "audit"
+    started = event(kind="run_started", run_id=SHA, status="started")
+    sampled = event(
+        kind="process_sample",
+        run_id=SHA,
+        status="success",
+        exact_values=exact_values,
+    )
+
+    append_operation(root, started)
+    append_operation(root, sampled)
+
+    assert load_operation_cut(root).events == (started, sampled)
+
+
+@pytest.mark.parametrize("key", ("runs_total", "cpu_sum", "pid", "commit_sha"))
+def test_process_sample_exact_values_remain_raw_and_closed(key: str) -> None:
+    with pytest.raises(ValidationError, match="exact_values"):
+        event(
+            kind="process_sample",
+            run_id=SHA,
+            status="success",
+            exact_values={key: 1},
+        )
+
+
+def test_process_and_build_dataclasses_reject_invalid_builtin_values() -> None:
+    class TaggedInt(int):
+        pass
+
+    invalid_process = (
+        {"resident_memory_bytes": -1},
+        {"peak_resident_memory_bytes": 2**63},
+        {"user_cpu_nanoseconds": True},
+        {"system_cpu_nanoseconds": TaggedInt(1)},
+        {"open_fds": -1},
+        {"probe_available": 1},
+    )
+    process_defaults: dict[str, Any] = {
+        "resident_memory_bytes": None,
+        "peak_resident_memory_bytes": None,
+        "user_cpu_nanoseconds": 0,
+        "system_cpu_nanoseconds": 0,
+        "open_fds": None,
+        "probe_available": False,
+    }
+    for changes in invalid_process:
+        with pytest.raises((TypeError, ValueError)):
+            ProcessSample(**(process_defaults | changes))
+
+    with pytest.raises((TypeError, ValueError)):
+        BuildIdentity(True, None, None, "unknown")  # type: ignore[arg-type]
+    with pytest.raises((TypeError, ValueError)):
+        BuildIdentity(1000, -1, None, "unknown")
+    with pytest.raises((TypeError, ValueError)):
+        BuildIdentity(1000, None, 0, "unknown")  # type: ignore[arg-type]
+    with pytest.raises((TypeError, ValueError)):
+        BuildIdentity(1000, None, None, "other")  # type: ignore[arg-type]
 
 
 def test_blob_reference_schema_metadata_is_strict() -> None:

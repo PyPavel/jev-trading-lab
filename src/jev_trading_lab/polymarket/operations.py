@@ -5,16 +5,21 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import os
+import re
+import resource
 import stat
+import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal, Self, cast
 
 from pydantic import Field, StringConstraints, field_validator, model_validator
 
+from jev_trading_lab import __version__
 from jev_trading_lab.core.ids import canonical_json_bytes
 from jev_trading_lab.persistence.blobs import (
     BlobError,
@@ -247,8 +252,15 @@ _EVENT_EXACT_KEYS = {
     OperationKind.RECOVERY: frozenset({"discarded_bytes"}),
     OperationKind.DEDUPLICATION: frozenset(),
     OperationKind.STORAGE_FAILURE: frozenset(),
-    # Task 4 deliberately extends process facts after its own reviewed TDD cycle.
-    OperationKind.PROCESS_SAMPLE: frozenset(),
+    OperationKind.PROCESS_SAMPLE: frozenset(
+        {
+            "resident_memory_bytes",
+            "peak_resident_memory_bytes",
+            "user_cpu_nanoseconds",
+            "system_cpu_nanoseconds",
+            "open_fds",
+        }
+    ),
     OperationKind.METRICS_GENERATION: frozenset(),
 }
 
@@ -275,6 +287,179 @@ BoundedLabel = Annotated[
     str, StringConstraints(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")
 ]
 ExactInt = Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)]
+_BUILD_STATUSES = frozenset({"valid", "dirty", "mismatch", "unknown"})
+_SEMVER_PATTERN = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
+_GIT_COMMIT_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+
+
+def _bounded_int(value: object, name: str) -> int:
+    if type(value) is not int or not 0 <= value <= INT64_MAX:
+        raise ValueError(f"{name} must be a nonnegative signed 64-bit built-in int")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessSample:
+    resident_memory_bytes: int | None
+    peak_resident_memory_bytes: int | None
+    user_cpu_nanoseconds: int
+    system_cpu_nanoseconds: int
+    open_fds: int | None
+    probe_available: bool
+
+    def __post_init__(self) -> None:
+        for name in (
+            "resident_memory_bytes",
+            "peak_resident_memory_bytes",
+            "open_fds",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                _bounded_int(value, name)
+        _bounded_int(self.user_cpu_nanoseconds, "user_cpu_nanoseconds")
+        _bounded_int(self.system_cpu_nanoseconds, "system_cpu_nanoseconds")
+        if type(self.probe_available) is not bool:
+            raise TypeError("probe_available must be a built-in bool")
+
+
+@dataclass(frozen=True, slots=True)
+class BuildIdentity:
+    version_code: int
+    commit_timestamp_seconds: int | None
+    dirty: bool | None
+    status: Literal["valid", "dirty", "mismatch", "unknown"]
+
+    def __post_init__(self) -> None:
+        _bounded_int(self.version_code, "version_code")
+        if self.commit_timestamp_seconds is not None:
+            _bounded_int(self.commit_timestamp_seconds, "commit_timestamp_seconds")
+        if self.dirty is not None and type(self.dirty) is not bool:
+            raise TypeError("dirty must be a built-in bool or None")
+        if type(self.status) is not str or self.status not in _BUILD_STATUSES:
+            raise ValueError("status must be an approved build status")
+
+
+def _read_proc_statm() -> str:
+    return Path("/proc/self/statm").read_text(encoding="ascii")
+
+
+def _count_open_fds() -> int:
+    with os.scandir("/proc/self/fd") as entries:
+        return sum(1 for _entry in entries)
+
+
+def _cpu_nanoseconds(seconds: object) -> int:
+    if type(seconds) is not float or seconds < 0:
+        raise ValueError("CPU seconds are invalid")
+    numerator, denominator = Decimal(str(seconds)).as_integer_ratio()
+    return _bounded_int((numerator * 1_000_000_000) // denominator, "CPU nanoseconds")
+
+
+def sample_process() -> ProcessSample:
+    """Capture bounded Linux process facts without wall-clock inference."""
+
+    resident: int | None = None
+    try:
+        fields = _read_proc_statm().split()
+        if len(fields) < 2 or not fields[1].isascii() or not fields[1].isdecimal():
+            raise ValueError
+        pages = int(fields[1])
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if pages <= 0 or type(page_size) is not int or page_size <= 0:
+            raise ValueError
+        resident = _bounded_int(pages * page_size, "resident_memory_bytes")
+    except (OSError, UnicodeError, ValueError):
+        resident = None
+
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    peak: int | None = None
+    try:
+        if type(usage.ru_maxrss) not in {int, float} or usage.ru_maxrss < 0:
+            raise ValueError
+        peak_kib = int(usage.ru_maxrss)
+        if peak_kib != usage.ru_maxrss:
+            raise ValueError
+        peak = _bounded_int(peak_kib * 1024, "peak_resident_memory_bytes")
+    except (OverflowError, ValueError):
+        peak = None
+
+    open_fds: int | None = None
+    try:
+        open_fds = _bounded_int(_count_open_fds(), "open_fds")
+    except (OSError, ValueError):
+        open_fds = None
+
+    return ProcessSample(
+        resident_memory_bytes=resident,
+        peak_resident_memory_bytes=peak,
+        user_cpu_nanoseconds=_cpu_nanoseconds(usage.ru_utime),
+        system_cpu_nanoseconds=_cpu_nanoseconds(usage.ru_stime),
+        open_fds=open_fds,
+        probe_available=resident is not None and open_fds is not None,
+    )
+
+
+def package_version_code(version: str) -> int:
+    """Encode supported release-only SemVer with three decimal component slots."""
+
+    if type(version) is not str:
+        raise TypeError("version must be a built-in string")
+    if _SEMVER_PATTERN.fullmatch(version) is None:
+        raise ValueError("version must be release-only SemVer")
+    major, minor, patch = (int(component) for component in version.split("."))
+    if minor > 999 or patch > 999:
+        raise ValueError("version components exceed encoding width")
+    return _bounded_int(major * 1_000_000 + minor * 1_000 + patch, "version code")
+
+
+def _run_git(arguments: tuple[str, ...]) -> str:
+    completed = subprocess.run(
+        ("git", "-c", "color.ui=false", *arguments),
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        timeout=5,
+    )
+    if len(completed.stdout) > 4096:
+        raise ValueError("git output exceeds bound")
+    return completed.stdout.strip()
+
+
+def capture_build_identity(expected_commit: str | None) -> BuildIdentity:
+    """Capture sanitized metric-facing build facts; omit repository identity details."""
+
+    if expected_commit is not None:
+        if type(expected_commit) is not str:
+            raise TypeError("expected_commit must be a built-in string or None")
+        if _GIT_COMMIT_PATTERN.fullmatch(expected_commit) is None:
+            raise ValueError("expected_commit must be a lowercase full Git object ID")
+    version_code = package_version_code(__version__)
+    try:
+        commit = _run_git(("rev-parse", "HEAD"))
+        timestamp_text = _run_git(("show", "-s", "--format=%ct", "HEAD"))
+        dirty_text = _run_git(("status", "--porcelain"))
+        if (
+            _GIT_COMMIT_PATTERN.fullmatch(commit) is None
+            or not timestamp_text.isdecimal()
+        ):
+            raise ValueError
+        timestamp = _bounded_int(int(timestamp_text), "commit_timestamp_seconds")
+        dirty = bool(dirty_text)
+    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
+        return BuildIdentity(version_code, None, None, "unknown")
+
+    if expected_commit is None:
+        status: Literal["valid", "dirty", "mismatch", "unknown"] = "unknown"
+    elif dirty:
+        status = "dirty"
+    elif commit != expected_commit:
+        status = "mismatch"
+    else:
+        status = "valid"
+    return BuildIdentity(version_code, timestamp, dirty, status)
 
 
 class BlobRefModel(StrictModel):
