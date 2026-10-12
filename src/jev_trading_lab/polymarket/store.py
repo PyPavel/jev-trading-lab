@@ -1035,6 +1035,16 @@ def _contains_credentials(
     return False
 
 
+def _contains_strict_provider_credentials(
+    value: object, sentinels: tuple[bytes, ...]
+) -> bool:
+    """Reuse the adapter screen without broadening public artifact policy."""
+
+    from jev_trading_lab.polymarket.ai import _contains_credentials as contains
+
+    return contains(value, sentinels)
+
+
 def failure_artifact_from_adapter(failure: AdapterFailure) -> FailureArtifact:
     """Convert only typed adapter metadata; failed response bodies stay discarded."""
 
@@ -1740,6 +1750,7 @@ def _screen_payload(
     *,
     strict_json: bool = False,
     patterns: bool = True,
+    provider_output: bool = False,
 ) -> None:
     sentinels: list[str] = []
     for value in forbidden_secret_values:
@@ -1773,14 +1784,29 @@ def _screen_payload(
             decoded = load_strict_json(payload)
         except (TypeError, ValueError):
             return
+        strict_credentials = False
+        if provider_output:
+            try:
+                strict_credentials = _contains_strict_provider_credentials(
+                    decoded, forbidden_secret_values
+                )
+            except (TypeError, ValueError, RecursionError):
+                strict_credentials = True
         if (
             _contains_credentials(decoded, tuple(sentinels), patterns=patterns)
+            or strict_credentials
             or patterns
             and contains_public_credential_semantics(decoded)
         ):
             raise StoreSecurityError("artifact contains credential-like data")
 
 
+_PROVIDER_OUTPUT_KINDS = frozenset(
+    {
+        ArtifactKind.OPENAI_RESPONSE_SUCCESS,
+        ArtifactKind.JEV_RESPONSE_SUCCESS,
+    }
+)
 _PUBLIC_RESPONSE_KINDS = frozenset(
     {
         ArtifactKind.PRECHECK_BOOK_RAW,
@@ -1812,6 +1838,7 @@ def _screen_artifact(
         forbidden_secret_values,
         strict_json=public_gamma or not public,
         patterns=not (public or public_gamma),
+        provider_output=kind in _PROVIDER_OUTPUT_KINDS,
     )
 
 

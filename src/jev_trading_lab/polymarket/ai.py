@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 from pydantic import ValidationError
 
 from jev_trading_lab.core.ids import canonical_json_bytes
+from jev_trading_lab.persistence.blobs import is_credential_name
 from jev_trading_lab.polymarket.client import (
     contains_credential_semantics,
     contains_public_credential_semantics,
@@ -760,6 +761,48 @@ def _semantic_bytes(value: str) -> bytes:
     return unicodedata.normalize("NFKC", value).encode("utf-8")
 
 
+_PROVIDER_GENERIC_CREDENTIAL_NAMES = frozenset({"auth", "key", "secret", "token"})
+_PROVIDER_CREDENTIAL_COMPACT_NAMES = _PROVIDER_GENERIC_CREDENTIAL_NAMES | frozenset(
+    {
+        "proxyauth",
+        "proxyauthorization",
+        "setcookie",
+        "xapikey",
+    }
+)
+_PROVIDER_NAME_WORD = re.compile(r"\w+")
+
+
+def _provider_credential_key(value: str) -> bool:
+    """Apply strict credential-name policy to one decoded provider mapping key."""
+
+    normalized = unicodedata.normalize("NFKC", value)
+    compact = "".join(
+        character for character in normalized.casefold() if character.isalnum()
+    )
+    return compact in _PROVIDER_CREDENTIAL_COMPACT_NAMES or is_credential_name(
+        normalized
+    )
+
+
+def _contains_provider_credential_phrase(value: str) -> bool:
+    """Recognize provider credential names across arbitrary Unicode separators."""
+
+    normalized = unicodedata.normalize("NFKC", value)
+    words = list(_PROVIDER_NAME_WORD.finditer(normalized))
+    for start in range(len(words)):
+        for end in range(start + 1, min(len(words), start + 4) + 1):
+            phrase = normalized[words[start].start() : words[end - 1].end()]
+            compact = "".join(
+                character for character in phrase.casefold() if character.isalnum()
+            )
+            if compact not in _PROVIDER_GENERIC_CREDENTIAL_NAMES and is_credential_name(
+                phrase
+            ):
+                return True
+    return False
+
+
 def _contains_credentials(value: object, sensitive_values: tuple[bytes, ...]) -> bool:
     normalized_sentinels: list[bytes] = []
     for sentinel in sensitive_values:
@@ -768,10 +811,18 @@ def _contains_credentials(value: object, sensitive_values: tuple[bytes, ...]) ->
         except UnicodeDecodeError:
             continue
 
-    def contains(nested: object, *, mapping_key: bool = False) -> bool:
+    def contains(nested: object) -> bool:
         if isinstance(nested, Mapping):
             return any(
-                type(key) is str and contains(key, mapping_key=True) for key in nested
+                type(key) is str
+                and (
+                    _provider_credential_key(key)
+                    or any(
+                        sentinel in _semantic_bytes(key)
+                        for sentinel in normalized_sentinels
+                    )
+                )
+                for key in nested
             ) or any(contains(item) for item in nested.values())
         if isinstance(nested, list | tuple):
             return any(contains(item) for item in nested)
@@ -779,8 +830,8 @@ def _contains_credentials(value: object, sensitive_values: tuple[bytes, ...]) ->
             semantic = _semantic_bytes(nested)
             if (
                 contains_credential_semantics(nested)
+                or _contains_provider_credential_phrase(nested)
                 or bool(_SECRET_PATTERN.search(semantic))
-                or (mapping_key and bool(_SECRET_PATTERN.search(semantic + b": safe")))
                 or any(sentinel in semantic for sentinel in normalized_sentinels)
             ):
                 return True

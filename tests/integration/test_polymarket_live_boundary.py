@@ -3336,6 +3336,55 @@ def test_provider_credential_output_fails_closed_before_jev_or_persistence(
     assert jev.requests == []
 
 
+def test_provider_generic_credential_key_fails_closed_before_jev_or_persistence(
+    tmp_path: Path,
+) -> None:
+    provider_secret = "ARBITRARY$PUNCT秘密"
+    market = _market()
+    openai = ModelTransport("openai", _market_sha(market))
+    envelope = json.loads(openai.raw)
+    envelope["metadata"] = {"token": provider_secret}
+    openai.raw = _wire(envelope)
+    jev = ModelTransport("jev")
+
+    summary = _observe(tmp_path, market=market, openai=openai, jev=jev)[0]
+
+    replay = load_observation(tmp_path, str(summary["observation_id"]))
+    encoded_secret = provider_secret.encode()
+    assert summary["ai"]["disposition"] == "MODEL_FAILURE"
+    assert jev.requests == []
+    assert encoded_secret not in b"".join(replay.artifacts.values())
+    assert encoded_secret not in (tmp_path / "provider_calls.jsonl").read_bytes()
+
+
+def test_provider_embedded_json_punctuated_key_fails_before_jev_or_persistence(
+    tmp_path: Path,
+) -> None:
+    provider_secret = "ARBITRARY秘密$VALUE"
+    market = _market()
+    openai = ModelTransport("openai", _market_sha(market))
+    envelope = json.loads(openai.raw)
+    message = next(item for item in envelope["output"] if item["type"] == "message")
+    brief = json.loads(message["content"][0]["text"])
+    brief["missing_evidence"] = [
+        f'provider prefix {{"api/key":"{provider_secret}"}} provider suffix'
+    ]
+    message["content"][0]["text"] = json.dumps(
+        brief, separators=(",", ":"), sort_keys=True
+    )
+    openai.raw = _wire(envelope)
+    jev = ModelTransport("jev")
+
+    summary = _observe(tmp_path, market=market, openai=openai, jev=jev)[0]
+
+    replay = load_observation(tmp_path, str(summary["observation_id"]))
+    encoded_secret = provider_secret.encode()
+    assert summary["ai"]["disposition"] == "MODEL_FAILURE"
+    assert jev.requests == []
+    assert encoded_secret not in b"".join(replay.artifacts.values())
+    assert encoded_secret not in (tmp_path / "provider_calls.jsonl").read_bytes()
+
+
 def test_hardening_gamma_access_token_prose_never_reaches_model_or_artifacts(
     tmp_path: Path,
 ) -> None:

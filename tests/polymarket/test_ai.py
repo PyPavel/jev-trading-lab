@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from jev_trading_lab.core.ids import canonical_json_bytes
 from jev_trading_lab.polymarket.ai import (
@@ -606,7 +608,7 @@ def test_wrong_response_model_is_explicit_model_failure(
         lambda r: _openai_message(r)["content"][0]["annotations"].append(
             {"type": "url_citation"}
         ),
-        lambda r: _openai_message(r)["content"][0]["logprobs"].append({"token": "x"}),
+        lambda r: _openai_message(r)["content"][0]["logprobs"].append({"lexeme": "x"}),
     ),
 )
 def test_openai_rejects_noncompleted_refusal_tool_or_nonunique_output_text(
@@ -2170,6 +2172,91 @@ def test_provider_scanner_rejects_semantic_credential_mapping_keys(
     credential_key: str,
 ) -> None:
     assert _contains_credentials({credential_key: "safe"}, ())
+
+
+@pytest.mark.parametrize(
+    "credential_key",
+    (
+        "token",
+        "secret",
+        "key",
+        "password",
+        "cookie",
+        "authorization",
+        "proxy/auth",
+        "set/cookie",
+        "x/api/key",
+        "api/key",
+        "api:key",
+        "api$key",
+        "api／key",
+        "ａｐｉ：ｋｅｙ",
+        "api💥：／keyV２",
+        "x／auth：token-v３",
+    ),
+)
+def test_provider_scanner_rejects_strict_normalized_credential_mapping_keys(
+    credential_key: str,
+) -> None:
+    assert _contains_credentials({credential_key: "ARBITRARY秘密$VALUE"}, ())
+
+
+@pytest.mark.parametrize(
+    "credential_key", ("monkey", "keyframe", "tokenization", "secretariat")
+)
+def test_provider_scanner_accepts_harmless_mapping_key_near_misses(
+    credential_key: str,
+) -> None:
+    assert not _contains_credentials({credential_key: "ordinary metadata"}, ())
+
+
+@pytest.mark.parametrize(
+    "embedded",
+    (
+        'prefix {"api/key":"ARBITRARY秘密$VALUE"} suffix',
+        'prefix {"outer":{"api\\u002fkey":"ARBITRARY秘密$VALUE"}} suffix',
+        'prefix [{"token":"ARBITRARY秘密$VALUE"}] suffix',
+    ),
+)
+def test_provider_scanner_rejects_credential_keys_in_embedded_json_anywhere(
+    embedded: str,
+) -> None:
+    assert _contains_credentials({"missing_evidence": [embedded]}, ())
+
+
+@pytest.mark.parametrize(
+    "prose",
+    (
+        "reported api/key was unavailable",
+        "reported API：KEY-v２ was unavailable",
+        "Authorization／Bearer arbitrary",
+        "Basic：arbitrary",
+    ),
+)
+def test_provider_scanner_rejects_punctuated_credential_prose(prose: str) -> None:
+    assert _contains_credentials({"missing_evidence": [prose]}, ())
+
+
+def test_provider_scanner_does_not_require_secret_value_punctuation() -> None:
+    assert _contains_credentials({"missing_evidence": ["api/key unavailable"]}, ())
+
+
+@settings(max_examples=40, deadline=None)
+@given(
+    st.sampled_from(
+        (
+            ("api", "key"),
+            ("access", "token"),
+            ("refresh", "token"),
+            ("session", "token"),
+        )
+    ),
+    st.sampled_from(("/", ":", "$", "／", "：", "💥", "／：$")),
+)
+def test_provider_scanner_fuzzes_arbitrary_credential_key_separators(
+    phrase: tuple[str, str], separator: str
+) -> None:
+    assert _contains_credentials({separator.join(phrase): "safe"}, ())
 
 
 def test_custom_zero_offset_tzinfo_cannot_reach_result_metadata_or_repr(
