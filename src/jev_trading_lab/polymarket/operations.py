@@ -482,8 +482,8 @@ def _open_root(root: Path) -> int:
     path = root if root.is_absolute() else root.absolute()
     try:
         return _open_or_create_root(path)
-    except BlobSecurityError as error:
-        raise OperationSecurityError("operation root is unsafe") from error
+    except BlobSecurityError:
+        raise OperationSecurityError("operation root is unsafe") from None
 
 
 def _open_journal(root_fd: int) -> tuple[int, bool]:
@@ -492,6 +492,10 @@ def _open_journal(root_fd: int) -> tuple[int, bool]:
         os.stat("operations.jsonl", dir_fd=root_fd, follow_symlinks=False)
     except FileNotFoundError:
         created = True
+    except OSError:
+        raise OperationSecurityError(
+            "operation journal cannot be inspected safely"
+        ) from None
     flags = (
         os.O_RDWR
         | os.O_APPEND
@@ -502,11 +506,17 @@ def _open_journal(root_fd: int) -> tuple[int, bool]:
     )
     try:
         descriptor = os.open("operations.jsonl", flags, 0o600, dir_fd=root_fd)
-    except OSError as error:
+    except OSError:
         raise OperationSecurityError(
             "operation journal cannot be opened safely"
-        ) from error
-    metadata = os.fstat(descriptor)
+        ) from None
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError:
+        os.close(descriptor)
+        raise OperationSecurityError(
+            "operation journal cannot be inspected safely"
+        ) from None
     if (
         not stat.S_ISREG(metadata.st_mode)
         or metadata.st_uid != os.geteuid()
@@ -555,9 +565,14 @@ def _read_bytes(descriptor: int) -> bytes:
 
 
 def _parse_events(raw: bytes) -> tuple[OperationEvent, ...]:
-    lines = raw.splitlines()
+    if not raw:
+        return ()
+    lines = raw.split(b"\n")
+    if lines[-1]:
+        raise OperationCorruptError("operation journal has a truncated tail")
+    lines.pop()
     if len(lines) > _MAX_LINES or any(
-        not line or len(line) + 1 > _MAX_LINE_BYTES for line in lines
+        not line or b"\r" in line or len(line) + 1 > _MAX_LINE_BYTES for line in lines
     ):
         raise OperationCorruptError("operation journal contains an invalid line")
     events: list[OperationEvent] = []
@@ -568,10 +583,10 @@ def _parse_events(raw: bytes) -> tuple[OperationEvent, ...]:
             if type(document) is not dict or canonical_json_bytes(document) != line:
                 raise ValueError
             value = OperationEvent.model_validate_json(line)
-        except (TypeError, ValueError) as error:
+        except (TypeError, ValueError, RecursionError):
             raise OperationCorruptError(
                 "operation journal contains invalid canonical event JSON"
-            ) from error
+            ) from None
         prior = identities.get(value.event_id)
         if prior is not None:
             if prior != line:
@@ -634,10 +649,10 @@ def _verify_blobs(root: Path, events: tuple[OperationEvent, ...]) -> int:
                 payload = store.read_verified(reference.blob_ref())
                 for kind in kinds:
                     _parse_evidence(payload, kind)
-    except (BlobError, OSError, OperationSecurityError) as error:
+    except (BlobError, OSError, OperationSecurityError):
         raise OperationCorruptError(
             "operation evidence is missing or corrupt"
-        ) from error
+        ) from None
     return len(references)
 
 
@@ -741,14 +756,14 @@ def append_operation(
                                 "operation evidence publication changed its identity"
                             )
                         store.read_verified(reference)
-                except BlobSecurityError as error:
+                except BlobSecurityError:
                     raise OperationSecurityError(
                         "operation evidence path is unsafe"
-                    ) from error
-                except BlobError as error:
+                    ) from None
+                except BlobError:
                     raise OperationCorruptError(
                         "operation evidence cannot be stored safely"
-                    ) from error
+                    ) from None
             os.lseek(descriptor, 0, os.SEEK_END)
             _write_all(descriptor, framed)
             os.fsync(descriptor)

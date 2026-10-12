@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -159,6 +160,15 @@ def evidence_payload(kind: str = "process_sample") -> bytes:
 
 def journal_line(value: OperationEvent) -> bytes:
     return canonical_json_bytes(value.model_dump(mode="json")) + b"\n"
+
+
+def assert_sanitized_domain_error(error: Exception, marker: str) -> None:
+    rendered = "".join(traceback.format_exception(error))
+    assert marker not in str(error)
+    assert marker not in repr(error)
+    assert error.__cause__ is None
+    assert error.__suppress_context__
+    assert marker not in rendered
 
 
 def test_operation_kind_is_closed_to_all_nine_approved_values() -> None:
@@ -452,6 +462,180 @@ def test_blob_corruption_fails_closed(tmp_path: Path, damage: str) -> None:
         load_operation_cut(root)
 
 
+@pytest.mark.parametrize(
+    "raw",
+    (
+        journal_line(event()).rstrip(b"\n")
+        + b"\r"
+        + journal_line(event(status="recovery_required")),
+        journal_line(event()).replace(b"\n", b"\r\n"),
+        journal_line(event())
+        + journal_line(event(status="recovery_required")).replace(b"\n", b"\r\n"),
+    ),
+    ids=("bare-cr", "crlf", "mixed-lf-crlf"),
+)
+def test_only_lf_delimits_complete_journal_records(tmp_path: Path, raw: bytes) -> None:
+    root = tmp_path / "audit"
+    journal = append_raw_lines(root, tail=raw)
+
+    with pytest.raises(OperationCorruptError, match="invalid line"):
+        load_operation_cut(root, recover_tail=True)
+
+    assert journal.read_bytes() == raw
+
+
+@pytest.mark.parametrize("control", (b"\x00", b"\t", b"\x1f", b"\n\n"))
+def test_raw_control_bytes_and_empty_records_are_invalid_framing(
+    tmp_path: Path, control: bytes
+) -> None:
+    line = journal_line(event()).rstrip(b"\n")
+    raw = line[:1] + control + line[1:] + b"\n"
+    journal = append_raw_lines(tmp_path / "audit", tail=raw)
+
+    with pytest.raises(OperationCorruptError):
+        load_operation_cut(tmp_path / "audit", recover_tail=True)
+
+    assert journal.read_bytes() == raw
+
+
+def test_json_escaped_carriage_return_is_not_raw_framing(tmp_path: Path) -> None:
+    document = event().model_dump(mode="json")
+    document["status"] = "clean\rSUPERSECRET"
+    document["event_id"] = operation_event_id(
+        {key: value for key, value in document.items() if key != "event_id"}
+    )
+    raw = canonical_json_bytes(document) + b"\n"
+    assert b"\\rSUPERSECRET" in raw
+    assert b"\r" not in raw
+    journal = append_raw_lines(tmp_path / "audit", tail=raw)
+
+    with pytest.raises(
+        OperationCorruptError, match="invalid canonical event JSON"
+    ) as captured:
+        load_operation_cut(tmp_path / "audit")
+
+    assert journal.read_bytes() == raw
+    assert_sanitized_domain_error(captured.value, "SUPERSECRET")
+
+
+@pytest.mark.parametrize("failure", ("json", "utf8", "pydantic", "blob-ref"))
+def test_persisted_event_parse_errors_hide_hostile_data_from_tracebacks(
+    tmp_path: Path, failure: str
+) -> None:
+    marker = "SUPERSECRET"
+    if failure == "json":
+        raw = b'{"value":"SUPERSECRET"\n'
+    elif failure == "utf8":
+        raw = b'{"value":"SUPERSECRET\xff"}\n'
+    else:
+        document = event().model_dump(mode="json")
+        if failure == "pydantic":
+            document["status"] = marker
+        else:
+            document["evidence"] = {
+                "schema_version": 1,
+                "sha256": "b" * 64,
+                "byte_size": 1,
+                "storage_relpath": marker,
+            }
+        document["event_id"] = operation_event_id(
+            {key: value for key, value in document.items() if key != "event_id"}
+        )
+        raw = canonical_json_bytes(document) + b"\n"
+    append_raw_lines(tmp_path / "audit", tail=raw)
+
+    with pytest.raises(OperationCorruptError) as captured:
+        load_operation_cut(tmp_path / "audit")
+
+    assert_sanitized_domain_error(captured.value, marker)
+
+
+def test_persisted_hostile_evidence_is_hidden_from_tracebacks(tmp_path: Path) -> None:
+    marker = "SUPERSECRET"
+    root = tmp_path / "audit"
+    payload = canonical_json_bytes(
+        {
+            "schema_version": 1,
+            "kind": "process_sample",
+            "status": "unavailable",
+            "detail": marker,
+        }
+    )
+    reference = persist_raw_evidence(root, payload)
+    append_raw_lines(
+        root,
+        event(kind="run_started", run_id=SHA, status="started"),
+        event(
+            kind="process_sample",
+            run_id=SHA,
+            status="success",
+            evidence=reference.model_dump(),
+        ),
+    )
+
+    with pytest.raises(OperationCorruptError) as captured:
+        load_operation_cut(root)
+
+    assert_sanitized_domain_error(captured.value, marker)
+
+
+def test_persisted_evidence_errors_hide_backend_exception_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    marker = "SUPERSECRET"
+    root = tmp_path / "audit"
+    payload = evidence_payload()
+    reference = persist_raw_evidence(root, payload)
+    started = event(kind="run_started", run_id=SHA, status="started")
+    sampled = event(
+        kind="process_sample",
+        run_id=SHA,
+        status="success",
+        evidence=reference.model_dump(),
+    )
+    append_raw_lines(root, started, sampled)
+
+    def fail_read(_store: Any, _reference: Any) -> bytes:
+        raise operations.BlobError(marker)
+
+    monkeypatch.setattr(operations.BlobStore, "read_verified", fail_read)
+    with pytest.raises(OperationCorruptError) as captured:
+        load_operation_cut(root)
+
+    assert_sanitized_domain_error(captured.value, marker)
+
+
+def test_tail_recovery_uses_last_lf_and_never_parses_discarded_cr_bytes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "audit"
+    value = event()
+    tail = b'SUPERSECRET\r{"torn":'
+    journal = append_raw_lines(root, value, tail=tail)
+
+    cut = load_operation_cut(root, recover_tail=True)
+
+    assert cut.events == (value,)
+    assert cut.discarded_tail_bytes == len(tail)
+    assert journal.read_bytes() == journal_line(value)
+
+
+def test_bare_cr_without_any_lf_is_one_discarded_tail_candidate(tmp_path: Path) -> None:
+    root = tmp_path / "audit"
+    raw = journal_line(event()).rstrip(b"\n") + b"\rSUPERSECRET"
+    journal = append_raw_lines(root, tail=raw)
+
+    with pytest.raises(OperationCorruptError, match="truncated tail"):
+        load_operation_cut(root)
+    cut = load_operation_cut(root, recover_tail=True)
+
+    assert cut.events == ()
+    assert cut.discarded_tail_bytes == len(raw)
+    assert journal.read_bytes() == b""
+
+
 def test_complete_corruption_is_fatal_but_torn_tail_is_optionally_recovered(
     tmp_path: Path,
 ) -> None:
@@ -489,6 +673,30 @@ def test_unsafe_journal_objects_are_rejected(tmp_path: Path, object_kind: str) -
         journal.chmod(0o644)
     with pytest.raises(OperationSecurityError):
         append_operation(root, event())
+
+
+@pytest.mark.parametrize("probe", ("stat", "fstat"))
+def test_journal_security_probe_hides_backend_exception_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, probe: str
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    marker = "SUPERSECRET"
+    root = tmp_path / "audit"
+    root.mkdir(mode=0o700)
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+
+    def fail_probe(*_args: Any, **_kwargs: Any) -> os.stat_result:
+        raise OSError(marker)
+
+    monkeypatch.setattr(os, probe, fail_probe)
+    try:
+        with pytest.raises(OperationSecurityError) as captured:
+            operations._open_journal(root_fd)
+    finally:
+        os.close(root_fd)
+
+    assert_sanitized_domain_error(captured.value, marker)
 
 
 def test_foreign_owned_journal_is_rejected(
