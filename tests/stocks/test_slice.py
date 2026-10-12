@@ -100,11 +100,81 @@ def test_replay_writes_three_terminal_arms_and_integrated_metrics(
     assert not (tmp_path / "stocks.prom.tmp").exists()
 
 
-def test_replay_appends_complete_observations(tmp_path: Path) -> None:
+def test_replay_appends_complete_observations_and_cumulative_metrics(
+    tmp_path: Path,
+) -> None:
     replay_fixture(FIXTURE, tmp_path)
+    first_metrics = (tmp_path / "stocks.prom").read_text()
     replay_fixture(FIXTURE, tmp_path)
 
+    metrics = (tmp_path / "stocks.prom").read_text()
     assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 6
+    assert metrics != first_metrics
+    market_requests = (
+        'jev_stocks_market_data_requests_total{provider="yahoo_chart_v8",'
+        'status="success"} 6'
+    )
+    assert market_requests in metrics
+    assert 'jev_stocks_decisions_total{arm="openai",action="BUY"} 2' in metrics
+    assert 'jev_stocks_decisions_total{arm="jev",action="HOLD"} 2' in metrics
+    assert 'jev_stocks_abstentions_total{arm="jev"} 2' in metrics
+    assert 'jev_stocks_decisions_total{arm="deterministic",action="BUY"} 2' in metrics
+
+
+def test_replay_accumulates_calls_and_failures_from_captured_rows(
+    tmp_path: Path,
+) -> None:
+    fixture = json.loads(FIXTURE.read_text())
+    fixture["source_mode"] = "captured_replay"
+    provenance = "captured-provider-artifact-sha256:" + "a" * 64
+    fixture["fixture_decisions"]["openai"].update(
+        {
+            "called": True,
+            "cost_microdollars": 10,
+            "input_tokens": 10,
+            "latency_ms": 5,
+            "output_tokens": 5,
+            "source_provenance": provenance,
+            "status": "success",
+        }
+    )
+    fixture["fixture_decisions"]["jev"].update(
+        {
+            "called": True,
+            "confidence_micros": 0,
+            "source_provenance": provenance,
+            "status": "provider_failure",
+        }
+    )
+    path = tmp_path / "captured.json"
+    path.write_text(json.dumps(fixture))
+
+    replay_fixture(path, tmp_path / "output")
+    replay_fixture(path, tmp_path / "output")
+
+    metrics = (tmp_path / "output/stocks.prom").read_text()
+    assert (
+        'jev_stocks_provider_calls_total{provider="openai",'
+        'model="gpt-5-2025-08-07"} 2'
+        in metrics
+    )
+    assert 'jev_stocks_failures_total{arm="jev"} 2' in metrics
+
+
+def test_decision_counters_preserve_prior_action_series(tmp_path: Path) -> None:
+    replay_fixture(FIXTURE, tmp_path / "output")
+    fixture = json.loads(FIXTURE.read_text())
+    fixture["fixture_decisions"]["openai"].update(
+        {"action": "HOLD", "symbol": None}
+    )
+    path = tmp_path / "hold.json"
+    path.write_text(json.dumps(fixture))
+
+    replay_fixture(path, tmp_path / "output")
+
+    metrics = (tmp_path / "output/stocks.prom").read_text()
+    assert 'jev_stocks_decisions_total{arm="openai",action="BUY"} 1' in metrics
+    assert 'jev_stocks_decisions_total{arm="openai",action="HOLD"} 1' in metrics
 
 
 @pytest.mark.parametrize(
@@ -152,6 +222,90 @@ def test_captured_replay_requires_provenance_for_each_model_arm(tmp_path: Path) 
 
     with pytest.raises(ValueError, match="fixture decision"):
         replay_fixture(path, tmp_path / "output")
+
+
+@pytest.mark.parametrize("location", ["fixture", "quote", "decision"])
+def test_replay_rejects_unknown_fields(tmp_path: Path, location: str) -> None:
+    fixture = json.loads(FIXTURE.read_text())
+    target = (
+        fixture
+        if location == "fixture"
+        else fixture["quotes"][0]
+        if location == "quote"
+        else fixture["fixture_decisions"]["openai"]
+    )
+    target["unexpected"] = True
+    path = tmp_path / "invalid.json"
+    path.write_text(json.dumps(fixture))
+
+    with pytest.raises(ValueError):
+        replay_fixture(path, tmp_path / "output")
+
+
+def test_replay_rejects_contradictory_provider_failure(tmp_path: Path) -> None:
+    fixture = json.loads(FIXTURE.read_text())
+    fixture["source_mode"] = "captured_replay"
+    for decision in fixture["fixture_decisions"].values():
+        decision.update(
+            {
+                "called": True,
+                "status": "provider_failure",
+                "action": "HOLD",
+                "symbol": None,
+                "confidence_micros": 0,
+                "source_provenance": "captured-provider-artifact-sha256:" + "a" * 64,
+            }
+        )
+    fixture["fixture_decisions"]["openai"].update(
+        {"action": "BUY", "symbol": "AAPL", "confidence_micros": 900000}
+    )
+    path = tmp_path / "invalid.json"
+    path.write_text(json.dumps(fixture))
+
+    with pytest.raises(ValueError, match="fixture decision"):
+        replay_fixture(path, tmp_path / "output")
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    ["", "captured-provider-artifact-sha256:test", "sha256:" + "a" * 64],
+)
+def test_captured_replay_rejects_invalid_provenance(
+    tmp_path: Path, provenance: str
+) -> None:
+    fixture = json.loads(FIXTURE.read_text())
+    fixture["source_mode"] = "captured_replay"
+    for decision in fixture["fixture_decisions"].values():
+        decision.update(
+            {
+                "called": True,
+                "status": "success",
+                "source_provenance": provenance,
+            }
+        )
+    path = tmp_path / "invalid.json"
+    path.write_text(json.dumps(fixture))
+
+    with pytest.raises(ValueError, match="fixture decision"):
+        replay_fixture(path, tmp_path / "output")
+
+
+def test_failed_decision_never_fills() -> None:
+    fixture = json.loads(FIXTURE.read_text())
+    quotes = stock_slice._validate_quotes(fixture["quotes"])
+    decision = copy.deepcopy(fixture["fixture_decisions"]["openai"])
+    decision.update(
+        {"called": True, "status": "provider_failure", "confidence_micros": 900000}
+    )
+
+    row = stock_slice._row(
+        "id", "2026-10-09T20:00:00Z", "digest", quotes, "openai", decision, 1
+    )
+
+    assert row["terminal_status"] == "failed"
+    assert row["fill"]["price_microdollars"] is None
+    assert row["fill"]["quantity"] == 0
+    assert row["position_quantity"] == 0
 
 
 def test_stocks_replay_cli(tmp_path: Path) -> None:
@@ -284,6 +438,99 @@ def test_openai_response_rejects_extra_completed_message_without_text(
     )
 
 
+@pytest.mark.parametrize(
+    "answer",
+    [
+        [],
+        {"action": "HOLD", "symbol": None, "confidence": 0.5, "extra": True},
+        {"action": "HOLD", "symbol": None},
+        {"action": "HOLD", "symbol": None, "confidence": True},
+        {"action": "HOLD", "symbol": None, "confidence": 1.1},
+    ],
+)
+def test_openai_response_rejects_decisions_outside_exact_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer: object
+) -> None:
+    del tmp_path
+    fixture = json.loads(FIXTURE.read_text())
+    quotes = stock_slice._validate_quotes(fixture["quotes"])
+    envelope = {
+        "output": [
+            {
+                "content": [{"text": json.dumps(answer), "type": "output_text"}],
+                "status": "completed",
+                "type": "message",
+            }
+        ],
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    }
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    monkeypatch.setattr(
+        stock_slice.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: _Response(envelope),
+    )
+
+    decision = stock_slice._provider_decision("openai", b"{}", quotes)
+
+    assert decision["status"] == "provider_failure"
+    assert decision["action"] == "HOLD"
+    assert decision["symbol"] is None
+
+
+def test_openai_response_rejects_non_object_envelope_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = json.loads(FIXTURE.read_text())
+    quotes = stock_slice._validate_quotes(fixture["quotes"])
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    monkeypatch.setattr(
+        stock_slice.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: _Response([]),
+    )
+
+    decision = stock_slice._provider_decision("openai", b"{}", quotes)
+
+    assert decision["status"] == "provider_failure"
+    assert decision["action"] == "HOLD"
+    assert decision["symbol"] is None
+
+
+def test_openai_response_rejects_negative_token_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = json.loads(FIXTURE.read_text())
+    quotes = stock_slice._validate_quotes(fixture["quotes"])
+    envelope = {
+        "output": [
+            {
+                "content": [
+                    {
+                        "text": json.dumps(
+                            {"action": "HOLD", "symbol": None, "confidence": 0.5}
+                        ),
+                        "type": "output_text",
+                    }
+                ],
+                "status": "completed",
+                "type": "message",
+            }
+        ],
+        "usage": {"input_tokens": -1, "output_tokens": 5},
+    }
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    monkeypatch.setattr(
+        stock_slice.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: _Response(envelope),
+    )
+
+    assert stock_slice._provider_decision("openai", b"{}", quotes)["status"] == (
+        "provider_failure"
+    )
+
+
 def test_observe_without_keys_fails_model_arms_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -376,6 +623,43 @@ def test_known_provider_cost_reduces_economic_not_trading_equity() -> None:
         openai["trading_pnl_microdollars"] - 90
     )
     assert openai["economic_cost_unknown"] is False
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"input_tokens": -1, "output_tokens": 5},
+        {"input_tokens": 5, "output_tokens": -1},
+        {"input_tokens": 1.5, "output_tokens": 5},
+        {"input_tokens": 5, "output_tokens": True},
+    ],
+)
+def test_provider_cost_rejects_invalid_usage_without_credit(
+    monkeypatch: pytest.MonkeyPatch, usage: dict[str, object]
+) -> None:
+    monkeypatch.setenv("OPENAI_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS", "1000000")
+    monkeypatch.setenv(
+        "OPENAI_CACHED_INPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS", "1000000"
+    )
+    monkeypatch.setenv("OPENAI_OUTPUT_COST_MICRODOLLARS_PER_MILLION_TOKENS", "1000000")
+
+    assert stock_slice._provider_cost("openai", usage) is None
+
+
+def test_negative_provider_cost_cannot_increase_equity() -> None:
+    fixture = json.loads(FIXTURE.read_text())
+    quotes = stock_slice._validate_quotes(fixture["quotes"])
+    decision = copy.deepcopy(fixture["fixture_decisions"]["openai"])
+    decision.update(
+        {"called": True, "cost_microdollars": -90, "status": "provider_failure"}
+    )
+
+    row = stock_slice._row(
+        "id", "2026-10-09T20:00:00Z", "digest", quotes, "openai", decision, 1
+    )
+
+    assert row["economic_cost_unknown"] is True
+    assert row["economic_equity_microdollars"] is None
 
 
 def test_unknown_called_provider_cost_marks_economics_unknown() -> None:

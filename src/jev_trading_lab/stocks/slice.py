@@ -90,6 +90,16 @@ def _validate_quotes(
     for raw in value:
         if not isinstance(raw, dict):
             raise ValueError("quote must be an object")
+        if set(raw) != {
+            "symbol",
+            "timestamp",
+            "price_micros",
+            "previous_close_micros",
+            "request_status",
+            "request_latency_ms",
+            "age_seconds",
+        }:
+            raise ValueError("quote fields are invalid")
         symbol = raw.get("symbol")
         timestamp = raw.get("timestamp")
         price = raw.get("price_micros")
@@ -169,7 +179,12 @@ def _provider_cost(
     try:
         input_tokens = usage["input_tokens"]
         output_tokens = usage["output_tokens"]
-        if type(input_tokens) is not int or type(output_tokens) is not int:
+        if (
+            type(input_tokens) is not int
+            or input_tokens < 0
+            or type(output_tokens) is not int
+            or output_tokens < 0
+        ):
             return None
         if arm == "openai":
             details = usage.get("input_tokens_details")
@@ -282,20 +297,36 @@ def _provider_decision(
         if status_code != 200 or len(raw) > 1_000_000:
             raise ValueError("provider response invalid")
         envelope = json.loads(raw)
+        if not isinstance(envelope, dict):
+            raise ValueError("provider response must be an object")
         usage = envelope.get("usage", {})
+        if not isinstance(usage, dict):
+            raise ValueError("provider usage must be an object")
+        for token_field in ("input_tokens", "output_tokens"):
+            token_count = usage.get(token_field)
+            if token_count is not None and (
+                type(token_count) is not int or token_count < 0
+            ):
+                raise ValueError("provider token usage must be non-negative integers")
         if arm == "openai":
+            output = envelope.get("output")
+            if not isinstance(output, list):
+                raise ValueError("provider output must be a list")
             messages = [
                 item
-                for item in envelope["output"]
+                for item in output
                 if isinstance(item, dict)
                 and item.get("type") == "message"
                 and item.get("status") == "completed"
             ]
             if len(messages) != 1:
                 raise ValueError("provider response must contain one completed message")
+            content_items = messages[0].get("content")
+            if not isinstance(content_items, list):
+                raise ValueError("provider message content must be a list")
             output_texts = [
-                content["text"]
-                for content in messages[0].get("content", [])
+                content.get("text")
+                for content in content_items
                 if isinstance(content, dict) and content.get("type") == "output_text"
             ]
             if len(output_texts) != 1 or not isinstance(output_texts[0], str):
@@ -312,11 +343,18 @@ def _provider_decision(
             }
             if answer["symbol"] == "NONE":
                 answer["symbol"] = None
+        if not isinstance(answer, dict) or set(answer) != {
+            "action",
+            "symbol",
+            "confidence",
+        }:
+            raise ValueError("provider decision must match the exact schema")
         action = answer["action"]
-        symbol = answer.get("symbol")
+        symbol = answer["symbol"]
         confidence = answer["confidence"]
         if (
-            action not in {"BUY", "HOLD"}
+            type(action) is not str
+            or action not in {"BUY", "HOLD"}
             or symbol not in {None, *(quote["symbol"] for quote in quotes)}
             or type(confidence) not in {int, float}
             or not 0 <= confidence <= 1
@@ -327,8 +365,8 @@ def _provider_decision(
             "provider": arm,
             "model": _OPENAI_MODEL if arm == "openai" else _JEV_MODEL,
             "called": True,
-            "action": action,
-            "symbol": symbol,
+            "action": cast(Literal["BUY", "HOLD"], action),
+            "symbol": cast(str | None, symbol),
             "confidence_micros": round(confidence * 1_000_000),
             "status": "success",
             "latency_ms": latency,
@@ -361,7 +399,23 @@ def _provider_decision(
 def _validate_fixture_decision(
     arm: Literal["openai", "jev"], value: object, symbols: set[str]
 ) -> Decision:
-    if not isinstance(value, dict):
+    base_fields = {
+        "provider",
+        "model",
+        "called",
+        "action",
+        "symbol",
+        "confidence_micros",
+        "status",
+        "latency_ms",
+        "input_tokens",
+        "output_tokens",
+        "cost_microdollars",
+    }
+    if not isinstance(value, dict) or set(value) not in {
+        frozenset(base_fields),
+        frozenset({*base_fields, "source_provenance"}),
+    }:
         raise ValueError("stock fixture decision is invalid")
     expected_model = _OPENAI_MODEL if arm == "openai" else _JEV_MODEL
     action = value.get("action")
@@ -384,7 +438,8 @@ def _validate_fixture_decision(
     )
     confidence = value.get("confidence_micros")
     synthetic = (
-        called is False
+        "source_provenance" not in value
+        and called is False
         and status == "synthetic_replay"
         and value.get("latency_ms") == 0
         and all(
@@ -392,11 +447,19 @@ def _validate_fixture_decision(
             for field in ("input_tokens", "output_tokens", "cost_microdollars")
         )
     )
+    provenance = value.get("source_provenance")
+    provenance_prefix = "captured-provider-artifact-sha256:"
     captured = (
         called is True
         and status in {"success", "provider_failure"}
-        and isinstance(value.get("source_provenance"), str)
-        and bool(value["source_provenance"])
+        and isinstance(provenance, str)
+        and provenance.startswith(provenance_prefix)
+        and len(provenance) == len(provenance_prefix) + 64
+        and all(character in "0123456789abcdef" for character in provenance[-64:])
+        and (
+            status != "provider_failure"
+            or (action == "HOLD" and symbol is None and confidence == 0)
+        )
     )
     if (
         value.get("provider") != arm
@@ -450,7 +513,11 @@ def _row(
     quantity = 0
     fill_price = None
     slippage = 0
-    if decision["action"] == "BUY" and quote is not None:
+    if (
+        decision["status"] in {"success", "not_applicable", "synthetic_replay"}
+        and decision["action"] == "BUY"
+        and quote is not None
+    ):
         fill_price = (quote["price_micros"] * 10_005 + 9_999) // 10_000
         quantity = _POSITION_BUDGET // fill_price
         slippage = (fill_price - quote["price_micros"]) * quantity
@@ -461,8 +528,14 @@ def _row(
     unrealized = position_value - notional
     trading_equity = cash + position_value
     trading_pnl = trading_equity - _STARTING_CASH
-    cost_unknown = decision["called"] and decision["cost_microdollars"] is None
-    provider_cost = decision["cost_microdollars"] or 0
+    raw_provider_cost = decision["cost_microdollars"]
+    valid_provider_cost = (
+        raw_provider_cost
+        if type(raw_provider_cost) is int and raw_provider_cost >= 0
+        else None
+    )
+    cost_unknown = decision["called"] and valid_provider_cost is None
+    provider_cost = valid_provider_cost or 0
     economic_equity = None if cost_unknown else trading_equity - provider_cost
     economic_pnl = None if economic_equity is None else economic_equity - _STARTING_CASH
     terminal = (
@@ -536,66 +609,111 @@ def _metric(name: str, labels: Mapping[str, object], value: object) -> str:
     return f"{name}{{{label_text}}} {value}"
 
 
+def _result_rows(path: Path) -> list[dict[str, object]]:
+    source_cut = path.read_bytes()
+    return [
+        cast(dict[str, object], json.loads(line)) for line in source_cut.splitlines()
+    ]
+
+
 def _write_metrics(path: Path, rows: list[dict[str, object]]) -> None:
     lines = ["# Stock paper metrics derived from terminal JSONL rows."]
-    market_data = cast(dict[str, object], rows[0]["market_data"])
-    market_provider = str(market_data["provider"])
-    quotes = cast(list[Quote], market_data["quotes"])
-    market_status = str(market_data.get("request_status", "success"))
-    market_labels = {"provider": market_provider, "status": market_status}
-    lines.append(
-        _metric(
-            "jev_stocks_market_data_requests_total",
-            market_labels,
-            market_data["request_count"],
+    market_totals: dict[tuple[str, str], int] = {}
+    latest_market: dict[str, object] | None = None
+    latest_cycle_status = "success"
+    failures: dict[str, int] = {}
+    abstentions: dict[str, int] = {}
+    decisions: dict[tuple[str, str], int] = {}
+    provider_calls: dict[tuple[str, str], int] = {}
+    provider_input_tokens: dict[tuple[str, str], int] = {}
+    provider_output_tokens: dict[tuple[str, str], int] = {}
+    provider_costs: dict[tuple[str, str], int] = {}
+    latest_by_arm: dict[str, dict[str, object]] = {}
+
+    for row in rows:
+        arm = str(row["arm"])
+        market_data = cast(dict[str, object], row["market_data"])
+        if arm in {"openai", "cycle"}:
+            market_provider = str(market_data["provider"])
+            market_status = str(market_data.get("request_status", "success"))
+            market_key = (market_provider, market_status)
+            market_totals[market_key] = market_totals.get(market_key, 0) + int(
+                cast(int, market_data["request_count"])
+            )
+            latest_market = market_data
+            latest_cycle_status = "failure" if arm == "cycle" else "success"
+        terminal_status = str(row["terminal_status"])
+        failures[arm] = failures.get(arm, 0) + int(terminal_status == "failed")
+        abstentions[arm] = abstentions.get(arm, 0) + int(
+            terminal_status == "abstained"
         )
-    )
-    labels = {"provider": market_provider}
-    if quotes:
-        lines.extend(
-            [
+        latest_by_arm[arm] = row
+        if arm == "cycle":
+            continue
+        provider = cast(Decision, row["provider"])
+        provider_key = (provider["provider"], provider["model"])
+        provider_calls[provider_key] = provider_calls.get(provider_key, 0) + int(
+            provider["called"]
+        )
+        provider_input_tokens[provider_key] = provider_input_tokens.get(
+            provider_key, 0
+        ) + (provider["input_tokens"] or 0)
+        provider_output_tokens[provider_key] = provider_output_tokens.get(
+            provider_key, 0
+        ) + (provider["output_tokens"] or 0)
+        provider_costs[provider_key] = provider_costs.get(provider_key, 0) + (
+            provider["cost_microdollars"] or 0
+        )
+        decision = cast(dict[str, object], row["decision"])
+        decision_key = (arm, str(decision["action"]))
+        decisions[decision_key] = decisions.get(decision_key, 0) + 1
+
+    for (market_provider, status), total in sorted(market_totals.items()):
+        lines.append(
+            _metric(
+                "jev_stocks_market_data_requests_total",
+                {"provider": market_provider, "status": status},
+                total,
+            )
+        )
+    if latest_market is not None:
+        market_provider = str(latest_market["provider"])
+        labels = {"provider": market_provider}
+        quotes = cast(list[Quote], latest_market["quotes"])
+        if quotes:
+            lines.extend(
+                [
+                    _metric(
+                        "jev_stocks_market_data_request_latency_milliseconds",
+                        labels,
+                        max(quote["request_latency_ms"] for quote in quotes),
+                    ),
+                    _metric(
+                        "jev_stocks_market_data_age_seconds",
+                        labels,
+                        max(quote["age_seconds"] for quote in quotes),
+                    ),
+                ]
+            )
+        elif "request_latency_ms" in latest_market:
+            lines.append(
                 _metric(
                     "jev_stocks_market_data_request_latency_milliseconds",
                     labels,
-                    max(quote["request_latency_ms"] for quote in quotes),
-                ),
-                _metric(
-                    "jev_stocks_market_data_age_seconds",
-                    labels,
-                    max(quote["age_seconds"] for quote in quotes),
-                ),
-            ]
-        )
-    elif "request_latency_ms" in market_data:
-        lines.append(
-            _metric(
-                "jev_stocks_market_data_request_latency_milliseconds",
-                labels,
-                market_data["request_latency_ms"],
+                    latest_market["request_latency_ms"],
+                )
             )
-        )
-
-    cycle_status = (
-        "failure" if any(row["arm"] == "cycle" for row in rows) else "success"
+    lines.append(
+        _metric("jev_stocks_cycle_status", {"status": latest_cycle_status}, 1)
     )
-    lines.append(_metric("jev_stocks_cycle_status", {"status": cycle_status}, 1))
-    for row in sorted(rows, key=lambda item: str(item["arm"])):
-        arm = str(row["arm"])
+
+    for arm, row in sorted(latest_by_arm.items()):
         labels = {"arm": arm}
-        terminal_status = str(row["terminal_status"])
         process = cast(dict[str, int], row["process"])
         lines.extend(
             [
-                _metric(
-                    "jev_stocks_failures_total",
-                    labels,
-                    int(terminal_status == "failed"),
-                ),
-                _metric(
-                    "jev_stocks_abstentions_total",
-                    labels,
-                    int(terminal_status == "abstained"),
-                ),
+                _metric("jev_stocks_failures_total", labels, failures[arm]),
+                _metric("jev_stocks_abstentions_total", labels, abstentions[arm]),
                 _metric(
                     "jev_stocks_cycle_duration_milliseconds",
                     labels,
@@ -606,10 +724,8 @@ def _write_metrics(path: Path, rows: list[dict[str, object]]) -> None:
         if arm == "cycle":
             continue
         provider = cast(Decision, row["provider"])
-        provider_labels = {
-            "provider": provider["provider"],
-            "model": provider["model"],
-        }
+        provider_key = (provider["provider"], provider["model"])
+        provider_labels = {"provider": provider_key[0], "model": provider_key[1]}
         status_labels = {**provider_labels, "status": provider["status"]}
         decision = cast(dict[str, object], row["decision"])
         fill = cast(dict[str, object], row["fill"])
@@ -618,18 +734,18 @@ def _write_metrics(path: Path, rows: list[dict[str, object]]) -> None:
                 _metric(
                     "jev_stocks_provider_calls_total",
                     provider_labels,
-                    int(provider["called"]),
+                    provider_calls[provider_key],
                 ),
                 _metric("jev_stocks_provider_status", status_labels, 1),
                 _metric(
                     "jev_stocks_provider_input_tokens_total",
                     provider_labels,
-                    provider["input_tokens"] or 0,
+                    provider_input_tokens[provider_key],
                 ),
                 _metric(
                     "jev_stocks_provider_output_tokens_total",
                     provider_labels,
-                    provider["output_tokens"] or 0,
+                    provider_output_tokens[provider_key],
                 ),
                 _metric(
                     "jev_stocks_provider_latency_milliseconds",
@@ -639,7 +755,7 @@ def _write_metrics(path: Path, rows: list[dict[str, object]]) -> None:
                 _metric(
                     "jev_stocks_provider_cost_microdollars_total",
                     provider_labels,
-                    provider["cost_microdollars"] or 0,
+                    provider_costs[provider_key],
                 ),
                 _metric(
                     "jev_stocks_provider_unknown_cost",
@@ -648,11 +764,6 @@ def _write_metrics(path: Path, rows: list[dict[str, object]]) -> None:
                         provider["called"]
                         and provider["cost_microdollars"] is None
                     ),
-                ),
-                _metric(
-                    "jev_stocks_decisions_total",
-                    {"arm": arm, "action": decision["action"]},
-                    1,
                 ),
                 _metric(
                     "jev_stocks_fill_price_microdollars",
@@ -692,6 +803,15 @@ def _write_metrics(path: Path, rows: list[dict[str, object]]) -> None:
                     row["trading_pnl_microdollars"],
                 ),
             ]
+        )
+        lines.extend(
+            _metric(
+                "jev_stocks_decisions_total",
+                {"arm": decision_arm, "action": action},
+                total,
+            )
+            for (decision_arm, action), total in sorted(decisions.items())
+            if decision_arm == arm
         )
         if row["economic_equity_microdollars"] is not None:
             lines.extend(
@@ -749,7 +869,7 @@ def _run(
     result_path = output_dir / "results.jsonl"
     metrics_path = output_dir / "stocks.prom"
     _append_rows(result_path, rows)
-    _write_metrics(metrics_path, rows)
+    _write_metrics(metrics_path, _result_rows(result_path))
     return {
         "arms": {str(row["arm"]): row["terminal_status"] for row in rows},
         "metrics_path": str(metrics_path),
@@ -767,9 +887,17 @@ def replay_fixture(fixture: Path, output_dir: Path) -> dict[str, object]:
     observed_at = value.get("observed_at")
     decisions = value.get("fixture_decisions")
     if (
-        type(observation_id) is not str
+        set(value) != {
+            "fixture_decisions",
+            "observation_id",
+            "observed_at",
+            "quotes",
+            "source_mode",
+        }
+        or type(observation_id) is not str
         or type(observed_at) is not str
         or not isinstance(decisions, dict)
+        or set(decisions) != {"openai", "jev"}
     ):
         raise ValueError("stock fixture metadata is invalid")
     quotes = _validate_quotes(value.get("quotes"))
@@ -862,7 +990,7 @@ def observe_public(symbols: str, output_dir: Path) -> dict[str, object]:
         result_path = output_dir / "results.jsonl"
         metrics_path = output_dir / "stocks.prom"
         _append_rows(result_path, rows)
-        _write_metrics(metrics_path, rows)
+        _write_metrics(metrics_path, _result_rows(result_path))
         return {
             "arms": {"cycle": "failed"},
             "metrics_path": str(metrics_path),

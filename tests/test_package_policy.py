@@ -270,7 +270,7 @@ _APPROVED_SOURCE_HASHES = {
         "9536ea64aba216d7afcea434ba1e73634eca501095e72229797b45b8e2fed453"
     ),
     "src/jev_trading_lab/stocks/slice.py": (
-        "17a5a5ad01af8a7d71cbfe01a8e78da7785924b0513c860c32b027463bc26201"
+        "57ed1a64fb2275f459f0c79656d8afdf37db02d1822543ee13346f5eb091b2f8"
     ),
 }
 _ALLOWED_TOOL_CONFIG = {
