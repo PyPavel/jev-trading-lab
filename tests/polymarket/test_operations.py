@@ -23,6 +23,7 @@ from jev_trading_lab.core.ids import canonical_json_bytes
 from jev_trading_lab.polymarket.operations import (
     BlobRefModel,
     BuildIdentity,
+    JournalRecovery,
     OperationConflictError,
     OperationCorruptError,
     OperationEvent,
@@ -38,6 +39,8 @@ from jev_trading_lab.polymarket.operations import (
     package_version_code,
     process_sample_exact_values,
     process_sample_from_exact_values,
+    recover_operation_tail,
+    recovery_event,
     sample_process,
 )
 
@@ -132,6 +135,8 @@ def event(**changes: Any) -> OperationEvent:
         "evidence": None,
     }
     defaults.update(changes)
+    if kind is OperationKind.RECOVERY:
+        defaults.setdefault("journal_kind", "operations")
     if (
         kind is OperationKind.PROCESS_SAMPLE
         and defaults["status"] == "failure"
@@ -201,6 +206,17 @@ def assert_sanitized_domain_error(error: Exception, marker: str) -> None:
     assert error.__cause__ is None
     assert error.__suppress_context__
     assert marker not in rendered
+
+
+def test_recovery_event_binds_kind_count_and_content_addressed_identity() -> None:
+    value = recovery_event(JournalRecovery("artifacts", 17), occurred_at=NOW)
+
+    assert value.journal_kind == "artifacts"
+    assert value.reason == "partial_tail"
+    assert value.exact_values == {"discarded_bytes": 17}
+    assert value.event_id == operation_event_id(
+        value.model_dump(mode="json", exclude={"event_id"})
+    )
 
 
 def test_operation_kind_is_closed_to_all_nine_approved_values() -> None:
@@ -525,7 +541,7 @@ def test_only_lf_delimits_complete_journal_records(tmp_path: Path, raw: bytes) -
     journal = append_raw_lines(root, tail=raw)
 
     with pytest.raises(OperationCorruptError, match="invalid line"):
-        load_operation_cut(root, recover_tail=True)
+        recover_operation_tail(root)
 
     assert journal.read_bytes() == raw
 
@@ -539,7 +555,7 @@ def test_raw_control_bytes_and_empty_records_are_invalid_framing(
     journal = append_raw_lines(tmp_path / "audit", tail=raw)
 
     with pytest.raises(OperationCorruptError):
-        load_operation_cut(tmp_path / "audit", recover_tail=True)
+        recover_operation_tail(tmp_path / "audit")
 
     assert journal.read_bytes() == raw
 
@@ -661,10 +677,10 @@ def test_tail_recovery_uses_last_lf_and_never_parses_discarded_cr_bytes(
     tail = b'SUPERSECRET\r{"torn":'
     journal = append_raw_lines(root, value, tail=tail)
 
-    cut = load_operation_cut(root, recover_tail=True)
+    recovery = recover_operation_tail(root)
 
-    assert cut.events == (value,)
-    assert cut.discarded_tail_bytes == len(tail)
+    assert recovery == JournalRecovery("operations", len(tail))
+    assert load_operation_cut(root).events == (value,)
     assert journal.read_bytes() == journal_line(value)
 
 
@@ -675,32 +691,37 @@ def test_bare_cr_without_any_lf_is_one_discarded_tail_candidate(tmp_path: Path) 
 
     with pytest.raises(OperationCorruptError, match="truncated tail"):
         load_operation_cut(root)
-    cut = load_operation_cut(root, recover_tail=True)
+    recovery = recover_operation_tail(root)
 
-    assert cut.events == ()
-    assert cut.discarded_tail_bytes == len(raw)
+    assert recovery == JournalRecovery("operations", len(raw))
+    assert load_operation_cut(root).events == ()
     assert journal.read_bytes() == b""
 
 
-def test_complete_corruption_is_fatal_but_torn_tail_is_optionally_recovered(
+def test_complete_corruption_is_fatal_but_torn_tail_is_explicitly_recovered(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "audit"
     value = event()
     append_operation(root, value)
     journal = root / "operations.jsonl"
-    journal.write_bytes(journal.read_bytes() + b'{"torn":')
+    tail = b'{"torn":'
+    original = journal.read_bytes() + tail
+    journal.write_bytes(original)
 
     with pytest.raises(OperationCorruptError, match="truncated tail"):
         load_operation_cut(root)
-    cut = load_operation_cut(root, recover_tail=True)
-    assert cut.events == (value,)
-    assert cut.discarded_tail_bytes == len(b'{"torn":')
+    assert journal.read_bytes() == original
+    assert recover_operation_tail(root) == JournalRecovery("operations", len(tail))
+    assert load_operation_cut(root).events == (value,)
     assert journal.read_bytes() == journal_line(value)
+    assert recover_operation_tail(root) is None
 
     journal.write_bytes(journal_line(value) + b"{}\n")
+    complete_corruption = journal.read_bytes()
     with pytest.raises(OperationCorruptError):
-        load_operation_cut(root, recover_tail=True)
+        recover_operation_tail(root)
+    assert journal.read_bytes() == complete_corruption
 
 
 @pytest.mark.parametrize("object_kind", ("symlink", "fifo", "weak_mode"))
@@ -985,7 +1006,7 @@ def test_replayed_hostile_evidence_fails_closed_without_tail_mutation(
     journal = append_raw_lines(root, tail=original)
 
     with pytest.raises(OperationCorruptError) as captured:
-        load_operation_cut(root, recover_tail=True)
+        recover_operation_tail(root)
 
     assert str(captured.value) == "operation evidence is missing or corrupt"
     assert payload.decode(errors="replace") not in str(captured.value)
@@ -1044,7 +1065,7 @@ def test_tail_recovery_validates_complete_prefix_before_mutation(
 
     monkeypatch.setattr(os, "ftruncate", count_ftruncate)
     with pytest.raises(OperationCorruptError):
-        load_operation_cut(root, recover_tail=True)
+        recover_operation_tail(root)
     assert truncate_calls == 0
     assert journal.read_bytes() == original
 
@@ -1067,7 +1088,7 @@ def test_tail_recovery_validates_evidence_before_mutation(tmp_path: Path) -> Non
     journal = append_raw_lines(root, tail=original)
 
     with pytest.raises(OperationCorruptError, match="evidence"):
-        load_operation_cut(root, recover_tail=True)
+        recover_operation_tail(root)
     assert journal.read_bytes() == original
 
 
@@ -1084,7 +1105,7 @@ def test_tail_recovery_faults_propagate_only_after_prefix_validation(
 
     monkeypatch.setattr(os, "ftruncate", fail_truncate)
     with pytest.raises(OSError, match="truncate failed"):
-        load_operation_cut(root, recover_tail=True)
+        recover_operation_tail(root)
     assert journal.read_bytes() == original
 
 
@@ -1285,9 +1306,10 @@ def test_tail_recovery_retry_reestablishes_file_and_parent_durability(
 
     monkeypatch.setattr(os, "fsync", fail_journal_fsync_once)
     with pytest.raises(OSError, match="journal fsync failed"):
-        load_operation_cut(root, recover_tail=True)
+        recover_operation_tail(root)
     assert journal.read_bytes() == journal_line(value)
 
+    journal.write_bytes(journal_line(value) + b'{"torn":')
     journal_fsyncs = 0
     root_fsyncs = 0
 
@@ -1301,43 +1323,23 @@ def test_tail_recovery_retry_reestablishes_file_and_parent_durability(
         original_fsync(descriptor)
 
     monkeypatch.setattr(os, "fsync", count_fsync)
-    cut = load_operation_cut(root, recover_tail=True)
-    assert cut.events == (value,)
-    assert cut.discarded_tail_bytes == 0
+    assert recover_operation_tail(root) == JournalRecovery(
+        "operations", len(b'{"torn":')
+    )
+    assert load_operation_cut(root).events == (value,)
     assert journal_fsyncs == 1
     assert root_fsyncs >= 1
 
 
-def test_load_retry_reestablishes_parent_durability_after_creation_fsync_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_load_is_read_only_after_journal_creation(tmp_path: Path) -> None:
     root = tmp_path / "audit"
-    original_fsync = os.fsync
-    failed = False
-
-    def fail_once(descriptor: int) -> None:
-        nonlocal failed
-        if not failed and Path(f"/proc/self/fd/{descriptor}").resolve() == root:
-            failed = True
-            raise OSError("directory fsync failed")
-        original_fsync(descriptor)
-
-    monkeypatch.setattr(os, "fsync", fail_once)
-    with pytest.raises(OSError, match="directory fsync failed"):
-        load_operation_cut(root)
-    assert (root / "operations.jsonl").read_bytes() == b""
-
-    root_fsyncs = 0
-
-    def count_fsync(descriptor: int) -> None:
-        nonlocal root_fsyncs
-        if Path(f"/proc/self/fd/{descriptor}").resolve() == root:
-            root_fsyncs += 1
-        original_fsync(descriptor)
-
-    monkeypatch.setattr(os, "fsync", count_fsync)
     assert load_operation_cut(root).events == ()
-    assert root_fsyncs >= 1
+    journal = root / "operations.jsonl"
+    before = (journal.stat().st_mtime_ns, journal.read_bytes())
+
+    assert load_operation_cut(root).events == ()
+
+    assert (journal.stat().st_mtime_ns, journal.read_bytes()) == before
 
 
 @pytest.mark.parametrize(

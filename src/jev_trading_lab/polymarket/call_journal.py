@@ -40,6 +40,7 @@ from jev_trading_lab.polymarket.ai import (
     is_canonical_failure_message,
 )
 from jev_trading_lab.polymarket.models import StrictModel, load_strict_json
+from jev_trading_lab.polymarket.operations import JournalRecovery
 
 _SHA256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 _MAX_JOURNAL_BYTES = 64 * 1024 * 1024
@@ -451,6 +452,104 @@ class ProviderCallJournal:
         return descriptor
 
     def _entries(self, descriptor: int) -> list[_JournalEnvelope]:
+        return self._parse_entries(self._read_raw(descriptor))
+
+    def _parse_entries(self, raw: bytes) -> list[_JournalEnvelope]:
+        if raw and not raw.endswith(b"\n"):
+            raise ValueError("provider call journal has a truncated tail")
+        lines = raw.split(b"\n")
+        if lines:
+            lines.pop()
+        if len(lines) > _MAX_LINES or any(
+            not line or b"\r" in line or len(line) + 1 > _MAX_LINE_BYTES
+            for line in lines
+        ):
+            raise ValueError("provider call journal contains an invalid line")
+        entries: list[_JournalEnvelope] = []
+        for line in lines:
+            value = _strict_document(line, label="provider call journal")
+            try:
+                envelope = _JournalEnvelope.model_validate(value)
+            except (TypeError, ValueError) as error:
+                raise ValueError("provider call journal envelope is invalid") from error
+            entries.append(envelope)
+        return entries
+
+    def recovery_candidate(self) -> JournalRecovery | None:
+        root_fd = self._root_fd()
+        try:
+            try:
+                os.stat("provider_calls.jsonl", dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+            descriptor = self._open(root_fd)
+            try:
+                while True:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_SH)
+                        break
+                    except InterruptedError:
+                        continue
+                raw = self._read_raw(descriptor)
+                boundary = (
+                    len(raw) if not raw or raw.endswith(b"\n") else raw.rfind(b"\n") + 1
+                )
+                self._states(self._parse_entries(raw[:boundary]))
+                discarded = len(raw) - boundary
+                if discarded:
+                    return JournalRecovery("provider_calls", discarded)
+                return None
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(root_fd)
+
+    def recover_tail(self) -> JournalRecovery | None:
+        """Validate the complete prefix, then explicitly discard one torn final line."""
+
+        expected = self.recovery_candidate()
+        if expected is None:
+            return None
+        root_fd = self._root_fd()
+        try:
+            descriptor = self._open(root_fd)
+            try:
+                while True:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX)
+                        break
+                    except InterruptedError:
+                        continue
+                raw = self._read_raw(descriptor)
+                boundary = raw.rfind(b"\n") + 1
+                complete = raw[:boundary]
+                self._states(self._parse_entries(complete))
+                recovery = JournalRecovery("provider_calls", len(raw) - boundary)
+                if recovery != expected:
+                    raise ValueError("provider call journal changed during recovery")
+                truncated = False
+                try:
+                    os.ftruncate(descriptor, len(complete))
+                    truncated = True
+                    os.fsync(descriptor)
+                    os.fsync(root_fd)
+                except BaseException:
+                    if truncated:
+                        try:
+                            os.lseek(descriptor, 0, os.SEEK_END)
+                            _write_all(descriptor, raw[len(complete) :])
+                            os.fsync(descriptor)
+                            os.fsync(root_fd)
+                        except BaseException:
+                            pass
+                    raise
+                return recovery
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(root_fd)
+
+    def _read_raw(self, descriptor: int) -> bytes:
         metadata = os.fstat(descriptor)
         if metadata.st_size > _MAX_JOURNAL_BYTES:
             raise ValueError("provider call journal exceeds maximum size")
@@ -466,29 +565,7 @@ class ProviderCallJournal:
                 raise ValueError("provider call journal changed while locked")
             chunks.append(chunk)
             remaining -= len(chunk)
-        raw = b"".join(chunks)
-        complete = raw
-        torn_tail: bytes | None = None
-        if raw and not raw.endswith(b"\n"):
-            boundary = raw.rfind(b"\n") + 1
-            complete, torn_tail = raw[:boundary], raw[boundary:]
-        lines = complete.splitlines()
-        if len(lines) > _MAX_LINES or any(
-            not line or len(line) > _MAX_LINE_BYTES for line in lines
-        ):
-            raise ValueError("provider call journal contains an invalid line")
-        entries: list[_JournalEnvelope] = []
-        for line in lines:
-            value = _strict_document(line, label="provider call journal")
-            try:
-                envelope = _JournalEnvelope.model_validate(value)
-            except (TypeError, ValueError) as error:
-                raise ValueError("provider call journal envelope is invalid") from error
-            entries.append(envelope)
-        if torn_tail is not None:
-            os.ftruncate(descriptor, len(complete))
-            os.fsync(descriptor)
-        return entries
+        return b"".join(chunks)
 
     def _append(self, descriptor: int, value: _JournalEnvelope) -> None:
         framed = canonical_json_bytes(value.model_dump(mode="json")) + b"\n"

@@ -296,6 +296,9 @@ Stage = Literal[
     "replay",
 ]
 Provider = Literal["openai", "jev", "gamma", "clob"]
+JournalKind = Literal[
+    "results", "artifacts", "provider_calls", "completed_slots", "operations"
+]
 BoundedLabel = Annotated[
     str, StringConstraints(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")
 ]
@@ -309,6 +312,16 @@ def _bounded_int(value: object, name: str) -> int:
     if type(value) is not int or not 0 <= value <= INT64_MAX:
         raise ValueError(f"{name} must be a nonnegative signed 64-bit built-in int")
     return value
+
+
+@dataclass(frozen=True, slots=True)
+class JournalRecovery:
+    journal_kind: JournalKind
+    discarded_bytes: int
+
+    def __post_init__(self) -> None:
+        if type(self.discarded_bytes) is not int or self.discarded_bytes <= 0:
+            raise ValueError("discarded_bytes must be a positive built-in int")
 
 
 @dataclass(frozen=True, slots=True)
@@ -752,6 +765,9 @@ class OperationEvent(StrictModel):
     semantic_id: Sha256 | None = None
     stage: Stage | None = None
     provider: Provider | None = None
+    journal_kind: JournalKind | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     status: BoundedLabel
     reason: BoundedLabel | None = None
     elapsed_nanoseconds: ExactInt | None = None
@@ -843,6 +859,8 @@ class OperationEvent(StrictModel):
             raise ValueError("operation stage is invalid for deduplication")
         if self.provider is not None and self.kind is not OperationKind.STAGE_TERMINAL:
             raise ValueError("provider is valid only for a terminal stage")
+        if self.journal_kind is not None and self.kind is not OperationKind.RECOVERY:
+            raise ValueError("journal_kind presence is invalid for event kind")
         if self.kind is OperationKind.STAGE_TERMINAL:
             if self.elapsed_nanoseconds is None:
                 raise ValueError("stage terminal event requires elapsed nanoseconds")
@@ -1112,6 +1130,32 @@ def _parse_evidence(payload: bytes, kind: OperationKind) -> dict[str, object]:
     return cast(dict[str, object], document)
 
 
+def recovery_event(
+    recovery: JournalRecovery, *, occurred_at: datetime | None = None
+) -> OperationEvent:
+    """Build one content-addressed audit fact for a completed tail recovery."""
+
+    if type(recovery) is not JournalRecovery:
+        raise TypeError("recovery must be a JournalRecovery")
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "occurred_at": occurred_at or datetime.now(UTC),
+        "kind": OperationKind.RECOVERY,
+        "run_id": None,
+        "semantic_id": None,
+        "stage": "recovery",
+        "provider": None,
+        "journal_kind": recovery.journal_kind,
+        "status": "success",
+        "reason": "partial_tail",
+        "elapsed_nanoseconds": None,
+        "exact_values": {"discarded_bytes": recovery.discarded_bytes},
+        "evidence": None,
+    }
+    payload["event_id"] = operation_event_id(payload)
+    return OperationEvent.model_validate(payload)
+
+
 def append_operation(
     root: Path, event: OperationEvent, evidence: bytes | None = None
 ) -> None:
@@ -1200,39 +1244,84 @@ def append_operation(
         os.close(root_fd)
 
 
-def load_operation_cut(root: Path, *, recover_tail: bool = False) -> OperationCut:
-    """Load a verified cut; optionally discard, but never parse, a torn tail."""
+def inspect_operation_tail(root: Path) -> JournalRecovery | None:
+    """Validate the operations recovery candidate without mutating it."""
 
     if not isinstance(root, Path):
         raise TypeError("operation root must be a Path")
-    if type(recover_tail) is not bool:
-        raise TypeError("recover_tail must be a bool")
     root_path = root if root.is_absolute() else root.absolute()
     root_fd = _open_root(root_path)
-    discarded = 0
     try:
+        try:
+            os.stat("operations.jsonl", dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
         descriptor, _created = _open_journal(root_fd)
         try:
-            _lock(descriptor, fcntl.LOCK_EX if recover_tail else fcntl.LOCK_SH)
+            _lock(descriptor, fcntl.LOCK_SH)
             raw = _read_bytes(descriptor)
-            candidate = raw
-            if raw and not raw.endswith(b"\n"):
-                boundary = raw.rfind(b"\n") + 1
-                discarded = len(raw) - boundary
-                if not recover_tail:
-                    raise OperationCorruptError(
-                        "operation journal has a truncated tail"
-                    )
-                candidate = raw[:boundary]
-            events = _parse_events(candidate)
-            valid_blobs = _verify_blobs(root_path, events)
-            if discarded:
-                os.ftruncate(descriptor, len(candidate))
-            os.fsync(descriptor)
-            _fsync_root(root_fd)
-            journal_bytes = len(candidate)
+            boundary = (
+                len(raw) if not raw or raw.endswith(b"\n") else raw.rfind(b"\n") + 1
+            )
+            events = _parse_events(raw[:boundary])
+            _verify_blobs(root_path, events)
+            discarded = len(raw) - boundary
+            return JournalRecovery("operations", discarded) if discarded else None
         finally:
             os.close(descriptor)
     finally:
         os.close(root_fd)
-    return OperationCut(events, journal_bytes, valid_blobs, discarded)
+
+
+def recover_operation_tail(root: Path) -> JournalRecovery | None:
+    """Explicitly validate and discard only an operations journal torn final line."""
+
+    expected = inspect_operation_tail(root)
+    if expected is None:
+        return None
+    root_path = root if root.is_absolute() else root.absolute()
+    root_fd = _open_root(root_path)
+    try:
+        descriptor, _created = _open_journal(root_fd)
+        try:
+            _lock(descriptor, fcntl.LOCK_EX)
+            raw = _read_bytes(descriptor)
+            boundary = raw.rfind(b"\n") + 1
+            candidate = raw[:boundary]
+            events = _parse_events(candidate)
+            _verify_blobs(root_path, events)
+            recovery = JournalRecovery("operations", len(raw) - boundary)
+            if recovery != expected:
+                raise OperationCorruptError("operation journal changed during recovery")
+            os.ftruncate(descriptor, len(candidate))
+            os.fsync(descriptor)
+            _fsync_root(root_fd)
+            return recovery
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(root_fd)
+
+
+def load_operation_cut(root: Path) -> OperationCut:
+    """Load one verified fail-closed operation cut without mutating it."""
+
+    if not isinstance(root, Path):
+        raise TypeError("operation root must be a Path")
+    root_path = root if root.is_absolute() else root.absolute()
+    root_fd = _open_root(root_path)
+    try:
+        descriptor, created = _open_journal(root_fd)
+        try:
+            _lock(descriptor, fcntl.LOCK_SH)
+            raw = _read_bytes(descriptor)
+            events = _parse_events(raw)
+            valid_blobs = _verify_blobs(root_path, events)
+            if created:
+                os.fsync(descriptor)
+                _fsync_root(root_fd)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(root_fd)
+    return OperationCut(events, len(raw), valid_blobs)

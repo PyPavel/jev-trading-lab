@@ -25,7 +25,9 @@ from jev_trading_lab.polymarket.client import (
     read_bounded_body,
     resolve_public_addresses,
 )
+from jev_trading_lab.polymarket.operations import JournalRecovery
 from jev_trading_lab.polymarket.pipeline import observation_slot
+from jev_trading_lab.polymarket.store import recover_store_tails
 
 NOW = datetime(2026, 10, 10, 12, 0, 45, tzinfo=UTC)
 
@@ -302,7 +304,7 @@ def test_provider_journal_completes_short_interrupted_writes(tmp_path: Path) -> 
     assert journal.state(call_id) is not None
 
 
-def test_provider_journal_truncates_only_torn_final_tail_and_recovers_intent(
+def test_provider_journal_tail_recovery_is_explicit_and_reports_exact_bytes(
     tmp_path: Path,
 ) -> None:
     journal = ProviderCallJournal(tmp_path)
@@ -314,12 +316,119 @@ def test_provider_journal_truncates_only_torn_final_tail_and_recovers_intent(
     )
     path = tmp_path / "provider_calls.jsonl"
     durable_prefix = path.read_bytes()
-    path.write_bytes(durable_prefix + b'{"artifact_sha256":"torn')
+    tail = b'{"artifact_sha256":"torn'
+    original = durable_prefix + tail
+    path.write_bytes(original)
 
+    with pytest.raises(ValueError, match="truncated tail"):
+        ProviderCallJournal(tmp_path).state(call_id)
+    assert path.read_bytes() == original
+
+    recovered = ProviderCallJournal(tmp_path).recover_tail()
+
+    assert recovered == JournalRecovery("provider_calls", len(tail))
     state = ProviderCallJournal(tmp_path).state(call_id)
-
     assert state is not None and state["kind"] == "provider_call_intent"
     assert path.read_bytes() == durable_prefix
+    assert ProviderCallJournal(tmp_path).recover_tail() is None
+
+
+def test_store_recovery_audits_provider_tail(tmp_path: Path) -> None:
+    journal = ProviderCallJournal(tmp_path)
+    journal.begin(
+        provider="openai",
+        opportunity_id="1" * 64,
+        request_bytes=b"request",
+        created_at=NOW,
+    )
+    path = tmp_path / "provider_calls.jsonl"
+    durable_prefix = path.read_bytes()
+    tail = b"torn"
+    path.write_bytes(durable_prefix + tail)
+
+    assert recover_store_tails(tmp_path) == (
+        JournalRecovery("provider_calls", len(tail)),
+    )
+
+    assert path.read_bytes() == durable_prefix
+    assert recover_store_tails(tmp_path) == ()
+    from jev_trading_lab.polymarket.operations import load_operation_cut
+
+    events = load_operation_cut(tmp_path).events
+    assert len(events) == 1
+    assert events[0].kind.value == "recovery"
+    assert events[0].journal_kind == "provider_calls"
+    assert events[0].reason == "partial_tail"
+    assert events[0].exact_values == {"discarded_bytes": len(tail)}
+
+
+def test_provider_recovery_rejects_invalid_transition_without_mutation(
+    tmp_path: Path,
+) -> None:
+    journal = ProviderCallJournal(tmp_path)
+    journal.begin(
+        provider="openai",
+        opportunity_id="1" * 64,
+        request_bytes=b"request",
+        created_at=NOW,
+    )
+    path = tmp_path / "provider_calls.jsonl"
+    first = path.read_bytes().splitlines()[0]
+    original = first + b"\n" + first + b"\npartial"
+    path.write_bytes(original)
+
+    with pytest.raises(ValueError, match="transition"):
+        journal.recover_tail()
+
+    assert path.read_bytes() == original
+
+
+def test_provider_recovery_truncate_failure_preserves_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = ProviderCallJournal(tmp_path)
+    journal.begin(
+        provider="openai",
+        opportunity_id="1" * 64,
+        request_bytes=b"request",
+        created_at=NOW,
+    )
+    path = tmp_path / "provider_calls.jsonl"
+    original = path.read_bytes() + b"partial"
+    path.write_bytes(original)
+
+    def fail(_descriptor: int, _length: int) -> None:
+        raise OSError("truncate failed")
+
+    monkeypatch.setattr(os, "ftruncate", fail)
+    with pytest.raises(OSError, match="truncate failed"):
+        journal.recover_tail()
+    assert path.read_bytes() == original
+
+
+def test_provider_empty_unnterminated_journal_is_recovered(tmp_path: Path) -> None:
+    path = tmp_path / "provider_calls.jsonl"
+    path.write_bytes(b"partial")
+    path.chmod(0o600)
+
+    assert ProviderCallJournal(tmp_path).recover_tail() == JournalRecovery(
+        "provider_calls", 7
+    )
+    assert path.read_bytes() == b""
+
+
+def test_provider_complete_final_line_needs_no_recovery(tmp_path: Path) -> None:
+    journal = ProviderCallJournal(tmp_path)
+    journal.begin(
+        provider="openai",
+        opportunity_id="1" * 64,
+        request_bytes=b"request",
+        created_at=NOW,
+    )
+    before = (tmp_path / "provider_calls.jsonl").read_bytes()
+
+    assert journal.recover_tail() is None
+    assert (tmp_path / "provider_calls.jsonl").read_bytes() == before
 
 
 def test_provider_journal_rejects_newline_terminated_or_earlier_corruption(

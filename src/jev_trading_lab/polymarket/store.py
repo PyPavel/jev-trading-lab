@@ -91,6 +91,13 @@ from jev_trading_lab.polymarket.models import (
     load_strict_json,
     openai_response_brief,
 )
+from jev_trading_lab.polymarket.operations import (
+    JournalRecovery,
+    append_operation,
+    inspect_operation_tail,
+    recover_operation_tail,
+    recovery_event,
+)
 from jev_trading_lab.polymarket.paper import POLICY_VERSION
 
 _LABEL_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
@@ -1619,7 +1626,7 @@ def _lock(descriptor: int, operation: int) -> None:
             continue
 
 
-def _read_journal(descriptor: int, *, label: str) -> list[bytes]:
+def _read_journal_bytes(descriptor: int, *, label: str) -> bytes:
     metadata = os.fstat(descriptor)
     if metadata.st_size > _MAX_JOURNAL_BYTES:
         raise StoreCorruptError(f"{label} exceeds maximum size")
@@ -1635,13 +1642,64 @@ def _read_journal(descriptor: int, *, label: str) -> list[bytes]:
             raise StoreCorruptError(f"{label} changed while locked")
         chunks.append(chunk)
         remaining -= len(chunk)
-    raw = b"".join(chunks)
+    return b"".join(chunks)
+
+
+def _journal_lines(raw: bytes, *, label: str) -> list[bytes]:
     if raw and not raw.endswith(b"\n"):
         raise StoreCorruptError(f"{label} has a truncated tail")
-    lines = raw.splitlines()
-    if any(not line or len(line) > _MAX_LINE_BYTES for line in lines):
+    lines = raw.split(b"\n")
+    if lines:
+        lines.pop()
+    if any(
+        not line or b"\r" in line or len(line) + 1 > _MAX_LINE_BYTES for line in lines
+    ):
         raise StoreCorruptError(f"{label} contains an invalid line")
     return lines
+
+
+def _read_journal(descriptor: int, *, label: str) -> list[bytes]:
+    return _journal_lines(_read_journal_bytes(descriptor, label=label), label=label)
+
+
+def _complete_prefix(raw: bytes, *, label: str) -> tuple[bytes, int]:
+    if not raw or raw.endswith(b"\n"):
+        return raw, 0
+    boundary = raw.rfind(b"\n") + 1
+    complete = raw[:boundary]
+    _journal_lines(complete, label=label)
+    return complete, len(raw) - boundary
+
+
+def _truncate_durable(
+    descriptor: int, root_fd: int, *, complete: bytes, original: bytes
+) -> None:
+    try:
+        os.ftruncate(descriptor, len(complete))
+        os.fsync(descriptor)
+        os.fsync(root_fd)
+    except BaseException:
+        try:
+            os.ftruncate(descriptor, len(complete))
+            os.lseek(descriptor, 0, os.SEEK_END)
+            _append_raw(descriptor, original[len(complete) :])
+            os.fsync(descriptor)
+            os.fsync(root_fd)
+        except BaseException:
+            pass
+        raise
+
+
+def _append_raw(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        try:
+            written = os.write(descriptor, view)
+        except InterruptedError:
+            continue
+        if written <= 0:
+            raise OSError(errno.EIO, "journal write made no progress")
+        view = view[written:]
 
 
 def _append_lines(descriptor: int, lines: list[bytes], *, label: str) -> None:
@@ -3429,6 +3487,44 @@ def load_observation(
     return replay
 
 
+def _parse_completed_slots(lines: Iterable[bytes]) -> list[dict[str, object]]:
+    parsed: list[dict[str, object]] = []
+    identities: dict[tuple[str, str, int], list[str]] = {}
+    for line in lines:
+        try:
+            raw = load_strict_json(line)
+        except ValueError as error:
+            raise StoreCorruptError("completed slot journal is corrupt") from error
+        if (
+            not isinstance(raw, dict)
+            or canonical_json_bytes(raw) != line
+            or set(raw) != {"cutoff_at", "limit", "observation_ids", "policy_version"}
+        ):
+            raise StoreCorruptError("completed slot journal is corrupt")
+        value = dict(raw)
+        ids = value["observation_ids"]
+        if (
+            type(value["cutoff_at"]) is not str
+            or type(value["policy_version"]) is not str
+            or type(value["limit"]) is not int
+            or not 1 <= value["limit"] <= 20
+            or not isinstance(ids, list)
+            or len(ids) != len(set(ids))
+            or any(
+                type(item) is not str or re.fullmatch(r"[0-9a-f]{64}", item) is None
+                for item in ids
+            )
+        ):
+            raise StoreCorruptError("completed slot journal is corrupt")
+        key = (value["cutoff_at"], value["policy_version"], value["limit"])
+        prior = identities.get(key)
+        if prior is not None and ids[: len(prior)] != prior:
+            raise StoreCorruptError("completed slot has conflicting records")
+        identities[key] = ids
+        parsed.append(value)
+    return parsed
+
+
 def load_completed_slot(
     output_dir: str | os.PathLike[str],
     *,
@@ -3453,50 +3549,12 @@ def load_completed_slot(
         os.close(root_fd)
     wanted = cutoff.isoformat().replace("+00:00", "Z")
     selected: dict[str, object] | None = None
-    for line in lines:
-        try:
-            raw = load_strict_json(line)
-        except ValueError as error:
-            raise StoreCorruptError("completed slot journal is corrupt") from error
-        if (
-            not isinstance(raw, dict)
-            or canonical_json_bytes(raw) != line
-            or set(raw)
-            != {
-                "cutoff_at",
-                "limit",
-                "observation_ids",
-                "policy_version",
-            }
-        ):
-            raise StoreCorruptError("completed slot journal is corrupt")
-        value = dict(raw)
-        ids = value["observation_ids"]
-        if (
-            type(value["cutoff_at"]) is not str
-            or type(value["policy_version"]) is not str
-            or type(value["limit"]) is not int
-            or not 1 <= value["limit"] <= 20
-            or not isinstance(ids, list)
-            or len(ids) != len(set(ids))
-            or any(
-                type(item) is not str or re.fullmatch(r"[0-9a-f]{64}", item) is None
-                for item in ids
-            )
-        ):
-            raise StoreCorruptError("completed slot journal is corrupt")
+    for value in _parse_completed_slots(lines):
         if (
             value["cutoff_at"] == wanted
             and value["policy_version"] == policy_version
             and value["limit"] == limit
         ):
-            if selected is not None and selected != value:
-                prior_ids = selected["observation_ids"]
-                if (
-                    not isinstance(prior_ids, list)
-                    or ids[: len(prior_ids)] != prior_ids
-                ):
-                    raise StoreCorruptError("completed slot has conflicting records")
             selected = value
     if selected is None:
         return None
@@ -3510,6 +3568,168 @@ def load_completed_slot(
     ):
         raise StoreCorruptError("completed slot observation binding is invalid")
     return replays
+
+
+_STORE_RECOVERY_JOURNALS: tuple[
+    tuple[str, Literal["results", "artifacts", "completed_slots"]], ...
+] = (
+    ("results.jsonl", "results"),
+    ("artifacts.jsonl", "artifacts"),
+    ("completed_slots.jsonl", "completed_slots"),
+)
+
+
+def _store_recovery_candidate(
+    root_fd: int,
+    name: str,
+    kind: Literal["results", "artifacts", "completed_slots"],
+) -> tuple[JournalRecovery | None, bytes]:
+    label = {
+        "results": "result journal",
+        "artifacts": "artifact journal",
+        "completed_slots": "completed slot journal",
+    }[kind]
+    try:
+        os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None, b""
+    descriptor = _open_journal(root_fd, name, label=label)
+    try:
+        _lock(descriptor, fcntl.LOCK_SH)
+        raw = _read_journal_bytes(descriptor, label=label)
+        complete, discarded = _complete_prefix(raw, label=label)
+        lines = _journal_lines(complete, label=label)
+        if kind == "results":
+            _parse_results(lines)
+        elif kind == "artifacts":
+            _parse_envelopes(lines)
+        else:
+            _parse_completed_slots(lines)
+        return (JournalRecovery(kind, discarded) if discarded else None), complete
+    finally:
+        os.close(descriptor)
+
+
+def _recover_store_journal(
+    root_fd: int,
+    name: str,
+    expected: JournalRecovery,
+) -> JournalRecovery:
+    kind = expected.journal_kind
+    assert kind in {"results", "artifacts", "completed_slots"}
+    label = {
+        "results": "result journal",
+        "artifacts": "artifact journal",
+        "completed_slots": "completed slot journal",
+    }[kind]
+    descriptor = _open_journal(root_fd, name, label=label)
+    try:
+        _lock(descriptor, fcntl.LOCK_EX)
+        raw = _read_journal_bytes(descriptor, label=label)
+        complete, discarded = _complete_prefix(raw, label=label)
+        candidate = JournalRecovery(kind, discarded)
+        if candidate != expected:
+            raise StoreCorruptError(f"{label} changed during recovery")
+        _truncate_durable(descriptor, root_fd, complete=complete, original=raw)
+        return candidate
+    finally:
+        os.close(descriptor)
+
+
+def recover_store_tails(output_dir: Path) -> tuple[JournalRecovery, ...]:
+    """Validate all journals, recover tails, then audit every completed action."""
+
+    if not isinstance(output_dir, Path):
+        raise TypeError("output_dir must be a Path")
+    output = output_dir if output_dir.is_absolute() else output_dir.absolute()
+    root_fd = _open_output(output)
+    recovered: list[JournalRecovery] = []
+    try:
+        operation = inspect_operation_tail(output)
+        candidates: list[tuple[str, JournalRecovery]] = []
+        parsed: dict[str, object] = {}
+        for name, kind in _STORE_RECOVERY_JOURNALS:
+            item, complete = _store_recovery_candidate(root_fd, name, kind)
+            lines = _journal_lines(
+                complete,
+                label={
+                    "results": "result journal",
+                    "artifacts": "artifact journal",
+                    "completed_slots": "completed slot journal",
+                }[kind],
+            )
+            if kind == "results":
+                parsed[kind] = _parse_results(lines)
+            elif kind == "artifacts":
+                parsed[kind] = _parse_envelopes(lines)
+            if item is not None:
+                candidates.append((name, item))
+        results = parsed.get("results", {})
+        envelopes = parsed.get("artifacts", [])
+        assert isinstance(results, dict) and isinstance(envelopes, list)
+        if results or envelopes:
+            with BlobStore(output / "blobs") as blob_store:
+                _validate_journals_locked(blob_store, results, envelopes)
+        for slot in _parse_completed_slots(
+            _journal_lines(
+                _store_recovery_candidate(
+                    root_fd, "completed_slots.jsonl", "completed_slots"
+                )[1],
+                label="completed slot journal",
+            )
+        ):
+            ids = slot["observation_ids"]
+            assert isinstance(ids, list)
+            for observation_id in ids:
+                found = results.get(observation_id)
+                if found is None:
+                    raise StoreCorruptError(
+                        "completed slot observation binding is invalid"
+                    )
+                result = found[0]
+                cutoff = result.cutoff_at.replace(second=0, microsecond=0)
+                if (
+                    cutoff.isoformat().replace("+00:00", "Z") != slot["cutoff_at"]
+                    or result.policy_version != slot["policy_version"]
+                ):
+                    raise StoreCorruptError(
+                        "completed slot observation binding is invalid"
+                    )
+        from jev_trading_lab.polymarket.call_journal import ProviderCallJournal
+
+        provider_journal = ProviderCallJournal(output)
+        provider = provider_journal.recovery_candidate()
+        if operation is not None:
+            current = recover_operation_tail(output)
+            assert current is not None
+            recovered.append(current)
+            append_operation(output, recovery_event(current))
+        completed: tuple[str, JournalRecovery] | None = None
+        for name, item in candidates:
+            if item.journal_kind == "completed_slots":
+                completed = (name, item)
+                continue
+            current = _recover_store_journal(root_fd, name, item)
+            recovered.append(current)
+            append_operation(output, recovery_event(current))
+        if provider is not None:
+            current = provider_journal.recover_tail()
+            assert current is not None
+            recovered.append(current)
+            append_operation(output, recovery_event(current))
+        if completed is not None:
+            current = _recover_store_journal(root_fd, *completed)
+            recovered.append(current)
+            append_operation(output, recovery_event(current))
+    finally:
+        os.close(root_fd)
+    order = {
+        kind: index
+        for index, kind in enumerate(
+            ("operations", "results", "artifacts", "provider_calls", "completed_slots")
+        )
+    }
+    return tuple(sorted(recovered, key=lambda item: order[item.journal_kind]))
 
 
 def record_completed_slot(

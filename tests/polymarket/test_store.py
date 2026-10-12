@@ -31,6 +31,7 @@ from jev_trading_lab.polymarket.models import (
     ResearchBrief,
     load_strict_json,
 )
+from jev_trading_lab.polymarket.operations import JournalRecovery, load_operation_cut
 from jev_trading_lab.polymarket.store import (
     ArtifactEnvelope,
     ArtifactToFreeze,
@@ -43,6 +44,7 @@ from jev_trading_lab.polymarket.store import (
     failure_artifact_from_adapter,
     load_observation,
     record_observation,
+    recover_store_tails,
 )
 
 FIXTURE_PATH = Path(__file__).parents[1] / "fixtures/polymarket/feasibility_cycle.json"
@@ -1307,6 +1309,134 @@ def test_truncated_tail_fails_closed(
 
     with pytest.raises(StoreCorruptError, match="truncated"):
         load_observation(output, result.observation_id)
+
+
+@pytest.mark.parametrize(
+    ("journal", "kind"),
+    (("results.jsonl", "results"), ("artifacts.jsonl", "artifacts")),
+)
+def test_explicit_store_tail_recovery_is_audited_and_idempotent(
+    tmp_path: Path, cycle: dict[str, Any], journal: str, kind: str
+) -> None:
+    output = tmp_path / "output"
+    result = _result(cycle)
+    record_observation(output, result, _artifacts(cycle))
+    path = output / journal
+    durable = path.read_bytes()
+    tail = b'{"torn":'
+    original = durable + tail
+    path.write_bytes(original)
+
+    with pytest.raises(StoreCorruptError, match="truncated"):
+        load_observation(output, result.observation_id)
+    assert path.read_bytes() == original
+
+    assert recover_store_tails(output) == (JournalRecovery(kind, len(tail)),)
+    assert path.read_bytes() == durable
+    assert recover_store_tails(output) == ()
+    events = load_operation_cut(output).events
+    recoveries = [event for event in events if event.kind.value == "recovery"]
+    assert len(recoveries) == 1
+    assert recoveries[0].journal_kind == kind
+    assert recoveries[0].exact_values == {"discarded_bytes": len(tail)}
+    assert recoveries[0].reason == "partial_tail"
+
+
+def test_completed_slot_tail_recovery_validates_conflicts_before_mutation(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir(mode=0o700)
+    journal = output / "completed_slots.jsonl"
+    first = canonical_json_bytes(
+        {
+            "cutoff_at": "2026-10-12T12:00:00Z",
+            "limit": 1,
+            "observation_ids": ["a" * 64],
+            "policy_version": "v1",
+        }
+    )
+    conflict = canonical_json_bytes(
+        {
+            "cutoff_at": "2026-10-12T12:00:00Z",
+            "limit": 1,
+            "observation_ids": ["b" * 64],
+            "policy_version": "v1",
+        }
+    )
+    original = first + b"\n" + conflict + b"\npartial"
+    journal.write_bytes(original)
+    journal.chmod(0o600)
+
+    with pytest.raises(StoreCorruptError, match="conflicting"):
+        recover_store_tails(output)
+    assert journal.read_bytes() == original
+
+
+def test_multiple_store_tails_recover_in_deterministic_order(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    output.mkdir(mode=0o700)
+    tails = {
+        "results.jsonl": b"r",
+        "artifacts.jsonl": b"aa",
+        "completed_slots.jsonl": b"ccc",
+    }
+    for name, tail in tails.items():
+        path = output / name
+        path.write_bytes(tail)
+        path.chmod(0o600)
+
+    assert recover_store_tails(output) == (
+        JournalRecovery("results", 1),
+        JournalRecovery("artifacts", 2),
+        JournalRecovery("completed_slots", 3),
+    )
+    assert [event.journal_kind for event in load_operation_cut(output).events] == [
+        "results",
+        "artifacts",
+        "completed_slots",
+    ]
+
+
+def test_recovery_with_no_tails_does_not_touch_unrelated_files(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    output.mkdir(mode=0o700)
+    sentinel = output / "sentinel"
+    sentinel.write_bytes(b"unchanged")
+    before = {
+        path.name: (path.stat().st_mtime_ns, path.read_bytes())
+        for path in output.iterdir()
+    }
+
+    assert recover_store_tails(output) == ()
+
+    after = {
+        path.name: (path.stat().st_mtime_ns, path.read_bytes())
+        for path in output.iterdir()
+    }
+    assert after == before
+
+
+def test_cross_journal_corruption_is_fatal_before_any_tail_mutation(
+    tmp_path: Path, cycle: dict[str, Any]
+) -> None:
+    output = tmp_path / "output"
+    result = _result(cycle)
+    record_observation(output, result, _artifacts(cycle))
+    results = output / "results.jsonl"
+    artifacts = output / "artifacts.jsonl"
+    results_original = results.read_bytes() + b"partial"
+    results.write_bytes(results_original)
+    artifact_lines = artifacts.read_bytes().splitlines()
+    artifact_lines.pop(4)
+    artifacts_original = b"\n".join(artifact_lines) + b"\n"
+    artifacts.write_bytes(artifacts_original)
+
+    with pytest.raises(StoreCorruptError, match="incomplete|path"):
+        recover_store_tails(output)
+
+    assert results.read_bytes() == results_original
+    assert artifacts.read_bytes() == artifacts_original
 
 
 def test_duplicate_keys_and_duplicate_ids_fail_closed(
