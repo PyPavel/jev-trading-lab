@@ -8,9 +8,10 @@ import os
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Final, Literal, TypedDict, cast
+from typing import Any, Final, Literal, NotRequired, TypedDict, cast
 
 from jev_trading_lab.core.ids import canonical_json_bytes
 
@@ -44,6 +45,19 @@ class Decision(TypedDict):
     input_tokens: int | None
     output_tokens: int | None
     cost_microdollars: int | None
+    source_provenance: NotRequired[str]
+
+
+_OPENAI_DECISION_SCHEMA: Final = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": ["BUY", "HOLD"]},
+        "symbol": {"type": ["string", "null"], "enum": [*DEFAULT_SYMBOLS, None]},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+    "required": ["action", "symbol", "confidence"],
+    "additionalProperties": False,
+}
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -217,7 +231,20 @@ def _provider_decision(
     )
     if arm == "openai":
         url = "https://api.openai.com/v1/responses"
-        body = canonical_json_bytes({"model": _OPENAI_MODEL, "input": prompt})
+        body = canonical_json_bytes(
+            {
+                "model": _OPENAI_MODEL,
+                "input": prompt,
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "stock_decision",
+                        "strict": True,
+                        "schema": _OPENAI_DECISION_SCHEMA,
+                    }
+                },
+            }
+        )
     else:
         url = "https://api.typesafe.ai/v1/systemone"
         body = canonical_json_bytes(
@@ -257,8 +284,25 @@ def _provider_decision(
         envelope = json.loads(raw)
         usage = envelope.get("usage", {})
         if arm == "openai":
-            text = envelope["output"][0]["content"][0]["text"]
-            answer = json.loads(text)
+            messages = [
+                item
+                for item in envelope["output"]
+                if isinstance(item, dict)
+                and item.get("type") == "message"
+                and item.get("status") == "completed"
+            ]
+            if len(messages) != 1:
+                raise ValueError("provider response must contain one completed message")
+            output_texts = [
+                content["text"]
+                for content in messages[0].get("content", [])
+                if isinstance(content, dict) and content.get("type") == "output_text"
+            ]
+            if len(output_texts) != 1 or not isinstance(output_texts[0], str):
+                raise ValueError(
+                    "provider response must contain one completed output text"
+                )
+            answer = json.loads(output_texts[0])
         else:
             answers = envelope["answers"]
             answer = {
@@ -314,6 +358,59 @@ def _provider_decision(
         }
 
 
+def _validate_fixture_decision(
+    arm: Literal["openai", "jev"], value: object, symbols: set[str]
+) -> Decision:
+    if not isinstance(value, dict):
+        raise ValueError("stock fixture decision is invalid")
+    expected_model = _OPENAI_MODEL if arm == "openai" else _JEV_MODEL
+    action = value.get("action")
+    symbol = value.get("symbol")
+    called = value.get("called")
+    status = value.get("status")
+    numeric_fields = (
+        value.get("latency_ms"),
+        value.get("input_tokens"),
+        value.get("output_tokens"),
+        value.get("cost_microdollars"),
+    )
+    valid_numbers = all(
+        item is None or (type(item) is int and item >= 0) for item in numeric_fields
+    )
+    valid_action = (
+        action in {"BUY", "HOLD"}
+        and symbol in {None, *symbols}
+        and (action == "BUY") == (symbol is not None)
+    )
+    confidence = value.get("confidence_micros")
+    synthetic = (
+        called is False
+        and status == "synthetic_replay"
+        and value.get("latency_ms") == 0
+        and all(
+            value.get(field) is None
+            for field in ("input_tokens", "output_tokens", "cost_microdollars")
+        )
+    )
+    captured = (
+        called is True
+        and status in {"success", "provider_failure"}
+        and isinstance(value.get("source_provenance"), str)
+        and bool(value["source_provenance"])
+    )
+    if (
+        value.get("provider") != arm
+        or value.get("model") != expected_model
+        or not valid_action
+        or type(confidence) is not int
+        or not 0 <= confidence <= 1_000_000
+        or not valid_numbers
+        or not (synthetic or captured)
+    ):
+        raise ValueError("stock fixture decision is invalid")
+    return cast(Decision, value)
+
+
 def _control(quotes: list[Quote]) -> Decision:
     winner = max(
         quotes, key=lambda quote: quote["price_micros"] / quote["previous_close_micros"]
@@ -345,6 +442,7 @@ def _row(
     arm: str,
     decision: Decision,
     cycle_duration_ms: int,
+    source_mode: str = "live_public",
 ) -> dict[str, object]:
     quote = next(
         (item for item in quotes if item["symbol"] == decision["symbol"]), None
@@ -361,16 +459,23 @@ def _row(
     liquidation = quote["price_micros"] * 9_995 // 10_000 if quote is not None else 0
     position_value = liquidation * quantity
     unrealized = position_value - notional
+    trading_equity = cash + position_value
+    trading_pnl = trading_equity - _STARTING_CASH
+    cost_unknown = decision["called"] and decision["cost_microdollars"] is None
+    provider_cost = decision["cost_microdollars"] or 0
+    economic_equity = None if cost_unknown else trading_equity - provider_cost
+    economic_pnl = None if economic_equity is None else economic_equity - _STARTING_CASH
     terminal = (
         "completed"
-        if decision["status"] in {"success", "not_applicable"}
+        if decision["status"] in {"success", "not_applicable", "synthetic_replay"}
         and decision["action"] == "BUY"
         else "abstained"
-        if decision["status"] in {"success", "not_applicable"}
+        if decision["status"] in {"success", "not_applicable", "synthetic_replay"}
         else "failed"
     )
     return {
         "schema_version": 1,
+        "source_mode": source_mode,
         "observation_id": observation_id,
         "observed_at": observed_at,
         "snapshot_sha256": snapshot_sha256,
@@ -397,9 +502,15 @@ def _row(
         "cash_microdollars": cash,
         "position_quantity": quantity,
         "position_value_microdollars": position_value,
-        "equity_microdollars": cash + position_value,
+        "equity_microdollars": trading_equity,
+        "trading_equity_microdollars": trading_equity,
         "realized_pnl_microdollars": 0,
         "unrealized_pnl_microdollars": unrealized,
+        "trading_pnl_microdollars": trading_pnl,
+        "provider_cost_microdollars": decision["cost_microdollars"],
+        "economic_cost_unknown": cost_unknown,
+        "economic_equity_microdollars": economic_equity,
+        "economic_pnl_microdollars": economic_pnl,
         "failure": None if terminal != "failed" else decision["status"],
         "abstention": terminal == "abstained",
         "terminal_status": terminal,
@@ -420,37 +531,195 @@ def _append_rows(path: Path, rows: list[dict[str, object]]) -> None:
         os.close(descriptor)
 
 
+def _metric(name: str, labels: Mapping[str, object], value: object) -> str:
+    label_text = ",".join(f'{key}="{item}"' for key, item in labels.items())
+    return f"{name}{{{label_text}}} {value}"
+
+
 def _write_metrics(path: Path, rows: list[dict[str, object]]) -> None:
-    lines = [
-        "# HELP jev_stocks_terminal Terminal stock paper observations.",
-        "# TYPE jev_stocks_terminal gauge",
-        "# HELP jev_stocks_equity_microdollars Paper equity by arm.",
-        "# TYPE jev_stocks_equity_microdollars gauge",
-        "# HELP jev_stocks_cycle_duration_milliseconds Observation cycle duration.",
-        "# TYPE jev_stocks_cycle_duration_milliseconds gauge",
-        "# HELP jev_stocks_failures Terminal failures by arm.",
-        "# TYPE jev_stocks_failures gauge",
-        "# HELP jev_stocks_abstentions Terminal abstentions by arm.",
-        "# TYPE jev_stocks_abstentions gauge",
-    ]
+    lines = ["# Stock paper metrics derived from terminal JSONL rows."]
+    market_data = cast(dict[str, object], rows[0]["market_data"])
+    market_provider = str(market_data["provider"])
+    quotes = cast(list[Quote], market_data["quotes"])
+    market_status = str(market_data.get("request_status", "success"))
+    market_labels = {"provider": market_provider, "status": market_status}
+    lines.append(
+        _metric(
+            "jev_stocks_market_data_requests_total",
+            market_labels,
+            market_data["request_count"],
+        )
+    )
+    labels = {"provider": market_provider}
+    if quotes:
+        lines.extend(
+            [
+                _metric(
+                    "jev_stocks_market_data_request_latency_milliseconds",
+                    labels,
+                    max(quote["request_latency_ms"] for quote in quotes),
+                ),
+                _metric(
+                    "jev_stocks_market_data_age_seconds",
+                    labels,
+                    max(quote["age_seconds"] for quote in quotes),
+                ),
+            ]
+        )
+    elif "request_latency_ms" in market_data:
+        lines.append(
+            _metric(
+                "jev_stocks_market_data_request_latency_milliseconds",
+                labels,
+                market_data["request_latency_ms"],
+            )
+        )
+
+    cycle_status = (
+        "failure" if any(row["arm"] == "cycle" for row in rows) else "success"
+    )
+    lines.append(_metric("jev_stocks_cycle_status", {"status": cycle_status}, 1))
     for row in sorted(rows, key=lambda item: str(item["arm"])):
-        arm = row["arm"]
-        status = row["terminal_status"]
+        arm = str(row["arm"])
+        labels = {"arm": arm}
+        terminal_status = str(row["terminal_status"])
         process = cast(dict[str, int], row["process"])
         lines.extend(
             [
-                f'jev_stocks_terminal{{arm="{arm}",status="{status}"}} 1',
-                "jev_stocks_equity_microdollars"
-                f'{{arm="{arm}"}} {row["equity_microdollars"]}',
-                "jev_stocks_cycle_duration_milliseconds"
-                f'{{arm="{arm}"}} {process["cycle_duration_ms"]}',
-                f'jev_stocks_failures{{arm="{arm}"}} {int(status == "failed")}',
-                f'jev_stocks_abstentions{{arm="{arm}"}} {int(status == "abstained")}',
+                _metric(
+                    "jev_stocks_failures_total",
+                    labels,
+                    int(terminal_status == "failed"),
+                ),
+                _metric(
+                    "jev_stocks_abstentions_total",
+                    labels,
+                    int(terminal_status == "abstained"),
+                ),
+                _metric(
+                    "jev_stocks_cycle_duration_milliseconds",
+                    labels,
+                    process["cycle_duration_ms"],
+                ),
             ]
         )
+        if arm == "cycle":
+            continue
+        provider = cast(Decision, row["provider"])
+        provider_labels = {
+            "provider": provider["provider"],
+            "model": provider["model"],
+        }
+        status_labels = {**provider_labels, "status": provider["status"]}
+        decision = cast(dict[str, object], row["decision"])
+        fill = cast(dict[str, object], row["fill"])
+        lines.extend(
+            [
+                _metric(
+                    "jev_stocks_provider_calls_total",
+                    provider_labels,
+                    int(provider["called"]),
+                ),
+                _metric("jev_stocks_provider_status", status_labels, 1),
+                _metric(
+                    "jev_stocks_provider_input_tokens_total",
+                    provider_labels,
+                    provider["input_tokens"] or 0,
+                ),
+                _metric(
+                    "jev_stocks_provider_output_tokens_total",
+                    provider_labels,
+                    provider["output_tokens"] or 0,
+                ),
+                _metric(
+                    "jev_stocks_provider_latency_milliseconds",
+                    provider_labels,
+                    provider["latency_ms"],
+                ),
+                _metric(
+                    "jev_stocks_provider_cost_microdollars_total",
+                    provider_labels,
+                    provider["cost_microdollars"] or 0,
+                ),
+                _metric(
+                    "jev_stocks_provider_unknown_cost",
+                    provider_labels,
+                    int(
+                        provider["called"]
+                        and provider["cost_microdollars"] is None
+                    ),
+                ),
+                _metric(
+                    "jev_stocks_decisions_total",
+                    {"arm": arm, "action": decision["action"]},
+                    1,
+                ),
+                _metric(
+                    "jev_stocks_fill_price_microdollars",
+                    labels,
+                    fill["price_microdollars"] or 0,
+                ),
+                _metric(
+                    "jev_stocks_fill_fees_microdollars",
+                    labels,
+                    fill["fees_microdollars"],
+                ),
+                _metric(
+                    "jev_stocks_fill_slippage_microdollars",
+                    labels,
+                    fill["slippage_microdollars"],
+                ),
+                _metric("jev_stocks_fill_quantity", labels, fill["quantity"]),
+                _metric(
+                    "jev_stocks_cash_microdollars", labels, row["cash_microdollars"]
+                ),
+                _metric(
+                    "jev_stocks_position_quantity", labels, row["position_quantity"]
+                ),
+                _metric(
+                    "jev_stocks_position_value_microdollars",
+                    labels,
+                    row["position_value_microdollars"],
+                ),
+                _metric(
+                    "jev_stocks_trading_equity_microdollars",
+                    labels,
+                    row["trading_equity_microdollars"],
+                ),
+                _metric(
+                    "jev_stocks_trading_pnl_microdollars",
+                    labels,
+                    row["trading_pnl_microdollars"],
+                ),
+            ]
+        )
+        if row["economic_equity_microdollars"] is not None:
+            lines.extend(
+                [
+                    _metric(
+                        "jev_stocks_economic_equity_microdollars",
+                        labels,
+                        row["economic_equity_microdollars"],
+                    ),
+                    _metric(
+                        "jev_stocks_economic_pnl_microdollars",
+                        labels,
+                        row["economic_pnl_microdollars"],
+                    ),
+                ]
+            )
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with temporary.open("w", encoding="utf-8") as stream:
+        stream.write("\n".join(lines) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
     os.replace(temporary, path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def _run(
@@ -460,6 +729,7 @@ def _run(
     decisions: dict[str, Decision],
     output_dir: Path,
     started_ns: int,
+    source_mode: str,
 ) -> dict[str, object]:
     snapshot = canonical_json_bytes({"observed_at": observed_at, "quotes": quotes})
     digest = hashlib.sha256(snapshot).hexdigest()
@@ -472,6 +742,7 @@ def _run(
             arm,
             decision,
             (time.perf_counter_ns() - started_ns) // 1_000_000,
+            source_mode,
         )
         for arm, decision in decisions.items()
     ]
@@ -503,20 +774,102 @@ def replay_fixture(fixture: Path, output_dir: Path) -> dict[str, object]:
         raise ValueError("stock fixture metadata is invalid")
     quotes = _validate_quotes(value.get("quotes"))
     typed: dict[str, Decision] = {}
+    fixture_mode = value.get("source_mode")
+    if fixture_mode not in {"captured_replay", "synthetic_replay"}:
+        raise ValueError("stock fixture source mode is invalid")
+    symbols = {quote["symbol"] for quote in quotes}
     for arm in ("openai", "jev"):
-        decision = decisions.get(arm)
-        if not isinstance(decision, dict):
+        decision = _validate_fixture_decision(arm, decisions.get(arm), symbols)
+        if fixture_mode == "synthetic_replay" and (
+            decision["called"] or decision["status"] != "synthetic_replay"
+        ):
             raise ValueError("stock fixture decision is invalid")
-        typed[arm] = cast(Decision, decision)
+        if fixture_mode == "captured_replay" and (
+            not decision["called"] or "source_provenance" not in decision
+        ):
+            raise ValueError("stock fixture decision is invalid")
+        typed[arm] = decision
     typed["deterministic"] = _control(quotes)
-    return _run(observation_id, observed_at, quotes, typed, output_dir, started)
+    return _run(
+        observation_id,
+        observed_at,
+        quotes,
+        typed,
+        output_dir,
+        started,
+        fixture_mode,
+    )
+
+
+def _market_data_failure_row(
+    observation_id: str,
+    observed_at: str,
+    request_count: int,
+    request_latency_ms: int,
+    cycle_duration_ms: int,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "source_mode": "live_public",
+        "observation_id": observation_id,
+        "observed_at": observed_at,
+        "snapshot_sha256": None,
+        "arm": "cycle",
+        "market_data": {
+            "provider": "yahoo_chart_v8",
+            "request_count": request_count,
+            "request_status": "failure",
+            "request_latency_ms": request_latency_ms,
+            "quotes": [],
+        },
+        "failure": "market_data_failure",
+        "abstention": False,
+        "terminal_status": "failed",
+        "process": {"cycle_duration_ms": cycle_duration_ms},
+    }
 
 
 def observe_public(symbols: str, output_dir: Path) -> dict[str, object]:
     """Fetch one Yahoo snapshot and make paper-only decisions; never place orders."""
     started = time.perf_counter_ns()
     selected = _symbols(symbols)
-    quotes = _validate_quotes([_fetch_quote(symbol) for symbol in selected], selected)
+    quotes: list[Quote] = []
+    request_count = 0
+    try:
+        for symbol in selected:
+            request_count += 1
+            quotes.append(_fetch_quote(symbol))
+        quotes = _validate_quotes(quotes, selected)
+    except (OSError, ValueError, urllib.error.URLError):
+        observed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        observation_id = (
+            "stocks-failed-"
+            + hashlib.sha256(
+                canonical_json_bytes(
+                    {"observed_at": observed_at, "symbols": list(selected)}
+                )
+            ).hexdigest()[:20]
+        )
+        rows = [
+            _market_data_failure_row(
+                observation_id,
+                observed_at,
+                request_count,
+                (time.perf_counter_ns() - started) // 1_000_000,
+                (time.perf_counter_ns() - started) // 1_000_000,
+            )
+        ]
+        result_path = output_dir / "results.jsonl"
+        metrics_path = output_dir / "stocks.prom"
+        _append_rows(result_path, rows)
+        _write_metrics(metrics_path, rows)
+        return {
+            "arms": {"cycle": "failed"},
+            "metrics_path": str(metrics_path),
+            "observation_id": observation_id,
+            "result_path": str(result_path),
+            "terminal_rows": 1,
+        }
     observed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     snapshot = canonical_json_bytes({"observed_at": observed_at, "quotes": quotes})
     observation_id = "stocks-" + hashlib.sha256(snapshot).hexdigest()[:20]
@@ -525,4 +878,12 @@ def observe_public(symbols: str, output_dir: Path) -> dict[str, object]:
         "jev": _provider_decision("jev", snapshot, quotes),
         "deterministic": _control(quotes),
     }
-    return _run(observation_id, observed_at, quotes, decisions, output_dir, started)
+    return _run(
+        observation_id,
+        observed_at,
+        quotes,
+        decisions,
+        output_dir,
+        started,
+        "live_public",
+    )

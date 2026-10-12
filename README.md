@@ -87,10 +87,13 @@ corresponding arm closed; the deterministic arm still reaches a terminal row:
 uv run jev-lab stocks observe --output-dir /tmp/jev-stocks-observe
 ```
 
-Both commands append one terminal JSONL row per arm and atomically replace a bounded-label
-Prometheus textfile. Every arm has separate $10,000 paper capital and simulated long-only
-fills with a deterministic 10 bps round-trip slippage assumption. No brokerage or order
-surface exists.
+Successful commands append one terminal JSONL row per arm and atomically replace a
+bounded-label Prometheus textfile. A Yahoo failure appends one cycle-failure row without
+fabricating quotes or decisions. Replay rows are explicitly synthetic unless every captured
+provider artifact has provenance. Every arm has separate $10,000 paper capital, trading and
+model-cost-adjusted economic P&L, and simulated long-only fills with a deterministic 10 bps
+round-trip slippage assumption. Unknown provider cost leaves economic P&L unknown. No
+brokerage or order surface exists.
 
 Clean-wheel migration and report-render smoke checks are deferred until those resources exist; they become mandatory release checks when introduced.
 

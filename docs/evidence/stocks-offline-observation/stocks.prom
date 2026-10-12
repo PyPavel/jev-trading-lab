@@ -1,25 +1,71 @@
-# HELP jev_stocks_terminal Terminal stock paper observations.
-# TYPE jev_stocks_terminal gauge
-# HELP jev_stocks_equity_microdollars Paper equity by arm.
-# TYPE jev_stocks_equity_microdollars gauge
-# HELP jev_stocks_cycle_duration_milliseconds Observation cycle duration.
-# TYPE jev_stocks_cycle_duration_milliseconds gauge
-# HELP jev_stocks_failures Terminal failures by arm.
-# TYPE jev_stocks_failures gauge
-# HELP jev_stocks_abstentions Terminal abstentions by arm.
-# TYPE jev_stocks_abstentions gauge
-jev_stocks_terminal{arm="deterministic",status="completed"} 1
-jev_stocks_equity_microdollars{arm="deterministic"} 9999050000
+# Stock paper metrics derived from terminal JSONL rows.
+jev_stocks_market_data_requests_total{provider="yahoo_chart_v8",status="success"} 3
+jev_stocks_market_data_request_latency_milliseconds{provider="yahoo_chart_v8"} 44
+jev_stocks_market_data_age_seconds{provider="yahoo_chart_v8"} 0
+jev_stocks_cycle_status{status="success"} 1
+jev_stocks_failures_total{arm="deterministic"} 0
+jev_stocks_abstentions_total{arm="deterministic"} 0
 jev_stocks_cycle_duration_milliseconds{arm="deterministic"} 0
-jev_stocks_failures{arm="deterministic"} 0
-jev_stocks_abstentions{arm="deterministic"} 0
-jev_stocks_terminal{arm="jev",status="abstained"} 1
-jev_stocks_equity_microdollars{arm="jev"} 10000000000
+jev_stocks_provider_calls_total{provider="deterministic",model="momentum-v1"} 0
+jev_stocks_provider_status{provider="deterministic",model="momentum-v1",status="not_applicable"} 1
+jev_stocks_provider_input_tokens_total{provider="deterministic",model="momentum-v1"} 0
+jev_stocks_provider_output_tokens_total{provider="deterministic",model="momentum-v1"} 0
+jev_stocks_provider_latency_milliseconds{provider="deterministic",model="momentum-v1"} 0
+jev_stocks_provider_cost_microdollars_total{provider="deterministic",model="momentum-v1"} 0
+jev_stocks_provider_unknown_cost{provider="deterministic",model="momentum-v1"} 0
+jev_stocks_decisions_total{arm="deterministic",action="BUY"} 1
+jev_stocks_fill_price_microdollars{arm="deterministic"} 190095000
+jev_stocks_fill_fees_microdollars{arm="deterministic"} 0
+jev_stocks_fill_slippage_microdollars{arm="deterministic"} 475000
+jev_stocks_fill_quantity{arm="deterministic"} 5
+jev_stocks_cash_microdollars{arm="deterministic"} 9049525000
+jev_stocks_position_quantity{arm="deterministic"} 5
+jev_stocks_position_value_microdollars{arm="deterministic"} 949525000
+jev_stocks_trading_equity_microdollars{arm="deterministic"} 9999050000
+jev_stocks_trading_pnl_microdollars{arm="deterministic"} -950000
+jev_stocks_economic_equity_microdollars{arm="deterministic"} 9999050000
+jev_stocks_economic_pnl_microdollars{arm="deterministic"} -950000
+jev_stocks_failures_total{arm="jev"} 0
+jev_stocks_abstentions_total{arm="jev"} 1
 jev_stocks_cycle_duration_milliseconds{arm="jev"} 0
-jev_stocks_failures{arm="jev"} 0
-jev_stocks_abstentions{arm="jev"} 1
-jev_stocks_terminal{arm="openai",status="completed"} 1
-jev_stocks_equity_microdollars{arm="openai"} 9999250000
+jev_stocks_provider_calls_total{provider="jev",model="jev-1.13.0"} 0
+jev_stocks_provider_status{provider="jev",model="jev-1.13.0",status="synthetic_replay"} 1
+jev_stocks_provider_input_tokens_total{provider="jev",model="jev-1.13.0"} 0
+jev_stocks_provider_output_tokens_total{provider="jev",model="jev-1.13.0"} 0
+jev_stocks_provider_latency_milliseconds{provider="jev",model="jev-1.13.0"} 0
+jev_stocks_provider_cost_microdollars_total{provider="jev",model="jev-1.13.0"} 0
+jev_stocks_provider_unknown_cost{provider="jev",model="jev-1.13.0"} 0
+jev_stocks_decisions_total{arm="jev",action="HOLD"} 1
+jev_stocks_fill_price_microdollars{arm="jev"} 0
+jev_stocks_fill_fees_microdollars{arm="jev"} 0
+jev_stocks_fill_slippage_microdollars{arm="jev"} 0
+jev_stocks_fill_quantity{arm="jev"} 0
+jev_stocks_cash_microdollars{arm="jev"} 10000000000
+jev_stocks_position_quantity{arm="jev"} 0
+jev_stocks_position_value_microdollars{arm="jev"} 0
+jev_stocks_trading_equity_microdollars{arm="jev"} 10000000000
+jev_stocks_trading_pnl_microdollars{arm="jev"} 0
+jev_stocks_economic_equity_microdollars{arm="jev"} 10000000000
+jev_stocks_economic_pnl_microdollars{arm="jev"} 0
+jev_stocks_failures_total{arm="openai"} 0
+jev_stocks_abstentions_total{arm="openai"} 0
 jev_stocks_cycle_duration_milliseconds{arm="openai"} 0
-jev_stocks_failures{arm="openai"} 0
-jev_stocks_abstentions{arm="openai"} 0
+jev_stocks_provider_calls_total{provider="openai",model="gpt-5-2025-08-07"} 0
+jev_stocks_provider_status{provider="openai",model="gpt-5-2025-08-07",status="synthetic_replay"} 1
+jev_stocks_provider_input_tokens_total{provider="openai",model="gpt-5-2025-08-07"} 0
+jev_stocks_provider_output_tokens_total{provider="openai",model="gpt-5-2025-08-07"} 0
+jev_stocks_provider_latency_milliseconds{provider="openai",model="gpt-5-2025-08-07"} 0
+jev_stocks_provider_cost_microdollars_total{provider="openai",model="gpt-5-2025-08-07"} 0
+jev_stocks_provider_unknown_cost{provider="openai",model="gpt-5-2025-08-07"} 0
+jev_stocks_decisions_total{arm="openai",action="BUY"} 1
+jev_stocks_fill_price_microdollars{arm="openai"} 250125000
+jev_stocks_fill_fees_microdollars{arm="openai"} 0
+jev_stocks_fill_slippage_microdollars{arm="openai"} 375000
+jev_stocks_fill_quantity{arm="openai"} 3
+jev_stocks_cash_microdollars{arm="openai"} 9249625000
+jev_stocks_position_quantity{arm="openai"} 3
+jev_stocks_position_value_microdollars{arm="openai"} 749625000
+jev_stocks_trading_equity_microdollars{arm="openai"} 9999250000
+jev_stocks_trading_pnl_microdollars{arm="openai"} -750000
+jev_stocks_economic_equity_microdollars{arm="openai"} 9999250000
+jev_stocks_economic_pnl_microdollars{arm="openai"} -750000

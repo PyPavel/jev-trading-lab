@@ -2,28 +2,28 @@
   "fixture_decisions": {
     "jev": {
       "action": "HOLD",
-      "called": true,
+      "called": false,
       "confidence_micros": 620000,
-      "cost_microdollars": 50,
-      "input_tokens": 160,
-      "latency_ms": 98,
+      "cost_microdollars": null,
+      "input_tokens": null,
+      "latency_ms": 0,
       "model": "jev-1.13.0",
-      "output_tokens": 12,
+      "output_tokens": null,
       "provider": "jev",
-      "status": "success",
+      "status": "synthetic_replay",
       "symbol": null
     },
     "openai": {
       "action": "BUY",
-      "called": true,
+      "called": false,
       "confidence_micros": 810000,
-      "cost_microdollars": 90,
-      "input_tokens": 180,
-      "latency_ms": 125,
+      "cost_microdollars": null,
+      "input_tokens": null,
+      "latency_ms": 0,
       "model": "gpt-5-2025-08-07",
-      "output_tokens": 18,
+      "output_tokens": null,
       "provider": "openai",
-      "status": "success",
+      "status": "synthetic_replay",
       "symbol": "AAPL"
     }
   },
@@ -57,5 +57,6 @@
       "symbol": "NVDA",
       "timestamp": "2026-10-09T20:00:00Z"
     }
-  ]
+  ],
+  "source_mode": "synthetic_replay"
 }
