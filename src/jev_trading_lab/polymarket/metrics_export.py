@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import secrets
 from collections import Counter
@@ -11,17 +12,15 @@ from pathlib import Path
 from typing import Literal, cast
 
 from jev_trading_lab.polymarket.ai import JEV_MODEL_ID, OPENAI_MODEL_ID, _usage_terms
+from jev_trading_lab.polymarket.call_journal import ProviderCallJournal
 from jev_trading_lab.polymarket.metrics_render import (
     Histogram,
     Sample,
     render_exposition,
 )
 from jev_trading_lab.polymarket.models import ArmResult, BookSnapshot, ObservationResult
-from jev_trading_lab.polymarket.store import (
-    FailureArtifact,
-    SuccessArtifact,
-    load_observation,
-)
+from jev_trading_lab.polymarket.operations import OperationKind, load_operation_cut
+from jev_trading_lab.polymarket.store import load_observation
 
 _USD = Decimal(1_000_000)
 _MODELS = {"openai": OPENAI_MODEL_ID, "jev": JEV_MODEL_ID}
@@ -114,12 +113,6 @@ def _arm_samples(output: Path, results: list[ObservationResult]) -> list[Sample]
             if arm.quantity and arm.payout_micros is None
         )
         initial = arms[-1].initial_cash_microdollars if arms else 0
-        resolved_value = sum(
-            arm.valuation_notional_microdollars or 0
-            for arm in arms
-            if arm.payout_micros is not None
-        )
-        cash = initial - notional - fees + resolved_value
         exposure = sum(
             arm.valuation_notional_microdollars or 0
             for arm in arms
@@ -149,9 +142,7 @@ def _arm_samples(output: Path, results: list[ObservationResult]) -> list[Sample]
             ("unrealized_pnl_usd", _usd(unrealized)),
             ("trading_pnl_usd", _usd(trading)),
             ("capital_initial_usd", _usd(initial)),
-            ("capital_cash_usd", _usd(cash)),
             ("capital_gross_exposure_usd", _usd(exposure)),
-            ("capital_equity_usd", _usd(cash + exposure)),
         ):
             samples.append(
                 Sample("jev_polymarket_" + family, _labels(arm=arm_name), value)
@@ -171,73 +162,95 @@ def _arm_samples(output: Path, results: list[ObservationResult]) -> list[Sample]
                     ),
                 )
             )
-        if all(arm.economic_pnl_microdollars is not None for arm in arms):
-            samples.append(
-                Sample(
-                    "jev_polymarket_economic_pnl_usd",
-                    _labels(arm=arm_name),
-                    _usd(sum(arm.economic_pnl_microdollars or 0 for arm in arms)),
+        if arms and all(arm.economic_pnl_microdollars is not None for arm in arms):
+            economic = sum(arm.economic_pnl_microdollars or 0 for arm in arms)
+            samples.extend(
+                (
+                    Sample(
+                        "jev_polymarket_economic_pnl_usd",
+                        _labels(arm=arm_name),
+                        _usd(economic),
+                    ),
+                    Sample(
+                        "jev_polymarket_capital_equity_usd",
+                        _labels(arm=arm_name),
+                        _usd(initial + economic),
+                    ),
                 )
             )
     return samples
 
 
-def _provider_metrics(
-    output: Path, results: list[ObservationResult]
-) -> tuple[list[Sample], list[Histogram]]:
+def _provider_metrics(output: Path) -> tuple[list[Sample], list[Histogram]]:
     samples: list[Sample] = []
     durations: dict[str, list[Decimal]] = {provider: [] for provider in _MODELS}
     calls: Counter[tuple[str, str]] = Counter()
     tokens: Counter[tuple[str, str]] = Counter()
     costs: Counter[str] = Counter()
     unknown_usage: Counter[str] = Counter()
-    for result in results:
-        replay = load_observation(output, result.observation_id)
-        for provider in _MODELS:
-            request = replay.envelopes.get(f"{provider}_request")
-            success = replay.typed_artifacts.get(f"{provider}_success_metadata")
-            failure = replay.typed_artifacts.get(f"{provider}_failure")
-            overflow = replay.typed_artifacts.get(f"{provider}_cost_overflow")
-            if request is None and failure is None:
+    unknown_cost: Counter[str] = Counter()
+    pending: Counter[str] = Counter()
+    for record in ProviderCallJournal(output).snapshot():
+        provider = cast(str, record.get("provider"))
+        if provider not in _MODELS:
+            outcome = record.get("outcome")
+            if not isinstance(outcome, dict):
                 continue
-            status = "success"
-            finished_at: datetime | None = None
-            if isinstance(success, SuccessArtifact):
-                costs[provider] += success.billed_cost_microdollars
-                finished_at = success.retrieved_at
-            elif isinstance(failure, FailureArtifact):
-                status = (
-                    "unknown_in_flight"
-                    if failure.code == "UNKNOWN_IN_FLIGHT"
-                    else "failure"
-                )
-                if failure.billed_cost_microdollars is not None:
-                    costs[provider] += failure.billed_cost_microdollars
-                finished_at = failure.retrieved_at
-            elif overflow is not None:
-                status = "cost_overflow"
-                finished_at = getattr(overflow, "retrieved_at", None)
-            calls[(provider, status)] += 1
-            response = replay.artifacts.get(f"{provider}_response_success")
-            usage = (
-                _usage_terms(response, cast(Literal["openai", "jev"], provider))
-                if response is not None
-                else None
-            )
-            if usage is None:
-                unknown_usage[provider] += 1
-            else:
-                tokens[(provider, "input")] += usage[0]
-                tokens[(provider, "cached")] += usage[1] or 0
-                tokens[(provider, "output")] += usage[2]
-            if request is not None and finished_at is not None:
-                elapsed = (finished_at - request.retrieved_at).total_seconds()
-                if elapsed >= 0:
-                    durations[provider].append(Decimal(str(elapsed)))
-    histograms: list[Histogram] = []
-    for provider, model in _MODELS.items():
-        if not any(item_provider == provider for item_provider, _status in calls):
+            provider = cast(str, outcome.get("provider", ""))
+        if provider not in _MODELS:
+            # Results omit provider because it is bound by their verified intent.
+            call_id = cast(str, record["call_id"])
+            state = ProviderCallJournal(output).state(call_id)
+            if state is None:
+                continue
+            # Recover provider from the verified request model for legacy records.
+            request = base64.b64decode(state["outcome"]["request_b64"], validate=True)
+            decoded = __import__("json").loads(request)
+            provider = "openai" if decoded.get("model") == OPENAI_MODEL_ID else "jev"
+        model = _MODELS[provider]
+        base = _labels(provider=provider, model_snapshot=model)
+        if record["kind"] == "provider_call_intent":
+            pending[provider] += 1
+            unknown_cost[provider] += 1
             continue
+        outcome = cast(dict[str, object], record["outcome"])
+        kind = outcome["type"]
+        status = "success"
+        if kind == "AdapterCostOverflow":
+            status = "cost_overflow"
+            unknown_cost[provider] += 1
+        elif kind == "AdapterFailure":
+            status = (
+                "unknown_in_flight"
+                if outcome.get("code") == "UNKNOWN_IN_FLIGHT"
+                else "failure"
+            )
+        calls[(provider, status)] += 1
+        cost = outcome.get("billed_cost_microdollars")
+        if type(cost) is int:
+            costs[provider] += cost
+        elif kind != "AdapterCostOverflow":
+            unknown_cost[provider] += 1
+        response_b64 = outcome.get("response_b64")
+        usage = None
+        if type(response_b64) is str:
+            usage = _usage_terms(
+                base64.b64decode(response_b64, validate=True),
+                cast(Literal["openai", "jev"], provider),
+            )
+        if usage is None:
+            unknown_usage[provider] += 1
+        else:
+            tokens[(provider, "input")] += usage[0]
+            tokens[(provider, "cached")] += usage[1] or 0
+            tokens[(provider, "output")] += usage[2]
+        elapsed = record.get("elapsed_nanoseconds")
+        if type(elapsed) is int:
+            durations[provider].append(Decimal(elapsed) / Decimal(1_000_000_000))
+    histograms: list[Histogram] = []
+    active = set(provider for provider, _status in calls) | set(pending)
+    for provider in sorted(active):
+        model = _MODELS[provider]
         base = _labels(provider=provider, model_snapshot=model)
         samples.append(Sample("jev_polymarket_llm_model_snapshot_active", base, 1))
         for (item_provider, status), count in calls.items():
@@ -245,14 +258,18 @@ def _provider_metrics(
                 samples.append(
                     Sample(
                         "jev_polymarket_llm_calls_total",
-                        _labels(
-                            provider=provider,
-                            model_snapshot=model,
-                            status=status,
-                        ),
+                        _labels(provider=provider, model_snapshot=model, status=status),
                         count,
                     )
                 )
+        if pending[provider]:
+            samples.append(
+                Sample(
+                    "jev_polymarket_llm_restart_recoveries_total",
+                    _labels(provider=provider, model_snapshot=model, status="pending"),
+                    pending[provider],
+                )
+            )
         samples.extend(
             (
                 Sample(
@@ -288,46 +305,54 @@ def _provider_metrics(
                     unknown_usage[provider],
                 )
             )
-        histograms.append(
-            Histogram(
-                "jev_polymarket_llm_call_duration_seconds",
-                base,
-                tuple(durations[provider]),
+        if unknown_cost[provider]:
+            samples.append(
+                Sample(
+                    "jev_polymarket_llm_unknown_cost_calls_total",
+                    base,
+                    unknown_cost[provider],
+                )
             )
-        )
+        if durations[provider]:
+            histograms.append(
+                Histogram(
+                    "jev_polymarket_llm_call_duration_seconds",
+                    base,
+                    tuple(durations[provider]),
+                )
+            )
     return samples, histograms
 
 
-def _market_metrics(
-    output: Path, results: list[ObservationResult], generated_at: datetime
-) -> tuple[list[Sample], list[Histogram]]:
+def _operation_metrics(
+    output: Path,
+) -> tuple[list[Sample], list[Histogram], datetime | None]:
     samples: list[Sample] = []
-    durations: list[Decimal] = []
-    book_ages: dict[str, list[Decimal]] = {"precheck_book": [], "execution_book": []}
-    calls: Counter[tuple[str, str]] = Counter()
-    latest_poll: datetime | None = None
-    for result in results:
-        replay = load_observation(output, result.observation_id)
-        calls[("gamma", "success")] += 1
-        latest_poll = max(latest_poll or result.cutoff_at, result.cutoff_at)
-        if (
-            "precheck_book_raw" in replay.artifacts
-            or "precheck_book" in replay.artifacts
-        ):
-            calls[("clob", "success")] += 1
-        if "execution_book" in replay.artifacts:
-            calls[("clob", "success")] += 1
-        for stage in book_ages:
-            book = replay.typed_artifacts.get(stage)
-            if book is None:
-                continue
-            retrieved = getattr(book, "response_retrieved_at", None) or getattr(
-                book, "retrieved_at"
-            )
-            age = (retrieved - getattr(book, "retrieved_at")).total_seconds()
-            if age >= 0:
-                book_ages[stage].append(Decimal(str(age)))
-    for (provider, status), count in calls.items():
+    histograms: list[Histogram] = []
+    cut = load_operation_cut(output)
+    market_calls: Counter[tuple[str, str]] = Counter()
+    market_failures: Counter[tuple[str, str]] = Counter()
+    market_durations: dict[str, list[Decimal]] = {"gamma": [], "clob": []}
+    run_counts: Counter[str] = Counter()
+    terminals = [
+        event for event in cut.events if event.kind is OperationKind.RUN_TERMINAL
+    ]
+    for event in cut.events:
+        if event.kind is OperationKind.STAGE_TERMINAL and event.provider in {
+            "gamma",
+            "clob",
+        }:
+            status = "timeout" if event.status == "timeout" else event.status
+            market_calls[(event.provider, status)] += 1
+            if status != "success" and event.reason is not None:
+                market_failures[(event.provider, event.reason)] += 1
+            if event.elapsed_nanoseconds is not None:
+                market_durations[event.provider].append(
+                    Decimal(event.elapsed_nanoseconds) / Decimal(1_000_000_000)
+                )
+        elif event.kind is OperationKind.RUN_TERMINAL:
+            run_counts[event.status] += 1
+    for (provider, status), count in market_calls.items():
         samples.append(
             Sample(
                 "jev_polymarket_market_data_calls_total",
@@ -335,39 +360,40 @@ def _market_metrics(
                 count,
             )
         )
-    if latest_poll is not None:
-        samples.extend(
-            (
-                Sample(
-                    "jev_polymarket_market_data_last_poll_timestamp_seconds",
-                    _labels(status="success"),
-                    _seconds(latest_poll),
-                ),
-                Sample(
-                    "jev_polymarket_market_data_poll_age_seconds",
-                    _labels(status="success"),
-                    Decimal(str((generated_at - latest_poll).total_seconds())),
-                ),
+    for (provider, reason), count in market_failures.items():
+        samples.append(
+            Sample(
+                "jev_polymarket_market_data_failures_total",
+                _labels(provider=provider, reason=reason),
+                count,
             )
         )
-    for stage, ages in book_ages.items():
-        if ages:
-            samples.append(
-                Sample(
-                    "jev_polymarket_market_data_latest_book_age_seconds",
-                    _labels(stage=stage),
-                    ages[-1],
+    for provider, values in market_durations.items():
+        if values:
+            histograms.append(
+                Histogram(
+                    "jev_polymarket_market_data_call_duration_seconds",
+                    _labels(provider=provider),
+                    tuple(values),
                 )
             )
-    histograms = [
-        Histogram(
-            "jev_polymarket_market_data_call_duration_seconds",
-            _labels(provider=provider),
-            tuple(durations),
+    for status, count in run_counts.items():
+        samples.append(
+            Sample("jev_polymarket_pipeline_runs_total", _labels(status=status), count)
         )
-        for provider in {provider for provider, _status in calls}
-    ]
-    return samples, histograms
+    latest = max(
+        terminals, key=lambda event: (event.occurred_at, event.event_id), default=None
+    )
+    if latest is not None and latest.elapsed_nanoseconds is not None:
+        samples.append(
+            Sample(
+                "jev_polymarket_process_last_run_runtime_seconds",
+                _labels(status=latest.status),
+                Decimal(latest.elapsed_nanoseconds) / Decimal(1_000_000_000),
+            )
+        )
+    max_timestamp = max((event.occurred_at for event in cut.events), default=None)
+    return samples, histograms, max_timestamp
 
 
 def render_paper_metrics(output_dir: str | os.PathLike[str]) -> Path:
@@ -375,10 +401,20 @@ def render_paper_metrics(output_dir: str | os.PathLike[str]) -> Path:
 
     output = Path(output_dir).absolute()
     results = _read_results(output)
-    generated_at = (
-        max(result.observed_at for result in results) if results else datetime.now(UTC)
-    )
+    operation_samples, operation_histograms, operation_max = _operation_metrics(output)
+    source_times = [result.observed_at for result in results]
+    if operation_max is not None:
+        source_times.append(operation_max)
+    generated_at = max(source_times) if source_times else datetime.now(UTC)
     samples = _arm_samples(output, results)
+    if results:
+        samples.append(
+            Sample(
+                "jev_polymarket_metrics_source_unknown_total",
+                _labels(reason="capital"),
+                1,
+            )
+        )
     terminal = Counter(_terminal(result) for result in results)
     for (status, reason), count in terminal.items():
         samples.append(
@@ -396,11 +432,6 @@ def render_paper_metrics(output_dir: str | os.PathLike[str]) -> Path:
                     _labels(status="terminal"),
                     len(results),
                 ),
-                Sample(
-                    "jev_polymarket_pipeline_runs_total",
-                    _labels(status="success"),
-                    len(results),
-                ),
                 Sample("jev_polymarket_metrics_schema_version", (), 1),
                 Sample(
                     "jev_polymarket_metrics_snapshot_generation_timestamp_seconds",
@@ -412,25 +443,12 @@ def render_paper_metrics(output_dir: str | os.PathLike[str]) -> Path:
                     (),
                     _seconds(max(result.observed_at for result in results)),
                 ),
-                Sample(
-                    "jev_polymarket_process_last_run_runtime_seconds",
-                    _labels(status="success"),
-                    Decimal(
-                        str(
-                            (
-                                max(result.observed_at for result in results)
-                                - min(result.cutoff_at for result in results)
-                            ).total_seconds()
-                        )
-                    ),
-                ),
             )
         )
-    provider_samples, provider_histograms = _provider_metrics(output, results)
-    market_samples, market_histograms = _market_metrics(output, results, generated_at)
+    samples.extend(operation_samples)
+    provider_samples, provider_histograms = _provider_metrics(output)
     samples.extend(provider_samples)
-    samples.extend(market_samples)
-    payload = render_exposition(samples, (*provider_histograms, *market_histograms))
+    payload = render_exposition(samples, (*provider_histograms, *operation_histograms))
     target = output / "polymarket.prom"
     temporary = output / f".polymarket.prom.{secrets.token_hex(16)}"
     descriptor = os.open(

@@ -134,7 +134,9 @@ def test_completed_legacy_replay_is_read_only_before_transport_or_book_access(
     assert actual == expected
     assert provider_calls == []
     assert accesses == []
-    assert _journal_tree(output) == before
+    after = _journal_tree(output)
+    for name in ("results.jsonl", "artifacts.jsonl", "completed_slots.jsonl"):
+        assert after.get(name) == before.get(name)
 
 
 @pytest.mark.parametrize("shape", ("success", "openai_failure", "jev_failure"))
@@ -197,9 +199,11 @@ def test_replay_is_offline_ordered_and_matches_recomputed_fixture(
     assert 'jev_polymarket_fill_quantity_contracts_total{arm="ai"} 500' in metrics
     assert 'jev_polymarket_fees_usd_total{arm="ai"} 5' in metrics
     assert 'jev_polymarket_slippage_usd_total{arm="ai"} 0' in metrics
-    assert 'jev_polymarket_capital_cash_usd{arm="ai"} 10224' in metrics
+    assert 'jev_polymarket_capital_cash_usd{arm="ai"}' not in metrics
     assert 'jev_polymarket_capital_gross_exposure_usd{arm="ai"} 0' in metrics
-    assert 'jev_polymarket_capital_equity_usd{arm="ai"} 10224' in metrics
+    assert 'jev_polymarket_capital_equity_usd{arm="ai"} 10223.5' in metrics
+    assert 'jev_polymarket_trading_pnl_usd{arm="ai"} 224' in metrics
+    assert 'jev_polymarket_economic_pnl_usd{arm="ai"} 223.5' in metrics
     assert 'jev_polymarket_realized_pnl_usd{arm="ai"} 224' in metrics
     assert (
         'jev_polymarket_llm_calls_total{model_snapshot="gpt-5-2025-08-07",'

@@ -154,6 +154,9 @@ class _Intent(StrictModel):
 
 class _Result(StrictModel):
     call_id: _SHA256
+    elapsed_nanoseconds: (
+        Annotated[int, Field(strict=True, ge=0, le=2**63 - 1)] | None
+    ) = None
     finished_at: datetime
     intent_sha256: _SHA256
     kind: Literal["provider_call_result"]
@@ -773,6 +776,7 @@ class ProviderCallJournal:
         *,
         outcome: dict[str, Any],
         finished_at: datetime,
+        elapsed_nanoseconds: int | None = None,
     ) -> None:
         root_fd, descriptor, states = self._locked_states(fcntl.LOCK_EX)
         try:
@@ -793,6 +797,7 @@ class ProviderCallJournal:
                 return
             value = _Result(
                 call_id=call_id,
+                elapsed_nanoseconds=elapsed_nanoseconds,
                 finished_at=finished_at,
                 intent_sha256=intent_envelope.artifact_sha256,
                 kind="provider_call_result",
@@ -830,6 +835,7 @@ class ProviderCallJournal:
             storage_relpath=envelope.storage_relpath,
             artifact_bytes=payload,
             call_id=call_id,
+            provider=intent.provider,
         )
         return document
 
@@ -838,6 +844,19 @@ class ProviderCallJournal:
         try:
             state = states.get(call_id)
             return self._state_value(call_id, state) if state is not None else None
+        finally:
+            os.close(descriptor)
+            os.close(root_fd)
+
+    def snapshot(self) -> tuple[dict[str, Any], ...]:
+        """Return every verified durable call state in canonical call-ID order."""
+
+        root_fd, descriptor, states = self._locked_states(fcntl.LOCK_SH)
+        try:
+            return tuple(
+                self._state_value(call_id, states[call_id])
+                for call_id in sorted(states)
+            )
         finally:
             os.close(descriptor)
             os.close(root_fd)

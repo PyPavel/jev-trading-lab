@@ -126,6 +126,7 @@ class HttpResponse:
 
 
 ByteTransport = Callable[[HttpRequest], HttpResponse]
+AttemptSink = Callable[[str, str, str, str | None, int], None]
 Resolver = Callable[..., list[tuple[Any, ...]]]
 _RESOLVERS = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bounded-dns")
 
@@ -1131,35 +1132,62 @@ class PolymarketClient:
     """Discover at most twenty candidates and fetch only their public YES books."""
 
     def __init__(
-        self, transport: ByteTransport, *, page_size: int = 20, max_pages: int = 3
+        self,
+        transport: ByteTransport,
+        *,
+        page_size: int = 20,
+        max_pages: int = 3,
+        attempt_sink: AttemptSink | None = None,
     ) -> None:
         if not 1 <= page_size <= 20 or not 1 <= max_pages <= 20:
             raise ValueError("page and page-count bounds must be in 1..20")
         self.transport = transport
         self.page_size = page_size
         self.max_pages = max_pages
+        self.attempt_sink = attempt_sink
+
+    def _record_attempt(
+        self,
+        provider: str,
+        stage: str,
+        status: str,
+        reason: str | None,
+        started_ns: int,
+    ) -> None:
+        if self.attempt_sink is not None:
+            self.attempt_sink(
+                provider, stage, status, reason, time.monotonic_ns() - started_ns
+            )
 
     def _get(self, url: str, *, label: str) -> tuple[bytes, object, datetime]:
+        provider = "gamma" if label == "Gamma" else "clob"
+        stage = "gamma_poll" if label == "Gamma" else "execution_book"
+        started_ns = time.monotonic_ns()
         try:
             response = self.transport(HttpRequest("GET", url))
         except TimeoutError as error:
+            self._record_attempt(provider, stage, "timeout", "timeout", started_ns)
             reason = "PRECHECK_TIMEOUT" if label == "CLOB" else "PUBLIC_DATA_TIMEOUT"
             raise PublicDataTimeout(
                 f"{label} transport timed out", reason=reason
             ) from error
         except PublicDataError:
+            self._record_attempt(provider, stage, "failure", "transport", started_ns)
             raise
         except Exception as error:
+            self._record_attempt(provider, stage, "failure", "transport", started_ns)
             raise PublicDataError(f"{label} transport failed") from error
         try:
             value = _strict_response(response, label=label)
         except PublicDataError as error:
+            self._record_attempt(provider, stage, "failure", "malformed", started_ns)
             raise PublicDataError(
                 str(error),
                 reason="MALFORMED_BOOK" if label == "CLOB" else error.reason,
                 raw_bytes=response.body,
                 retrieved_at=response.retrieved_at,
             ) from error
+        self._record_attempt(provider, stage, "success", None, started_ns)
         return response.body, value, response.retrieved_at
 
     def _precheck_attempt(
@@ -1173,11 +1201,18 @@ class PolymarketClient:
             )
 
         url = f"{CLOB_ENDPOINT}?{urlencode({'token_id': token_id})}"
+        started_ns = time.monotonic_ns()
         try:
             response = self.transport(HttpRequest("GET", url))
         except (TimeoutError, PublicDataTimeout):
+            self._record_attempt(
+                "clob", "precheck_book", "timeout", "timeout", started_ns
+            )
             return no_response("TIMEOUT")
         except Exception:
+            self._record_attempt(
+                "clob", "precheck_book", "failure", "transport", started_ns
+            )
             return no_response("TRANSPORT_ERROR")
         if (
             not isinstance(response, HttpResponse)
@@ -1188,10 +1223,31 @@ class PolymarketClient:
             or type(response.retrieved_at) is not datetime
             or response.retrieved_at.tzinfo is None
         ):
+            self._record_attempt(
+                "clob", "precheck_book", "failure", "transport", started_ns
+            )
             return no_response("TRANSPORT_ERROR")
         truncated = bool(response.oversized) or len(response.body) > MAX_PUBLIC_BYTES
         body = response.body[:MAX_PUBLIC_BYTES]
         content_type = normalize_content_type(response.headers.get("content-type"))
+        reason = derive_precheck_transport_reason(
+            status_code=response.status_code,
+            content_type=content_type,
+            truncated=truncated,
+            body=body,
+        )
+        status = "success" if reason == "OK" else "failure"
+        metric_reason = (
+            None
+            if status == "success"
+            else {
+                "HTTP_STATUS": "http_status",
+                "CONTENT_TYPE": "content_type",
+                "OVERSIZED": "oversized",
+                "MALFORMED": "malformed",
+            }.get(reason, "other")
+        )
+        self._record_attempt("clob", "precheck_book", status, metric_reason, started_ns)
         return PrecheckAttempt(
             token_id,
             attempted_at,
@@ -1200,12 +1256,7 @@ class PolymarketClient:
             response.retrieved_at.astimezone(UTC),
             body,
             truncated,
-            derive_precheck_transport_reason(
-                status_code=response.status_code,
-                content_type=content_type,
-                truncated=truncated,
-                body=body,
-            ),
+            reason,
         )
 
     def poll(

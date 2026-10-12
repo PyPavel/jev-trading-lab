@@ -5,8 +5,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import secrets
 import stat
+import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -67,6 +70,14 @@ from jev_trading_lab.polymarket.models import (
     load_strict_json,
     validate_feasibility_fixture,
 )
+from jev_trading_lab.polymarket.operations import (
+    OperationEvent,
+    OperationKind,
+    append_operation,
+    operation_event_id,
+    process_sample_exact_values,
+    sample_process,
+)
 from jev_trading_lab.polymarket.paper import (
     POLICY_VERSION,
     STARTING_CASH_MICRODOLLARS,
@@ -103,6 +114,85 @@ from jev_trading_lab.polymarket.store import (
 
 EventSink = Callable[[str], None]
 Summary = dict[str, object]
+
+
+def _operation_event(**values: object) -> OperationEvent:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "occurred_at": values.pop("occurred_at", datetime.now(UTC)),
+        "kind": values.pop("kind"),
+        "run_id": values.pop("run_id", None),
+        "semantic_id": None,
+        "stage": values.pop("stage", None),
+        "provider": values.pop("provider", None),
+        "status": values.pop("status"),
+        "reason": values.pop("reason", None),
+        "elapsed_nanoseconds": values.pop("elapsed_nanoseconds", None),
+        "exact_values": values.pop("exact_values", {}),
+        "evidence": None,
+    }
+    assert not values
+    payload["event_id"] = operation_event_id(payload)
+    return OperationEvent.model_validate(payload)
+
+
+def _run_id(kind: str, output_dir: str | os.PathLike[str]) -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "kind": kind,
+                "nonce": secrets.token_hex(16),
+                "output": str(Path(output_dir).absolute()),
+            }
+        )
+    ).hexdigest()
+
+
+def _attempt_sink(
+    output_dir: str | os.PathLike[str], run_id: str
+) -> Callable[[str, str, str, str | None, int], None]:
+    def record(
+        provider: str, stage: str, status: str, reason: str | None, elapsed: int
+    ) -> None:
+        append_operation(
+            Path(output_dir),
+            _operation_event(
+                kind=OperationKind.STAGE_TERMINAL,
+                run_id=run_id,
+                stage=stage,
+                provider=provider,
+                status=status,
+                reason=reason,
+                elapsed_nanoseconds=elapsed,
+            ),
+        )
+
+    return record
+
+
+def _finish_run(
+    output_dir: str | os.PathLike[str], run_id: str, status: str, elapsed: int
+) -> None:
+    sample = sample_process()
+    append_operation(
+        Path(output_dir),
+        _operation_event(
+            kind=OperationKind.PROCESS_SAMPLE,
+            run_id=run_id,
+            status="success",
+            exact_values=process_sample_exact_values(sample),
+        ),
+    )
+    append_operation(
+        Path(output_dir),
+        _operation_event(
+            kind=OperationKind.RUN_TERMINAL,
+            run_id=run_id,
+            status=status,
+            reason="other" if status == "failure" else None,
+            elapsed_nanoseconds=elapsed,
+        ),
+    )
 
 
 @dataclass(slots=True)
@@ -617,6 +707,7 @@ def _journaled_provider_call(
     created_at: datetime,
     invoke: Callable[[], object],
     event_sink: EventSink | None,
+    unknown_on_transport_failure: bool = True,
 ) -> object:
     existing = journal.lookup(opportunity_id, provider)  # type: ignore[arg-type]
     if existing is not None:
@@ -638,16 +729,24 @@ def _journaled_provider_call(
     )
     if event_sink is not None:
         event_sink(f"{provider}_intent_frozen")
+    started_ns = time.monotonic_ns()
     result = invoke()
-    if isinstance(result, AdapterFailure) and result.code in {
-        "TIMEOUT",
-        "PROVIDER_ERROR",
-    }:
+    elapsed_nanoseconds = time.monotonic_ns() - started_ns
+    if (
+        unknown_on_transport_failure
+        and isinstance(result, AdapterFailure)
+        and result.code
+        in {
+            "TIMEOUT",
+            "PROVIDER_ERROR",
+        }
+    ):
         result = _unknown_provider_result(provider, result.request_bytes)
     journal.finish(
         call_id,
         outcome=adapter_outcome(result),
         finished_at=getattr(result, "retrieved_at", None) or datetime.now(UTC),
+        elapsed_nanoseconds=elapsed_nanoseconds,
     )
     if event_sink is not None:
         event_sink(f"{provider}_result_frozen")
@@ -1333,6 +1432,7 @@ def _observe_markets(
     jev_transport: Transport | None = None,
     now: datetime | None = None,
     event_sink: EventSink | None = None,
+    _lock_held: bool = False,
 ) -> list[Summary]:
     """Run one bounded, paper-only public polling pass.
 
@@ -1348,7 +1448,7 @@ def _observe_markets(
     if not 1 <= limit <= 20:
         raise ValueError("limit must be in 1..20")
     config = _runtime_config_bytes()
-    with observation_lock(output_dir):
+    with nullcontext() if _lock_held else observation_lock(output_dir):
         slot = observation_slot(now or datetime.now(UTC))
         completed = load_completed_slot(
             output_dir, cutoff=slot, policy_version=POLICY_VERSION, limit=limit
@@ -1963,11 +2063,28 @@ def _replay_fixture(
         )
         freeze_observation_artifacts(output_dir, identity, _chain(identity, prefix))
 
-    openai = call_openai(
-        evidence_model,
-        OPENAI_MODEL_ID,
-        _publishing_transport(openai_base_transport, publish_openai_request),
-    )
+    if OPENAI_MODEL_ID == "gpt-5-2025-08-07":
+        publish_openai_request(openai_request)
+        openai = _journaled_provider_call(
+            journal=ProviderCallJournal(output_dir),
+            provider="openai",
+            opportunity_id=identity.opportunity_id,
+            request_bytes=openai_request,
+            created_at=chronology.openai_request_at,
+            invoke=lambda: call_openai(
+                evidence_model,
+                OPENAI_MODEL_ID,
+                openai_base_transport,
+            ),
+            event_sink=None,
+            unknown_on_transport_failure=False,
+        )
+    else:
+        openai = call_openai(
+            evidence_model,
+            OPENAI_MODEL_ID,
+            _publishing_transport(openai_base_transport, publish_openai_request),
+        )
     if isinstance(openai, AdapterCostOverflow):
         raise ValueError("fixture replay cannot record a billing overflow")
     if isinstance(openai, AdapterFailure):
@@ -2071,12 +2188,30 @@ def _replay_fixture(
         )
         freeze_observation_artifacts(output_dir, identity, _chain(identity, prefix))
 
-    jev = call_jev(
-        openai.brief,
-        evidence_model,
-        JEV_MODEL_ID,
-        _publishing_transport(jev_base_transport, publish_jev_request),
-    )
+    if JEV_MODEL_ID == "jev-1.13.0":
+        publish_jev_request(jev_request)
+        jev = _journaled_provider_call(
+            journal=ProviderCallJournal(output_dir),
+            provider="jev",
+            opportunity_id=identity.opportunity_id,
+            request_bytes=jev_request,
+            created_at=chronology.jev_request_at,
+            invoke=lambda: call_jev(
+                openai.brief,
+                evidence_model,
+                JEV_MODEL_ID,
+                jev_base_transport,
+            ),
+            event_sink=None,
+            unknown_on_transport_failure=False,
+        )
+    else:
+        jev = call_jev(
+            openai.brief,
+            evidence_model,
+            JEV_MODEL_ID,
+            _publishing_transport(jev_base_transport, publish_jev_request),
+        )
     if isinstance(jev, AdapterCostOverflow):
         raise ValueError("fixture replay cannot record a billing overflow")
     if isinstance(jev, AdapterFailure):
@@ -2220,21 +2355,40 @@ def observe_markets(
     now: datetime | None = None,
     event_sink: EventSink | None = None,
 ) -> list[Summary]:
-    """Run one paper pass and refresh metrics from committed results."""
+    """Run one audited paper pass and publish metrics under the observation lock."""
 
     from jev_trading_lab.polymarket.metrics_export import render_paper_metrics
 
-    summaries = _observe_markets(
-        limit=limit,
-        output_dir=output_dir,
-        client=client,
-        openai_transport=openai_transport,
-        jev_transport=jev_transport,
-        now=now,
-        event_sink=event_sink,
-    )
-    render_paper_metrics(output_dir)
-    return summaries
+    _runtime_config_bytes()
+    with observation_lock(output_dir):
+        run_id = _run_id("observe", output_dir)
+        append_operation(
+            Path(output_dir),
+            _operation_event(
+                kind=OperationKind.RUN_STARTED, run_id=run_id, status="started"
+            ),
+        )
+        started_ns = time.monotonic_ns()
+        public = client or PolymarketClient(SecureHttpTransport())
+        public.attempt_sink = _attempt_sink(output_dir, run_id)
+        try:
+            summaries = _observe_markets(
+                limit=limit,
+                output_dir=output_dir,
+                client=public,
+                openai_transport=openai_transport,
+                jev_transport=jev_transport,
+                now=now,
+                event_sink=event_sink,
+                _lock_held=True,
+            )
+        except BaseException:
+            _finish_run(output_dir, run_id, "failure", time.monotonic_ns() - started_ns)
+            render_paper_metrics(output_dir)
+            raise
+        _finish_run(output_dir, run_id, "success", time.monotonic_ns() - started_ns)
+        render_paper_metrics(output_dir)
+        return summaries
 
 
 def replay_fixture(
@@ -2245,16 +2399,31 @@ def replay_fixture(
     openai_transport: Transport | None = None,
     jev_transport: Transport | None = None,
 ) -> Summary:
-    """Replay one fixture and refresh metrics from committed results."""
+    """Replay one fixture and publish after its durable audited terminal event."""
 
     from jev_trading_lab.polymarket.metrics_export import render_paper_metrics
 
-    summary = _replay_fixture(
-        fixture_path,
-        output_dir,
-        event_sink=event_sink,
-        openai_transport=openai_transport,
-        jev_transport=jev_transport,
-    )
-    render_paper_metrics(output_dir)
-    return summary
+    with observation_lock(output_dir):
+        run_id = _run_id("replay", output_dir)
+        append_operation(
+            Path(output_dir),
+            _operation_event(
+                kind=OperationKind.RUN_STARTED, run_id=run_id, status="started"
+            ),
+        )
+        started_ns = time.monotonic_ns()
+        try:
+            summary = _replay_fixture(
+                fixture_path,
+                output_dir,
+                event_sink=event_sink,
+                openai_transport=openai_transport,
+                jev_transport=jev_transport,
+            )
+        except BaseException:
+            _finish_run(output_dir, run_id, "failure", time.monotonic_ns() - started_ns)
+            render_paper_metrics(output_dir)
+            raise
+        _finish_run(output_dir, run_id, "replayed", time.monotonic_ns() - started_ns)
+        render_paper_metrics(output_dir)
+        return summary
