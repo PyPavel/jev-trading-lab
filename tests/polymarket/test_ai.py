@@ -2224,7 +2224,17 @@ def test_provider_scanner_rejects_versioned_generic_credential_mapping_keys(
     tuple(
         f"{name}{suffix}"
         for name in ("key", "auth", "token", "secret", "proxyAuth")
-        for suffix in ("2", "V2", "_v２", "-2026", "V2_v3")
+        for suffix in (
+            "2",
+            "V2",
+            "_v２",
+            "-2026",
+            "V2_v3",
+            "Version2",
+            "_version_２",
+            "Version2-v3",
+            "_v2-Version_3",
+        )
     ),
 )
 def test_provider_scanner_fuzzes_bounded_generic_key_version_forms(
@@ -2235,12 +2245,90 @@ def test_provider_scanner_fuzzes_bounded_generic_key_version_forms(
 
 @pytest.mark.parametrize(
     "credential_key",
-    ("monkey", "keyframe", "tokenization", "secretariat", "authoritative"),
+    (
+        "monkey",
+        "keyframe",
+        "tokenization",
+        "secretariat",
+        "authoritative",
+        "keyVersion",
+        "tokenVersionTwo",
+        "secret_version_beta",
+        "passwordVersioned2",
+        "apiKeyVersion2suffix",
+    ),
 )
 def test_provider_scanner_accepts_harmless_mapping_key_near_misses(
     credential_key: str,
 ) -> None:
     assert not _contains_credentials({credential_key: "ordinary metadata"}, ())
+
+
+@pytest.mark.parametrize("provider", ("openai", "jev"))
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "token value is ARBITRARY秘密$VALUE",
+        "secret credential equals ARBITRARY秘密$VALUE",
+        "key value was ARBITRARY秘密$VALUE",
+        "auth credential is ARBITRARY秘密$VALUE",
+        "ｔｏｋｅｎ—ｖａｌｕｅ：ARBITRARY秘密$VALUE",
+        "secret💥credential／ARBITRARY秘密$VALUE",
+        "keyVersion2 value = ARBITRARY秘密$VALUE",
+        "auth_version_２ credential：ARBITRARY秘密$VALUE",
+        "token is unavailable",
+        "key value was required",
+    ),
+)
+def test_provider_optional_qualifier_assignments_are_typed_reflections(
+    cycle: dict[str, Any],
+    evidence: EvidencePacket,
+    brief: ResearchBrief,
+    provider: str,
+    phrase: str,
+) -> None:
+    response = (
+        _official_openai_response(cycle) if provider == "openai" else _jev_body(cycle)
+    )
+    response["nested_safe_field"] = {"message": phrase}
+    body = _wire_json(response).replace(b"ARBITRARY", b"\\u0041RBITRARY")
+
+    result = _call(provider, cycle, evidence, brief, FixtureTransport(body))
+
+    assert isinstance(result, AdapterFailure)
+    assert result.code == "CREDENTIAL_REFLECTION"
+    assert result.response_sha256 == hashlib.sha256(body).hexdigest()
+    assert result.response_byte_length == len(body)
+    assert not hasattr(result, "response_bytes")
+    assert "ARBITRARY秘密$VALUE" not in repr(result)
+
+
+@pytest.mark.parametrize(
+    "prose",
+    (
+        "token value remains unavailable",
+        "secret credentialing is documented",
+        "key valuable was auctioned",
+        "auth credentials are required",
+    ),
+)
+def test_provider_optional_qualifier_near_misses_remain_safe(prose: str) -> None:
+    assert not _contains_credentials({"missing_evidence": [prose]}, ())
+
+
+@settings(max_examples=40, deadline=None)
+@given(
+    st.sampled_from(("token", "secret", "key", "auth")),
+    st.sampled_from(("value", "credential")),
+    st.sampled_from(("is", "was", "equals", ":", "=")),
+    st.sampled_from((" ", "—", "💥", "／", "：")),
+    st.from_regex(r"[A-Za-z][A-Za-z0-9_$-]{7,24}", fullmatch=True),
+)
+def test_provider_qualified_assignment_fuzz_rejects_arbitrary_separators(
+    name: str, qualifier: str, connector: str, separator: str, secret: str
+) -> None:
+    phrase = separator.join((name, qualifier, connector, secret))
+    assert _contains_credentials({"outer": [f'prefix {{"message":"{phrase}"}}']}, ())
 
 
 @pytest.mark.parametrize(
@@ -2255,6 +2343,10 @@ def test_provider_scanner_accepts_harmless_mapping_key_near_misses(
         "proxy authorization V3 equals arbitrary",
         "prefix token\\u003darbitrary suffix",
         'prefix {"outer":"secret：arbitrary"} suffix',
+        "token is unavailable",
+        "secret credential equals documented",
+        "key value was required",
+        "auth credential is optional",
     ),
 )
 def test_provider_scanner_rejects_generic_credential_assignments(prose: str) -> None:
@@ -2279,7 +2371,6 @@ def test_provider_scanner_rejects_assignments_inside_mapping_keys(
         "tokenization improves search",
         "the secretariat met today",
         "authoritative sources agree",
-        "the token is unavailable",
     ),
 )
 def test_provider_scanner_accepts_harmless_generic_prose_near_misses(

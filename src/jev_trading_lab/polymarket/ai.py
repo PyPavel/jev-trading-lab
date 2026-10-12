@@ -22,6 +22,8 @@ from pydantic import ValidationError
 from jev_trading_lab.core.ids import canonical_json_bytes
 from jev_trading_lab.persistence.blobs import is_credential_name
 from jev_trading_lab.polymarket.client import (
+    _credential_assignment_matches,
+    _credential_compact,
     contains_credential_semantics,
     contains_public_credential_semantics,
     is_safe_global_ip,
@@ -775,34 +777,13 @@ _PROVIDER_GENERIC_CREDENTIAL_NAMES = frozenset(
     }
 )
 _PROVIDER_CREDENTIAL_COMPACT_NAMES = _PROVIDER_GENERIC_CREDENTIAL_NAMES | frozenset(
-    {"setcookie", "xapikey"}
+    {"apikey", "setcookie", "xapikey"}
 )
-_PROVIDER_HARMLESS_ASSIGNMENT_VALUES = frozenset(
-    {
-        "available",
-        "configured",
-        "documented",
-        "needed",
-        "optional",
-        "required",
-        "stored",
-        "unavailable",
-        "used",
-    }
-)
-_PROVIDER_ASSIGNMENT_CONNECTORS = frozenset({"equals", "is", "was"})
 _PROVIDER_NAME_WORD = re.compile(r"\w+")
-_PROVIDER_VERSION_SUFFIX = re.compile(r"v?\d+$")
 
 
 def _provider_credential_compact(value: str) -> str:
-    normalized = unicodedata.normalize("NFKC", value)
-    compact = "".join(
-        character for character in normalized.casefold() if character.isalnum()
-    )
-    while match := _PROVIDER_VERSION_SUFFIX.search(compact):
-        compact = compact[: match.start()]
-    return compact
+    return _credential_compact(value)
 
 
 def _provider_credential_key(value: str) -> bool:
@@ -836,27 +817,14 @@ def _provider_credential_phrase_spans(value: str) -> list[tuple[int, int, str]]:
 
 
 def _contains_generic_provider_assignment(value: str) -> bool:
-    """Detect generic credential assignments without broadening public prose policy."""
+    """Detect generic credential assignments under the fail-closed provider policy."""
 
-    for _start, end, compact in _provider_credential_phrase_spans(value):
-        if compact not in _PROVIDER_GENERIC_CREDENTIAL_NAMES:
-            continue
-        following = list(_PROVIDER_NAME_WORD.finditer(value, end))
-        if not following:
-            continue
-        next_word = following[0]
-        separator = value[end : next_word.start()]
-        candidate = next_word.group(0).casefold()
-        if candidate in _PROVIDER_ASSIGNMENT_CONNECTORS:
-            values = list(_PROVIDER_NAME_WORD.finditer(value, next_word.end()))
-            if not values:
-                continue
-            assigned = values[0].group(0).casefold()
-            if assigned not in _PROVIDER_HARMLESS_ASSIGNMENT_VALUES:
-                return True
-        elif separator and any(not character.isspace() for character in separator):
-            return True
-    return False
+    spans = [
+        (start, end)
+        for start, end, compact in _provider_credential_phrase_spans(value)
+        if compact in _PROVIDER_GENERIC_CREDENTIAL_NAMES
+    ]
+    return bool(_credential_assignment_matches(value, spans))
 
 
 def _contains_provider_credential_phrase(value: str) -> bool:
@@ -931,9 +899,9 @@ def build_openai_request(evidence: EvidencePacket, model: str) -> bytes:
         raise TypeError("OpenAI request requires an EvidencePacket")
     _require_model(model, OPENAI_MODEL_ID, "OpenAI")
     evidence_value = evidence.model_dump(mode="json")
+    _reject_forbidden_names(evidence_value, label="OpenAI evidence")
     if contains_public_credential_semantics(evidence_value):
         raise ValueError("OpenAI evidence contains residual credential semantics")
-    _reject_forbidden_names(evidence_value, label="OpenAI evidence")
     _reject_delimiters(evidence_value)
     evidence_input = (
         _OPENAI_DELIMITERS[0]

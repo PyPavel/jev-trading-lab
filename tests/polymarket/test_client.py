@@ -747,6 +747,36 @@ _HOSTILE_VALUES = st.one_of(_JSON, st.sampled_from(_HOSTILE_STRINGS))
             "The [REDACTED].",
         ),
         (
+            "The bearer_tokenVersion2 credential was VersionWordSecret.",
+            "VersionWordSecret",
+            "The [REDACTED].",
+        ),
+        (
+            "The apiKey_version_2-v3 equals VersionChainSecret.",
+            "VersionChainSecret",
+            "The [REDACTED].",
+        ),
+        (
+            "token value is GenericTokenSecret.",
+            "GenericTokenSecret",
+            "[REDACTED].",
+        ),
+        (
+            "secret credential equals GenericSecretValue.",
+            "GenericSecretValue",
+            "[REDACTED].",
+        ),
+        (
+            "key—value：GenericKeyValue.",
+            "GenericKeyValue",
+            "[REDACTED].",
+        ),
+        (
+            "auth💥credential／GenericAuthValue.",
+            "GenericAuthValue",
+            "[REDACTED].",
+        ),
+        (
             "The API key is 'AlphabeticSecret' in the report.",
             "AlphabeticSecret",
             "The [REDACTED] in the report.",
@@ -811,6 +841,12 @@ def test_gamma_credential_assignment_redacts_semantic_variants(
         "The client secret is configured for client setup.",
         "The session token value was needed during setup.",
         "The bearer token was unavailable during maintenance.",
+        "The token is unavailable.",
+        "Key value was required for setup.",
+        "Secret credential equals documented in the guide.",
+        "Auth credential is optional for clients.",
+        "The token value remains unavailable.",
+        "The secret credentialing is documented.",
     ),
 )
 def test_gamma_credential_assignment_preserves_harmless_near_misses(

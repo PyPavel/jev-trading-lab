@@ -89,7 +89,12 @@ def test_sanitized_artifact_screen_rejects_residual_credential_semantics(
     (
         b'{"metadata":{"keyV2":"arbitrary"}}',
         '{"metadata":{"AUTH_v２":"arbitrary"}}'.encode(),
+        b'{"metadata":{"keyVersion2":"arbitrary"}}',
+        b'{"metadata":{"apiKeyVersion2":"arbitrary"}}',
         b'{"message":"token=arbitrary"}',
+        b'{"message":"token value is arbitrary"}',
+        b'{"message":"secret credential equals arbitrary"}',
+        '{"message":"auth💥credential／arbitrary"}'.encode(),
         '{"message":"auth💥arbitrary"}'.encode(),
         b'{"message":"prefix {\\"secret\\":\\"arbitrary\\"} suffix"}',
     ),
@@ -106,7 +111,7 @@ def test_provider_output_artifact_screen_rejects_strict_credentials(
     (
         b'{"metadata":{"monkey":"ordinary"}}',
         b'{"message":"keyframe animation uses tokenization"}',
-        b'{"message":"the token is unavailable"}',
+        b'{"message":"the tokenization is unavailable"}',
     ),
 )
 def test_provider_output_artifact_screen_accepts_harmless_near_misses(

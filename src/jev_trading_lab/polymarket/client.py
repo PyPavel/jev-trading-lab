@@ -597,8 +597,66 @@ _PUBLIC_HARMLESS_PREDICATES = frozenset(
 )
 _PUBLIC_MAX_CREDENTIAL_WORDS = 4
 _PUBLIC_MAX_CREDENTIAL_NAME_CHARS = 256
-_PUBLIC_GENERIC_CREDENTIAL_WORDS = frozenset({"key", "secret", "token"})
+_PUBLIC_GENERIC_CREDENTIAL_WORDS = frozenset({"auth", "key", "secret", "token"})
 _PUBLIC_HARMLESS_PREFIXES = frozenset({"", "a", "an", "the"})
+_CREDENTIAL_ASSIGNMENT_QUALIFIERS = frozenset({"credential", "value"})
+_CREDENTIAL_ASSIGNMENT_CONNECTORS = frozenset({"equals", "is", "was"})
+_CREDENTIAL_VERSION_SUFFIX = re.compile(r"(?:version|v)?\d+$")
+_CREDENTIAL_MAX_VERSION_SUFFIXES = 4
+
+
+def _credential_compact(name: str) -> str:
+    normalized = unicodedata.normalize("NFKC", name)
+    compact = "".join(
+        character for character in normalized.casefold() if character.isalnum()
+    )
+    for _ in range(_CREDENTIAL_MAX_VERSION_SUFFIXES):
+        match = _CREDENTIAL_VERSION_SUFFIX.search(compact)
+        if match is None:
+            break
+        compact = compact[: match.start()]
+    return compact
+
+
+def _credential_assignment_matches(
+    text: str, phrase_spans: list[tuple[int, int]]
+) -> list[tuple[int, int, str]]:
+    """Parse bounded credential assignments for public and provider policies."""
+
+    words = list(_PUBLIC_PROSE_WORD_PATTERN.finditer(text))
+    matches: list[tuple[int, int, str]] = []
+    for start, end in phrase_spans:
+        following = [word for word in words if word.start() >= end][:3]
+        if not following:
+            continue
+        cursor = 0
+        previous_end = end
+        if following[0].group(0).casefold() in _CREDENTIAL_ASSIGNMENT_QUALIFIERS:
+            previous_end = following[0].end()
+            cursor += 1
+        if cursor >= len(following):
+            continue
+        candidate = following[cursor]
+        if candidate.group(0).casefold() in _CREDENTIAL_ASSIGNMENT_CONNECTORS:
+            previous_end = candidate.end()
+            cursor += 1
+            if cursor >= len(following):
+                continue
+            candidate = following[cursor]
+        else:
+            separator = text[previous_end : candidate.start()]
+            if not separator or separator.isspace():
+                continue
+        matches.append((start, candidate.end(), candidate.group(0).casefold()))
+    return matches
+
+
+def _generic_credential_phrase_spans(text: str) -> list[tuple[int, int]]:
+    return [
+        (word.start(), word.end())
+        for word in _PUBLIC_PROSE_WORD_PATTERN.finditer(text)
+        if _credential_compact(word.group(0)) in _PUBLIC_GENERIC_CREDENTIAL_WORDS
+    ]
 
 
 def _is_semantic_credential_name(name: str) -> bool:
@@ -607,11 +665,10 @@ def _is_semantic_credential_name(name: str) -> bool:
     if len(name) > _PUBLIC_MAX_CREDENTIAL_NAME_CHARS:
         return False
     normalized = unicodedata.normalize("NFKC", name)
-    compact = "".join(
-        character for character in normalized.casefold() if character.isalnum()
-    )
+    compact = _credential_compact(normalized)
     return compact not in _PUBLIC_GENERIC_CREDENTIAL_WORDS and (
         is_credential_name(normalized)
+        or is_credential_name(compact)
         or compact
         in {
             "authorization",
@@ -687,20 +744,28 @@ def contains_credential_semantics(value: object) -> bool:
 
 def _is_harmless_credential_field(text: str) -> bool:
     phrases = _credential_phrase_spans(text)
-    if len(phrases) != 1 or _contains_direct_auth_scheme(text):
+    if not phrases:
+        phrases = _generic_credential_phrase_spans(text)
+    assignments = _credential_assignment_matches(text, phrases)
+    if len(phrases) != 1 or len(assignments) != 1 or _contains_direct_auth_scheme(text):
         return False
-    start, end = phrases[0]
+    start, end, assigned = assignments[0]
     prefix = " ".join(_PUBLIC_PROSE_WORD_PATTERN.findall(text[:start])).casefold()
-    if prefix not in _PUBLIC_HARMLESS_PREFIXES:
-        return False
     suffix = text[end:].strip()
-    match = re.fullmatch(
-        r"(?:(?:credential|value)\s+)?(?:equals|is|was)\s+([\w]+)"
-        r"(?:\s+(?:during|for|in)\b[^.!?\n]*)?",
-        suffix,
-        flags=re.IGNORECASE,
+    harmless_suffix = not suffix or bool(
+        re.fullmatch(r"(?:during|for|in)\b[^.!?\n]*", suffix, flags=re.IGNORECASE)
     )
-    return bool(match and match.group(1).casefold() in _PUBLIC_HARMLESS_PREDICATES)
+    return (
+        prefix in _PUBLIC_HARMLESS_PREFIXES
+        and assigned in _PUBLIC_HARMLESS_PREDICATES
+        and harmless_suffix
+    )
+
+
+def _contains_generic_credential_assignment(text: str) -> bool:
+    return bool(
+        _credential_assignment_matches(text, _generic_credential_phrase_spans(text))
+    )
 
 
 def _public_field_spans(text: str) -> list[tuple[int, int]]:
@@ -723,7 +788,10 @@ def _unsafe_public_field_spans(text: str) -> list[tuple[int, int]]:
     return [
         (start, end)
         for start, end in _public_field_spans(text)
-        if contains_credential_semantics(text[start:end])
+        if (
+            contains_credential_semantics(text[start:end])
+            or _contains_generic_credential_assignment(text[start:end])
+        )
         and not _is_harmless_credential_field(text[start:end].strip())
     ]
 
