@@ -80,7 +80,7 @@ def event(**changes: Any) -> OperationEvent:
             OperationKind.STORAGE_FAILURE: "terminal_commit",
             OperationKind.METRICS_GENERATION: "metrics_render",
         }.get(kind),
-        "provider": None,
+        "provider": "gamma" if kind is OperationKind.STAGE_TERMINAL else None,
         "status": {
             OperationKind.STARTUP: "clean",
             OperationKind.RUN_STARTED: "started",
@@ -99,7 +99,9 @@ def event(**changes: Any) -> OperationEvent:
         "elapsed_nanoseconds": 10
         if kind in {OperationKind.RUN_TERMINAL, OperationKind.STAGE_TERMINAL}
         else None,
-        "exact_values": {"open_fds": 4} if kind is OperationKind.PROCESS_SAMPLE else {},
+        "exact_values": {"discarded_bytes": 1}
+        if kind is OperationKind.RECOVERY
+        else {},
         "evidence": None,
     }
     defaults.update(changes)
@@ -116,9 +118,29 @@ def event(**changes: Any) -> OperationEvent:
 def blob_ref(payload: bytes) -> BlobRefModel:
     digest = hashlib.sha256(payload).hexdigest()
     return BlobRefModel(
+        schema_version=1,
         sha256=digest,
         byte_size=len(payload),
         storage_relpath=f"operation-blobs/{digest[:2]}/{digest[2:4]}/{digest}",
+    )
+
+
+def append_raw_lines(root: Path, *values: OperationEvent, tail: bytes = b"") -> Path:
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    journal = root / "operations.jsonl"
+    journal.write_bytes(b"".join(journal_line(value) for value in values) + tail)
+    journal.chmod(0o600)
+    return journal
+
+
+def evidence_payload(kind: str = "process_sample") -> bytes:
+    return canonical_json_bytes(
+        {
+            "schema_version": 1,
+            "kind": kind,
+            "status": "unavailable",
+            "detail": "probe_unavailable",
+        }
     )
 
 
@@ -182,7 +204,7 @@ def test_operation_kind_is_closed_to_all_nine_approved_values() -> None:
             "kind": "process_sample",
             "run_id": SHA,
             "status": "success",
-            "exact_values": {"resident_memory_bytes": 4096, "open_fds": 4},
+            "exact_values": {},
         },
         {
             "kind": "metrics_generation",
@@ -223,7 +245,7 @@ def test_all_kind_contracts_round_trip(tmp_path: Path, changes: dict[str, Any]) 
 
 
 def test_evidence_is_content_addressed_and_verified(tmp_path: Path) -> None:
-    payload = b'{"probe":"unavailable"}'
+    payload = evidence_payload()
     value = event(
         kind="process_sample",
         run_id=SHA,
@@ -287,15 +309,6 @@ def test_evidence_is_content_addressed_and_verified(tmp_path: Path) -> None:
             },
             "reason",
         ),
-        (
-            {
-                "kind": "process_sample",
-                "run_id": SHA,
-                "status": "success",
-                "exact_values": {},
-            },
-            "exact_values",
-        ),
         ({"stage": "arbitrary"}, "stage"),
         ({"status": "arbitrary"}, "status"),
         ({"reason": "arbitrary"}, "reason"),
@@ -303,8 +316,8 @@ def test_evidence_is_content_addressed_and_verified(tmp_path: Path) -> None:
         ({"elapsed_nanoseconds": 2**63}, "signed 64-bit"),
         ({"exact_values": {"open_fds": -1}}, "exact_values"),
         ({"exact_values": {"open_fds": 2**63}}, "signed 64-bit"),
-        ({"exact_values": {"runs_total": 1}}, "preaggregated"),
-        ({"exact_values": {"request_id": 1}}, "label"),
+        ({"exact_values": {"runs_total": 1}}, "exact_values"),
+        ({"exact_values": {"request_id": 1}}, "exact_values"),
         ({"reason": "/tmp/private"}, "reason"),
     ),
 )
@@ -386,7 +399,7 @@ def test_identical_duplicate_is_idempotent_and_conflict_fails(tmp_path: Path) ->
 
 
 def test_evidence_argument_must_match_reference(tmp_path: Path) -> None:
-    payload = b"safe evidence"
+    payload = evidence_payload()
     value = event(
         kind="process_sample",
         run_id=SHA,
@@ -405,7 +418,7 @@ def test_evidence_argument_must_match_reference(tmp_path: Path) -> None:
 @pytest.mark.parametrize("damage", ("missing", "size", "hash"))
 def test_blob_corruption_fails_closed(tmp_path: Path, damage: str) -> None:
     root = tmp_path / "audit"
-    payload = b"safe evidence"
+    payload = evidence_payload()
     value = event(
         kind="process_sample",
         run_id=SHA,
@@ -498,7 +511,7 @@ def test_unsafe_ancestor_and_blob_symlink_are_rejected(tmp_path: Path) -> None:
     target = tmp_path / "elsewhere"
     target.mkdir(mode=0o700)
     (root / "operation-blobs").symlink_to(target, target_is_directory=True)
-    payload = b"safe"
+    payload = evidence_payload()
     value = event(
         kind="process_sample",
         run_id=SHA,
@@ -571,15 +584,47 @@ def test_event_and_evidence_reject_secrets_paths_and_exception_text(
     tmp_path: Path,
 ) -> None:
     for value in (
-        "sk-abcdefghijklmnopqrstuvwxyz",
-        "Authorization: Bearer secret",
+        "«redacted:sk-…»",
+        "Authorization: Bearer ***",
         "/home/alice/private",
         "Traceback (most recent call last): ValueError: boom",
     ):
         with pytest.raises((ValidationError, ValueError)):
             event(reason=value)
 
-    payload = b'{"authorization":"Bearer secret"}'
+    unsafe_payloads = (
+        b"opaque bytes",
+        b'{"schema_version":1,"kind":"process_sample","detail":"password=hunter2"}',
+        b'{"schema_version":1,"kind":"process_sample","detail":"Bearer token"}',
+        b'{"schema_version":1,"kind":"process_sample","detail":"../private"}',
+        b'{"schema_version":1,"kind":"process_sample","detail":"C:\\\\Users\\\\me"}',
+        b'{"schema_version":1,"kind":"process_sample","detail":"private/secrets.txt"}',
+        b'{"schema_version":1,"kind":"process_sample","detail":"ValueError: boom"}',
+        b'{"schema_version":1,"kind":"process_sample","error":"boom"}',
+        b'{"schema_version":1,"kind":"process_sample","detail":{"nested":"x"}}',
+        b'{"schema_version":1,"kind":"process_sample","detail":"https://example.com"}',
+        b'{"schema_version":1,"kind":"process_sample","detail":"api.example.com"}',
+    )
+    for index, payload in enumerate(unsafe_payloads):
+        value = event(
+            kind="process_sample",
+            run_id=SHA,
+            status="failure",
+            reason="process",
+            evidence=blob_ref(payload).model_dump(),
+            occurred_at=f"2026-10-12T12:01:{index:02d}Z",
+        )
+        with pytest.raises(OperationSecurityError) as captured:
+            append_operation(tmp_path / f"unsafe-{index}", value, payload)
+        assert len(str(captured.value)) < 200
+        assert payload.decode(errors="replace") not in str(captured.value)
+
+
+def test_canonical_bounded_evidence_is_published(tmp_path: Path) -> None:
+    payload = (
+        b'{"detail":"probe_unavailable","kind":"process_sample",'
+        b'"schema_version":1,"status":"unavailable"}'
+    )
     value = event(
         kind="process_sample",
         run_id=SHA,
@@ -587,5 +632,487 @@ def test_event_and_evidence_reject_secrets_paths_and_exception_text(
         reason="process",
         evidence=blob_ref(payload).model_dump(),
     )
-    with pytest.raises(OperationSecurityError):
-        append_operation(tmp_path / "audit", value, payload)
+    root = tmp_path / "audit"
+    append_operation(root, event(kind="run_started", run_id=SHA, status="started"))
+    append_operation(root, value, payload)
+    assert load_operation_cut(root).events[-1] == value
+
+
+@pytest.mark.parametrize(
+    "tail_prefix",
+    (
+        b"{}\n",
+        journal_line(event(kind="run_terminal", run_id=SHA, status="success")),
+    ),
+)
+def test_tail_recovery_validates_complete_prefix_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tail_prefix: bytes,
+) -> None:
+    root = tmp_path / "audit"
+    original = tail_prefix + b'{"torn":'
+    journal = append_raw_lines(root, tail=original)
+    truncate_calls = 0
+    original_ftruncate = os.ftruncate
+
+    def count_ftruncate(descriptor: int, length: int) -> None:
+        nonlocal truncate_calls
+        truncate_calls += 1
+        original_ftruncate(descriptor, length)
+
+    monkeypatch.setattr(os, "ftruncate", count_ftruncate)
+    with pytest.raises(OperationCorruptError):
+        load_operation_cut(root, recover_tail=True)
+    assert truncate_calls == 0
+    assert journal.read_bytes() == original
+
+
+def test_tail_recovery_validates_evidence_before_mutation(tmp_path: Path) -> None:
+    root = tmp_path / "audit"
+    payload = (
+        b'{"detail":"probe_unavailable","kind":"process_sample",'
+        b'"schema_version":1,"status":"unavailable"}'
+    )
+    started = event(kind="run_started", run_id=SHA, status="started")
+    sampled = event(
+        kind="process_sample",
+        run_id=SHA,
+        status="failure",
+        reason="process",
+        evidence=blob_ref(payload).model_dump(),
+    )
+    original = journal_line(started) + journal_line(sampled) + b'{"torn":'
+    journal = append_raw_lines(root, tail=original)
+
+    with pytest.raises(OperationCorruptError, match="evidence"):
+        load_operation_cut(root, recover_tail=True)
+    assert journal.read_bytes() == original
+
+
+def test_tail_recovery_faults_propagate_only_after_prefix_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "audit"
+    value = event()
+    original = journal_line(value) + b'{"torn":'
+    journal = append_raw_lines(root, tail=original)
+
+    def fail_truncate(_descriptor: int, _length: int) -> None:
+        raise OSError("truncate failed")
+
+    monkeypatch.setattr(os, "ftruncate", fail_truncate)
+    with pytest.raises(OSError, match="truncate failed"):
+        load_operation_cut(root, recover_tail=True)
+    assert journal.read_bytes() == original
+
+
+def test_conflicting_blob_reference_metadata_is_corruption(tmp_path: Path) -> None:
+    root = tmp_path / "audit"
+    payload = (
+        b'{"detail":"probe_unavailable","kind":"process_sample",'
+        b'"schema_version":1,"status":"unavailable"}'
+    )
+    reference = blob_ref(payload)
+    started = event(kind="run_started", run_id=SHA, status="started")
+    wrong = event(
+        kind="process_sample",
+        run_id=SHA,
+        status="failure",
+        reason="process",
+        evidence={**reference.model_dump(), "byte_size": len(payload) + 1},
+    )
+    correct = event(
+        kind="process_sample",
+        run_id=SHA,
+        status="failure",
+        reason="process",
+        evidence=reference.model_dump(),
+        occurred_at="2026-10-12T12:00:01Z",
+    )
+    append_operation(root, started)
+    append_operation(root, correct, payload)
+    journal = root / "operations.jsonl"
+    journal.write_bytes(
+        journal_line(started) + journal_line(wrong) + journal_line(correct)
+    )
+
+    with pytest.raises(OperationCorruptError, match="conflicting.*reference"):
+        load_operation_cut(root)
+
+
+def test_identical_blob_references_are_verified_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from jev_trading_lab.polymarket import operations
+
+    root = tmp_path / "audit"
+    payload = (
+        b'{"detail":"probe_unavailable","kind":"process_sample",'
+        b'"schema_version":1,"status":"unavailable"}'
+    )
+    reference = blob_ref(payload)
+    started = event(kind="run_started", run_id=SHA, status="started")
+    first = event(
+        kind="process_sample",
+        run_id=SHA,
+        status="failure",
+        reason="process",
+        evidence=reference.model_dump(),
+    )
+    second = event(
+        kind="process_sample",
+        run_id=SHA,
+        status="failure",
+        reason="process",
+        evidence=reference.model_dump(),
+        occurred_at="2026-10-12T12:00:01Z",
+    )
+    append_operation(root, started)
+    append_operation(root, first, payload)
+    append_raw_lines(root, started, first, second)
+    calls = 0
+    original = operations.BlobStore.read_verified
+
+    def count_read(store: Any, reference: Any) -> bytes:
+        nonlocal calls
+        calls += 1
+        return original(store, reference)
+
+    monkeypatch.setattr(operations.BlobStore, "read_verified", count_read)
+    cut = load_operation_cut(root)
+    assert cut.valid_blobs == 1
+    assert calls == 1
+
+
+def test_duplicate_retry_reestablishes_journal_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "audit"
+    value = event()
+    original_fsync = os.fsync
+    failed = False
+
+    def fail_once(descriptor: int) -> None:
+        nonlocal failed
+        if (
+            not failed
+            and Path(f"/proc/self/fd/{descriptor}").resolve()
+            == root / "operations.jsonl"
+        ):
+            failed = True
+            raise OSError("fsync failed")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_once)
+    with pytest.raises(OSError, match="fsync failed"):
+        append_operation(root, value)
+    assert (root / "operations.jsonl").read_bytes() == journal_line(value)
+
+    journal_fsyncs = 0
+
+    def count_fsync(descriptor: int) -> None:
+        nonlocal journal_fsyncs
+        if Path(f"/proc/self/fd/{descriptor}").resolve() == root / "operations.jsonl":
+            journal_fsyncs += 1
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", count_fsync)
+    append_operation(root, value)
+    assert journal_fsyncs == 1
+    assert (root / "operations.jsonl").read_bytes() == journal_line(value)
+
+
+def test_retry_reestablishes_file_and_parent_after_creation_dir_fsync_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "audit"
+    journal = root / "operations.jsonl"
+    value = event()
+    original_fsync = os.fsync
+    journal_was_fsynced = False
+    failed = False
+
+    def fail_after_journal_fsync(descriptor: int) -> None:
+        nonlocal failed, journal_was_fsynced
+        target = Path(f"/proc/self/fd/{descriptor}").resolve()
+        if target == journal:
+            journal_was_fsynced = True
+        if not failed and journal_was_fsynced and target == root:
+            failed = True
+            raise OSError("directory fsync failed")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_after_journal_fsync)
+    with pytest.raises(OSError, match="directory fsync failed"):
+        append_operation(root, value)
+    assert journal.read_bytes() == journal_line(value)
+
+    journal_fsyncs = 0
+    root_fsyncs = 0
+
+    def count_fsync(descriptor: int) -> None:
+        nonlocal journal_fsyncs, root_fsyncs
+        target = Path(f"/proc/self/fd/{descriptor}").resolve()
+        if target == journal:
+            journal_fsyncs += 1
+        elif target == root:
+            root_fsyncs += 1
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", count_fsync)
+    append_operation(root, value)
+    assert journal_fsyncs == 1
+    assert root_fsyncs >= 1
+    assert journal.read_bytes() == journal_line(value)
+
+
+def test_tail_recovery_retry_reestablishes_file_and_parent_durability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "audit"
+    value = event()
+    journal = append_raw_lines(root, value, tail=b'{"torn":')
+    original_fsync = os.fsync
+    failed = False
+
+    def fail_journal_fsync_once(descriptor: int) -> None:
+        nonlocal failed
+        if not failed and Path(f"/proc/self/fd/{descriptor}").resolve() == journal:
+            failed = True
+            raise OSError("journal fsync failed")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_journal_fsync_once)
+    with pytest.raises(OSError, match="journal fsync failed"):
+        load_operation_cut(root, recover_tail=True)
+    assert journal.read_bytes() == journal_line(value)
+
+    journal_fsyncs = 0
+    root_fsyncs = 0
+
+    def count_fsync(descriptor: int) -> None:
+        nonlocal journal_fsyncs, root_fsyncs
+        target = Path(f"/proc/self/fd/{descriptor}").resolve()
+        if target == journal:
+            journal_fsyncs += 1
+        elif target == root:
+            root_fsyncs += 1
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", count_fsync)
+    cut = load_operation_cut(root, recover_tail=True)
+    assert cut.events == (value,)
+    assert cut.discarded_tail_bytes == 0
+    assert journal_fsyncs == 1
+    assert root_fsyncs >= 1
+
+
+def test_load_retry_reestablishes_parent_durability_after_creation_fsync_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "audit"
+    original_fsync = os.fsync
+    failed = False
+
+    def fail_once(descriptor: int) -> None:
+        nonlocal failed
+        if not failed and Path(f"/proc/self/fd/{descriptor}").resolve() == root:
+            failed = True
+            raise OSError("directory fsync failed")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_once)
+    with pytest.raises(OSError, match="directory fsync failed"):
+        load_operation_cut(root)
+    assert (root / "operations.jsonl").read_bytes() == b""
+
+    root_fsyncs = 0
+
+    def count_fsync(descriptor: int) -> None:
+        nonlocal root_fsyncs
+        if Path(f"/proc/self/fd/{descriptor}").resolve() == root:
+            root_fsyncs += 1
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", count_fsync)
+    assert load_operation_cut(root).events == ()
+    assert root_fsyncs >= 1
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"kind": "startup", "stage": "startup", "status": "clean"},
+        {"kind": "run_started", "run_id": SHA, "status": "started"},
+        {"kind": "run_terminal", "run_id": SHA, "status": "recovered"},
+        {
+            "kind": "stage_terminal",
+            "run_id": SHA,
+            "stage": "gamma_poll",
+            "provider": "gamma",
+            "status": "timeout",
+            "reason": "timeout",
+            "elapsed_nanoseconds": 1,
+        },
+        {
+            "kind": "stage_terminal",
+            "run_id": SHA,
+            "stage": "openai",
+            "provider": "openai",
+            "status": "failure",
+            "reason": "provider_error",
+            "elapsed_nanoseconds": 1,
+        },
+        {
+            "kind": "stage_terminal",
+            "run_id": SHA,
+            "stage": "eligibility",
+            "provider": None,
+            "status": "skipped",
+            "elapsed_nanoseconds": 1,
+        },
+        {
+            "kind": "recovery",
+            "stage": "recovery",
+            "status": "success",
+            "reason": "partial_tail",
+            "exact_values": {"discarded_bytes": 1},
+        },
+        {
+            "kind": "storage_failure",
+            "stage": "terminal_commit",
+            "status": "failure",
+            "reason": "directory_fsync",
+        },
+        {
+            "kind": "metrics_generation",
+            "stage": "metrics_render",
+            "status": "failure",
+            "reason": "write",
+        },
+    ),
+)
+def test_approved_event_contract_matrix(changes: dict[str, Any]) -> None:
+    event(**changes)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {
+            "kind": "stage_terminal",
+            "run_id": SHA,
+            "stage": "startup",
+            "provider": "openai",
+            "status": "success",
+            "elapsed_nanoseconds": 1,
+        },
+        {
+            "kind": "stage_terminal",
+            "run_id": SHA,
+            "stage": "gamma_poll",
+            "provider": "openai",
+            "status": "success",
+            "elapsed_nanoseconds": 1,
+        },
+        {
+            "kind": "deduplication",
+            "semantic_id": SHA,
+            "stage": "startup",
+            "status": "deduplicated",
+        },
+        {
+            "kind": "storage_failure",
+            "stage": "terminal_commit",
+            "status": "failure",
+            "reason": "fees",
+        },
+        {
+            "kind": "recovery",
+            "stage": "recovery",
+            "status": "failure",
+            "reason": "fees",
+            "exact_values": {},
+        },
+        {
+            "kind": "stage_terminal",
+            "run_id": SHA,
+            "stage": "openai",
+            "provider": "openai",
+            "status": "failure",
+            "reason": "wide_spread",
+            "elapsed_nanoseconds": 1,
+        },
+        {
+            "kind": "metrics_generation",
+            "stage": "metrics_render",
+            "status": "failure",
+            "reason": "provider_error",
+        },
+    ),
+)
+def test_event_contract_matrix_rejects_denied_mutations(
+    changes: dict[str, Any],
+) -> None:
+    with pytest.raises(ValidationError, match="contract|provider|reason|stage"):
+        event(**changes)
+
+
+@pytest.mark.parametrize(
+    "key",
+    (
+        "runs_count",
+        "success_count",
+        "successful_runs",
+        "latency_sum",
+        "aggregate_runs",
+        "unknown_value",
+        "resident_memory_bytes",
+    ),
+)
+def test_exact_values_use_closed_task3_raw_fact_schemas(key: str) -> None:
+    with pytest.raises(ValidationError, match="exact_values"):
+        event(
+            kind="recovery",
+            stage="recovery",
+            status="success",
+            reason="partial_tail",
+            exact_values={key: 1},
+        )
+
+
+def test_exact_values_reject_bool_and_subclasses() -> None:
+    class TaggedInt(int):
+        pass
+
+    class TaggedStr(str):
+        pass
+
+    for values in (
+        {"discarded_bytes": True},
+        {"discarded_bytes": TaggedInt(1)},
+        {TaggedStr("discarded_bytes"): 1},
+    ):
+        with pytest.raises((ValidationError, TypeError)):
+            event(
+                kind="recovery",
+                stage="recovery",
+                status="success",
+                reason="partial_tail",
+                exact_values=values,
+            )
+
+
+def test_blob_reference_schema_metadata_is_strict() -> None:
+    payload = b"{}"
+    with pytest.raises(ValidationError, match="schema_version"):
+        BlobRefModel(
+            schema_version=2,
+            sha256=hashlib.sha256(payload).hexdigest(),
+            byte_size=len(payload),
+            storage_relpath=(
+                "operation-blobs/44/13/"
+                "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+            ),
+        )

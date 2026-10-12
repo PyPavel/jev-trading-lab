@@ -5,7 +5,6 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import os
-import re
 import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -56,33 +55,67 @@ _STAGE_VALUES = frozenset(
         "replay",
     }
 )
-_STATUS_VALUES = frozenset(
+_RELIABILITY_REASONS = frozenset(
     {
-        "clean",
-        "recovery_required",
-        "recovery_failed",
-        "started",
-        "success",
-        "failure",
-        "skipped",
-        "recovered",
-        "replayed",
-        "deduplicated",
-        "timeout",
+        "partial_tail",
+        "reused_result",
+        "unknown_in_flight",
+        "stale_temporary",
+        "invalid_line",
+        "invalid_transition",
+        "conflict",
+        "missing_blob",
+        "digest_mismatch",
+        "unsafe_path",
+        "lock_timeout",
+        "write",
+        "flush",
+        "fsync",
+        "rename",
+        "directory_fsync",
+        "other",
     }
 )
-_REASON_VALUES = frozenset(
+_STORAGE_REASONS = frozenset(
+    {"lock_timeout", "write", "flush", "fsync", "rename", "directory_fsync", "other"}
+)
+_MARKET_REASONS = frozenset(
     {
-        "fees",
-        "slippage",
-        "realized_pnl",
-        "unrealized_pnl",
-        "capital",
-        "brier",
-        "latency",
-        "tokens",
-        "cost",
-        "process",
+        "timeout",
+        "transport",
+        "http_status",
+        "redirect",
+        "content_type",
+        "oversized",
+        "not_json",
+        "malformed",
+        "stale",
+        "crossed",
+        "token_drift",
+        "market_drift",
+        "duplicate",
+        "other",
+    }
+)
+_MODEL_REASONS = frozenset(
+    {
+        "input_error",
+        "input_changed",
+        "config_failure",
+        "unknown_in_flight",
+        "provider_error",
+        "timeout",
+        "http_error",
+        "parse_error",
+        "model_mismatch",
+        "citation_error",
+        "credential_reflection",
+        "cost_overflow",
+        "other",
+    }
+)
+_PIPELINE_REASONS = frozenset(
+    {
         "none",
         "inactive",
         "closed",
@@ -104,52 +137,62 @@ _REASON_VALUES = frozenset(
         "model_failure",
         "public_data_failure",
         "timeout",
-        "transport",
-        "http_status",
-        "redirect",
-        "content_type",
-        "oversized",
-        "not_json",
-        "malformed",
-        "stale",
-        "crossed",
-        "token_drift",
-        "market_drift",
-        "duplicate",
-        "input_error",
-        "input_changed",
-        "config_failure",
-        "unknown_in_flight",
-        "provider_error",
-        "http_error",
-        "parse_error",
-        "model_mismatch",
-        "citation_error",
-        "credential_reflection",
-        "cost_overflow",
-        "partial_tail",
-        "reused_result",
-        "stale_temporary",
-        "invalid_line",
-        "invalid_transition",
-        "conflict",
-        "missing_blob",
-        "digest_mismatch",
-        "unsafe_path",
-        "lock_timeout",
-        "write",
-        "flush",
-        "fsync",
-        "rename",
-        "directory_fsync",
         "other",
     }
 )
-_LABEL_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
-_FORBIDDEN_EVIDENCE = re.compile(
-    rb"(?i)(?:sk-[a-z0-9_-]{8,}|authorization\s*[:=]|api[-_]?key\s*[:=]|"
-    rb"cookie\s*[:=]|traceback \(most recent call last\)|(?:^|[\s\"'])/"
-    rb"(?:home|tmp|var|etc|root|proc|sys|dev)/)"
+_DEDUPLICATION_STAGES = frozenset(
+    {"openai", "jev", "terminal_commit", "completed_slot", "replay"}
+)
+_STAGE_PROVIDERS: dict[str, frozenset[str | None]] = {
+    "gamma_poll": frozenset({"gamma"}),
+    "precheck_book": frozenset({"clob"}),
+    "execution_book": frozenset({"clob"}),
+    "openai": frozenset({"openai"}),
+    "jev": frozenset({"jev"}),
+    "eligibility": frozenset({None}),
+    "evidence_freeze": frozenset({None}),
+    "decision_barrier": frozenset({None}),
+    "paper_execution": frozenset({None}),
+    "terminal_commit": frozenset({None}),
+    "completed_slot": frozenset({None}),
+    "replay": frozenset({None}),
+}
+_STAGE_REASONS: dict[str, frozenset[str]] = {
+    "gamma_poll": _MARKET_REASONS,
+    "precheck_book": _MARKET_REASONS,
+    "execution_book": _MARKET_REASONS,
+    "openai": _MODEL_REASONS,
+    "jev": _MODEL_REASONS,
+    "eligibility": _PIPELINE_REASONS,
+    "evidence_freeze": _PIPELINE_REASONS,
+    "decision_barrier": _PIPELINE_REASONS | _MODEL_REASONS,
+    "paper_execution": _PIPELINE_REASONS | _MARKET_REASONS,
+    "terminal_commit": _STORAGE_REASONS,
+    "completed_slot": _STORAGE_REASONS,
+    "replay": _RELIABILITY_REASONS,
+}
+_EVIDENCE_KEYS = frozenset({"schema_version", "kind", "status", "detail"})
+_EVIDENCE_STATUSES = frozenset({"available", "unavailable", "partial", "complete"})
+_EVIDENCE_DETAILS = frozenset(
+    {
+        "probe_available",
+        "probe_unavailable",
+        "metadata_available",
+        "metadata_unavailable",
+    }
+)
+_EVIDENCE_KINDS = frozenset(
+    {
+        "startup",
+        "run_started",
+        "run_terminal",
+        "stage_terminal",
+        "recovery",
+        "deduplication",
+        "storage_failure",
+        "process_sample",
+        "metrics_generation",
+    }
 )
 
 
@@ -181,6 +224,35 @@ class OperationKind(StrEnum):
     METRICS_GENERATION = "metrics_generation"
 
 
+_EVENT_STATUSES = {
+    OperationKind.STARTUP: frozenset({"clean", "recovery_required", "recovery_failed"}),
+    OperationKind.RUN_STARTED: frozenset({"started"}),
+    OperationKind.RUN_TERMINAL: frozenset(
+        {"success", "failure", "replayed", "recovered"}
+    ),
+    OperationKind.STAGE_TERMINAL: frozenset(
+        {"success", "failure", "skipped", "recovered", "timeout"}
+    ),
+    OperationKind.RECOVERY: frozenset({"success", "failure"}),
+    OperationKind.DEDUPLICATION: frozenset({"deduplicated"}),
+    OperationKind.STORAGE_FAILURE: frozenset({"failure"}),
+    OperationKind.PROCESS_SAMPLE: frozenset({"success", "failure"}),
+    OperationKind.METRICS_GENERATION: frozenset({"success", "failure", "skipped"}),
+}
+_EVENT_EXACT_KEYS = {
+    OperationKind.STARTUP: frozenset(),
+    OperationKind.RUN_STARTED: frozenset(),
+    OperationKind.RUN_TERMINAL: frozenset(),
+    OperationKind.STAGE_TERMINAL: frozenset(),
+    OperationKind.RECOVERY: frozenset({"discarded_bytes"}),
+    OperationKind.DEDUPLICATION: frozenset(),
+    OperationKind.STORAGE_FAILURE: frozenset(),
+    # Task 4 deliberately extends process facts after its own reviewed TDD cycle.
+    OperationKind.PROCESS_SAMPLE: frozenset(),
+    OperationKind.METRICS_GENERATION: frozenset(),
+}
+
+
 Stage = Literal[
     "startup",
     "recovery",
@@ -208,6 +280,7 @@ ExactInt = Annotated[int, Field(strict=True, ge=0, le=INT64_MAX)]
 class BlobRefModel(StrictModel):
     """Canonical reference to one operation evidence blob."""
 
+    schema_version: Literal[1]
     sha256: Sha256
     byte_size: Annotated[int, Field(strict=True, ge=0, le=_MAX_EVIDENCE_BYTES)]
     storage_relpath: str
@@ -296,46 +369,28 @@ class OperationEvent(StrictModel):
                 raise TypeError(
                     "exact_values must contain built-in string and int values"
                 )
-            if _LABEL_RE.fullmatch(key) is None:
-                raise ValueError("exact_values key must be a bounded label")
-            if (
-                key.endswith(("_total", "_counter", "_id", "_sha256", "_hash"))
-                or "path" in key
-            ):
-                raise ValueError(
-                    "preaggregated counters and metric-label IDs are forbidden"
-                )
         return value
 
     @model_validator(mode="after")
     def validate_contract(self) -> Self:
-        if self.status not in _STATUS_VALUES:
-            raise ValueError("operation status is not approved")
-        if self.reason is not None and self.reason not in _REASON_VALUES:
-            raise ValueError("operation reason is not approved")
+        if self.status not in _EVENT_STATUSES[self.kind]:
+            raise ValueError("operation status is invalid for event kind")
         if self.stage is not None and self.stage not in _STAGE_VALUES:
             raise ValueError("operation stage is not approved")
-        allowed_statuses: dict[OperationKind, frozenset[str]] = {
-            OperationKind.STARTUP: frozenset(
-                {"clean", "recovery_required", "recovery_failed"}
-            ),
-            OperationKind.RUN_STARTED: frozenset({"started"}),
-            OperationKind.RUN_TERMINAL: frozenset(
-                {"success", "failure", "replayed", "recovered"}
-            ),
-            OperationKind.STAGE_TERMINAL: frozenset(
-                {"success", "failure", "skipped", "recovered", "timeout"}
-            ),
-            OperationKind.RECOVERY: frozenset({"success", "failure"}),
-            OperationKind.DEDUPLICATION: frozenset({"deduplicated"}),
-            OperationKind.STORAGE_FAILURE: frozenset({"failure"}),
-            OperationKind.PROCESS_SAMPLE: frozenset({"success", "failure"}),
-            OperationKind.METRICS_GENERATION: frozenset(
-                {"success", "failure", "skipped"}
-            ),
-        }
-        if self.status not in allowed_statuses[self.kind]:
-            raise ValueError("operation status is invalid for event kind")
+        if set(self.exact_values) - _EVENT_EXACT_KEYS[self.kind]:
+            raise ValueError("exact_values keys are invalid for event kind")
+        if (
+            self.kind is OperationKind.RECOVERY
+            and self.reason == "partial_tail"
+            and ("discarded_bytes" not in self.exact_values)
+        ):
+            raise ValueError("partial-tail recovery reason requires discarded_bytes")
+        if (
+            self.kind is OperationKind.RECOVERY
+            and self.reason != "partial_tail"
+            and ("discarded_bytes" in self.exact_values)
+        ):
+            raise ValueError("discarded_bytes requires partial-tail recovery reason")
         requires_run = self.kind in {
             OperationKind.RUN_STARTED,
             OperationKind.RUN_TERMINAL,
@@ -363,38 +418,50 @@ class OperationEvent(StrictModel):
         }.get(self.kind)
         if expected_stage is not None and self.stage != expected_stage:
             raise ValueError("operation stage is invalid for event kind")
+        if self.kind is OperationKind.DEDUPLICATION and (
+            self.stage not in _DEDUPLICATION_STAGES
+        ):
+            raise ValueError("operation stage is invalid for deduplication")
         if self.provider is not None and self.kind is not OperationKind.STAGE_TERMINAL:
             raise ValueError("provider is valid only for a terminal stage")
         if self.kind is OperationKind.STAGE_TERMINAL:
             if self.elapsed_nanoseconds is None:
                 raise ValueError("stage terminal event requires elapsed nanoseconds")
+            if self.stage not in _STAGE_PROVIDERS:
+                raise ValueError("operation stage is invalid for terminal stage")
+            if self.provider not in _STAGE_PROVIDERS[self.stage]:
+                raise ValueError("operation provider is invalid for stage")
         elif (
             self.kind is not OperationKind.RUN_TERMINAL
             and self.elapsed_nanoseconds is not None
         ):
             raise ValueError("elapsed nanoseconds are invalid for event kind")
-        if self.kind in {OperationKind.RECOVERY, OperationKind.STORAGE_FAILURE}:
-            if self.reason is None:
-                raise ValueError("operation reason is required for event kind")
-        elif self.status in {"failure", "timeout", "recovery_failed"}:
-            if self.reason is None:
-                raise ValueError("failed operation requires a bounded reason")
-        elif self.reason is not None:
-            raise ValueError("operation reason is invalid for successful event")
-        if self.kind is OperationKind.PROCESS_SAMPLE and not self.exact_values:
-            raise ValueError("process sample requires exact_values")
-        if self.kind is not OperationKind.PROCESS_SAMPLE and any(
-            key
-            in {
-                "resident_memory_bytes",
-                "peak_resident_memory_bytes",
-                "user_cpu_nanoseconds",
-                "system_cpu_nanoseconds",
-                "open_fds",
-            }
-            for key in self.exact_values
-        ):
-            raise ValueError("process exact_values are invalid for event kind")
+        reason_required = self.kind in {
+            OperationKind.RECOVERY,
+            OperationKind.STORAGE_FAILURE,
+        } or self.status in {"failure", "timeout", "recovery_failed"}
+        if reason_required != (self.reason is not None):
+            raise ValueError("operation reason presence is invalid for status")
+        if self.reason is not None:
+            if self.kind is OperationKind.STAGE_TERMINAL:
+                assert self.stage is not None
+                allowed_reasons = _STAGE_REASONS[self.stage]
+            elif self.kind is OperationKind.RECOVERY:
+                allowed_reasons = _RELIABILITY_REASONS
+            elif self.kind is OperationKind.STORAGE_FAILURE:
+                allowed_reasons = _STORAGE_REASONS
+            elif self.kind is OperationKind.METRICS_GENERATION:
+                allowed_reasons = _STORAGE_REASONS
+            elif self.kind is OperationKind.RUN_TERMINAL:
+                allowed_reasons = _PIPELINE_REASONS | _RELIABILITY_REASONS
+            elif self.kind is OperationKind.PROCESS_SAMPLE:
+                allowed_reasons = frozenset({"process"})
+            elif self.kind is OperationKind.STARTUP:
+                allowed_reasons = _RELIABILITY_REASONS
+            else:
+                allowed_reasons = frozenset()
+            if self.reason not in allowed_reasons:
+                raise ValueError("operation reason is invalid for event contract")
         expected_id = operation_event_id(
             self.model_dump(mode="json", exclude={"event_id"})
         )
@@ -450,9 +517,13 @@ def _open_journal(root_fd: int) -> tuple[int, bool]:
         raise OperationSecurityError(
             "operation journal must be a private owner-only regular file"
         )
-    if created:
-        os.fsync(root_fd)
     return descriptor, created
+
+
+def _fsync_root(root_fd: int) -> None:
+    """Re-establish directory durability; retries cover ambiguous creation failures."""
+
+    os.fsync(root_fd)
 
 
 def _lock(descriptor: int, operation: int) -> None:
@@ -539,11 +610,17 @@ def _validate_transitions(events: tuple[OperationEvent, ...]) -> None:
 
 
 def _verify_blobs(root: Path, events: tuple[OperationEvent, ...]) -> int:
-    references = {
-        event.evidence.sha256: event.evidence
-        for event in events
-        if event.evidence is not None
-    }
+    references: dict[str, BlobRefModel] = {}
+    for event in events:
+        reference = event.evidence
+        if reference is None:
+            continue
+        prior = references.get(reference.sha256)
+        if prior is not None and prior != reference:
+            raise OperationCorruptError(
+                "operation evidence has conflicting blob reference metadata"
+            )
+        references[reference.sha256] = reference
     if not references:
         return 0
     try:
@@ -559,31 +636,33 @@ def _verify_blobs(root: Path, events: tuple[OperationEvent, ...]) -> int:
     return len(references)
 
 
-def _screen_evidence(payload: bytes) -> None:
+def _screen_evidence(payload: bytes, kind: OperationKind) -> None:
     if type(payload) is not bytes:
         raise TypeError("operation evidence must be exact bytes")
     if len(payload) > _MAX_EVIDENCE_BYTES:
         raise ValueError("operation evidence exceeds maximum size")
-    if _FORBIDDEN_EVIDENCE.search(payload):
-        raise OperationSecurityError("operation evidence contains forbidden data")
     try:
         document = load_strict_json(payload)
-    except (UnicodeError, ValueError):
-        return
-    pending = [document]
-    while pending:
-        value = pending.pop()
-        if type(value) is dict:
-            for key, nested in cast(dict[object, object], value).items():
-                if type(key) is not str:
-                    raise OperationSecurityError("operation evidence is unsafe")
-                if is_credential_name(key):
-                    raise OperationSecurityError(
-                        "operation evidence contains credential-like data"
-                    )
-                pending.append(nested)
-        elif type(value) is list:
-            pending.extend(cast(list[object], value))
+        if (
+            type(document) is not dict
+            or canonical_json_bytes(document) != payload
+            or set(document) != _EVIDENCE_KEYS
+            or type(document.get("schema_version")) is not int
+            or document["schema_version"] != 1
+            or type(document.get("kind")) is not str
+            or document["kind"] != kind.value
+            or document["kind"] not in _EVIDENCE_KINDS
+            or type(document.get("status")) is not str
+            or document["status"] not in _EVIDENCE_STATUSES
+            or type(document.get("detail")) is not str
+            or document["detail"] not in _EVIDENCE_DETAILS
+            or any(is_credential_name(key) for key in document)
+        ):
+            raise ValueError
+    except (TypeError, UnicodeError, ValueError):
+        raise OperationSecurityError(
+            "operation evidence violates the closed canonical schema"
+        ) from None
 
 
 def append_operation(
@@ -604,12 +683,12 @@ def append_operation(
     else:
         if evidence is None:
             raise ValueError("operation evidence bytes are required")
-        _screen_evidence(evidence)
         if (
             len(evidence) != event.evidence.byte_size
             or hashlib.sha256(evidence).hexdigest() != event.evidence.sha256
         ):
             raise ValueError("operation evidence does not match its reference")
+        _screen_evidence(evidence, event.kind)
     root_path = root if root.is_absolute() else root.absolute()
     root_fd = _open_root(root_path)
     try:
@@ -628,6 +707,8 @@ def append_operation(
                     raise OperationConflictError(
                         "operation event identity has conflicting canonical bytes"
                     )
+                os.fsync(descriptor)
+                _fsync_root(root_fd)
                 return
             try:
                 verified = OperationEvent.model_validate(
@@ -665,6 +746,7 @@ def append_operation(
             os.lseek(descriptor, 0, os.SEEK_END)
             _write_all(descriptor, framed)
             os.fsync(descriptor)
+            _fsync_root(root_fd)
         finally:
             os.close(descriptor)
     finally:
@@ -686,6 +768,7 @@ def load_operation_cut(root: Path, *, recover_tail: bool = False) -> OperationCu
         try:
             _lock(descriptor, fcntl.LOCK_EX if recover_tail else fcntl.LOCK_SH)
             raw = _read_bytes(descriptor)
+            candidate = raw
             if raw and not raw.endswith(b"\n"):
                 boundary = raw.rfind(b"\n") + 1
                 discarded = len(raw) - boundary
@@ -693,14 +776,16 @@ def load_operation_cut(root: Path, *, recover_tail: bool = False) -> OperationCu
                     raise OperationCorruptError(
                         "operation journal has a truncated tail"
                     )
-                os.ftruncate(descriptor, boundary)
-                os.fsync(descriptor)
-                raw = raw[:boundary]
-            events = _parse_events(raw)
-            journal_bytes = len(raw)
+                candidate = raw[:boundary]
+            events = _parse_events(candidate)
+            valid_blobs = _verify_blobs(root_path, events)
+            if discarded:
+                os.ftruncate(descriptor, len(candidate))
+            os.fsync(descriptor)
+            _fsync_root(root_fd)
+            journal_bytes = len(candidate)
         finally:
             os.close(descriptor)
     finally:
         os.close(root_fd)
-    valid_blobs = _verify_blobs(root_path, events)
     return OperationCut(events, journal_bytes, valid_blobs, discarded)
