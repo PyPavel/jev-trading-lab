@@ -2202,12 +2202,90 @@ def test_provider_scanner_rejects_strict_normalized_credential_mapping_keys(
 
 
 @pytest.mark.parametrize(
-    "credential_key", ("monkey", "keyframe", "tokenization", "secretariat")
+    "credential_key",
+    (
+        "keyV2",
+        "authV2",
+        "AUTH_v２",
+        "proxyAuthV2",
+        "proxy_authorization_2026",
+        "password-v17",
+        "cookie９",
+    ),
+)
+def test_provider_scanner_rejects_versioned_generic_credential_mapping_keys(
+    credential_key: str,
+) -> None:
+    assert _contains_credentials({credential_key: "ARBITRARY秘密$VALUE"}, ())
+
+
+@pytest.mark.parametrize(
+    "credential_key",
+    tuple(
+        f"{name}{suffix}"
+        for name in ("key", "auth", "token", "secret", "proxyAuth")
+        for suffix in ("2", "V2", "_v２", "-2026", "V2_v3")
+    ),
+)
+def test_provider_scanner_fuzzes_bounded_generic_key_version_forms(
+    credential_key: str,
+) -> None:
+    assert _contains_credentials({credential_key: "ARBITRARY秘密$VALUE"}, ())
+
+
+@pytest.mark.parametrize(
+    "credential_key",
+    ("monkey", "keyframe", "tokenization", "secretariat", "authoritative"),
 )
 def test_provider_scanner_accepts_harmless_mapping_key_near_misses(
     credential_key: str,
 ) -> None:
     assert not _contains_credentials({credential_key: "ordinary metadata"}, ())
+
+
+@pytest.mark.parametrize(
+    "prose",
+    (
+        "token=arbitrary",
+        "secret: arbitrary",
+        "key／arbitrary",
+        "auth💥arbitrary",
+        "the token is arbitrary",
+        "PASSWORD_v２🔐arbitrary",
+        "proxy authorization V3 equals arbitrary",
+        "prefix token\\u003darbitrary suffix",
+        'prefix {"outer":"secret：arbitrary"} suffix',
+    ),
+)
+def test_provider_scanner_rejects_generic_credential_assignments(prose: str) -> None:
+    assert _contains_credentials({"missing_evidence": [prose]}, ())
+
+
+@pytest.mark.parametrize(
+    "credential_key",
+    ("token=arbitrary", "AUTH_v２💥arbitrary", "the secret is arbitrary"),
+)
+def test_provider_scanner_rejects_assignments_inside_mapping_keys(
+    credential_key: str,
+) -> None:
+    assert _contains_credentials({credential_key: "ordinary metadata"}, ())
+
+
+@pytest.mark.parametrize(
+    "prose",
+    (
+        "monkey business",
+        "keyframe animation",
+        "tokenization improves search",
+        "the secretariat met today",
+        "authoritative sources agree",
+        "the token is unavailable",
+    ),
+)
+def test_provider_scanner_accepts_harmless_generic_prose_near_misses(
+    prose: str,
+) -> None:
+    assert not _contains_credentials({"missing_evidence": [prose]}, ())
 
 
 @pytest.mark.parametrize(

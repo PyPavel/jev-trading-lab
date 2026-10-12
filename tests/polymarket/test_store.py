@@ -84,6 +84,37 @@ def test_sanitized_artifact_screen_rejects_residual_credential_semantics(
         _screen_artifact("sanitized_evidence", canonical_json_bytes(payload), ())
 
 
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'{"metadata":{"keyV2":"arbitrary"}}',
+        '{"metadata":{"AUTH_v２":"arbitrary"}}'.encode(),
+        b'{"message":"token=arbitrary"}',
+        '{"message":"auth💥arbitrary"}'.encode(),
+        b'{"message":"prefix {\\"secret\\":\\"arbitrary\\"} suffix"}',
+    ),
+)
+def test_provider_output_artifact_screen_rejects_strict_credentials(
+    payload: bytes,
+) -> None:
+    with pytest.raises(StoreSecurityError, match="credential"):
+        _screen_artifact("openai_response_success", payload, ())
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'{"metadata":{"monkey":"ordinary"}}',
+        b'{"message":"keyframe animation uses tokenization"}',
+        b'{"message":"the token is unavailable"}',
+    ),
+)
+def test_provider_output_artifact_screen_accepts_harmless_near_misses(
+    payload: bytes,
+) -> None:
+    _screen_artifact("openai_response_success", payload, ())
+
+
 def _result(cycle: dict[str, Any], suffix: str = "") -> ObservationResult:
     value = deepcopy(cycle["expected"]["observation_result"])
     if suffix:

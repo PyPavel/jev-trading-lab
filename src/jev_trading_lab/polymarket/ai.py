@@ -761,46 +761,114 @@ def _semantic_bytes(value: str) -> bytes:
     return unicodedata.normalize("NFKC", value).encode("utf-8")
 
 
-_PROVIDER_GENERIC_CREDENTIAL_NAMES = frozenset({"auth", "key", "secret", "token"})
-_PROVIDER_CREDENTIAL_COMPACT_NAMES = _PROVIDER_GENERIC_CREDENTIAL_NAMES | frozenset(
+_PROVIDER_GENERIC_CREDENTIAL_NAMES = frozenset(
     {
+        "auth",
+        "authorization",
+        "cookie",
+        "key",
+        "password",
         "proxyauth",
         "proxyauthorization",
-        "setcookie",
-        "xapikey",
+        "secret",
+        "token",
     }
 )
+_PROVIDER_CREDENTIAL_COMPACT_NAMES = _PROVIDER_GENERIC_CREDENTIAL_NAMES | frozenset(
+    {"setcookie", "xapikey"}
+)
+_PROVIDER_HARMLESS_ASSIGNMENT_VALUES = frozenset(
+    {
+        "available",
+        "configured",
+        "documented",
+        "needed",
+        "optional",
+        "required",
+        "stored",
+        "unavailable",
+        "used",
+    }
+)
+_PROVIDER_ASSIGNMENT_CONNECTORS = frozenset({"equals", "is", "was"})
 _PROVIDER_NAME_WORD = re.compile(r"\w+")
+_PROVIDER_VERSION_SUFFIX = re.compile(r"v?\d+$")
+
+
+def _provider_credential_compact(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value)
+    compact = "".join(
+        character for character in normalized.casefold() if character.isalnum()
+    )
+    while match := _PROVIDER_VERSION_SUFFIX.search(compact):
+        compact = compact[: match.start()]
+    return compact
 
 
 def _provider_credential_key(value: str) -> bool:
     """Apply strict credential-name policy to one decoded provider mapping key."""
 
     normalized = unicodedata.normalize("NFKC", value)
-    compact = "".join(
-        character for character in normalized.casefold() if character.isalnum()
-    )
+    compact = _provider_credential_compact(normalized)
     return compact in _PROVIDER_CREDENTIAL_COMPACT_NAMES or is_credential_name(
         normalized
     )
 
 
+def _provider_credential_phrase_spans(value: str) -> list[tuple[int, int, str]]:
+    words = list(_PROVIDER_NAME_WORD.finditer(value))
+    spans: list[tuple[int, int, str]] = []
+    for start in range(len(words)):
+        matched: tuple[int, int, str] | None = None
+        for end in range(start + 1, min(len(words), start + 4) + 1):
+            phrase_start = words[start].start()
+            phrase_end = words[end - 1].end()
+            phrase = value[phrase_start:phrase_end]
+            if _provider_credential_key(phrase):
+                matched = (
+                    phrase_start,
+                    phrase_end,
+                    _provider_credential_compact(phrase),
+                )
+        if matched is not None:
+            spans.append(matched)
+    return spans
+
+
+def _contains_generic_provider_assignment(value: str) -> bool:
+    """Detect generic credential assignments without broadening public prose policy."""
+
+    for _start, end, compact in _provider_credential_phrase_spans(value):
+        if compact not in _PROVIDER_GENERIC_CREDENTIAL_NAMES:
+            continue
+        following = list(_PROVIDER_NAME_WORD.finditer(value, end))
+        if not following:
+            continue
+        next_word = following[0]
+        separator = value[end : next_word.start()]
+        candidate = next_word.group(0).casefold()
+        if candidate in _PROVIDER_ASSIGNMENT_CONNECTORS:
+            values = list(_PROVIDER_NAME_WORD.finditer(value, next_word.end()))
+            if not values:
+                continue
+            assigned = values[0].group(0).casefold()
+            if assigned not in _PROVIDER_HARMLESS_ASSIGNMENT_VALUES:
+                return True
+        elif separator and any(not character.isspace() for character in separator):
+            return True
+    return False
+
+
 def _contains_provider_credential_phrase(value: str) -> bool:
-    """Recognize provider credential names across arbitrary Unicode separators."""
+    """Recognize provider credential names and assignments after NFKC decoding."""
 
     normalized = unicodedata.normalize("NFKC", value)
-    words = list(_PROVIDER_NAME_WORD.finditer(normalized))
-    for start in range(len(words)):
-        for end in range(start + 1, min(len(words), start + 4) + 1):
-            phrase = normalized[words[start].start() : words[end - 1].end()]
-            compact = "".join(
-                character for character in phrase.casefold() if character.isalnum()
-            )
-            if compact not in _PROVIDER_GENERIC_CREDENTIAL_NAMES and is_credential_name(
-                phrase
-            ):
-                return True
-    return False
+    if _contains_generic_provider_assignment(normalized):
+        return True
+    return any(
+        compact not in _PROVIDER_GENERIC_CREDENTIAL_NAMES
+        for _start, _end, compact in _provider_credential_phrase_spans(normalized)
+    )
 
 
 def _contains_credentials(value: object, sensitive_values: tuple[bytes, ...]) -> bool:
@@ -817,6 +885,7 @@ def _contains_credentials(value: object, sensitive_values: tuple[bytes, ...]) ->
                 type(key) is str
                 and (
                     _provider_credential_key(key)
+                    or _contains_provider_credential_phrase(key)
                     or any(
                         sentinel in _semantic_bytes(key)
                         for sentinel in normalized_sentinels

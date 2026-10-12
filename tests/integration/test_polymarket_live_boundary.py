@@ -3357,6 +3357,46 @@ def test_provider_generic_credential_key_fails_closed_before_jev_or_persistence(
     assert encoded_secret not in (tmp_path / "provider_calls.jsonl").read_bytes()
 
 
+@pytest.mark.parametrize(
+    ("surface", "credential"),
+    (
+        ("mapping", "keyV2"),
+        ("mapping", "AUTH_v２"),
+        ("prose", "the token is ARBITRARY$PUNCT秘密"),
+        ("prose", "prefix auth💥ARBITRARY$PUNCT秘密 suffix"),
+    ),
+)
+def test_provider_versioned_generic_credentials_fail_closed_end_to_end(
+    tmp_path: Path, surface: str, credential: str
+) -> None:
+    provider_secret = "ARBITRARY$PUNCT秘密"
+    market = _market()
+    openai = ModelTransport("openai", _market_sha(market))
+    envelope = json.loads(openai.raw)
+    if surface == "mapping":
+        envelope["metadata"] = {credential: provider_secret}
+    else:
+        message = next(item for item in envelope["output"] if item["type"] == "message")
+        brief = json.loads(message["content"][0]["text"])
+        brief["missing_evidence"] = [credential]
+        message["content"][0]["text"] = json.dumps(
+            brief, separators=(",", ":"), sort_keys=True
+        )
+    openai.raw = _wire(envelope)
+    jev = ModelTransport("jev")
+
+    summary = _observe(tmp_path, market=market, openai=openai, jev=jev)[0]
+
+    replay = load_observation(tmp_path, str(summary["observation_id"]))
+    failure = json.loads(replay.artifacts["openai_failure"])
+    encoded_secret = provider_secret.encode()
+    assert summary["ai"]["disposition"] == "MODEL_FAILURE"
+    assert failure["code"] == "CREDENTIAL_REFLECTION"
+    assert jev.requests == []
+    assert encoded_secret not in b"".join(replay.artifacts.values())
+    assert encoded_secret not in (tmp_path / "provider_calls.jsonl").read_bytes()
+
+
 def test_provider_embedded_json_punctuated_key_fails_before_jev_or_persistence(
     tmp_path: Path,
 ) -> None:
