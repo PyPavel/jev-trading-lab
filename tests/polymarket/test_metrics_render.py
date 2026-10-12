@@ -6,6 +6,7 @@ from itertools import product
 
 import pytest
 
+from jev_trading_lab.polymarket import metrics_render
 from jev_trading_lab.polymarket.metrics_render import (
     ExpositionError,
     Histogram,
@@ -592,6 +593,125 @@ def test_histogram_observation_generator_is_rejected_without_consumption() -> No
     with pytest.raises(ExpositionError, match="observation tuple"):
         render_exposition([], [histogram])
     assert consumed == 0
+
+
+def test_validator_rejects_bytes_subclasses_without_invoking_decode() -> None:
+    callbacks = 0
+
+    class HostileBytes(bytes):
+        def decode(self, *args: object, **kwargs: object) -> str:
+            nonlocal callbacks
+            callbacks += 1
+            raise AssertionError("bytes subclass decode was invoked")
+
+    payload = HostileBytes(render_exposition((), ()))
+
+    with pytest.raises(ExpositionError, match="exposition must be bytes") as caught:
+        validate_exposition(payload)
+
+    assert callbacks == 0
+    assert len(str(caught.value)) < 100
+
+
+def test_validator_accepts_parser_bounds_and_largest_renderer_payload() -> None:
+    declaration_payload = render_exposition((), ())
+    declaration_lines = declaration_payload.splitlines()
+    assert max(map(len, declaration_lines)) <= metrics_render._MAX_EXPOSITION_LINE_BYTES
+
+    sample = b"jev_polymarket_metrics_series "
+    numeric = b"-0." + b"0" * 127 + b"1"
+    assert len(numeric) == metrics_render._MAX_DECIMAL_TEXT_LENGTH
+    assert validate_exposition(declaration_payload + sample + numeric + b"\n") == 1
+
+    label_text = b'arm="' + b"a" * 120 + b'",status="' + b"f" * 120 + b'"'
+    assert len(label_text) == metrics_render._MAX_LABEL_TEXT_LENGTH
+    with pytest.raises(ExpositionError, match="labels are invalid"):
+        validate_exposition(
+            declaration_payload + b"jev_polymarket_fills_total{" + label_text + b"} 1\n"
+        )
+
+    exact_line = b"x" * metrics_render._MAX_EXPOSITION_LINE_BYTES
+    with pytest.raises(ExpositionError, match="malformed"):
+        validate_exposition(declaration_payload + exact_line + b"\n")
+
+    exact_lines = declaration_payload + b"x\n" * (
+        metrics_render._MAX_EXPOSITION_LINES - len(declaration_lines)
+    )
+    with pytest.raises(ExpositionError, match="malformed"):
+        validate_exposition(exact_lines)
+
+    exact_payload = b"x" * (metrics_render._MAX_EXPOSITION_BYTES - 1) + b"\n"
+    with pytest.raises(ExpositionError, match="line"):
+        validate_exposition(exact_payload)
+
+    largest_samples = _bounded_samples(788)
+    largest_samples = [
+        Sample(sample.family, sample.labels, Decimal("1" + "0" * 127))
+        for sample in largest_samples
+    ]
+    histogram = Histogram(
+        "jev_polymarket_market_book_bid_near_depth_contracts_histogram",
+        (("stage", "precheck_book"),),
+        (Decimal("1" + "0" * 127),),
+    )
+    largest = render_exposition(largest_samples, (histogram,))
+    assert len(largest) <= metrics_render._MAX_EXPOSITION_BYTES
+    assert validate_exposition(largest) == 800
+
+
+def test_validator_rejects_parser_bounds_at_plus_one_without_reflection() -> None:
+    declaration_payload = render_exposition((), ())
+    declaration_line_count = len(declaration_payload.splitlines())
+    sample = b"jev_polymarket_metrics_series "
+    hostile = b"x" * 100_000
+    cases = (
+        (declaration_payload + sample + hostile + b"\n", "line"),
+        (
+            declaration_payload + sample + b"-0." + b"0" * 128 + b"1\n",
+            "value",
+        ),
+        (
+            declaration_payload
+            + b'jev_polymarket_fills_total{arm="'
+            + b"a" * 251
+            + b'"} 1\n',
+            "labels",
+        ),
+        (
+            declaration_payload
+            + b"x" * (metrics_render._MAX_EXPOSITION_LINE_BYTES + 1)
+            + b"\n",
+            "line",
+        ),
+        (
+            declaration_payload
+            + b"x\n"
+            * (metrics_render._MAX_EXPOSITION_LINES - declaration_line_count + 1),
+            "line limit",
+        ),
+        (
+            b"x" * metrics_render._MAX_EXPOSITION_BYTES + b"\n",
+            "size",
+        ),
+    )
+
+    for payload, message in cases:
+        with pytest.raises(ExpositionError, match=message) as caught:
+            validate_exposition(payload)
+        assert hostile.decode() not in str(caught.value)
+        assert len(str(caught.value)) < 100
+
+
+def test_validator_parser_errors_never_reflect_hostile_content() -> None:
+    declaration_payload = render_exposition((), ())
+    hostile = "x" * 100_000
+    malformed = declaration_payload + hostile.encode() + b"\n"
+
+    with pytest.raises(ExpositionError) as caught:
+        validate_exposition(malformed)
+
+    assert hostile not in str(caught.value)
+    assert len(str(caught.value)) < 100
 
 
 def test_render_validates_complete_result_before_returning(

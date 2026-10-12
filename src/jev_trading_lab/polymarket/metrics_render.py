@@ -19,6 +19,10 @@ _MAX_SERIES = 800
 _MAX_HISTOGRAM_OBSERVATIONS = 800
 _MAX_DECIMAL_DIGITS = 128
 _MAX_DECIMAL_TEXT_LENGTH = _MAX_DECIMAL_DIGITS + 3
+_MAX_LABEL_TEXT_LENGTH = 256
+_MAX_EXPOSITION_LINE_BYTES = 512
+_MAX_EXPOSITION_LINES = 2 * len(METRIC_FAMILIES) + _MAX_SERIES
+_MAX_EXPOSITION_BYTES = 256 * 1024
 _VALUE = re.compile(r"(?:0|-?[1-9][0-9]*(?:\.[0-9]*[1-9])?|-?0\.[0-9]*[1-9])\Z")
 _SAMPLE = re.compile(
     r"(?P<name>[a-z_:][a-z0-9_:]*)(?:\{(?P<labels>.*)\})? (?P<value>\S+)\Z"
@@ -255,6 +259,8 @@ def _decode_label_value(text: str, start: int) -> tuple[str, int]:
 def _parse_labels(text: str | None) -> tuple[tuple[str, str], ...]:
     if text is None:
         return ()
+    if len(text) > _MAX_LABEL_TEXT_LENGTH:
+        raise ExpositionError("sample labels exceed size limit")
     if not text:
         raise ExpositionError("empty label braces are not canonical")
     pairs: list[tuple[str, str]] = []
@@ -288,14 +294,16 @@ def _parse_labels(text: str | None) -> tuple[tuple[str, str], ...]:
 
 
 def _parse_value(text: str) -> Decimal:
-    if len(text) > _MAX_DECIMAL_TEXT_LENGTH or not _VALUE.fullmatch(text):
-        raise ExpositionError(f"noncanonical or nonfinite metric value: {text!r}")
+    if len(text) > _MAX_DECIMAL_TEXT_LENGTH:
+        raise ExpositionError("metric value exceeds size limit")
+    if not _VALUE.fullmatch(text):
+        raise ExpositionError("metric value is noncanonical or nonfinite")
     try:
         value = Decimal(text)
     except InvalidOperation as error:
-        raise ExpositionError(f"invalid metric value: {text!r}") from error
+        raise ExpositionError("metric value is invalid") from error
     if not value.is_finite() or canonical_decimal(value) != text:
-        raise ExpositionError(f"noncanonical or nonfinite metric value: {text!r}")
+        raise ExpositionError("metric value is noncanonical or nonfinite")
     return value
 
 
@@ -383,15 +391,21 @@ def _validate_histograms(
 
 def validate_exposition(payload: bytes) -> int:
     """Strictly parse the supported exposition subset and return unique series count."""
-    if not isinstance(payload, bytes):
+    if type(payload) is not bytes:
         raise ExpositionError("exposition must be bytes")
+    if len(payload) > _MAX_EXPOSITION_BYTES:
+        raise ExpositionError("exposition exceeds size limit")
+    if not payload.endswith(b"\n") or payload.endswith(b"\n\n") or b"\r" in payload:
+        raise ExpositionError("exposition must have exactly one final LF")
+    if payload.count(b"\n") > _MAX_EXPOSITION_LINES:
+        raise ExpositionError("exposition exceeds line limit")
+    byte_lines = payload[:-1].split(b"\n")
+    if any(len(line) > _MAX_EXPOSITION_LINE_BYTES for line in byte_lines):
+        raise ExpositionError("exposition line exceeds size limit")
     try:
-        text = payload.decode("utf-8")
+        lines = [line.decode("utf-8") for line in byte_lines]
     except UnicodeDecodeError as error:
         raise ExpositionError("exposition must be valid UTF-8") from error
-    if not text.endswith("\n") or text.endswith("\n\n") or "\r" in text:
-        raise ExpositionError("exposition must have exactly one final LF")
-    lines = text[:-1].split("\n")
     if any(not line for line in lines):
         raise ExpositionError("blank exposition lines are forbidden")
 
@@ -408,7 +422,7 @@ def validate_exposition(payload: bytes) -> int:
     for line in sample_lines:
         match = _SAMPLE.fullmatch(line)
         if match is None:
-            raise ExpositionError(f"malformed sample line: {line!r}")
+            raise ExpositionError("sample line is malformed")
         name = match.group("name")
         labels = _parse_labels(match.group("labels"))
         value = _parse_value(match.group("value"))
