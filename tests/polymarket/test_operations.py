@@ -133,6 +133,19 @@ def append_raw_lines(root: Path, *values: OperationEvent, tail: bytes = b"") -> 
     return journal
 
 
+def persist_raw_evidence(root: Path, payload: bytes) -> BlobRefModel:
+    reference = blob_ref(payload)
+    path = root / reference.storage_relpath
+    path.parent.mkdir(mode=0o700, parents=True)
+    root.chmod(0o700)
+    (root / "operation-blobs").chmod(0o700)
+    path.parent.parent.chmod(0o700)
+    path.parent.chmod(0o700)
+    path.write_bytes(payload)
+    path.chmod(0o600)
+    return reference
+
+
 def evidence_payload(kind: str = "process_sample") -> bytes:
     return canonical_json_bytes(
         {
@@ -636,6 +649,120 @@ def test_canonical_bounded_evidence_is_published(tmp_path: Path) -> None:
     append_operation(root, event(kind="run_started", run_id=SHA, status="started"))
     append_operation(root, value, payload)
     assert load_operation_cut(root).events[-1] == value
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "kind": "process_sample",
+                "status": "unavailable",
+                "detail": "password=hunter2",
+            }
+        ),
+        canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "kind": "process_sample",
+                "status": "unavailable",
+                "detail": "Authorization: Bearer secret",
+            }
+        ),
+        canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "kind": "process_sample",
+                "status": "unavailable",
+                "detail": "/home/alice/private",
+            }
+        ),
+        canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "kind": "process_sample",
+                "status": "unavailable",
+                "detail": "https://example.com/private",
+            }
+        ),
+        canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "kind": "process_sample",
+                "status": "unavailable",
+                "error": "ValueError: boom",
+            }
+        ),
+        b"opaque bytes",
+        canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "kind": "process_sample",
+                "status": "unknown",
+                "detail": "probe_unavailable",
+            }
+        ),
+        canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "kind": "process_sample",
+                "status": "unavailable",
+                "detail": {"nested": "probe_unavailable"},
+            }
+        ),
+    ),
+    ids=("password", "bearer", "path", "url", "error", "opaque", "unknown", "nested"),
+)
+def test_replayed_hostile_evidence_fails_closed_without_tail_mutation(
+    tmp_path: Path, payload: bytes
+) -> None:
+    root = tmp_path / "audit"
+    reference = persist_raw_evidence(root, payload)
+    started = event(kind="run_started", run_id=SHA, status="started")
+    sampled = event(
+        kind="process_sample",
+        run_id=SHA,
+        status="failure",
+        reason="process",
+        evidence=reference.model_dump(),
+    )
+    original = journal_line(started) + journal_line(sampled) + b'{"torn":'
+    journal = append_raw_lines(root, tail=original)
+
+    with pytest.raises(OperationCorruptError) as captured:
+        load_operation_cut(root, recover_tail=True)
+
+    assert str(captured.value) == "operation evidence is missing or corrupt"
+    assert payload.decode(errors="replace") not in str(captured.value)
+    assert journal.read_bytes() == original
+    assert (root / reference.storage_relpath).read_bytes() == payload
+
+
+def test_replayed_evidence_must_match_every_referencing_event_kind(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "audit"
+    payload = evidence_payload()
+    reference = persist_raw_evidence(root, payload)
+    started = event(kind="run_started", run_id=SHA, status="started")
+    sampled = event(
+        kind="process_sample",
+        run_id=SHA,
+        status="success",
+        evidence=reference.model_dump(),
+    )
+    terminal = event(
+        kind="run_terminal",
+        run_id=SHA,
+        status="success",
+        evidence=reference.model_dump(),
+        occurred_at="2026-10-12T12:00:01Z",
+    )
+    append_raw_lines(root, started, sampled, terminal)
+
+    with pytest.raises(OperationCorruptError, match="evidence"):
+        load_operation_cut(root)
 
 
 @pytest.mark.parametrize(

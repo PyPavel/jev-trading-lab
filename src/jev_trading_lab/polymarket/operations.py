@@ -610,33 +610,38 @@ def _validate_transitions(events: tuple[OperationEvent, ...]) -> None:
 
 
 def _verify_blobs(root: Path, events: tuple[OperationEvent, ...]) -> int:
-    references: dict[str, BlobRefModel] = {}
+    references: dict[str, tuple[BlobRefModel, set[OperationKind]]] = {}
     for event in events:
         reference = event.evidence
         if reference is None:
             continue
         prior = references.get(reference.sha256)
-        if prior is not None and prior != reference:
+        if prior is not None and prior[0] != reference:
             raise OperationCorruptError(
                 "operation evidence has conflicting blob reference metadata"
             )
-        references[reference.sha256] = reference
+        if prior is None:
+            references[reference.sha256] = (reference, {event.kind})
+        else:
+            prior[1].add(event.kind)
     if not references:
         return 0
     try:
         with BlobStore(
             root / "operation-blobs", max_bytes=_MAX_EVIDENCE_BYTES
         ) as store:
-            for reference in references.values():
-                store.read_verified(reference.blob_ref())
-    except (BlobError, OSError) as error:
+            for reference, kinds in references.values():
+                payload = store.read_verified(reference.blob_ref())
+                for kind in kinds:
+                    _parse_evidence(payload, kind)
+    except (BlobError, OSError, OperationSecurityError) as error:
         raise OperationCorruptError(
             "operation evidence is missing or corrupt"
         ) from error
     return len(references)
 
 
-def _screen_evidence(payload: bytes, kind: OperationKind) -> None:
+def _parse_evidence(payload: bytes, kind: OperationKind) -> dict[str, object]:
     if type(payload) is not bytes:
         raise TypeError("operation evidence must be exact bytes")
     if len(payload) > _MAX_EVIDENCE_BYTES:
@@ -663,6 +668,7 @@ def _screen_evidence(payload: bytes, kind: OperationKind) -> None:
         raise OperationSecurityError(
             "operation evidence violates the closed canonical schema"
         ) from None
+    return cast(dict[str, object], document)
 
 
 def append_operation(
@@ -688,7 +694,7 @@ def append_operation(
             or hashlib.sha256(evidence).hexdigest() != event.evidence.sha256
         ):
             raise ValueError("operation evidence does not match its reference")
-        _screen_evidence(evidence, event.kind)
+        _parse_evidence(evidence, event.kind)
     root_path = root if root.is_absolute() else root.absolute()
     root_fd = _open_root(root_path)
     try:
