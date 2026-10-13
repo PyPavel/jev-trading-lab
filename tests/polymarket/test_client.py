@@ -258,6 +258,27 @@ def test_gamma_attempt_records_failure_only_after_endpoint_validation(
     assert len(transport.requests) == 1
 
 
+@pytest.mark.parametrize("payload", ([{}], [market(active="true")]))
+def test_gamma_attempt_fails_before_success_for_malformed_market_items(
+    payload: list[dict[str, Any]],
+) -> None:
+    attempts: list[tuple[str, str, str, str | None, int]] = []
+    transport = CannedTransport([payload], [])
+
+    result = PolymarketClient(
+        transport,
+        attempt_sink=lambda *attempt: attempts.append(attempt),
+    ).poll(limit=1, now=NOW)
+
+    assert [(item.market_id, item.reason) for item in result.rejections] == [
+        ("UNKNOWN" if payload == [{}] else "m1", "MALFORMED_MARKET")
+    ]
+    assert [attempt[:4] for attempt in attempts] == [
+        ("gamma", "gamma_poll", "failure", "malformed")
+    ]
+    assert len(transport.requests) == 1
+
+
 def test_execution_attempt_records_failure_only_for_malformed_clob_payload() -> None:
     client = PolymarketClient(CannedTransport([[market()]], [book(), []]))
     candidate = client.poll(limit=1, now=NOW).eligible[0]

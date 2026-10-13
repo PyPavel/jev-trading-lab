@@ -1329,6 +1329,9 @@ class PolymarketClient:
                     raise outcome
                 raise PublicDataError("Gamma transport failed") from outcome
             response = outcome
+            page_rows: list[
+                tuple[datetime, str, bytes, Mapping[str, object], datetime]
+            ] = []
             try:
                 value = _strict_response(response, label="Gamma")
                 if not isinstance(value, list):
@@ -1348,18 +1351,34 @@ class PolymarketClient:
                     raw_bytes=response.body,
                     retrieved_at=response.retrieved_at,
                 ) from error
-            self._record_attempt("gamma", "gamma_poll", "success", None, started_ns)
-            retrieved_at = response.retrieved_at
+            malformed = False
             for item_raw, item in zip(raw_items, value, strict=True):
                 assert isinstance(item, Mapping)
                 try:
+                    _gamma_semantic_identity(item)
+                    gamma_eligibility_reason(item, cutoff=cutoff)
                     close = normalize_gamma_utc(item.get("endDate"))
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, ArithmeticError):
+                    malformed = True
                     close = datetime.max.replace(tzinfo=UTC)
-                normalized.append(
-                    (close, _text(item.get("id")), item_raw, item, retrieved_at)
+                page_rows.append(
+                    (
+                        close,
+                        _text(item.get("id")),
+                        item_raw,
+                        item,
+                        response.retrieved_at,
+                    )
                 )
-            if len(value) < self.page_size:
+            self._record_attempt(
+                "gamma",
+                "gamma_poll",
+                "failure" if malformed else "success",
+                "malformed" if malformed else None,
+                started_ns,
+            )
+            normalized.extend(page_rows)
+            if malformed or len(value) < self.page_size:
                 break
         normalized.sort(key=lambda row: (row[0], row[1], row[2]))
         unique: list[tuple[datetime, str, bytes, Mapping[str, object], datetime]] = []
