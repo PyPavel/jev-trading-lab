@@ -644,9 +644,7 @@ def _write_metrics(path: Path, rows: list[dict[str, object]]) -> None:
             latest_cycle_status = "failure" if arm == "cycle" else "success"
         terminal_status = str(row["terminal_status"])
         failures[arm] = failures.get(arm, 0) + int(terminal_status == "failed")
-        abstentions[arm] = abstentions.get(arm, 0) + int(
-            terminal_status == "abstained"
-        )
+        abstentions[arm] = abstentions.get(arm, 0) + int(terminal_status == "abstained")
         latest_by_arm[arm] = row
         if arm == "cycle":
             continue
@@ -703,9 +701,7 @@ def _write_metrics(path: Path, rows: list[dict[str, object]]) -> None:
                     latest_market["request_latency_ms"],
                 )
             )
-    lines.append(
-        _metric("jev_stocks_cycle_status", {"status": latest_cycle_status}, 1)
-    )
+    lines.append(_metric("jev_stocks_cycle_status", {"status": latest_cycle_status}, 1))
 
     for arm, row in sorted(latest_by_arm.items()):
         labels = {"arm": arm}
@@ -760,10 +756,7 @@ def _write_metrics(path: Path, rows: list[dict[str, object]]) -> None:
                 _metric(
                     "jev_stocks_provider_unknown_cost",
                     provider_labels,
-                    int(
-                        provider["called"]
-                        and provider["cost_microdollars"] is None
-                    ),
+                    int(provider["called"] and provider["cost_microdollars"] is None),
                 ),
                 _metric(
                     "jev_stocks_fill_price_microdollars",
@@ -887,7 +880,8 @@ def replay_fixture(fixture: Path, output_dir: Path) -> dict[str, object]:
     observed_at = value.get("observed_at")
     decisions = value.get("fixture_decisions")
     if (
-        set(value) != {
+        set(value)
+        != {
             "fixture_decisions",
             "observation_id",
             "observed_at",

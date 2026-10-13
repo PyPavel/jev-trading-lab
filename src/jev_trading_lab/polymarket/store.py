@@ -4017,10 +4017,10 @@ def _finish_recovery_audit(
             raw = os.read(descriptor, _RECOVERY_MARKER_MAX_BYTES + 1)
         finally:
             os.close(descriptor)
-        if (
-            (owned.st_dev, owned.st_ino) != (expected_device, expected_inode)
-            or hashlib.sha256(raw).hexdigest() != expected_sha256
-        ):
+        if (owned.st_dev, owned.st_ino) != (
+            expected_device,
+            expected_inode,
+        ) or hashlib.sha256(raw).hexdigest() != expected_sha256:
             raise StoreCorruptError("recovery intent identity changed")
         _recovery_failpoint("marker_quarantine")
         try:

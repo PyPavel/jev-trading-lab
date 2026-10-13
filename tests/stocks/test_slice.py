@@ -156,8 +156,7 @@ def test_replay_accumulates_calls_and_failures_from_captured_rows(
     metrics = (tmp_path / "output/stocks.prom").read_text()
     assert (
         'jev_stocks_provider_calls_total{provider="openai",'
-        'model="gpt-5-2025-08-07"} 2'
-        in metrics
+        'model="gpt-5-2025-08-07"} 2' in metrics
     )
     assert 'jev_stocks_failures_total{arm="jev"} 2' in metrics
 
@@ -165,9 +164,7 @@ def test_replay_accumulates_calls_and_failures_from_captured_rows(
 def test_decision_counters_preserve_prior_action_series(tmp_path: Path) -> None:
     replay_fixture(FIXTURE, tmp_path / "output")
     fixture = json.loads(FIXTURE.read_text())
-    fixture["fixture_decisions"]["openai"].update(
-        {"action": "HOLD", "symbol": None}
-    )
+    fixture["fixture_decisions"]["openai"].update({"action": "HOLD", "symbol": None})
     path = tmp_path / "hold.json"
     path.write_text(json.dumps(fixture))
 
@@ -430,9 +427,7 @@ def test_openai_response_rejects_extra_completed_message_without_text(
     monkeypatch.setattr(
         stock_slice.urllib.request,
         "urlopen",
-        lambda *_args, **_kwargs: _Response(
-            {"output": [message, empty_message]}
-        ),
+        lambda *_args, **_kwargs: _Response({"output": [message, empty_message]}),
     )
 
     assert stock_slice._provider_decision("openai", b"{}", quotes)["status"] == (
