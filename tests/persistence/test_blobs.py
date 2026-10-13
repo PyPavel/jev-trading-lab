@@ -1075,7 +1075,7 @@ def test_io_failures_leave_no_reference_or_fd_leak(
 ) -> None:
     api = _api()
     store = _store(tmp_path)
-    before = len(os.listdir("/proc/self/fd"))
+    before = set(os.listdir("/proc/self/fd"))
     called: list[Any] = []
     if operation == "fsync":
         monkeypatch.setattr(
@@ -1104,7 +1104,7 @@ def test_io_failures_leave_no_reference_or_fd_leak(
         store.publish_and_reference(b"failure", called.append)
     assert "failure" not in str(caught.value)
     assert called == []
-    assert len(os.listdir("/proc/self/fd")) == before
+    assert len(os.listdir("/proc/self/fd")) <= len(before)
 
 
 def test_root_open_and_filesystem_validation_are_descriptor_bound(

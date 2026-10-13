@@ -4008,7 +4008,10 @@ def _finish_recovery_audit(
     os.rename(canonical, quarantine, src_dir_fd=root_fd, dst_dir_fd=root_fd)
     try:
         flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
-        descriptor = os.open(quarantine, flags, dir_fd=root_fd)
+        try:
+            descriptor = os.open(quarantine, flags, dir_fd=root_fd)
+        except OSError:
+            raise StoreCorruptError("recovery intent identity changed") from None
         try:
             owned = os.fstat(descriptor)
             raw = os.read(descriptor, _RECOVERY_MARKER_MAX_BYTES + 1)

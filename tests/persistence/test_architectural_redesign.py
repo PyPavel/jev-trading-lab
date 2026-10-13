@@ -759,7 +759,7 @@ def test_migration_helper_eof_still_enforces_lifetime_deadline(
         "p=subprocess.Popen([sys.executable,'-B','-c',"
         "'import os,time; os.close(1); os.close(2); time.sleep(30)']); "
         "pathlib.Path(sys.argv[1]).write_text(str(p.pid)); "
-        "os.close(1); os.close(2); time.sleep(1)"
+        "time.sleep(0.02); os.close(1); os.close(2); time.sleep(1)"
     )
     command = (sys.executable, "-B", "-c", code, str(pid_file))
     monkeypatch.setattr(migration_module, "_helper_command", lambda *_args: command)
