@@ -238,19 +238,24 @@ def test_malformed_timeout_redirect_and_oversize_are_bounded() -> None:
             client.poll(limit=1, now=NOW)
 
 
-def test_gamma_attempt_records_failure_only_after_endpoint_validation() -> None:
+@pytest.mark.parametrize("payload", ({}, [1]))
+def test_gamma_attempt_records_failure_only_after_endpoint_validation(
+    payload: object,
+) -> None:
     attempts: list[tuple[str, str, str, str | None, int]] = []
+    transport = CannedTransport([payload], [])
     client = PolymarketClient(
-        CannedTransport([{}], []),
+        transport,
         attempt_sink=lambda *attempt: attempts.append(attempt),
     )
 
-    with pytest.raises(PublicDataError, match="must be an array"):
+    with pytest.raises(PublicDataError, match="array|object"):
         client.poll(limit=1, now=NOW)
 
     assert [attempt[:4] for attempt in attempts] == [
         ("gamma", "gamma_poll", "failure", "malformed")
     ]
+    assert len(transport.requests) == 1
 
 
 def test_execution_attempt_records_failure_only_for_malformed_clob_payload() -> None:
@@ -265,6 +270,52 @@ def test_execution_attempt_records_failure_only_for_malformed_clob_payload() -> 
     assert [attempt[:4] for attempt in attempts] == [
         ("clob", "execution_book", "failure", "malformed")
     ]
+
+
+@pytest.mark.parametrize(
+    "changed",
+    (
+        book(asset_id="other"),
+        book(market="other"),
+        book(timestamp=str(int((NOW - timedelta(seconds=31)).timestamp() * 1000))),
+        book(asks=[{"price": "0.47", "size": "5000"}]),
+        [],
+    ),
+)
+def test_precheck_attempt_records_failure_only_after_book_validation(
+    changed: object,
+) -> None:
+    attempts: list[tuple[str, str, str, str | None, int]] = []
+    transport = CannedTransport([[market()]], [changed])
+
+    result = PolymarketClient(
+        transport,
+        attempt_sink=lambda *attempt: attempts.append(attempt),
+    ).poll(limit=1, now=NOW)
+
+    assert len(result.rejections) == 1
+    assert [attempt[:4] for attempt in attempts] == [
+        ("gamma", "gamma_poll", "success", None),
+        ("clob", "precheck_book", "failure", "malformed"),
+    ]
+    assert len(transport.requests) == 2
+
+
+def test_precheck_validated_snapshot_records_one_success() -> None:
+    attempts: list[tuple[str, str, str, str | None, int]] = []
+    transport = CannedTransport([[market()]], [book()])
+
+    result = PolymarketClient(
+        transport,
+        attempt_sink=lambda *attempt: attempts.append(attempt),
+    ).poll(limit=1, now=NOW)
+
+    assert len(result.eligible) == 1
+    assert [attempt[:4] for attempt in attempts] == [
+        ("gamma", "gamma_poll", "success", None),
+        ("clob", "precheck_book", "success", None),
+    ]
+    assert len(transport.requests) == 2
 
 
 def test_validated_attempt_records_one_success_with_monotonic_latency(

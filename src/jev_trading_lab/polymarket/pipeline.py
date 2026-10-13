@@ -734,21 +734,23 @@ def _journaled_provider_call(
     existing = journal.lookup(opportunity_id, provider)  # type: ignore[arg-type]
     if existing is not None:
         if existing["kind"] == "provider_call_result":
+            recovered = adapter_from_outcome(provider, existing["outcome"])  # type: ignore[arg-type]
+            status = (
+                "unknown_in_flight"
+                if isinstance(recovered, AdapterFailure)
+                and recovered.code == "UNKNOWN_IN_FLIGHT"
+                else "reused_result"
+            )
             _record_provider_recovery(
                 root=journal.root,
                 provider=provider,
                 call_id=existing["call_id"],
                 occurred_at=created_at,
-                status="reused_result",
+                status=status,
             )
-            return adapter_from_outcome(provider, existing["outcome"])  # type: ignore[arg-type]
+            return recovered
         frozen_request = base64.b64decode(existing["request_b64"], validate=True)
         unknown = _unknown_provider_result(provider, frozen_request)
-        journal.finish(
-            existing["call_id"],
-            outcome=adapter_outcome(unknown),
-            finished_at=created_at,
-        )
         _record_provider_recovery(
             root=journal.root,
             provider=provider,
@@ -756,6 +758,15 @@ def _journaled_provider_call(
             occurred_at=created_at,
             status="unknown_in_flight",
         )
+        if event_sink is not None:
+            event_sink(f"{provider}_recovery_classified")
+        journal.finish(
+            existing["call_id"],
+            outcome=adapter_outcome(unknown),
+            finished_at=created_at,
+        )
+        if event_sink is not None:
+            event_sink(f"{provider}_recovery_terminalized")
         return unknown
     call_id = journal.begin(
         provider=provider,  # type: ignore[arg-type]

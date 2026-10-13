@@ -127,7 +127,6 @@ class HttpResponse:
 
 ByteTransport = Callable[[HttpRequest], HttpResponse]
 AttemptSink = Callable[[str, str, str, str | None, int], None]
-ResponseValidator = Callable[[bytes, object, datetime], None]
 Resolver = Callable[..., list[tuple[Any, ...]]]
 _RESOLVERS = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bounded-dns")
 
@@ -1160,30 +1159,37 @@ class PolymarketClient:
                 provider, stage, status, reason, time.monotonic_ns() - started_ns
             )
 
-    def _get(
-        self, url: str, *, label: str, validate: ResponseValidator | None = None
-    ) -> tuple[bytes, object, datetime]:
-        provider = "gamma" if label == "Gamma" else "clob"
-        stage = "gamma_poll" if label == "Gamma" else "execution_book"
+    def _request(self, url: str) -> tuple[int, HttpResponse | Exception]:
+        """Return one unrecorded transport outcome for endpoint-owned validation."""
+
         started_ns = time.monotonic_ns()
         try:
-            response = self.transport(HttpRequest("GET", url))
-        except TimeoutError as error:
-            self._record_attempt(provider, stage, "timeout", "timeout", started_ns)
-            reason = "PRECHECK_TIMEOUT" if label == "CLOB" else "PUBLIC_DATA_TIMEOUT"
-            raise PublicDataTimeout(
-                f"{label} transport timed out", reason=reason
-            ) from error
-        except PublicDataError:
-            self._record_attempt(provider, stage, "failure", "transport", started_ns)
-            raise
+            return started_ns, self.transport(HttpRequest("GET", url))
         except Exception as error:
+            return started_ns, error
+
+    def _get(self, url: str, *, label: str) -> tuple[bytes, object, datetime]:
+        """Fetch and validate a generic endpoint response for direct callers."""
+
+        provider = "gamma" if label == "Gamma" else "clob"
+        stage = "gamma_poll" if label == "Gamma" else "execution_book"
+        started_ns, outcome = self._request(url)
+        if isinstance(outcome, Exception):
+            if isinstance(outcome, (TimeoutError, PublicDataTimeout)):
+                self._record_attempt(provider, stage, "timeout", "timeout", started_ns)
+                reason = (
+                    "PRECHECK_TIMEOUT" if label == "CLOB" else "PUBLIC_DATA_TIMEOUT"
+                )
+                raise PublicDataTimeout(
+                    f"{label} transport timed out", reason=reason
+                ) from outcome
             self._record_attempt(provider, stage, "failure", "transport", started_ns)
-            raise PublicDataError(f"{label} transport failed") from error
+            if isinstance(outcome, PublicDataError):
+                raise outcome
+            raise PublicDataError(f"{label} transport failed") from outcome
+        response = outcome
         try:
             value = _strict_response(response, label=label)
-            if validate is not None:
-                validate(response.body, value, response.retrieved_at)
         except (PublicDataError, TypeError, ValueError, ArithmeticError) as error:
             self._record_attempt(provider, stage, "failure", "malformed", started_ns)
             message = _reason(error) if label == "CLOB" else str(error)
@@ -1199,7 +1205,12 @@ class PolymarketClient:
         return response.body, value, response.retrieved_at
 
     def _precheck_attempt(
-        self, token_id: str, attempted_at: datetime
+        self,
+        token_id: str,
+        attempted_at: datetime,
+        *,
+        market_id: str,
+        condition_id: str,
     ) -> PrecheckAttempt:
         """Make one precheck request and keep its exact bounded outcome."""
 
@@ -1209,19 +1220,18 @@ class PolymarketClient:
             )
 
         url = f"{CLOB_ENDPOINT}?{urlencode({'token_id': token_id})}"
-        started_ns = time.monotonic_ns()
-        try:
-            response = self.transport(HttpRequest("GET", url))
-        except (TimeoutError, PublicDataTimeout):
+        started_ns, outcome = self._request(url)
+        if isinstance(outcome, (TimeoutError, PublicDataTimeout)):
             self._record_attempt(
                 "clob", "precheck_book", "timeout", "timeout", started_ns
             )
             return no_response("TIMEOUT")
-        except Exception:
+        if isinstance(outcome, Exception):
             self._record_attempt(
                 "clob", "precheck_book", "failure", "transport", started_ns
             )
             return no_response("TRANSPORT_ERROR")
+        response = outcome
         if (
             not isinstance(response, HttpResponse)
             or type(response.status_code) is not int
@@ -1244,7 +1254,17 @@ class PolymarketClient:
             truncated=truncated,
             body=body,
         )
-        status = "success" if reason == "OK" else "failure"
+        snapshot = None
+        if reason == "OK":
+            _snapshot_reason, snapshot = derive_precheck_rejection(
+                transport_reason=reason,
+                body=body,
+                market_id=market_id,
+                condition_id=condition_id,
+                token_id=token_id,
+                now=response.retrieved_at.astimezone(UTC),
+            )
+        status = "success" if snapshot is not None else "failure"
         metric_reason = (
             None
             if status == "success"
@@ -1252,8 +1272,7 @@ class PolymarketClient:
                 "HTTP_STATUS": "http_status",
                 "CONTENT_TYPE": "content_type",
                 "OVERSIZED": "oversized",
-                "MALFORMED": "malformed",
-            }.get(reason, "other")
+            }.get(reason, "malformed" if reason == "OK" else "other")
         )
         self._record_attempt("clob", "precheck_book", status, metric_reason, started_ns)
         return PrecheckAttempt(
@@ -1294,22 +1313,45 @@ class PolymarketClient:
                 }
             )
 
-            def validate_gamma(
-                raw: bytes, value: object, _retrieved_at: datetime
-            ) -> None:
+            started_ns, outcome = self._request(f"{GAMMA_ENDPOINT}?{params}")
+            if isinstance(outcome, Exception):
+                if isinstance(outcome, (TimeoutError, PublicDataTimeout)):
+                    self._record_attempt(
+                        "gamma", "gamma_poll", "timeout", "timeout", started_ns
+                    )
+                    raise PublicDataTimeout(
+                        "Gamma transport timed out", reason="PUBLIC_DATA_TIMEOUT"
+                    ) from outcome
+                self._record_attempt(
+                    "gamma", "gamma_poll", "failure", "transport", started_ns
+                )
+                if isinstance(outcome, PublicDataError):
+                    raise outcome
+                raise PublicDataError("Gamma transport failed") from outcome
+            response = outcome
+            try:
+                value = _strict_response(response, label="Gamma")
                 if not isinstance(value, list):
                     raise PublicDataError("Gamma response must be an array")
-                if len(_market_raw_items(raw)) != len(value):
+                raw_items = _market_raw_items(response.body)
+                if len(raw_items) != len(value):
                     raise PublicDataError("Gamma raw item count is inconsistent")
-
-            raw, value, retrieved_at = self._get(
-                f"{GAMMA_ENDPOINT}?{params}", label="Gamma", validate=validate_gamma
-            )
-            assert isinstance(value, list)
-            raw_items = _market_raw_items(raw)
-            for item_raw, item in zip(raw_items, value, strict=True):
-                if not isinstance(item, Mapping):
+                if any(not isinstance(item, Mapping) for item in value):
                     raise PublicDataError("Gamma market must be an object")
+            except (PublicDataError, TypeError, ValueError, ArithmeticError) as error:
+                self._record_attempt(
+                    "gamma", "gamma_poll", "failure", "malformed", started_ns
+                )
+                raise PublicDataError(
+                    str(error),
+                    reason=getattr(error, "reason", "BOOK_UNAVAILABLE"),
+                    raw_bytes=response.body,
+                    retrieved_at=response.retrieved_at,
+                ) from error
+            self._record_attempt("gamma", "gamma_poll", "success", None, started_ns)
+            retrieved_at = response.retrieved_at
+            for item_raw, item in zip(raw_items, value, strict=True):
+                assert isinstance(item, Mapping)
                 try:
                     close = normalize_gamma_utc(item.get("endDate"))
                 except (TypeError, ValueError):
@@ -1444,7 +1486,12 @@ class PolymarketClient:
                         attempts[-1].retrieved_at or attempts[-1].attempted_at,
                     )
                 )
-                attempt = self._precheck_attempt(yes_token, attempted_at)
+                attempt = self._precheck_attempt(
+                    yes_token,
+                    attempted_at,
+                    market_id=market_id,
+                    condition_id=condition_id,
+                )
                 snapshot_reason, snapshot = derive_precheck_rejection(
                     transport_reason=attempt.transport_reason,
                     body=attempt.body,
@@ -1546,30 +1593,42 @@ class PolymarketClient:
         if cutoff.tzinfo is not UTC:
             cutoff = cutoff.astimezone(UTC)
 
-        def validate_book(raw: bytes, value: object, retrieved_at: datetime) -> None:
-            _book_snapshot(
-                raw,
-                value,
-                expected_market_id=candidate.market_id,
-                expected_condition_id=candidate.condition_id,
-                expected_token_id=candidate.yes_token_id,
-                now=retrieved_at,
+        url = f"{CLOB_ENDPOINT}?{urlencode({'token_id': candidate.yes_token_id})}"
+        started_ns, outcome = self._request(url)
+        if isinstance(outcome, Exception):
+            if isinstance(outcome, (TimeoutError, PublicDataTimeout)):
+                self._record_attempt(
+                    "clob", "execution_book", "timeout", "timeout", started_ns
+                )
+                raise PublicDataTimeout(
+                    "CLOB transport timed out", reason="PRECHECK_TIMEOUT"
+                ) from outcome
+            self._record_attempt(
+                "clob", "execution_book", "failure", "transport", started_ns
             )
-
-        raw, value, retrieved_at = self._get(
-            f"{CLOB_ENDPOINT}?{urlencode({'token_id': candidate.yes_token_id})}",
-            label="CLOB",
-            validate=validate_book,
-        )
+            if isinstance(outcome, PublicDataError):
+                raise outcome
+            raise PublicDataError("CLOB transport failed") from outcome
+        response = outcome
         try:
+            value = _strict_response(response, label="CLOB")
             snapshot = _book_snapshot(
-                raw,
+                response.body,
                 value,
                 expected_market_id=candidate.market_id,
                 expected_condition_id=candidate.condition_id,
                 expected_token_id=candidate.yes_token_id,
-                now=retrieved_at,
+                now=response.retrieved_at,
             )
-        except (TypeError, ValueError, ArithmeticError) as error:
-            raise PublicDataError(_reason(error)) from error
-        return raw, snapshot
+        except (PublicDataError, TypeError, ValueError, ArithmeticError) as error:
+            self._record_attempt(
+                "clob", "execution_book", "failure", "malformed", started_ns
+            )
+            raise PublicDataError(
+                _reason(error),
+                reason="MALFORMED_BOOK",
+                raw_bytes=response.body,
+                retrieved_at=response.retrieved_at,
+            ) from error
+        self._record_attempt("clob", "execution_book", "success", None, started_ns)
+        return response.body, snapshot

@@ -2314,6 +2314,40 @@ def test_crash_after_provider_intent_never_retries_unknown_call(tmp_path: Path) 
     )
 
 
+@pytest.mark.parametrize(
+    "boundary", ("openai_recovery_classified", "openai_recovery_terminalized")
+)
+def test_pending_recovery_is_crash_consistent_at_each_durable_boundary(
+    tmp_path: Path, boundary: str
+) -> None:
+    def crash_after_intent(event: str) -> None:
+        if event == "openai_intent_frozen":
+            raise RuntimeError("provider intent frozen")
+
+    with pytest.raises(RuntimeError, match="intent"):
+        _observe(tmp_path, event_sink=crash_after_intent)
+
+    def crash_during_recovery(event: str) -> None:
+        if event == boundary:
+            raise RuntimeError("recovery boundary")
+
+    with pytest.raises(RuntimeError, match="recovery boundary"):
+        _observe(tmp_path, event_sink=crash_during_recovery)
+
+    summary = _observe(tmp_path)[0]
+    assert summary["ai"]["disposition"] == "UNKNOWN_IN_FLIGHT"
+    assert _observe(tmp_path) == [summary]
+    recoveries = [
+        event
+        for event in load_operation_cut(tmp_path).events
+        if event.kind is OperationKind.RECOVERY and event.provider == "openai"
+    ]
+    assert [event.reason for event in recoveries] == ["unknown_in_flight"]
+    metrics = (tmp_path / "polymarket.prom").read_text()
+    assert 'provider="openai",status="unknown_in_flight"} 1' in metrics
+    assert 'provider="openai",status="reused_result"}' not in metrics
+
+
 def test_completed_slot_replay_terminalizes_other_same_slot_pending_intent(
     tmp_path: Path,
 ) -> None:
