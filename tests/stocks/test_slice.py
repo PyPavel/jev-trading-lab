@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import urllib.error
 from pathlib import Path
 from typing import Any
@@ -324,9 +325,10 @@ def test_stocks_replay_cli(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert json.loads(result.stdout)["terminal_rows"] == 3
     help_result = CliRunner().invoke(app, ["stocks", "observe", "--help"])
+    help_text = re.sub(r"\x1b\[[0-9;]*m", "", help_result.stdout)
     assert help_result.exit_code == 0
-    assert "--symbols" in help_result.stdout
-    assert "broker" not in help_result.stdout.casefold()
+    assert "--symbols" in help_text
+    assert "broker" not in help_text.casefold()
 
 
 def test_openai_response_accepts_one_message_after_reasoning(

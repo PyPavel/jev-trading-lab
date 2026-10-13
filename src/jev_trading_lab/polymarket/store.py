@@ -3825,7 +3825,7 @@ def _write_recovery_marker(root_fd: int, candidate: _RecoveryCandidate) -> None:
 
 def _read_recovery_marker(
     root_fd: int, kind: JournalKind
-) -> tuple[_RecoveryCandidate, tuple[int, int]]:
+) -> tuple[_RecoveryCandidate, tuple[int, int, str]]:
     name = _marker_name(kind)
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
@@ -3852,7 +3852,11 @@ def _read_recovery_marker(
         candidate = _candidate_from_document(document)
         if candidate.kind != kind:
             raise StoreCorruptError("recovery intent identity is invalid")
-        return candidate, (metadata.st_dev, metadata.st_ino)
+        return candidate, (
+            metadata.st_dev,
+            metadata.st_ino,
+            hashlib.sha256(raw).hexdigest(),
+        )
     except (TypeError, ValueError):
         raise StoreCorruptError("recovery intent is invalid") from None
     finally:
@@ -3879,7 +3883,7 @@ def _recover_store_journal(
     opened: dict[JournalKind, tuple[int, str]],
     expected: _RecoveryCandidate,
     output: Path,
-) -> tuple[JournalRecovery, tuple[int, int]]:
+) -> tuple[JournalRecovery, tuple[int, int, str]]:
     selected = opened.get(expected.kind)
     if selected is None:
         raise StoreCorruptError("recovery journal identity changed")
@@ -3906,10 +3910,19 @@ def _recover_store_journal(
         raise StoreCorruptError(f"{label} accepted prefix changed during recovery")
     _validate_recovery_cut(output, prefixes)
     _write_recovery_marker(root_fd, expected)
-    marker_metadata = os.stat(
-        _marker_name(expected.kind), dir_fd=root_fd, follow_symlinks=False
+    marker_name = _marker_name(expected.kind)
+    marker_metadata = os.stat(marker_name, dir_fd=root_fd, follow_symlinks=False)
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    marker_descriptor = os.open(marker_name, flags, dir_fd=root_fd)
+    try:
+        marker_raw = os.read(marker_descriptor, _RECOVERY_MARKER_MAX_BYTES + 1)
+    finally:
+        os.close(marker_descriptor)
+    marker_identity = (
+        marker_metadata.st_dev,
+        marker_metadata.st_ino,
+        hashlib.sha256(marker_raw).hexdigest(),
     )
-    marker_identity = (marker_metadata.st_dev, marker_metadata.st_ino)
     os.ftruncate(descriptor, expected.prefix_size)
     _recovery_failpoint("truncate")
     os.fsync(descriptor)
@@ -3976,7 +3989,7 @@ def _finish_recovery_audit(
     root_fd: int,
     output: Path,
     candidate: _RecoveryCandidate,
-    marker_identity: tuple[int, int],
+    marker_identity: tuple[int, int, str],
 ) -> None:
     append_operation(output, candidate.event, _locked_root_fd=root_fd)
     _recovery_failpoint("audit_append")
@@ -3987,14 +4000,24 @@ def _finish_recovery_audit(
         )
     except OSError:
         raise StoreCorruptError("recovery intent identity changed") from None
-    if (metadata.st_dev, metadata.st_ino) != marker_identity:
+    expected_device, expected_inode, expected_sha256 = marker_identity
+    if (metadata.st_dev, metadata.st_ino) != (expected_device, expected_inode):
         raise StoreCorruptError("recovery intent identity changed")
     canonical = _marker_name(candidate.kind)
     quarantine = f".recovery-owned-{candidate.kind}-{secrets.token_hex(16)}"
     os.rename(canonical, quarantine, src_dir_fd=root_fd, dst_dir_fd=root_fd)
     try:
-        owned = os.stat(quarantine, dir_fd=root_fd, follow_symlinks=False)
-        if (owned.st_dev, owned.st_ino) != marker_identity:
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+        descriptor = os.open(quarantine, flags, dir_fd=root_fd)
+        try:
+            owned = os.fstat(descriptor)
+            raw = os.read(descriptor, _RECOVERY_MARKER_MAX_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        if (
+            (owned.st_dev, owned.st_ino) != (expected_device, expected_inode)
+            or hashlib.sha256(raw).hexdigest() != expected_sha256
+        ):
             raise StoreCorruptError("recovery intent identity changed")
         _recovery_failpoint("marker_quarantine")
         try:
@@ -4064,7 +4087,7 @@ def recover_store_tails(
                 for index, (_name, kind, _label) in enumerate(_RECOVERY_JOURNALS)
             }
             candidates.sort(key=lambda item: order[item.kind])
-            created: list[tuple[_RecoveryCandidate, tuple[int, int]]] = []
+            created: list[tuple[_RecoveryCandidate, tuple[int, int, str]]] = []
             for candidate in candidates:
                 recovery, marker_identity = _recover_store_journal(
                     root_fd, opened, candidate, output

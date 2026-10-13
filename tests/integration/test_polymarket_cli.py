@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -144,8 +145,10 @@ def test_help_exposes_public_observe_but_no_execution_capability() -> None:
         result.exit_code == 0
         for result in (root_help, polymarket_help, replay_help, observe_help)
     )
-    assert "observe" in polymarket_help.stdout.casefold()
-    assert "--limit" in observe_help.stdout.casefold()
+    polymarket_text = re.sub(r"\x1b\[[0-9;]*m", "", polymarket_help.stdout).casefold()
+    observe_text = re.sub(r"\x1b\[[0-9;]*m", "", observe_help.stdout).casefold()
+    assert "observe" in polymarket_text
+    assert "--limit" in observe_text
     for forbidden in (
         "wallet",
         "sign",
